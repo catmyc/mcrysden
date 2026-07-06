@@ -47,6 +47,8 @@ struct Scene: Codable {
     var cell: Cell?
     var title: String = ""
     var displayMode: DisplayMode = .ballStick
+    var isCrystal: Bool = false
+    var periodicDim: Int = 3
     var superCell: SuperCell = SuperCell()
     var slab: Slab?
     var background: String = "#101014"

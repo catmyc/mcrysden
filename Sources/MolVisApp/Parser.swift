@@ -48,7 +48,23 @@ enum Parser {
             throw ParseError.parse(path: url.path, line: 0, reason: msg)
         }
         defer { molenv_scene_free(scene) }
-        var s = scene.pointee
+        return copyOut(scene.pointee)
+    }
+
+    static func load(_ url: URL, frameIndex: Int) throws -> LoadedScene {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw ParseError.io(path: url.path, reason: "file not found")
+        }
+        let cPath = url.path.cString(using: .utf8)!
+        guard let scene = parse_axsf(cPath, Int32(frameIndex)) else {
+            let msg = String(cString: molenv_last_error()); throw ParseError.parse(path: url.path, line: 0, reason: msg)
+        }
+        defer { molenv_scene_free(scene) }
+        return copyOut(scene.pointee)
+    }
+
+    private static func copyOut(_ s: MolEnvScene) -> LoadedScene {
+        var s = s
         var out = LoadedScene()
         out.isCrystal = s.is_crystal != 0
         out.periodicDim = Int(s.periodic_dim)

@@ -1,0 +1,6 @@
+ATOM      1  N   ALA A   1       0.000   0.000   0.000
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000
+ATOM      3  C   ALA A   1       2.009   1.420   0.000
+ATOM      4  O   ALA A   1       1.251   2.390   0.000
+ATOM      5  CB  ALA A   1       1.989  -0.729   1.206
+END
