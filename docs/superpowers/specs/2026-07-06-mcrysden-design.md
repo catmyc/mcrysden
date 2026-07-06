@@ -306,8 +306,10 @@ Three layers, no mocking framework.
 
 ## 12. v1 delivery order (suggested)
 
+Each step is independently demoable in the GUI before moving on. Note the **design invariant**: `Renderer.encode(to commandBuffer:, target: MTLTexture, viewport:, scene:)` must take the target texture as a parameter *from step 2* so that headless export (step 10) is the same code path, not a later retrofit.
+
 1. SPM package skeleton + `MolEnvParse` C target + one trivial test that links.
-2. `parse_xyz` + `parse_pdb` (simplest) → `Scene` model → `Renderer` draws one instanced sphere → `MTKView` shows it.
+2. `parse_xyz` + `parse_pdb` (simplest) → `Scene` model → `Renderer` draws one instanced sphere via `encode(to:target:viewport:scene:)` (target = the MTKView's current drawable) → `MTKView` shows it. This step proves the C→Swift bridge works end-to-end.
 3. `parse_xsf` + `parse_axsf` → unit-cell frame + axes + bonds.
 4. Display-mode switching (ballStick → spaceFill → wireFrame → polyhedral).
 5. Camera: arcball rotate + dolly zoom + pan.
@@ -315,8 +317,6 @@ Three layers, no mocking framework.
 7. Supercell + slab.
 8. 2D renderer swap.
 9. `StateStore` (save/load `.molvis-state`).
-10. `PngExporter` + headless `--export` path + `smoke.sh`.
+10. `PngExporter` — reuse `Renderer.encode` with an **owned** `MTLTexture` target (no MTKView), blit → `CGImage` → PNG — plus the `--export` CLI path in `MolVisApp` and `scripts/smoke.sh`.
 11. Snapshot tests + CI.
 12. Element-table polish, color schemes, polyhedral via ported `voronoi.c`.
-
-Each step is independently demoable in the GUI before moving on.
