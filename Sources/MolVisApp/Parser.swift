@@ -14,10 +14,6 @@ enum ParseError: Error, CustomStringConvertible {
     }
 }
 
-struct Atom { var coord: SIMD3<Float>; var atomicNumber: Int; var label: String }
-struct Bond  { var i: Int; var j: Int }
-struct Cell  { var a: SIMD3<Float>; var b: SIMD3<Float>; var c: SIMD3<Float> }
-
 struct LoadedScene {
     var atoms: [Atom] = []
     var bonds: [Bond] = []
