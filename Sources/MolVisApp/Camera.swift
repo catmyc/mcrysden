@@ -4,12 +4,14 @@ import simd
 
 extension Camera {
     func viewMatrix() -> float4x4 {
-        let t = float4x4(translation: -center)
+        // Orbit camera: sit  from , oriented by .
+        // view = R^T * translate(-eye), eye = center + R*(0,0,distance).
         let r = float4x4(rotation)
-        let eye = SIMD3<Float>(0, 0, distance)
-        let rotatedEye = (r * SIMD4<Float>(eye, 1)).xyz
-        let T = float4x4(translation: -rotatedEye + center)
-        return T * r * t
+        let eye = center + (r * SIMD4<Float>(0, 0, distance, 1)).xyz
+        let rt = r.transpose                   // R is orthonormal, so R^-1 = R^T
+        var m = rt
+        m.columns.3 = rt * SIMD4<Float>(-eye.x, -eye.y, -eye.z, 1)
+        return m
     }
 
     func projectionMatrix(aspect: Float) -> float4x4 {
