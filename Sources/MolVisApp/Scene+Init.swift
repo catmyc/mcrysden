@@ -57,4 +57,55 @@ extension Scene {
         // TODO(Task 8): replace with C make_bonds bridge
         return []
     }
+
+    func applySlab(_ slab: Slab?) -> Scene {
+        guard let slab, let cell else { var s = self; s.slab = slab; return s }
+        let nA = SIMD3(Float(slab.planeA.h), Float(slab.planeA.k), Float(slab.planeA.l))
+        let nB = SIMD3(Float(slab.planeB.h), Float(slab.planeB.k), Float(slab.planeB.l))
+        // plane normals in Cartesian (cell-space normal × cell vectors)
+        let nA_c = (nA.x != 0 || nA.y != 0 || nA.z != 0) ? (cell.a*nA.x + cell.b*nA.y + cell.c*nA.z) : SIMD3(0,1,0)
+        let nB_c = (nB.x != 0 || nB.y != 0 || nB.z != 0) ? (cell.a*nB.x + cell.b*nB.y + cell.c*nB.z) : SIMD3(0,-1,0)
+        let dA = slab.planeA.distance
+        let dB = slab.planeB.distance
+        var kept: [Atom] = []
+        for a in atoms {
+            let frac = cartesianToFractional(a.coord, cell: cell)
+            let projA = frac.x*nA.x + frac.y*nA.y + frac.z*nA.z
+            let projB = frac.x*nB.x + frac.y*nB.y + frac.z*nB.z
+            if projA >= dA && projB <= dB { kept.append(a) }
+        }
+        var out = self
+        out.atoms = kept
+        out.bonds = []   // v1: drop bonds across slab cut
+        out.slab = slab
+        return out
+    }
+
+    private func cartesianToFractional(_ p: SIMD3<Float>, cell: Cell) -> SIMD3<Float> {
+        // Cramer's rule on the 3x3 [a b c] system: p = frac.x*a + frac.y*b + frac.z*c.
+        // Columns of the matrix are the cell vectors a, b, c.
+        let det = cell.a.x*(cell.b.y*cell.c.z - cell.c.y*cell.b.z)
+                - cell.b.x*(cell.a.y*cell.c.z - cell.c.y*cell.a.z)
+                + cell.c.x*(cell.a.y*cell.b.z - cell.b.y*cell.a.z)
+        if abs(det) < 1e-6 { return SIMD3(0,0,0) }   // singular cell
+        // det([col b c]) — replace column a with col
+        func det1(_ col: SIMD3<Float>) -> Float {
+            return col.x*(cell.b.y*cell.c.z - cell.c.y*cell.b.z)
+                 - cell.b.x*(col.y*cell.c.z - cell.c.y*col.z)
+                 + cell.c.x*(col.y*cell.b.z - cell.b.y*col.z)
+        }
+        // det([a col c]) — replace column b with col
+        func det2(_ col: SIMD3<Float>) -> Float {
+            return cell.a.x*(col.y*cell.c.z - cell.c.y*col.z)
+                 - col.x*(cell.a.y*cell.c.z - cell.c.y*cell.a.z)
+                 + cell.c.x*(cell.a.y*col.z - col.y*cell.a.z)
+        }
+        // det([a b col]) — replace column c with col
+        func det3(_ col: SIMD3<Float>) -> Float {
+            return cell.a.x*(cell.b.y*col.z - col.y*cell.b.z)
+                 - cell.b.x*(cell.a.y*col.z - col.y*cell.a.z)
+                 + col.x*(cell.a.y*cell.b.z - cell.b.y*cell.a.z)
+        }
+        return SIMD3(det1(p)/det, det2(p)/det, det3(p)/det)
+    }
 }

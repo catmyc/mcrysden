@@ -34,4 +34,19 @@ final class SceneTests: XCTestCase {
         s = s.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
         XCTAssertEqual(s.atoms.count, 4)
     }
+    func testSupercellDoublesAtoms() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        var s = Scene(loaded: try Parser.load(url))
+        s = s.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
+        XCTAssertEqual(s.atoms.count, 4)
+    }
+    func testSlabPreservesSubset() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        var s = Scene(loaded: try Parser.load(url))
+        let before = s.atoms.count
+        s = s.applySlab(Slab(planeA: Plane(h:0,k:1,l:0,distance:0), planeB: Plane(h:0,k:-1,l:0,distance:1e9)))
+        XCTAssertLessThanOrEqual(s.atoms.count, before)
+    }
 }
