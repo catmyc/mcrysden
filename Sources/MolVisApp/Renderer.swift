@@ -278,8 +278,17 @@ final class Renderer: NSObject {
     private func drawCell(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
         guard let cell = scene.cell, scene.showCellFrame else { return }
         let a = cell.a, b = cell.b, c = cell.c
-        let o = SIMD3<Float>.zero
-        let corners = [o, a, a + b, b, c, a + c, b + c, a + b + c]
+        // Center the displayed cell on the structure centroid so the box
+        // encloses the atoms (otherwise atoms at negative fractional coords,
+        // e.g. ZnS, would fall outside the origin-anchored box).
+        let n = max(1, scene.atoms.count)
+        var centroid = SIMD3<Float>.zero
+        for at in scene.atoms { centroid += at.coord }
+        centroid /= Float(n)
+        let cellCenter = (a + b + c) * 0.5
+        let offset = centroid - cellCenter
+        let o = offset
+        let corners = [o, a + o, a + b + o, b + o, c + o, a + c + o, b + c + o, a + b + c + o]
         // 12 edges as 24 indices into the 8 corners
         let edges: [(Int, Int)] = [
             (0,1),(1,2),(2,3),(3,0), // bottom face (o,a,a+b,b)
