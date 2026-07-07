@@ -22,8 +22,16 @@ enum StateStore {
             throw ParseError.parse(path: url.path, line: 0, reason: "state version \(v) too new")
         }
         let dec = JSONDecoder()
-        if let s = obj["scene"] {
-            scene = try dec.decode(Scene.self, from: try JSONSerialization.data(withJSONObject: s))
+        if let dict = obj["scene"] as? [String: Any] {
+            do {
+                scene = try dec.decode(Scene.self, from: try JSONSerialization.data(withJSONObject: dict))
+            } catch {
+                // Malformed scene payload — fall back to a default scene and
+                // continue loading the rest (spec §9: never crash on bad state).
+                print("[mcrysden] warning: state scene payload invalid (\(error)); using defaults")
+            }
+        } else if obj["scene"] != nil {
+            print("[mcrysden] warning: state scene payload not an object; using defaults")
         }
         if let c = obj["camera"] {
             camera = try dec.decode(Camera.self, from: try JSONSerialization.data(withJSONObject: c))

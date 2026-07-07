@@ -19,6 +19,7 @@ enum PngExporter {
         guard let tex = device.makeTexture(descriptor: desc) else { throw PngExportError.noTex }
         let q = device.makeCommandQueue()!
         let cb = q.makeCommandBuffer()!
+        renderer.background = PngExporter.clearColor(scene.background)
         var cam = camera ?? {
             var c = Camera()
             let (cen, r) = scene.boundingSphere()
@@ -39,5 +40,13 @@ enum PngExporter {
         let rep = NSBitmapImageRep(cgImage: cg)
         guard let png = rep.representation(using: .png, properties: [:]) else { throw PngExportError.noPNG }
         try png.write(to: url)
+    }
+    static func clearColor(_ hex: String) -> MTLClearColor {
+        var s = hex.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let v = UInt32(s, radix: 16) else { return MTLClearColorMake(0,0,0,1) }
+        return MTLClearColorMake(Double((v >> 16) & 0xFF) / 255.0,
+                                 Double((v >> 8) & 0xFF) / 255.0,
+                                 Double(v & 0xFF) / 255.0, 1)
     }
 }

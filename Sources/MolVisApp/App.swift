@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 final class App: NSObject, NSApplicationDelegate {
     var mainWC: MainWindowController?
@@ -21,9 +22,8 @@ final class App: NSObject, NSApplicationDelegate {
                 try PngExporter.export(scene: scene, camera: camera, to: outURL, size: CGSize(width: 800, height: 800))
             } catch {
                 print("[mcrysden] export failed: \(error)")
+                exit(EXIT_FAILURE)
             }
-            NSApp.terminate(nil)
-            return
         }
         // GUI path
         if let input = args.first {
@@ -35,10 +35,12 @@ final class App: NSObject, NSApplicationDelegate {
                 if let stIdx = args.firstIndex(where: { $0.hasSuffix(".mvis-state") }) {
                     try StateStore.load(&scene, camera: &camera, from: URL(fileURLWithPath: args[stIdx]))
                 }
-                mainWC = MainWindowController(scene: scene)
+                let wc = MainWindowController(scene: Scene())
+                mainWC = wc
+                wc.loadFile(scene)
                 if let camera {
-                    mainWC?.camera = camera
-                    mainWC?.setNeedsRender()
+                    wc.camera = camera
+                    wc.setNeedsRender()
                 }
             } catch {
                 print("[mcrysden] failed to open \(input): \(error)")

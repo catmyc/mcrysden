@@ -40,12 +40,19 @@ enum Parser {
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
-            // "path:line: reason" or "path: reason"
-            let parts = msg.components(separatedBy: ": ")
-            if parts.count >= 3, let ln = Int(parts[1]) {
-                throw ParseError.parse(path: String(parts[0]), line: ln, reason: parts.dropFirst(2).joined(separator: ": "))
+            // "path:line: reason" (line may be 0, written as "path: reason").
+            // Locate the last "<digits>:" group before the reason.
+            var path = url.path, line = 0, reason = msg
+            if let match = msg.range(of: #"^(.+):(\d+):\s?(.*)$"#, options: .regularExpression) {
+                let body = String(msg[match])
+                let parts = body.components(separatedBy: ":")
+                if parts.count >= 3, let n = Int(parts[parts.count-2]) {
+                    path = parts[0..<parts.count-2].joined(separator: ":")
+                    line = n
+                    reason = parts[parts.count-1].trimmingCharacters(in: .whitespaces)
+                }
             }
-            throw ParseError.parse(path: url.path, line: 0, reason: msg)
+            throw ParseError.parse(path: path, line: line, reason: reason)
         }
         defer { molenv_scene_free(scene) }
         return copyOut(scene.pointee)
@@ -57,7 +64,16 @@ enum Parser {
         }
         let cPath = url.path.cString(using: .utf8)!
         guard let scene = parse_axsf(cPath, Int32(frameIndex)) else {
-            let msg = String(cString: molenv_last_error()); throw ParseError.parse(path: url.path, line: 0, reason: msg)
+            let msg = String(cString: molenv_last_error())
+            var path = url.path, line = 0, reason = msg
+            if let match = msg.range(of: #"^(.+):(\d+):\s?(.*)$"#, options: .regularExpression) {
+                let body = String(msg[match]); let parts = body.components(separatedBy: ":")
+                if parts.count >= 3, let n = Int(parts[parts.count-2]) {
+                    path = parts[0..<parts.count-2].joined(separator: ":"); line = n
+                    reason = parts[parts.count-1].trimmingCharacters(in: .whitespaces)
+                }
+            }
+            throw ParseError.parse(path: path, line: line, reason: reason)
         }
         defer { molenv_scene_free(scene) }
         return copyOut(scene.pointee)

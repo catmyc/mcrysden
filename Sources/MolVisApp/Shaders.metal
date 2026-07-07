@@ -11,15 +11,16 @@ struct VInOut  { float4 position [[position]]; float3 worldPos; float3 normal; f
 struct LineVOut { float4 position [[position]]; float3 color; };
 
 vertex VInOut v_main(VertexIn in [[stage_in]],
-                     constant InstanceData &inst [[buffer(1)]],
+                     constant InstanceData *insts [[buffer(1)]],
                      constant FrameData &f [[buffer(2)]],
                      uint iid [[instance_id]]) {
     VInOut o;
-    float3 p = in.position * inst.radius + inst.model[3].xyz;
-    o.worldPos = p;
-    o.normal = in.normal;
+    constant InstanceData &inst = insts[iid];
+    float4 world = inst.model * float4(in.position * inst.radius, 1.0);
+    o.worldPos = world.xyz;
+    o.normal = (inst.model * float4(in.normal, 0.0)).xyz;
     o.color = inst.color.rgb;
-    o.position = f.proj * f.view * float4(p, 1.0);
+    o.position = f.proj * f.view * world;
     return o;
 }
 

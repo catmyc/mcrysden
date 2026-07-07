@@ -51,15 +51,16 @@ final class Renderer: NSObject {
     struct LineVOut { float4 position [[position]]; float3 color; };
 
     vertex VInOut v_main(VertexIn in [[stage_in]],
-                         constant InstanceData &inst [[buffer(1)]],
+                         constant InstanceData *insts [[buffer(1)]],
                          constant FrameData &f [[buffer(2)]],
                          uint iid [[instance_id]]) {
         VInOut o;
-        float3 p = in.position * inst.radius + inst.model[3].xyz;
-        o.worldPos = p;
-        o.normal = in.normal;
+        constant InstanceData &inst = insts[iid];
+        float4 world = inst.model * float4(in.position * inst.radius, 1.0);
+        o.worldPos = world.xyz;
+        o.normal = (inst.model * float4(in.normal, 0.0)).xyz;
         o.color = inst.color.rgb;
-        o.position = f.proj * f.view * float4(p, 1.0);
+        o.position = f.proj * f.view * world;
         return o;
     }
 
@@ -133,9 +134,11 @@ final class Renderer: NSObject {
 
     // MARK: - Lock-bearing encode API
 
+    @discardableResult
     func encode(to commandBuffer: MTLCommandBuffer, target: MTLTexture,
-                viewport: MTLViewport, camera: Camera) {
+                viewport: MTLViewport, camera: Camera) -> Float {
         let w = target.width, h = target.height
+        let sceneRadius = scene.boundingSphere().radius
         let aspect = h > 0 ? Float(w) / Float(h) : 1.0
         let light = normalize(SIMD3<Float>(0.4, 0.7, 1.0))
 
@@ -170,7 +173,7 @@ final class Renderer: NSObject {
             desc.depthAttachment.storeAction = .dontCare
         }
 
-        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return }
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return sceneRadius }
         enc.setViewport(viewport)
         enc.setDepthStencilState(makeDepthStencilState())
         enc.setCullMode(.none)
@@ -185,6 +188,7 @@ final class Renderer: NSObject {
         drawCell(enc, frameBuffer: frameBuffer)
 
         enc.endEncoding()
+        return sceneRadius
     }
 
     // MARK: - Atoms
@@ -303,10 +307,11 @@ final class Renderer: NSObject {
                                        length: verts.count * MemoryLayout<SIMD3<Float>>.stride,
                                        options: [])
         var c = color
+        let colorBuf = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: [])
         enc.setRenderPipelineState(linePipeline)
         enc.setVertexBuffer(lineVB, offset: 0, index: 0)
+        enc.setVertexBuffer(colorBuf, offset: 0, index: 3)
         enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
-        enc.setFragmentBytes(&c, length: MemoryLayout<SIMD3<Float>>.stride, index: 3)
         enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: verts.count)
     }
 

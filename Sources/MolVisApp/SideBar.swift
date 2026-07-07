@@ -6,7 +6,7 @@ struct SideBar: View {
         Form {
             Section("Display") {
                 Picker("Mode", selection: $state.displayMode) {
-                    ForEach(DisplayMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                    ForEach(DisplayMode.allCases.filter { $0 != .polyhedral }, id: \.self) { Text($0.label).tag($0) }
                 }
                 .pickerStyle(.menu)
             }

@@ -16,8 +16,9 @@ extension Camera {
         if perspective {
             return float4x4(projectionFov: .pi / 4, aspect: aspect, near: 0.1, far: 1000)
         }
-        return float4x4(orthographicLeft: -10 * aspect, right: 10 * aspect,
-                        bottom: -10, top: 10, near: 0.1, far: 1000)
+        let half = max(1.0, distance)
+        return float4x4(orthographicLeft: -half * aspect, right: half * aspect,
+                        bottom: -half, top: half, near: 0.1, far: 1000)
     }
 
     var aspectFromViewport: Float { 1.0 }   // overridden by caller via viewport size

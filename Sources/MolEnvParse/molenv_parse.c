@@ -43,7 +43,7 @@ static int molenv_symbol_to_z(const char *s) {
 }
 
 /* Covalent-radius bond heuristic, operating purely on a MolEnvScene. */
-static MolEnvBond* make_bonds(const MolEnvScene *s, float factor, int *out_nbonds) {
+static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float factor, int *out_nbonds) {
     static float cov[119];
     static int ready = 0;
     if (!ready) {
@@ -55,15 +55,22 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, float factor, int *out_nbond
     int cap = s->natoms * 4, nb = 0;
     if (cap < 4) cap = 4;
     MolEnvBond *b = calloc(cap, sizeof(MolEnvBond));
+    if (!b) { set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
     for (int i=0;i<s->natoms;i++) for (int j=i+1;j<s->natoms;j++) {
-        if (s->atoms[i].atomic_number==0 || s->atoms[j].atomic_number==0) continue;
+        int zi=s->atoms[i].atomic_number, zj=s->atoms[j].atomic_number;
+        if (zi<=0 || zi>118 || zj<=0 || zj>118) continue;
         float dx=s->atoms[i].coord[0]-s->atoms[j].coord[0],
               dy=s->atoms[i].coord[1]-s->atoms[j].coord[1],
               dz=s->atoms[i].coord[2]-s->atoms[j].coord[2];
         float d2=dx*dx+dy*dy+dz*dz;
-        float r=cov[s->atoms[i].atomic_number]+cov[s->atoms[j].atomic_number];
+        float r=cov[zi]+cov[zj];
         if (d2 <= (r*factor)*(r*factor)) {
-            if (nb>=cap) { cap*=2; b=realloc(b,cap*sizeof(MolEnvBond)); }
+            if (nb>=cap) {
+                cap*=2;
+                MolEnvBond *t=realloc(b,cap*sizeof(MolEnvBond));
+                if (!t) { free(b); set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
+                b=t;
+            }
             b[nb].i=i; b[nb].j=j; nb++;
         }
     }
@@ -87,6 +94,14 @@ static int first_tok(const char *line, char *out, int cap) {
     return i;
 }
 
+/* True if line looks like an atom record: first non-blank token starts with
+   a digit, '+' or '-' (Z number). Used to know when an ATOMS/ATOMS_FRAC block ends. */
+static int atom_line_p(const char *line) {
+    while (*line==' '||*line=='	') line++;
+    char c=*line;
+    return (c>='0'&&c<='9') || c=='+' || c=='-';
+}
+
 /* Read one PRIMCOORD structure chunk from the current file position.
    Reads an optional preceding structure keyword + PRIMVEC. Returns atom
    count on success, -1 on error. `*atoms` is reallocated; any prior value
@@ -94,9 +109,11 @@ static int first_tok(const char *line, char *out, int cap) {
 static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                       MolEnvAtom **atoms, int *natoms, const char *path, int *ln) {
     char line[256], tok[64];
+    char held[256]; int have_held = 0;
     int saw_primcoord = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        (*ln)++;
+    while (1) {
+        if (have_held) { strcpy(line, held); have_held = 0; }
+        else { if (!fgets(line, sizeof(line), fp)) break; (*ln)++; }
         if (first_tok(line, tok, sizeof(tok)) == 0) continue;
         if (tok[0]=='#') continue;
 
@@ -143,6 +160,36 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                 at[i].atomic_number = (int)Z;
                 at[i].coord[0]=(float)x; at[i].coord[1]=(float)y; at[i].coord[2]=(float)z;
                 snprintf(at[i].label,sizeof(at[i].label),"%d",(int)Z);
+            }
+            free(*atoms);
+            *atoms = at; *natoms = na;
+            saw_primcoord = 1;
+            break;
+        }
+        if (strcmp(tok,"ATOMS")==0 || strcmp(tok,"ATOMS_FRAC")==0) {
+            int frac = (strcmp(tok,"ATOMS_FRAC")==0);
+            if (frac && !*have_cell) { set_error(path,*ln,"ATOMS_FRAC before PRIMVEC"); return -1; }
+            MolEnvAtom *at = NULL; int na = 0, acap = 0;
+            while (fgets(line,sizeof(line),fp)) {
+                (*ln)++;
+                if (first_tok(line,tok,sizeof(tok))==0) continue;
+                if (tok[0]=='#') continue;
+                if (!atom_line_p(line)) { strcpy(held,line); have_held=1; break; }
+                double Z,x,y,z;
+                if (sscanf(line,"%lf %lf %lf %lf",&Z,&x,&y,&z)<4) continue;
+                if (na>=acap) { acap = acap?acap*2:16; MolEnvAtom *t=realloc(at,acap*sizeof(MolEnvAtom)); if(!t){free(at);set_error(path,*ln,"out of memory");return -1;} at=t; }
+                int zi=(int)Z; if(zi<0)zi=0; if(zi>118)zi=118;
+                float fx=(float)x, fy=(float)y, fz=(float)z;
+                if (frac) {
+                    at[na].coord[0] = fx*cell[0][0]+fy*cell[1][0]+fz*cell[2][0];
+                    at[na].coord[1] = fx*cell[0][1]+fy*cell[1][1]+fz*cell[2][1];
+                    at[na].coord[2] = fx*cell[0][2]+fy*cell[1][2]+fz*cell[2][2];
+                } else {
+                    at[na].coord[0]=fx; at[na].coord[1]=fy; at[na].coord[2]=fz;
+                }
+                at[na].atomic_number=zi;
+                snprintf(at[na].label,sizeof(at[na].label),"%d",zi);
+                na++;
             }
             free(*atoms);
             *atoms = at; *natoms = na;
@@ -202,7 +249,7 @@ MolEnvScene* parse_xsf(const char *path) {
     }
     fclose(fp);
 
-    s->bonds = make_bonds(s, 1.3f, &s->nbonds);
+    s->bonds = make_bonds(s, path, 1.3f, &s->nbonds);
     return s;
 }
 
@@ -241,7 +288,7 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
     memcpy(s->cell, cell, sizeof(s->cell));
     s->periodic_dim = pd;
     s->is_crystal = have_cell ? 1 : 0;
-    s->bonds = make_bonds(s, 1.3f, &s->nbonds);
+    s->bonds = make_bonds(s, path, 1.3f, &s->nbonds);
     return s;
 }
 
@@ -298,7 +345,8 @@ MolEnvScene* parse_pdb(const char *path) {
         }
         /* Atom name: PDB cols 13-16 (line[12..15]); resolve element symbol. */
         char sym[4]={0};
-        char c0 = line[12], c1 = line[13];
+        char c0 = '\0', c1 = '\0';
+        if ((int)strlen(line) >= 14) { c0 = line[12]; c1 = line[13]; }
         if (c0==' ') {              /* single-letter element, e.g. " N " */
             sym[0]=c1; sym[1]='\0';
         } else if (c0!='\0') {      /* two-letter, e.g. "CA " */
@@ -317,7 +365,7 @@ MolEnvScene* parse_pdb(const char *path) {
     s->is_crystal = 0;
     s->periodic_dim = 0;
     snprintf(s->title,sizeof(s->title),"%s",title);
-    s->bonds = make_bonds(s, 1.3f, &s->nbonds);
+    s->bonds = make_bonds(s, path, 1.3f, &s->nbonds);
     return s;
 }
 
@@ -378,7 +426,7 @@ static MolEnvScene* parse_xyz_impl(const char *path) {
     s->is_crystal = 0;
     s->periodic_dim = 0;
 
-    s->bonds = make_bonds(s, 1.3f, &s->nbonds);
+    s->bonds = make_bonds(s, path, 1.3f, &s->nbonds);
 
     return s;
 }

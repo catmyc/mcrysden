@@ -10,7 +10,7 @@ final class MainWindowController: NSObject, World {
     let canvas: MetalView
     let renderer: Renderer
     private lazy var renderer2D = try? Renderer2D(device: MTLCreateSystemDefaultDevice()!)
-    var scene: Scene { didSet { renderer.scene = scene; renderer2D?.scene = scene; applyCameraForNewSceneIfNeeded() } }
+    var scene: Scene { didSet { renderer.scene = scene; renderer2D?.scene = scene } }
     var camera = Camera()
     let state: SideBarState
 
@@ -34,6 +34,15 @@ final class MainWindowController: NSObject, World {
         layoutSplit()
         window.center()
         window.makeKeyAndOrderFront(nil)
+        applyCameraForNewSceneIfNeeded()
+    }
+
+    /// Apply a freshly-loaded scene: reframe the camera ONCE (spec §6 — the
+    /// camera resets on file open) and sync the sidebar so the next sidebar
+    /// change does not clobber the loaded state with defaults.
+    func loadFile(_ scene: Scene) {
+        self.scene = scene
+        state.syncFromScene(scene)
         applyCameraForNewSceneIfNeeded()
     }
 
