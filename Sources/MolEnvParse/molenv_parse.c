@@ -44,12 +44,36 @@ static int molenv_symbol_to_z(const char *s) {
 
 /* Covalent-radius bond heuristic, operating purely on a MolEnvScene. */
 static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float factor, int *out_nbonds) {
+    /* Covalent radii, ported verbatim from XCrySDen's rcovdef[] (atoms.h).
+       Index = atomic number (0..MAXNAT=100). Scaled by DEF_RCOVF (1.05), the
+       same way XCrySDen computes rcov[i] = DEF_RCOVF * rcovdef[i]. */
+    static const float rcovdef[] = {
+        0.38f, 0.38f, 0.38f, 1.23f, 0.89f, 0.91f,
+        0.77f, 0.75f, 0.73f, 0.71f, 0.71f,
+        1.60f, 1.40f, 1.25f, 1.11f, 1.00f,
+        1.04f, 0.99f, 0.98f, 2.13f, 1.74f,
+        1.60f, 1.40f, 1.35f, 1.40f, 1.40f,
+        1.40f, 1.35f, 1.35f, 1.35f, 1.35f,
+        1.30f, 1.25f, 1.15f, 1.15f, 1.14f,
+        1.12f, 2.20f, 2.00f, 1.85f, 1.55f,
+        1.45f, 1.45f, 1.35f, 1.30f, 1.35f,
+        1.40f, 1.60f, 1.55f, 1.55f, 1.41f,
+        1.45f, 1.40f, 1.40f, 1.31f, 2.60f,
+        2.00f, 1.75f, 1.55f, 1.55f, 1.55f,
+        1.55f, 1.55f, 1.55f, 1.55f, 1.55f,
+        1.55f, 1.55f, 1.55f, 1.55f, 1.55f,
+        1.55f, 1.55f, 1.45f, 1.35f, 1.35f,
+        1.30f, 1.35f, 1.35f, 1.35f, 1.50f,
+        1.90f, 1.80f, 1.60f, 1.55f, 1.55f,
+        1.55f, 2.80f, 1.44f, 1.95f, 1.55f,
+        1.55f, 1.55f, 1.55f, 1.55f, 1.55f,
+        1.55f, 1.55f, 1.55f, 1.55f, 1.55f
+    };
     static float cov[119];
     static int ready = 0;
     if (!ready) {
-        for (int i=0;i<119;i++) cov[i]=1.5f;
-        cov[1]=0.31f; cov[6]=0.76f; cov[7]=0.71f; cov[8]=0.66f; cov[14]=1.11f;
-        cov[15]=1.07f; cov[16]=1.05f; cov[17]=1.02f; cov[35]=1.14f; cov[53]=1.33f;
+        int n = (int)(sizeof(rcovdef)/sizeof(rcovdef[0]));
+        for (int i = 0; i < 119; i++) cov[i] = (i < n) ? 1.05f * rcovdef[i] : 0.0f;
         ready = 1;
     }
     int cap = s->natoms * 4, nb = 0;
@@ -249,7 +273,7 @@ MolEnvScene* parse_xsf(const char *path) {
     }
     fclose(fp);
 
-    s->bonds = make_bonds(s, path, 1.3f, &s->nbonds);
+    s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
     return s;
 }
 
@@ -288,7 +312,7 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
     memcpy(s->cell, cell, sizeof(s->cell));
     s->periodic_dim = pd;
     s->is_crystal = have_cell ? 1 : 0;
-    s->bonds = make_bonds(s, path, 1.3f, &s->nbonds);
+    s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
     return s;
 }
 
@@ -365,7 +389,7 @@ MolEnvScene* parse_pdb(const char *path) {
     s->is_crystal = 0;
     s->periodic_dim = 0;
     snprintf(s->title,sizeof(s->title),"%s",title);
-    s->bonds = make_bonds(s, path, 1.3f, &s->nbonds);
+    s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
     return s;
 }
 
@@ -426,7 +450,7 @@ static MolEnvScene* parse_xyz_impl(const char *path) {
     s->is_crystal = 0;
     s->periodic_dim = 0;
 
-    s->bonds = make_bonds(s, path, 1.3f, &s->nbonds);
+    s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
 
     return s;
 }
