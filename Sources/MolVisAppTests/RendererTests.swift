@@ -64,4 +64,13 @@ final class RendererTests: XCTestCase {
         XCTAssertEqual(ElementTable.symbol(79), "Au")
         XCTAssertEqual(ElementTable.covalentRadius(1), 0.31, accuracy: 0.01)
     }
+
+    func testHeadlessPngExport() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        let scene = Scene(loaded: try Parser.load(url))
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.png")
+        try PngExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
+        XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
+    }
 }

@@ -1,6 +1,5 @@
 import AppKit
 
-@main
 final class App: NSObject, NSApplicationDelegate {
     var mainWC: MainWindowController?
 
@@ -12,20 +11,16 @@ final class App: NSObject, NSApplicationDelegate {
         // headless export path
         if let idx = args.firstIndex(of: "--export"), idx + 1 < args.count {
             let outURL = URL(fileURLWithPath: args[idx + 1])
-            // find input file = first arg that isn't a flag and isn't the --export target
             let inURL = URL(fileURLWithPath: args.first!)
             do {
                 var scene = Scene(loaded: try Parser.load(inURL))
+                var camera: Camera? = nil
                 if let stIdx = args.firstIndex(where: { $0.hasSuffix(".mvis-state") }), stIdx != idx {
-                    var camera: Camera? = scene.camera
                     try StateStore.load(&scene, camera: &camera, from: URL(fileURLWithPath: args[stIdx]))
-                    if let camera { scene.camera = camera }
                 }
-                try PngExporter.export(scene: scene, camera: scene.camera, to: outURL, size: CGSize(width: 800, height: 800))
+                try PngExporter.export(scene: scene, camera: camera, to: outURL, size: CGSize(width: 800, height: 800))
             } catch {
                 print("[mcrysden] export failed: \(error)")
-                NSApp.terminate(nil)
-                return
             }
             NSApp.terminate(nil)
             return
