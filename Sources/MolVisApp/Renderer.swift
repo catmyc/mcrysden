@@ -134,11 +134,9 @@ final class Renderer: NSObject {
 
     // MARK: - Lock-bearing encode API
 
-    @discardableResult
     func encode(to commandBuffer: MTLCommandBuffer, target: MTLTexture,
-                viewport: MTLViewport, camera: Camera) -> Float {
+                viewport: MTLViewport, camera: Camera) {
         let w = target.width, h = target.height
-        let sceneRadius = scene.boundingSphere().radius
         let aspect = h > 0 ? Float(w) / Float(h) : 1.0
         let light = normalize(SIMD3<Float>(0.4, 0.7, 1.0))
 
@@ -173,7 +171,7 @@ final class Renderer: NSObject {
             desc.depthAttachment.storeAction = .dontCare
         }
 
-        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return sceneRadius }
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return }
         enc.setViewport(viewport)
         enc.setDepthStencilState(makeDepthStencilState())
         enc.setCullMode(.none)
@@ -188,7 +186,6 @@ final class Renderer: NSObject {
         drawCell(enc, frameBuffer: frameBuffer)
 
         enc.endEncoding()
-        return sceneRadius
     }
 
     // MARK: - Atoms
