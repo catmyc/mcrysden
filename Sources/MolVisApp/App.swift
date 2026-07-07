@@ -17,9 +17,9 @@ final class App: NSObject, NSApplicationDelegate {
             do {
                 var scene = Scene(loaded: try Parser.load(inURL))
                 if let stIdx = args.firstIndex(where: { $0.hasSuffix(".mvis-state") }), stIdx != idx {
-                    var camera = scene.camera
-                    try StateStore.load(&scene, &camera, from: URL(fileURLWithPath: args[stIdx]))
-                    scene.camera = camera
+                    var camera: Camera? = scene.camera
+                    try StateStore.load(&scene, camera: &camera, from: URL(fileURLWithPath: args[stIdx]))
+                    if let camera { scene.camera = camera }
                 }
                 try PngExporter.export(scene: scene, camera: scene.camera, to: outURL, size: CGSize(width: 800, height: 800))
             } catch {
