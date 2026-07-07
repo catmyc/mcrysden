@@ -9,7 +9,8 @@ final class MainWindowController: NSObject, World {
     let sidebar: NSHostingView<SideBar>
     let canvas: MetalView
     let renderer: Renderer
-    var scene: Scene { didSet { renderer.scene = scene; applyCameraForNewSceneIfNeeded() } }
+    private lazy var renderer2D = try? Renderer2D(device: MTLCreateSystemDefaultDevice()!)
+    var scene: Scene { didSet { renderer.scene = scene; renderer2D?.scene = scene; applyCameraForNewSceneIfNeeded() } }
     var camera = Camera()
 
     init(scene: Scene) {
@@ -25,6 +26,7 @@ final class MainWindowController: NSObject, World {
         canvas.delegate = renderer
         canvas.world = self
         renderer.currentCamera = camera
+        refreshDelegate()
         layoutSplit()
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -40,8 +42,20 @@ final class MainWindowController: NSObject, World {
         window.contentView = split
     }
 
+    private func refreshDelegate() {
+        if scene.displayMode.is2D {
+            canvas.delegate = renderer2D
+            renderer2D?.scene = scene
+            renderer2D?.background = renderer.background
+        } else {
+            canvas.delegate = renderer
+        }
+    }
+
     func setNeedsRender() {
         renderer.currentCamera = camera
+        renderer2D?.currentCamera = camera
+        refreshDelegate()
         canvas.draw()
     }
 

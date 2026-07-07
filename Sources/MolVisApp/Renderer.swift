@@ -139,8 +139,17 @@ final class Renderer: NSObject {
         let aspect = h > 0 ? Float(w) / Float(h) : 1.0
         let light = normalize(SIMD3<Float>(0.4, 0.7, 1.0))
 
-        var frame = FrameData(view: camera.viewMatrix(),
-                              proj: camera.projectionMatrix(aspect: aspect),
+        // v1 simplification for 2D modes: orthographic projection looking
+        // down +Z with no rotation. Renderer2D sets the same fields on its
+        // camera copy before calling; doing it here keeps encode self-contained.
+        var cam = camera
+        if scene.displayMode.is2D {
+            cam.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+            cam.perspective = false
+        }
+
+        var frame = FrameData(view: cam.viewMatrix(),
+                              proj: cam.projectionMatrix(aspect: aspect),
                               lightDir: light)
         let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: [])
         ensureDepthTexture(width: w, height: h)
@@ -185,9 +194,10 @@ final class Renderer: NSObject {
         inst.reserveCapacity(scene.atoms.count)
         for a in scene.atoms {
             let radius = atomRadius(z: a.atomicNumber)
-            if radius <= 0 { continue }                  // polyhedral: atoms not drawn
+            if radius <= 0 { continue }                  // polyhedral/wireFrame: atoms not drawn
+            let c = ElementTable.color(a.atomicNumber)
             inst.append(InstanceData(model: float4x4(translation: a.coord),
-                                     color: Self.cpkColor(a.atomicNumber),
+                                     color: SIMD4(c.x, c.y, c.z, 1.0),
                                      radius: radius, metalness: 0.0))
         }
         if inst.isEmpty { return }
@@ -211,20 +221,20 @@ final class Renderer: NSObject {
     private func atomRadius(z: Int) -> Float {
         switch scene.displayMode {
         case .spaceFill:
-            return Self.vdwRadius(z)
+            return ElementTable.vdwRadius(z)
         case .wireFrame:
             return 0.06
         case .polyhedral:
             return 0
         default: // ballStick and any 2D mode
-            return Self.covalentRadius(z) * scene.atomScale
+            return ElementTable.covalentRadius(z) * scene.atomScale
         }
     }
 
     // MARK: - Bonds
 
     private func drawBonds(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        let bondsDrawn: [DisplayMode] = [.ballStick, .wireFrame]
+        let bondsDrawn: [DisplayMode] = [.ballStick, .wireFrame, .line2D, .point2D, .ballStick2D]
         guard bondsDrawn.contains(scene.displayMode) else { return }
         let atoms = scene.atoms
         guard atoms.count > 1 else { return }
@@ -241,8 +251,8 @@ final class Renderer: NSObject {
             let model = float4x4(translation: mid)
                 * .rotation(fromYTo: dir / len)
                 * float4x4(scale: SIMD3<Float>(scene.bondRadius, len, scene.bondRadius))
-            let color = Self.cpkColor(atoms[b.i].atomicNumber)
-            inst.append(InstanceData(model: model, color: color, radius: 1.0, metalness: 0.0))
+            let c = ElementTable.color(atoms[b.i].atomicNumber)
+            inst.append(InstanceData(model: model, color: SIMD4(c.x, c.y, c.z, 1.0), radius: 1.0, metalness: 0.0))
         }
         if inst.isEmpty { return }
 
@@ -361,52 +371,6 @@ final class Renderer: NSObject {
 
     // MARK: - Periodic-table lookups (CPK-ish)
 
-    static func cpkColor(_ z: Int) -> SIMD4<Float> {
-        let rgb: SIMD3<Float>
-        switch z {
-        case 1: rgb = SIMD3(1, 1, 1)           // H
-        case 6: rgb = SIMD3(0.25, 0.25, 0.25)  // C
-        case 7: rgb = SIMD3(0, 0, 1)           // N
-        case 8: rgb = SIMD3(1, 0, 0)           // O
-        case 9: rgb = SIMD3(0.5, 0.7, 1)       // F
-        case 14: rgb = SIMD3(0.94, 0.78, 0.63) // Si
-        case 15: rgb = SIMD3(1, 0.5, 0)        // P
-        case 16: rgb = SIMD3(1, 1, 0)          // S
-        case 17: rgb = SIMD3(0, 1, 0)          // Cl
-        case 26: rgb = SIMD3(0.86, 0.24, 0.24) // Fe
-        case 35: rgb = SIMD3(0.6, 0.16, 0.16)  // Br
-        case 78: rgb = SIMD3(0.82, 0.82, 0.88) // Pt
-        case 79: rgb = SIMD3(1, 0.82, 0)       // Au
-        default: rgb = SIMD3(0.8, 0.8, 0.8)    // unknown
-        }
-        return SIMD4(rgb.x, rgb.y, rgb.z, 1.0)
-    }
-
-    static func vdwRadius(_ z: Int) -> Float {
-        switch z {
-        case 1: return 1.2
-        case 6: return 1.7
-        case 7: return 1.55
-        case 8: return 1.52
-        case 15: return 1.8
-        case 16: return 1.8
-        case 14: return 2.1
-        default: return 1.9
-        }
-    }
-
-    static func covalentRadius(_ z: Int) -> Float {
-        switch z {
-        case 1: return 0.31
-        case 6: return 0.76
-        case 7: return 0.71
-        case 8: return 0.66
-        case 15: return 1.07
-        case 16: return 1.05
-        case 14: return 1.11
-        default: return 0.9
-        }
-    }
 }
 
 // MARK: - MTKViewDelegate (stub; Task 7 wires gestures)
