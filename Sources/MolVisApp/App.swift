@@ -28,8 +28,18 @@ final class App: NSObject, NSApplicationDelegate {
         // GUI path
         if let input = args.first {
             do {
-                let scene = Scene(loaded: try Parser.load(URL(fileURLWithPath: input)))
+                var scene = Scene(loaded: try Parser.load(URL(fileURLWithPath: input)))
+                // If a companion .mvis-state was passed, load + apply it
+                // (final-review Minor #3: the GUI path used to ignore it).
+                var camera: Camera? = nil
+                if let stIdx = args.firstIndex(where: { $0.hasSuffix(".mvis-state") }) {
+                    try StateStore.load(&scene, camera: &camera, from: URL(fileURLWithPath: args[stIdx]))
+                }
                 mainWC = MainWindowController(scene: scene)
+                if let camera {
+                    mainWC?.camera = camera
+                    mainWC?.setNeedsRender()
+                }
             } catch {
                 print("[mcrysden] failed to open \(input): \(error)")
             }

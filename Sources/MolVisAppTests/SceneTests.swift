@@ -34,13 +34,6 @@ final class SceneTests: XCTestCase {
         s = s.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
         XCTAssertEqual(s.atoms.count, 4)
     }
-    func testSupercellDoublesAtoms() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
-        var s = Scene(loaded: try Parser.load(url))
-        s = s.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
-        XCTAssertEqual(s.atoms.count, 4)
-    }
     func testSlabPreservesSubset() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
@@ -48,5 +41,22 @@ final class SceneTests: XCTestCase {
         let before = s.atoms.count
         s = s.applySlab(Slab(planeA: Plane(h:0,k:1,l:0,distance:0), planeB: Plane(h:0,k:-1,l:0,distance:1e9)))
         XCTAssertLessThanOrEqual(s.atoms.count, before)
+    }
+
+    // A slab whose planes sit far outside the cell must keep every atom. This
+    // exercises the same fractional-projection filter that syncFromState now
+    // routes through via applySlab (final-review Important #2).
+    func testSlabFarPlanePreservesAllAtoms() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        var s = Scene(loaded: try Parser.load(url))
+        let before = s.atoms.count
+        XCTAssertGreaterThan(before, 0)
+        // planeA distance very negative => projA >= dA always true;
+        // planeB distance very positive => projB <= dB always true.
+        s = s.applySlab(Slab(planeA: Plane(h: 0, k: 1, l: 0, distance: -1e9),
+                             planeB: Plane(h: 0, k: -1, l: 0, distance: 1e9)))
+        XCTAssertEqual(s.atoms.count, before)
+        XCTAssertNotNil(s.slab)
     }
 }

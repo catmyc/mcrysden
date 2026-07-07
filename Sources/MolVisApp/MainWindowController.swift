@@ -81,13 +81,14 @@ final class MainWindowController: NSObject, World {
         if sc.total != scene.superCell.total {
             scene = scene.widenSuperCell(sc)
         }
-        // slab
-        if state.slabEnabled {
-            scene.slab = Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
-                              planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
-        } else {
-            scene.slab = nil
-        }
+        // slab — build the Slab then run the scene through applySlab so the
+        // atom set is actually filtered (Important #2 of the final review:
+        // assigning scene.slab alone left slab/vacuum inert at runtime).
+        let slab = state.slabEnabled
+            ? Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
+                   planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
+            : nil
+        scene = scene.applySlab(slab)
         // background
         if let c = colorFromHex(state.backgroundHex) {
             renderer.background = MTLClearColor(red: c.r, green: c.g, blue: c.b, alpha: 1)

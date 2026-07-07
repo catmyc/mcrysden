@@ -62,9 +62,6 @@ extension Scene {
         guard let slab, let cell else { var s = self; s.slab = slab; return s }
         let nA = SIMD3(Float(slab.planeA.h), Float(slab.planeA.k), Float(slab.planeA.l))
         let nB = SIMD3(Float(slab.planeB.h), Float(slab.planeB.k), Float(slab.planeB.l))
-        // plane normals in Cartesian (cell-space normal × cell vectors)
-        let nA_c = (nA.x != 0 || nA.y != 0 || nA.z != 0) ? (cell.a*nA.x + cell.b*nA.y + cell.c*nA.z) : SIMD3(0,1,0)
-        let nB_c = (nB.x != 0 || nB.y != 0 || nB.z != 0) ? (cell.a*nB.x + cell.b*nB.y + cell.c*nB.z) : SIMD3(0,-1,0)
         let dA = slab.planeA.distance
         let dB = slab.planeB.distance
         var kept: [Atom] = []

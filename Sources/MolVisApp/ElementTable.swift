@@ -9,8 +9,12 @@ enum ElementTable {
     static func vdwRadius(_ z: Int) -> Float { vdw[clamp(z)] }
     static func symbol(_ z: Int) -> String { symbols[clamp(z)] }
 
+    // Shared capacity across all per-element arrays (Z=0..118). Each array is
+    // padded to this length so a single clamp against capacity-1 is safe; see
+    // Important #1 of the final review (out-of-bounds crash on heavy elements).
+    private static let capacity = 119
     private static func clamp(_ z: Int) -> Int {
-        z < 0 ? 0 : (z >= colors.count ? colors.count - 1 : z)
+        z < 0 ? 0 : (z >= capacity ? capacity - 1 : z)
     }
 
     private static let colors: [SIMD3<Float>] = [
@@ -147,7 +151,7 @@ enum ElementTable {
         1.16, 1.15, 1.17, 1.25, 1.34, 1.32, 1.22, 1.19, 1.20, 1.20,  // 80..89
         1.16, 1.16, 1.15, 1.17, 1.25, 1.34, 1.32, 1.22, 1.19, 1.20,  // 90..99
         1.20, 1.16, 1.16, 1.15, 1.17, 1.25, 1.34, 1.32, 1.22, 1.19,  // 100..109
-        1.20, 1.20, 1.16, 1.16, 1.15, 1.17, 1.25, 1.34              // 110..117
+        1.20, 1.20, 1.16, 1.16, 1.15, 1.17, 1.25, 1.34, 1.34   // 110..118
     ]
 
     private static let vdw: [Float] = [
@@ -160,7 +164,9 @@ enum ElementTable {
         2.11, 2.09, 2.09, 2.10, 2.10, 2.06, 2.06, 2.07, 2.16, 2.17,  // 60..69
         2.11, 2.09, 2.09, 2.10, 2.10, 2.06, 2.06, 2.07, 2.16, 2.17,  // 70..79
         2.11, 2.09, 2.09, 2.10, 2.10, 2.06, 2.06, 2.07, 2.16, 2.17,  // 80..89
-        2.11, 2.09, 2.09, 2.10, 2.10, 2.06, 2.06, 2.07              // 100..107
+        2.11, 2.09, 2.09, 2.10, 2.10, 2.06, 2.06, 2.07, 2.07, 2.07,  // 90..99
+        2.07, 2.07, 2.07, 2.07, 2.07, 2.07, 2.07, 2.07, 2.07, 2.07,  // 100..109
+        2.07, 2.07, 2.07, 2.07, 2.07, 2.07, 2.07, 2.07, 2.07   // 110..118
     ]
 
     private static let symbols: [String] = [
