@@ -74,15 +74,10 @@ extension float4x4 {
     }
 
     /// Rotation matrix that maps +Y onto `dir` (unit). Used for bond cylinders.
+    /// Built on simd's minimal-rotation quaternion (verified: maps +Y->+X for dir=+X).
     static func rotation(fromYTo dir: SIMD3<Float>) -> float4x4 {
-        let y = SIMD3<Float>(0, 1, 0)
-        let v = cross(y, dir)
-        let c = dot(y, dir)
-        if length(v) < 1e-6 { return c > 0 ? matrix_identity_float4x4 : float4x4(diagonal: SIMD4(1, -1, 1, 1)) }
-        let k = float4x4(rows: [SIMD4(0, v.z, -v.y, 0),
-                                SIMD4(-v.z, 0, v.x, 0),
-                                SIMD4(v.y, -v.x, 0, 0),
-                                SIMD4(0, 0, 0, 1)])
-        return matrix_identity_float4x4 + k + k * k * (1 / (1 + c))
+        let from = SIMD3<Float>(0, 1, 0)
+        if length(dir) < 1e-8 { return matrix_identity_float4x4 }
+        return float4x4(simd_quatf(from: from, to: dir))
     }
 }

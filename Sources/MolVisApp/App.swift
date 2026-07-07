@@ -4,6 +4,9 @@ import Darwin
 final class App: NSObject, NSApplicationDelegate {
     var mainWC: MainWindowController?
 
+    /// Quit automatically when the user closes the last window (issue 1).
+    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         let args = Array(CommandLine.arguments.dropFirst())
         if args.contains("--help") || args.contains("-h") {

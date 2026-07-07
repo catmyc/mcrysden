@@ -21,8 +21,10 @@ final class MetalView: MTKView {
         colorPixelFormat = .rgba8Unorm
         depthStencilPixelFormat = .depth32Float
         preferredFramesPerSecond = 60
-        enableSetNeedsDisplay = false
-        isPaused = false
+        // On-demand rendering: we call setNeedsDisplay() ourselves after each
+        // camera/scene change instead of driving a continuous display loop.
+        enableSetNeedsDisplay = true
+        isPaused = true
         // delegate is the Renderer, set by owner after init
     }
 
