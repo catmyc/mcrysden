@@ -35,7 +35,9 @@ final class MetalView: MTKView {
         let dx = Float(p.x - last.x), dy = Float(p.y - last.y)
         lastMouse = p
         let rotX = simd_quatf(angle: dy * 0.01, axis: SIMD3(1,0,0))
-        let rotY = simd_quatf(angle: dx * 0.01, axis: SIMD3(0,1,0))
+        // Drag right (dx>0) should rotate the structure so a grabbed
+        // point follows the mouse to the right on screen -> negative yaw.
+        let rotY = simd_quatf(angle: -dx * 0.01, axis: SIMD3(0,1,0))
         world?.camera.rotation = rotY * rotX * world!.camera.rotation
         world?.setNeedsRender()
     }
