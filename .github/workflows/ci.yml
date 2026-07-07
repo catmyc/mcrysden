@@ -1,0 +1,12 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+    - uses: actions/checkout@v4
+      # macos-14 ships a usable Xcode 15.x; we omit the third-party
+      # maxim-lobanov/setup-xcode@v1 step to keep CI dependency-light.
+    - run: swift build
+    - run: swift test
+    - run: zsh scripts/smoke.sh
