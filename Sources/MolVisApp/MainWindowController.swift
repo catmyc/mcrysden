@@ -12,17 +12,21 @@ final class MainWindowController: NSObject, World {
     private lazy var renderer2D = try? Renderer2D(device: MTLCreateSystemDefaultDevice()!)
     var scene: Scene { didSet { renderer.scene = scene; renderer2D?.scene = scene; applyCameraForNewSceneIfNeeded() } }
     var camera = Camera()
+    let state: SideBarState
 
     init(scene: Scene) {
         self.scene = scene
         let device = MTLCreateSystemDefaultDevice()!
         renderer = try! Renderer(device: device)
         renderer.scene = scene
-        sidebar = NSHostingView(rootView: SideBar())
+        let state = SideBarState()
+        self.state = state
+        sidebar = NSHostingView(rootView: SideBar(state: state))
         canvas = MetalView(frame: .zero, device: device)
         let f = CGRect(x: 0, y: 0, width: 1100, height: 750)
         window = NSWindow(contentRect: f, styleMask: [.titled,.closable,.miniaturizable,.resizable], backing: .buffered, defer: false)
         super.init()
+        state.onChange = { [weak self] in self?.syncFromState() }
         canvas.delegate = renderer
         canvas.world = self
         renderer.currentCamera = camera
@@ -64,5 +68,37 @@ final class MainWindowController: NSObject, World {
         camera.center = c
         camera.distance = max(8, r * 3)
         setNeedsRender()
+    }
+
+    func syncFromState() {
+        scene.displayMode = state.displayMode
+        scene.atomScale = state.atomScale
+        scene.bondRadius = state.bondRadius
+        scene.showCellFrame = state.showCellFrame
+        scene.showAxes = state.showAxes
+        // supercell
+        let sc = SuperCell(n1: state.n1, n2: state.n2, n3: state.n3)
+        if sc.total != scene.superCell.total {
+            scene = scene.widenSuperCell(sc)
+        }
+        // slab
+        if state.slabEnabled {
+            scene.slab = Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
+                              planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
+        } else {
+            scene.slab = nil
+        }
+        // background
+        if let c = colorFromHex(state.backgroundHex) {
+            renderer.background = MTLClearColor(red: c.r, green: c.g, blue: c.b, alpha: 1)
+        }
+        setNeedsRender()
+    }
+
+    private func colorFromHex(_ hex: String) -> (r: Double, g: Double, b: Double)? {
+        var s = hex.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let v = UInt32(s, radix: 16) else { return nil }
+        return (Double((v >> 16) & 0xFF) / 255.0, Double((v >> 8) & 0xFF) / 255.0, Double(v & 0xFF) / 255.0)
     }
 }
