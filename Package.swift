@@ -20,6 +20,7 @@ let package = Package(
             name: "MolVisApp",
             dependencies: ["MolEnvParse"],
             path: "Sources/MolVisApp",
+            exclude: ["Shaders.metal"],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("Metal"),
