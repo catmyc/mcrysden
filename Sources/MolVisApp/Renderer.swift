@@ -275,6 +275,14 @@ final class Renderer: NSObject {
 
     // MARK: - Cell frame + axes
 
+    /// The 12 edges of a parallelepiped in terms of its 8 corner indices:
+    /// corners = [o, a, a+b, b, c, a+c, b+c, a+b+c].
+    static let cellEdges: [(Int, Int)] = [
+        (0,1),(1,2),(2,3),(3,0), // bottom face (o,a,a+b,b)
+        (4,5),(5,7),(7,6),(6,4), // top face   (c,a+c,a+b+c,b+c)
+        (0,4),(1,5),(2,7),(3,6), // verticals
+    ]
+
     private func drawCell(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
         guard let cell = scene.cell, scene.showCellFrame else { return }
         let a = cell.a, b = cell.b, c = cell.c
@@ -289,12 +297,7 @@ final class Renderer: NSObject {
         let offset = centroid - cellCenter
         let o = offset
         let corners = [o, a + o, a + b + o, b + o, c + o, a + c + o, b + c + o, a + b + c + o]
-        // 12 edges as 24 indices into the 8 corners
-        let edges: [(Int, Int)] = [
-            (0,1),(1,2),(2,3),(3,0), // bottom face (o,a,a+b,b)
-            (4,5),(5,6),(6,7),(7,4), // top face   (c,a+c,b+c,a+b+c)
-            (0,4),(1,5),(2,6),(3,7), // verticals
-        ]
+        let edges = Renderer.cellEdges
         var frameVerts: [SIMD3<Float>] = []
         frameVerts.reserveCapacity(24)
         for (i, j) in edges { frameVerts.append(corners[i]); frameVerts.append(corners[j]) }

@@ -4,16 +4,12 @@ import simd
 @testable import MolVisApp
 private enum Thrown: Error { case msg(String) }
 
-// Ground-truth: an atom is "inside the displayed unit cell" iff its fractional
-// coordinates w.r.t. the cell edges are in [0, 1). This is the invariant
-// drawCell must guarantee.
 final class CellEnclosureTests: XCTestCase {
     private func load(_ path: String) throws -> Scene {
         return Scene(loaded: try Parser.load(URL(fileURLWithPath: path)))
     }
 
-    // Replicates drawCell's centering so the test checks the SAME corners the
-    // renderer draws.
+    // Replicates drawCell's centering (kept in sync with the offset formula).
     private func displayedCorners(_ scene: Scene) -> [SIMD3<Float>]? {
         guard let cell = scene.cell else { return nil }
         let a = cell.a, b = cell.b, c = cell.c
@@ -62,10 +58,29 @@ final class CellEnclosureTests: XCTestCase {
                 let f = fractional(at.coord, o: o, a: a, b: b, c: c)
                 let inCell = inside(f)
                 if !inCell { allInside = false }
-                print("[cell3d] " + tag + " atom" + String(k) + " coord=" + String(describing: at.coord) + " fractional=" + String(describing: f) + " inside=" + String(inCell))
+                print("[cell3d] " + tag + " atom" + String(k) + " fractional=" + String(describing: f) + " inside=" + String(inCell))
             }
             print("[cell3d] " + tag + " allAtomsEnclosed=" + String(allInside))
             XCTAssertTrue(allInside, tag + ": displayed cell must enclose all atoms")
+        }
+    }
+
+    // Tests the ACTUAL edges the renderer draws (Renderer.cellEdges), and
+    // verifies each is parallel to one of the three lattice vectors.
+    func testRendererCellEdgesAreLatticeVectors() throws {
+        let s = try load("/Users/mao/dev/mcrysden/Sources/MolVisAppTests/Fixtures/si110.xsf")
+        guard let corners = displayedCorners(s) else { throw Thrown.msg("no cell") }
+        let a = corners[1] - corners[0]
+        let b = corners[3] - corners[0]
+        let c = corners[4] - corners[0]
+        let lens = [length(a), length(b), length(c)]
+        print("[cell3d] lattice lengths a=\(lens[0]) b=\(lens[1]) c=\(lens[2])")
+        for (idx, (i, j)) in Renderer.cellEdges.enumerated() {
+            let e = corners[j] - corners[i]
+            let el = length(e)
+            let matches = lens.map { abs(el - $0) < 1e-3 }
+            let ok = matches.contains(true)
+            XCTAssertTrue(ok, "cell edge \(idx) length \(el) must match a lattice vector (\(lens))")
         }
     }
 }
