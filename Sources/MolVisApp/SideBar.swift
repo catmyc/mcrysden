@@ -4,6 +4,10 @@ struct SideBar: View {
     @ObservedObject var state: SideBarState
     var body: some View {
         Form {
+            Section {
+                Button("Reset View") { state.onResetView?() }
+                    .buttonStyle(.borderedProminent)
+            }
             Section("Display") {
                 Picker("Mode", selection: $state.displayMode) {
                     ForEach(DisplayMode.allCases.filter { $0 != .polyhedral }, id: \.self) { Text($0.label).tag($0) }
@@ -15,6 +19,7 @@ struct SideBar: View {
                 Slider(value: $state.bondRadius, in: 0.02...0.4) { Text("Bond Radius: \(state.bondRadius, specifier: "%.2f")") }
                 Toggle("Cell Frame", isOn: $state.showCellFrame)
                 Toggle("Axes", isOn: $state.showAxes)
+                Toggle("Element Labels", isOn: $state.showLabels)
                 HStack { Text("BG"); TextField("hex", text: $state.backgroundHex).frame(width: 90) }
             }
             Section("Supercell") {
@@ -32,6 +37,6 @@ struct SideBar: View {
         }
         .formStyle(.grouped)
         .padding()
-        .frame(minWidth: 240)
+        .frame(minWidth: 200)
     }
 }

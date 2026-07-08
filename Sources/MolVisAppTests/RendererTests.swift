@@ -73,6 +73,56 @@ final class RendererTests: XCTestCase {
         try PngExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
     }
+    // Axes must draw independently of the cell frame. A cell-only scene (no
+    // atoms/bonds) isolates the axes: with Cell Frame OFF and Axes ON the axes
+    // alone must render; flipping Axes OFF must blank the image entirely.
+    func testAxesIndependentOfCellFrame() throws {
+        var s = Scene()
+        s.isCrystal = true
+        s.cell = Cell(a: SIMD3(5,0,0), b: SIMD3(0,5,0), c: SIMD3(0,0,5))
+        s.showCellFrame = false
+        s.showAxes = true
+        let tex = try render(scene: s, dist: 12, w: 120, h: 120)
+        let on = nonzeroPixels(tex)
+        XCTAssertGreaterThan(on, 0, "axes should render even with cell frame off")
+
+        s.showAxes = false
+        let tex2 = try render(scene: s, dist: 12, w: 120, h: 120)
+        XCTAssertEqual(nonzeroPixels(tex2), 0, "with axes off and no atoms/cell-frame, nothing should render")
+    }
+
+    // The orientation gizmo must keep a constant pixel size regardless of zoom:
+    // the old in-3D axes grew/shrank with the camera distance, the corner gizmo
+    // must not. Render the same cell-only scene at two zoom levels and compare
+    // the axis pixel counts.
+    func testOrientationGizmoFixedSize() throws {
+        func axisPixels(dist: Float) throws -> Int {
+            var s = Scene()
+            s.isCrystal = true
+            s.cell = Cell(a: SIMD3(5,0,0), b: SIMD3(0,5,0), c: SIMD3(0,0,5))
+            s.showCellFrame = false // isolate the gizmo from the (zoom-scaled) cell box
+            s.showAxes = true
+            return nonzeroPixels(try render(scene: s, dist: dist, w: 200, h: 200))
+        }
+        let near = try axisPixels(dist: 8)
+        let far = try axisPixels(dist: 40)
+        XCTAssertGreaterThan(near, 0, "gizmo should render")
+        XCTAssertGreaterThan(far, 0, "gizmo should render at distance too")
+        // Fixed on-screen size: counts agree within a tolerant factor (perspective
+        // and integer sampling prevent exact equality).
+        let ratio = Float(max(1,near)) / Float(max(1,far))
+        XCTAssertEqual(ratio, 1.0, accuracy: 0.5, "gizmo size should not track zoom (near=\(near), far=\(far))")
+    }
+
+    private func nonzeroPixels(_ tex: MTLTexture) -> Int {
+        let w = tex.width, h = tex.height
+        var px = [UInt8](repeating: 0, count: w*h*4)
+        tex.getBytes(&px, bytesPerRow: w*4, from: MTLRegionMake2D(0,0,w,h), mipmapLevel: 0)
+        var n = 0
+        for i in stride(from: 0, to: px.count, by: 4) where px[i] != 0 || px[i+1] != 0 || px[i+2] != 0 { n += 1 }
+        return n
+    }
+
     private func render(scene: Scene, dist: Float, w: Int = 96, h: Int = 96) throws -> MTLTexture {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
         let r = try Renderer(device: device)

@@ -32,6 +32,16 @@ final class CellRenderDiag: XCTestCase {
 
         var cMinX = w, cMinY = h, cMaxX = -1, cMaxY = -1
         var aMinX = w, aMinY = h, aMaxX = -1, aMaxY = -1
+        // The corner orientation gizmo is a fixed screen-space overlay pinned to
+        // the bottom-left corner (NDC ≈ -0.82, -0.82, arm length 0.10). Its bright
+        // pixels would otherwise be misclassified as atoms and inflate the atom
+        // bbox, so skip any pixel whose NDC coordinate falls in that corner box.
+        // This is viewport-size independent: pixel -> NDC, then compare.
+        func inGizmoCorner(_ x: Int, _ y: Int) -> Bool {
+            let ndcX = (Float(x) / Float(w)) * 2.0 - 1.0
+            let ndcY = 1.0 - (Float(y) / Float(h)) * 2.0 // row 0 = top = +NDC y
+            return ndcX < -0.70 || ndcY < -0.70
+        }
         for y in 0..<h {
             for x in 0..<w {
                 let i = (y*w+x)*4
@@ -39,6 +49,7 @@ final class CellRenderDiag: XCTestCase {
                 if red == g && g == b && red > 60 {
                     cMinX = min(cMinX, x); cMinY = min(cMinY, y); cMaxX = max(cMaxX, x); cMaxY = max(cMaxY, y)
                 } else if red > 30 || g > 30 || b > 30 {
+                    if inGizmoCorner(x, y) { continue } // skip the corner-gizmo axes
                     aMinX = min(aMinX, x); aMinY = min(aMinY, y); aMaxX = max(aMaxX, x); aMaxY = max(aMaxY, y)
                 }
             }

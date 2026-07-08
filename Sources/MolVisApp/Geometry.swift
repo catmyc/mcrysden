@@ -72,6 +72,34 @@ enum Geometry {
         return Mesh(positions: positions, normals: normals, indices: indices)
     }
 
+    /// Unit cone along +Y: base radius 1 at y = 0, tip at y = 1. Used for the
+    /// orientation-gizmo arrowheads (reused by the lit atom pipeline).
+    static func unitCone(radialSegments: Int = 16) -> Mesh {
+        var positions: [SIMD3<Float>] = []
+        var normals: [SIMD3<Float>] = []
+        let n = radialSegments
+        // side-wall ring (base, y = 0)
+        for s in 0..<n {
+            let phi = 2.0 * Float.pi * Float(s) / Float(n)
+            let cp = cos(phi); let sp = sin(phi)
+            positions.append(SIMD3<Float>(cp, 0, sp))
+            // slant normal: outward + up (cone rises 1 per radius 1)
+            normals.append(normalize(SIMD3<Float>(cp, 1.0, sp)))
+        }
+        let tip = UInt16(positions.count)
+        positions.append(SIMD3<Float>(0, 1, 0)); normals.append(SIMD3<Float>(0, 1, 0))
+        // base cap centre
+        let base = UInt16(positions.count)
+        positions.append(SIMD3<Float>(0, 0, 0)); normals.append(SIMD3<Float>(0, -1, 0))
+        var indices: [UInt16] = []
+        for s in 0..<n {
+            let s1 = (s + 1) % n
+            indices.append(UInt16(s)); indices.append(tip); indices.append(UInt16(s1))     // side
+            indices.append(base); indices.append(UInt16(s1)); indices.append(UInt16(s))     // base cap
+        }
+        return Mesh(positions: positions, normals: normals, indices: indices)
+    }
+
     /// Two vertices spanning +Y — basis for bond cylinders and line segments.
     static func unitLine() -> [SIMD3<Float>] { [SIMD3(0,0,0), SIMD3(0,1,0)] }
 }

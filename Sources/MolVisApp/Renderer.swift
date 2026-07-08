@@ -20,12 +20,21 @@ final class Renderer: NSObject {
     private let linePipeline: MTLRenderPipelineState
     private let library: MTLLibrary
 
+    /// Fixed world-space light direction — the same for the main scene and the
+    /// gizmo mini-scene. Stored centrally so both FrameData buffers stay in sync.
+    static let worldLight = normalize(SIMD3<Float>(0.3, 0.8, 0.5))
+
+    private let overlayDepthState: MTLDepthStencilState?
+    private var lastW: Int = 0, lastH: Int = 0    // viewport size from last encode()
     private let sphereMesh: Mesh
     private let cylinderMesh: Mesh
+    private let coneMesh: Mesh
     private let sphereVB: MTLBuffer
     private let sphereIB: MTLBuffer
     private let cylinderVB: MTLBuffer
     private let cylinderIB: MTLBuffer
+    private let coneVB: MTLBuffer
+    private let coneIB: MTLBuffer
 
     private var depthPixelFormat: MTLPixelFormat = .depth32Float
     private var depthTexture: MTLTexture?
@@ -116,6 +125,7 @@ final class Renderer: NSObject {
 
         self.sphereMesh = Geometry.unitSphere()
         self.cylinderMesh = Geometry.unitCylinder()
+        self.coneMesh = Geometry.unitCone()
         guard
             let svb = Renderer.makeInterleavedBuffer(device, mesh: sphereMesh),
             let sib = device.makeBuffer(bytes: sphereMesh.indices,
@@ -124,12 +134,28 @@ final class Renderer: NSObject {
             let cvb = Renderer.makeInterleavedBuffer(device, mesh: cylinderMesh),
             let cib = device.makeBuffer(bytes: cylinderMesh.indices,
                                        length: cylinderMesh.indices.count * MemoryLayout<UInt16>.stride,
+                                       options: []),
+            let gvb = Renderer.makeInterleavedBuffer(device, mesh: coneMesh),
+            let gib = device.makeBuffer(bytes: coneMesh.indices,
+                                       length: coneMesh.indices.count * MemoryLayout<UInt16>.stride,
                                        options: [])
         else { throw RenderError.makeBuffer }
         self.sphereVB = svb
         self.sphereIB = sib
         self.cylinderVB = cvb
         self.cylinderIB = cib
+        self.coneVB = gvb
+        self.coneIB = gib
+        self.overlayDepthState = Renderer.makeOverlayDepthState(device: device)
+    }
+
+    /// Depth state for the orientation gizmo: always pass, never write, so the
+    /// triad overlays the scene regardless of what was drawn before it.
+    private static func makeOverlayDepthState(device: MTLDevice) -> MTLDepthStencilState? {
+        let d = MTLDepthStencilDescriptor()
+        d.depthCompareFunction = .always
+        d.isDepthWriteEnabled = false
+        return device.makeDepthStencilState(descriptor: d)
     }
 
     // MARK: - Lock-bearing encode API
@@ -137,8 +163,9 @@ final class Renderer: NSObject {
     func encode(to commandBuffer: MTLCommandBuffer, target: MTLTexture,
                 viewport: MTLViewport, camera: Camera) {
         let w = target.width, h = target.height
+        lastW = w; lastH = h
         let aspect = h > 0 ? Float(w) / Float(h) : 1.0
-        let light = normalize(SIMD3<Float>(0.4, 0.7, 1.0))
+        let light = Self.worldLight
 
         // v1 simplification for 2D modes: orthographic projection looking
         // down +Z with no rotation. Renderer2D sets the same fields on its
@@ -185,18 +212,32 @@ final class Renderer: NSObject {
         // Cell frame + axes
         drawCell(enc, frameBuffer: frameBuffer)
 
+        // Screen-space orientation gizmo (fixed-size x/y/z arrows pinned to the
+        // corner; rotates with the camera, never scales with zoom).
+        if scene.showAxes {
+            drawOrientationGizmo(enc, camera: cam, w: w, h: h)
+        }
+
+        // Measurement lines between selected atoms — drawn last as a depth-
+        // disabled overlay so they stay readable through bonds.
+        drawMeasurements(enc, frameBuffer: frameBuffer)
+
         enc.endEncoding()
     }
 
     // MARK: - Atoms
 
     private func drawAtoms(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
+        let selected = Set(scene.selectedAtoms)
         var inst: [InstanceData] = []
         inst.reserveCapacity(scene.atoms.count)
-        for a in scene.atoms {
+        for (i, a) in scene.atoms.enumerated() {
             let radius = atomRadius(z: a.atomicNumber)
             if radius <= 0 { continue }                  // polyhedral/wireFrame: atoms not drawn
-            let c = ElementTable.color(a.atomicNumber)
+            var c = ElementTable.color(a.atomicNumber)
+            if selected.contains(i) {
+                c = SIMD3<Float>(1, 1, 0.2)               // bright yellow highlight
+            }
             inst.append(InstanceData(model: float4x4(translation: a.coord),
                                      color: SIMD4(c.x, c.y, c.z, 1.0),
                                      radius: radius, metalness: 0.0))
@@ -284,29 +325,156 @@ final class Renderer: NSObject {
     ]
 
     private func drawCell(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        guard let cell = scene.cell, scene.showCellFrame else { return }
+        guard let cell = scene.cell else { return }
         let a = cell.a, b = cell.b, c = cell.c
-        // Center the displayed cell on the structure centroid so the box
-        // encloses the atoms (otherwise atoms at negative fractional coords,
-        // e.g. ZnS, would fall outside the origin-anchored box).
+        // Center the displayed cells on the structure centroid so the set of
+        // supercell boxes encloses the atoms (otherwise atoms at negative
+        // fractional coords, e.g. ZnS, would fall outside the origin box).
         let n = max(1, scene.atoms.count)
         var centroid = SIMD3<Float>.zero
         for at in scene.atoms { centroid += at.coord }
         centroid /= Float(n)
-        let cellCenter = (a + b + c) * 0.5
-        let offset = centroid - cellCenter
-        let o = offset
-        let corners = [o, a + o, a + b + o, b + o, c + o, a + c + o, b + c + o, a + b + c + o]
-        let edges = Renderer.cellEdges
-        var frameVerts: [SIMD3<Float>] = []
-        frameVerts.reserveCapacity(24)
-        for (i, j) in edges { frameVerts.append(corners[i]); frameVerts.append(corners[j]) }
-        drawLineBuffer(frameVerts, color: SIMD3<Float>(0.75, 0.75, 0.75), enc: enc, frameBuffer: frameBuffer)
 
-        if scene.showAxes {
-            drawLineBuffer([o, o + a], color: SIMD3<Float>(1, 0.2, 0.2), enc: enc, frameBuffer: frameBuffer)
-            drawLineBuffer([o, o + b], color: SIMD3<Float>(0.2, 1, 0.2), enc: enc, frameBuffer: frameBuffer)
-            drawLineBuffer([o, o + c], color: SIMD3<Float>(0.2, 0.2, 1), enc: enc, frameBuffer: frameBuffer)
+        // Draw one unit-cell box per supercell replica.  The base origin of
+        // the box array is chosen so the AVERAGE of all box centres equals
+        // the structure centroid (single-box formula for n1=n2=n3=1).
+        let sc = scene.superCell
+        let base = centroid - (Float(sc.n1) * 0.5) * a
+                          - (Float(sc.n2) * 0.5) * b
+                          - (Float(sc.n3) * 0.5) * c
+        if scene.showCellFrame {
+            let edges = Renderer.cellEdges
+            var frameVerts: [SIMD3<Float>] = []
+            frameVerts.reserveCapacity(24 * sc.total)
+            for i in 0..<sc.n1 {
+                for j in 0..<sc.n2 {
+                    for k in 0..<sc.n3 {
+                        let t = a * Float(i) + b * Float(j) + c * Float(k)
+                        let o = base + t
+                        let corners = [o, a + o, a + b + o, b + o, c + o, a + c + o, b + c + o, a + b + c + o]
+                        for (ci, cj) in edges { frameVerts.append(corners[ci]); frameVerts.append(corners[cj]) }
+                    }
+                }
+            }
+            drawLineBuffer(frameVerts, color: SIMD3<Float>(0.75, 0.75, 0.75), enc: enc, frameBuffer: frameBuffer)
+        }
+
+    }
+
+    /// Draw measurement lines between selected atoms in 3D space.
+    private func drawMeasurements(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
+        // Only draw connecting lines while a measurement mode is active — never
+        // in plain Selection mode (.none).
+        guard scene.measurementMode != .none else { return }
+        let sel = scene.selectedAtoms
+        guard sel.count >= 2 else { return }
+        let atoms = scene.atoms
+        // connect consecutive selected atoms in order
+        var verts: [SIMD3<Float>] = []
+        verts.reserveCapacity(sel.count * 2)
+        for i in 0..<(sel.count - 1) {
+            guard sel[i] < atoms.count, sel[i+1] < atoms.count else { return }
+            verts.append(atoms[sel[i]].coord)
+            verts.append(atoms[sel[i+1]].coord)
+        }
+        // The orientation gizmo sets a corner sub-viewport; restore the full
+        // target viewport before drawing measurement lines.
+        enc.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(lastW), height: Double(lastH),
+                                    znear: 0, zfar: 1))
+        // Draw as a depth-disabled overlay (like the orientation gizmo) so the
+        // lines stay readable where they pass behind bonds or atoms.
+        enc.setDepthStencilState(overlayDepthState)
+        drawLineBuffer(verts, color: SIMD3<Float>(0.2, 0.6, 1), enc: enc, frameBuffer: frameBuffer)
+    }
+
+    /// Screen-space orientation gizmo: a fixed-size triad of bold arrows pinned
+    /// to the bottom-left corner of the viewport, showing how the world x/y/z
+    /// axes are currently oriented. It rotates as you orbit but never scales
+    /// with zoom.
+    ///
+    /// Arrows are real lit 3D geometry (cylinder shaft + cone head) drawn
+    /// through the SAME pipeline as atoms and bonds, in a miniature scene of
+    /// their own: a view matrix built from just the camera rotation (so the
+    /// triad spins with your orbit) and a fixed orthographic projection sized
+    /// to a corner sub-viewport (so the arrows keep a constant pixel size at
+    /// any zoom). This is the standard orientation-gizmo construction.
+    private func drawOrientationGizmo(_ enc: MTLRenderCommandEncoder, camera: Camera, w: Int, h: Int) {
+        // Corner sub-viewport (pixels); Metal origin is top-left, +y down.
+        let gSize = max(72.0, Double(min(w, h)) * 0.16)
+        let margin = 14.0
+        enc.setViewport(MTLViewport(originX: margin, originY: Double(h) - gSize - margin,
+                                    width: gSize, height: gSize, znear: 0, zfar: 1))
+
+        // Mini-camera: rotation-only view + fixed orthographic projection.
+        let R = float4x4(camera.rotation).transpose            // world -> view (no translation)
+        let half: Float = 1.05
+        let proj = float4x4(orthographicLeft: -half, right: half, bottom: -half, top: half,
+                            near: -10, far: 10)
+        var frame = FrameData(view: R, proj: proj, lightDir: Self.worldLight)
+        let fb = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: [])
+        enc.setRenderPipelineState(atomPipeline)
+        enc.setDepthStencilState(overlayDepthState)
+
+        let shaftLen: Float = 0.62, shaftR: Float = 0.05
+        let headLen: Float = 0.22, headR: Float = 0.13
+        // Unit cylinder/cone point +Y; rotate each onto its axis direction.
+        func shaftModel(_ dir: SIMD3<Float>) -> float4x4 {
+            float4x4(translation: dir * shaftLen * 0.5) * .rotation(fromYTo: dir) *
+            float4x4(scale: SIMD3<Float>(shaftR, shaftLen, shaftR))
+        }
+        func headModel(_ dir: SIMD3<Float>) -> float4x4 {
+            float4x4(translation: dir * shaftLen) * .rotation(fromYTo: dir) *
+            float4x4(scale: SIMD3<Float>(headR, headLen, headR))
+        }
+        struct Axis { let dir: SIMD3<Float>; let color: SIMD3<Float> }
+        let axes = [
+            Axis(dir: SIMD3<Float>(1, 0, 0), color: SIMD3<Float>(1, 0.2, 0.2)), // x red
+            Axis(dir: SIMD3<Float>(0, 1, 0), color: SIMD3<Float>(0.2, 1, 0.2)), // y green
+            Axis(dir: SIMD3<Float>(0, 0, 1), color: SIMD3<Float>(0.2, 0.2, 1)), // z blue
+        ]
+
+        // Draw shafts (cylinders) and heads (cones) as two instanced passes.
+        func drawInstances(_ meshVB: MTLBuffer, _ meshIB: MTLBuffer,
+                           _ model: (SIMD3<Float>) -> float4x4) {
+            var inst: [InstanceData] = []
+            for a in axes {
+                inst.append(InstanceData(model: model(a.dir), color: SIMD4(a.color, 1),
+                                         radius: 1.0, metalness: 0.0))
+            }
+            let buf = device.makeBuffer(bytes: inst, length: inst.count * MemoryLayout<InstanceData>.stride, options: [])
+            enc.setVertexBuffer(meshVB, offset: 0, index: 0)
+            enc.setVertexBuffer(buf, offset: 0, index: 1)
+            enc.setVertexBuffer(fb, offset: 0, index: 2)
+            enc.setFragmentBuffer(fb, offset: 0, index: 2)
+            enc.drawIndexedPrimitives(type: .triangle,
+                                      indexCount: meshIB.length / MemoryLayout<UInt16>.stride,
+                                      indexType: .uint16, indexBuffer: meshIB, indexBufferOffset: 0,
+                                      instanceCount: inst.count)
+        }
+        drawInstances(cylinderVB, cylinderIB, shaftModel)
+        drawInstances(coneVB, coneIB, headModel)
+
+        // x/y/z letter labels at each arrow tip (line-pipeline strokes).
+        // Letters are short line segments in the xy-plane, offset past the tip.
+        let tipLen = shaftLen + headLen
+        let lo: Float = tipLen + 0.07         // distance from origin
+        let hs: Float = 0.04                  // half-size of each letter
+        typealias V = SIMD3<Float>
+        let labelData: [(V, V, [V])] = [
+            (V(lo,0,0), V(1,0.2,0.2), [V(-hs,-hs,0),V(hs,hs,0), V(-hs,hs,0),V(hs,-hs,0)]),
+            (V(0,lo,0), V(0.2,1,0.2), [V(-hs,hs,0),V(0,0,0), V(hs,hs,0),V(0,0,0), V(0,0,0),V(0,-hs,0)]),
+            (V(0,0,lo), V(0.2,0.2,1), [V(-hs,hs,0),V(hs,hs,0), V(hs,hs,0),V(-hs,-hs,0), V(-hs,-hs,0),V(hs,-hs,0)]),
+        ]
+        enc.setRenderPipelineState(linePipeline)
+        for (pos, col, segs) in labelData {
+            let verts = segs.map { $0 + pos }    // offset from local origin to arrow tip
+            var c = col
+            let cb = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: [])!
+            let vb = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<SIMD3<Float>>.stride, options: [])
+            enc.setVertexBuffer(vb, offset: 0, index: 0)
+            enc.setVertexBuffer(cb, offset: 0, index: 3)
+            enc.setVertexBuffer(fb, offset: 0, index: 2)
+            enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: segs.count)
         }
     }
 

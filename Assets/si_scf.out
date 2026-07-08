@@ -1,0 +1,31 @@
+Program PWSCF v.6.7
+     Today is  1Jan2024 at  0:00:00
+
+     Parallel version (MPI)
+     Number of processors in use:       4
+
+     bravais-lattice index     =            1
+     lattice parameter (alat)  =      10.2000  a.u.
+     unit-cell volume          =    1061.2080 (a.u.)^3
+     number of atoms/cell      =            2
+     number of atomic types    =            1
+
+CELL_PARAMETERS (alat)
+  1.0000000  0.0000000  0.0000000
+  0.0000000  1.0000000  0.0000000
+  0.0000000  0.0000000  1.0000000
+
+ATOMIC_POSITIONS (crystal)
+Si        0.000000   0.000000   0.000000
+Si        0.250000   0.250000   0.250000
+
+     End of self-consistent calculation
+
+!    total energy              =     -15.84123456 Ry
+
+     Writing output data file ./pwscf.save/
+
+     init_run     :     0.12s CPU
+     electrons    :     2.34s CPU
+
+PWSCF        :     2.50s CPU

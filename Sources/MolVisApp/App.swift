@@ -36,6 +36,9 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        NSApp.mainMenu = buildMenu()
+        NSApp.activate(ignoringOtherApps: true)         // bring to front so menu bar changes
+        updateAnalysisCheckmarks()
         let args = Array(CommandLine.arguments.dropFirst())
         if args.contains("--help") || args.contains("-h") {
             Self.printHelp(); NSApp.terminate(nil); return
@@ -86,9 +89,115 @@ final class App: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Menu bar
+
+    private func buildMenu() -> NSMenu {
+        let main = NSMenu()
+        // File
+        let fileItem = NSMenuItem(); main.addItem(fileItem)
+        let file = NSMenu(title: "File")
+        fileItem.submenu = file
+        let openItem = file.addItem(withTitle: "Open\u{2026}", action: #selector(openDocument), keyEquivalent: "o")
+        openItem.target = self
+        file.addItem(.separator())
+        file.addItem(withTitle: "Quit", action: #selector(NSApp.terminate), keyEquivalent: "q")
+        // View
+        let viewItem = NSMenuItem(); main.addItem(viewItem)
+        let view = NSMenu(title: "View")
+        viewItem.submenu = view
+        let lbl = view.addItem(withTitle: "Toggle Element Labels", action: #selector(toggleLabelsFromMenu), keyEquivalent: "l")
+        lbl.target = self
+        // Analysis
+        let analysisItem = NSMenuItem(); main.addItem(analysisItem)
+        let analysis = NSMenu(title: "Analysis")
+        analysisItem.submenu = analysis
+        // Build the menu with a stable tag per item (1..4) so we can update
+        // the checkmark without matching titles.
+        let modeList: [(String, Int)] = [
+            ("Selection", 1),
+            ("Distance", 2),
+            ("Angle", 3),
+            ("Dihedral", 4),
+        ]
+        for (title, tag) in modeList {
+            let it = analysis.addItem(withTitle: title, action: #selector(selectAnalysisMode(_:)), keyEquivalent: "")
+            it.target = self
+            it.tag = tag
+        }
+        return main
+    }
+
+    /// File > Open...
+    @objc private func openDocument(_ sender: Any?) {
+        guard let wc = mainWC else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.init(filenameExtension: "xsf")!,
+                                      .init(filenameExtension: "xyz")!,
+                                      .init(filenameExtension: "pdb")!,
+                                      .init(filenameExtension: "axsf")!,
+                                      .init(filenameExtension: "pwi")!,
+                                      .init(filenameExtension: "in")!,
+                                      .init(filenameExtension: "inp")!].compactMap { $0 }
+        panel.beginSheetModal(for: wc.window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do {
+                let scene = Scene(loaded: try Parser.load(url))
+                wc.loadFile(scene)
+            } catch {
+                print("[mcrysden] open failed: \(error)")
+            }
+        }
+    }
+
+    /// View > Toggle Element Labels
+    @objc private func toggleLabelsFromMenu(_ sender: Any?) {
+        mainWC?.state.showLabels.toggle()      // propagates via onChange -> syncFromState
+    }
+
+    /// Mapping from menu tag to measurement mode.
+    private static func modeFor(tag: Int) -> MeasurementMode {
+        switch tag {
+        case 2: return .distance
+        case 3: return .angle
+        case 4: return .dihedral
+        default: return .none
+        }
+    }
+
+    /// Analysis > Selection / Distance / Angle / Dihedral (sender carries tag).
+    /// Toggling a measurement mode clears any previous selection and starts a
+    /// fresh pick; once the required number of atoms is reached the result is
+    /// computed automatically and shown in the bottom panel.
+    @objc private func selectAnalysisMode(_ sender: NSMenuItem) {
+        let mode = Self.modeFor(tag: sender.tag)
+        guard let wc = mainWC else { return }
+        if mode == .none {
+            wc.clearMeasurement()            // back to free selection
+        } else {
+            wc.scene.measurementMode = mode
+            wc.scene.measurementResult = nil
+            wc.scene.selectedAtoms = []      // always start fresh
+            wc.setNeedsRender()
+        }
+        updateAnalysisCheckmarks()
+    }
+
+    /// Reflect the active measurement mode with a checkmark in the Analysis menu.
+    private func updateAnalysisCheckmarks() {
+        guard let analysis = NSApp.mainMenu?.item(withTitle: "Analysis")?.submenu,
+              let mode = mainWC?.scene.measurementMode else { return }
+        let activeTag: Int = { switch mode {
+            case .none: return 1; case .distance: return 2; case .angle: return 3; case .dihedral: return 4
+        } }()
+        for item in analysis.items { item.state = (item.tag == activeTag) ? .on : .off }
+    }
+
+    /// Current app version, surfaced in --help output.
+    static let appVersion = "1.1.0"
+
     static func printHelp() {
         print("""
-        mcrysden — native macOS crystal/molecule viewer (Metal).
+        mcrysden v\(appVersion) — native macOS crystal/molecule viewer (Metal).
         Usage:
           mcrysden                                  # empty viewer
           mcrysden <file.xsf|xyz|pdb|axsf|pwi>      # open a structure

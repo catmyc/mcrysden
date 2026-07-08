@@ -1,0 +1,37 @@
+Program PWSCF v.6.7
+     Today is  1Jan2024 at  0:00:00
+
+     Parallel version (MPI)
+     Number of processors in use:       4
+
+     bravais-lattice index     =            1
+     lattice parameter (alat)  =      10.2000  a.u.
+     unit-cell volume          =    1061.2080 (a.u.)^3
+     number of atoms/cell      =            2
+     number of atomic types    =            1
+
+CELL_PARAMETERS (angstrom)
+  5.4300000  0.0000000  0.0000000
+  0.0000000  5.4300000  0.0000000
+  0.0000000  0.0000000  5.4300000
+
+ATOMIC_POSITIONS (crystal)
+Si        0.000000   0.000000   0.000000
+Si        0.250000   0.250000   0.250000
+
+     BFGS: convergence achieved, Efinal=  -15.84123456
+
+Begin final coordinates
+     new unit-cell volume = 1061.2080 (a.u.)^3
+
+CELL_PARAMETERS (angstrom)
+  5.4300000  0.0000000  0.0000000
+  0.0000000  5.4300000  0.0000000
+  0.0000000  0.0000000  5.4300000
+
+ATOMIC_POSITIONS (angstrom)
+Si        0.000000   0.000000   0.000000
+Si        1.357500   1.357500   1.357500
+End final coordinates
+
+PWSCF        :     5.00s CPU

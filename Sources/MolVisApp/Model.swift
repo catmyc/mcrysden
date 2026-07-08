@@ -26,6 +26,40 @@ struct SuperCell: Codable { var n1: Int = 1; var n2: Int = 1; var n3: Int = 1
     var total: Int { n1 * n2 * n3 }
 }
 
+/// What the next atom click measures. Caps selection at the needed count.
+enum MeasurementMode: String, Codable {
+    case none      // no active measurement
+    case distance  // pick 2 atoms
+    case angle     // pick 3 (middle is the vertex)
+    case dihedral  // pick 4 (ordered)
+    var selectionCap: Int {
+        switch self {
+        case .none: return Int.max
+        case .distance: return 2
+        case .angle: return 3
+        case .dihedral: return 4
+        }
+    }
+    var label: String {
+        switch self {
+        case .none: return "Selection"
+        case .distance: return "Distance"
+        case .angle: return "Angle"
+        case .dihedral: return "Dihedral"
+        }
+    }
+}
+
+/// Result of an explicit distance/angle/dihedral measurement, computed from
+/// a specific set of selected atom indices.
+struct MeasurementResult: Codable {
+    let mode: MeasurementMode
+    let atomIndices: [Int]      // atoms used, in pick order
+    let value: Float            // Å for distance, degrees for angles
+    /// Human-readable summary, e.g. "Distance (1-2): 1.234 Å".
+    let summary: String
+}
+
 struct Plane: Codable { var h: Int = 0; var k: Int = 1; var l: Int = 0; var distance: Float = 0 }
 
 struct Slab: Codable { var planeA: Plane = Plane(); var planeB: Plane = Plane() }
@@ -50,10 +84,28 @@ struct Scene: Codable {
     var isCrystal: Bool = false
     var periodicDim: Int = 3
     var superCell: SuperCell = SuperCell()
+    /// The pristine atom set and bond set BEFORE any supercell expansion.
+    /// `widenSuperCell` always builds from these so it can both grow and
+    /// shrink — otherwise a reduction would have no way to recover the
+    /// original atoms.
+    var baseAtoms: [Atom] = []
+    var baseBonds: [Bond] = []
+    /// The widened atom set BEFORE slab filtering.  Set by `widenSuperCell`
+    /// so `applySlab` always filters a fresh set rather than compounding
+    /// on a previously-filtered result.
+    var preslabAtoms: [Atom] = []
     var slab: Slab?
+    /// Indices (into `atoms`) of atoms the user has selected by clicking.
+    var selectedAtoms: [Int] = []
+    /// Active measurement mode (drives selection cap + what labels show).
+    var measurementMode: MeasurementMode = .none
+    /// The result of the last explicit measurement (non-nil => locked: no
+    /// new atoms can be selected until the user re-toggles a mode).
+    var measurementResult: MeasurementResult?
     var background: String = "#101014"
     var showCellFrame: Bool = true
     var showAxes: Bool = true
+    var showLabels: Bool = false
     var atomScale: Float = 0.35
     var bondRadius: Float = 0.10
     var camera: Camera = Camera()

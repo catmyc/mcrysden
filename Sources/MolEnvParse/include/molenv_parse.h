@@ -34,8 +34,10 @@ MolEnvScene* parse_axsf (const char *path, int frame_index);
 MolEnvScene* parse_xyz  (const char *path);
 MolEnvScene* parse_pdb  (const char *path);
 MolEnvScene* parse_pwi  (const char *path);
-void          molenv_scene_free(MolEnvScene*);
-const char*   molenv_last_error(void);
+MolEnvBond*  molenv_make_bonds(const MolEnvScene *scene, float factor, int *out_nbonds);
+void         molenv_free_bonds(MolEnvBond *bonds);
+void         molenv_scene_free(MolEnvScene*);
+const char*  molenv_last_error(void);
 
 #ifdef __cplusplus
 }

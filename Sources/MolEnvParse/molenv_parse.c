@@ -103,6 +103,12 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
     return b;
 }
 
+/* Public wrapper — used by Swift to recompute bonds after supercell expansion. */
+MolEnvBond* molenv_make_bonds(const MolEnvScene *scene, float factor, int *out_nbonds) {
+    return make_bonds(scene, "", factor, out_nbonds);
+}
+void molenv_free_bonds(MolEnvBond *bonds) { free(bonds); }
+
 static MolEnvScene* parse_xyz_impl(const char *path);
 
 MolEnvScene* parse_xyz(const char *path) {
