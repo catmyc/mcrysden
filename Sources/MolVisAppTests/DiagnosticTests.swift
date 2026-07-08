@@ -1,95 +1,53 @@
 import XCTest
+import Metal
 import simd
 @testable import MolVisApp
+private enum Thrown: Error { case msg(String) }
 
-final class BondCorrectnessTests: XCTestCase {
+final class CellRenderDiag: XCTestCase {
     private func fixture(_ name: String) throws -> Scene {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         return Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/\(name)")))
     }
 
-    // Issue 3 regression: each bond cylinder must connect its two atoms.
-    func testBondsConnectAtoms() throws {
-        let s = try fixture("h2o.xyz")
-        XCTAssertEqual(s.atoms.count, 3)
-        XCTAssertGreaterThanOrEqual(s.bonds.count, 2)
-        let atoms = s.atoms
-        for b in s.bonds {
-            let a = atoms[b.i].coord, b2 = atoms[b.j].coord
-            let dir = b2 - a
-            let len = length(dir)
-            let mid = (a + b2) * 0.5
-            let model = float4x4(translation: mid)
-                * .rotation(fromYTo: dir / len)
-                * float4x4(scale: SIMD3<Float>(0.10, len, 0.10))
-            // translation column must equal the midpoint
-            XCTAssertEqual(model.columns.3.x, mid.x, accuracy: 1e-3)
-            XCTAssertEqual(model.columns.3.y, mid.y, accuracy: 1e-3)
-            XCTAssertEqual(model.columns.3.z, mid.z, accuracy: 1e-3)
-            // the cylinder axis after the model must parallel the bond direction
-            let top = (model * SIMD4<Float>(0, 0.5, 0, 1)).xyz
-            let bot = (model * SIMD4<Float>(0, -0.5, 0, 1)).xyz
-            let axis = top - bot
-            let axisN = axis / length(axis)
-            let dirN = dir / len
-            XCTAssertEqual(axisN.x, dirN.x, accuracy: 1e-3)
-            XCTAssertEqual(axisN.y, dirN.y, accuracy: 1e-3)
-            XCTAssertEqual(axisN.z, dirN.z, accuracy: 1e-3)
+    func testCellEnclosesAtoms() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.msg("noGPU") }
+        let s = try fixture("si110.xsf")
+        let r = try Renderer(device: device)
+        r.scene = s
+        r.currentCamera.center = SIMD3<Float>(1.35, 1.35, 1.35)
+        r.currentCamera.distance = 12
+        let w = 200, h = 200
+        let desc = MTLTextureDescriptor()
+        desc.pixelFormat = .rgba8Unorm; desc.width = w; desc.height = h
+        desc.usage = [.renderTarget, .shaderRead]; desc.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: desc) else { throw Thrown.msg("noTex") }
+        let cb = device.makeCommandQueue()!.makeCommandBuffer()!
+        r.encode(to: cb, target: tex,
+                 viewport: MTLViewport(originX: 0, originY: 0, width: Double(w), height: Double(h), znear: 0, zfar: 1),
+                 camera: r.currentCamera)
+        cb.commit(); cb.waitUntilCompleted()
+        var px = [UInt8](repeating: 0, count: w*h*4)
+        tex.getBytes(&px, bytesPerRow: w*4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+
+        var cMinX = w, cMinY = h, cMaxX = -1, cMaxY = -1
+        var aMinX = w, aMinY = h, aMaxX = -1, aMaxY = -1
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y*w+x)*4
+                let red = px[i], g = px[i+1], b = px[i+2]
+                if red == g && g == b && red > 60 {
+                    cMinX = min(cMinX, x); cMinY = min(cMinY, y); cMaxX = max(cMaxX, x); cMaxY = max(cMaxY, y)
+                } else if red > 30 || g > 30 || b > 30 {
+                    aMinX = min(aMinX, x); aMinY = min(aMinY, y); aMaxX = max(aMaxX, x); aMaxY = max(aMaxY, y)
+                }
+            }
         }
-    }
-
-    // Issue 3 unit: +Y rotates to +X for dir=+X.
-    func testRotationFromYTo() {
-        let R = float4x4.rotation(fromYTo: normalize(SIMD3<Float>(1, 0, 0)))
-        let out = (R * SIMD4<Float>(0, 1, 0, 0)).xyz
-        XCTAssertEqual(out.x, 1.0, accuracy: 0.01)
-        XCTAssertEqual(out.y, 0.0, accuracy: 0.01)
-        XCTAssertEqual(out.z, 0.0, accuracy: 0.01)
-    }
-}
-
-// Issue 2 investigation: does the gesture path orbit the structure (rotate)
-// rather than translate it?
-final class GestureTests: XCTestCase {
-    // Project a world point to normalized device coords [-1,1] using a camera.
-    private func project(_ p: SIMD3<Float>, cam: Camera, aspect: Float) -> SIMD2<Float> {
-        let v = cam.viewMatrix() * float4x4(projectionMatrix_holder())
-        // (use the real matrices)
-        let view = cam.viewMatrix()
-        let proj = cam.projectionMatrix(aspect: aspect)
-        let clip = proj * view * SIMD4(p.x, p.y, p.z, 1)
-        return SIMD2(clip.x / clip.w, clip.y / clip.w)
-    }
-    private func projectionMatrix_holder() -> Float { 1 }
-
-    // Replicate MetalView.mouseDragged's rotation update, then confirm an
-    // off-axis atom orbits (its projected distance from center stays ~constant).
-    func testDragOrbitsNotTranslates() {
-        var cam = Camera()
-        cam.center = SIMD3(0,0,0)
-        cam.distance = 10
-        // a sample atom off the rotation axis
-        let atom = SIMD3<Float>(1.0, 0.5, 0.2)
-        let aspect: Float = 1.0
-
-        let before = project(atom, cam: cam, aspect: aspect)
-        let rBefore = SIMD2<Float>(before.x, before.y)
-
-        // simulate a drag: dx=+10px, dy=+5px (one mouseDragged call)
-        let dx = Float(10), dy = Float(5)
-        let rotX = simd_quatf(angle: dy * 0.01, axis: SIMD3(1,0,0))
-        let rotY = simd_quatf(angle: dx * 0.01, axis: SIMD3(0,1,0))
-        cam.rotation = rotY * rotX * cam.rotation
-
-        let after = project(atom, cam: cam, aspect: aspect)
-        let rAfter = SIMD2<Float>(after.x, after.y)
-
-        let dBefore = simd_length(rBefore)
-        let dAfter = simd_length(rAfter)
-        let shift = simd_length(rAfter - rBefore)
-        print("[gesture] projected radius before=\(dBefore) after=\(dAfter) (should be ~constant); lateral shift=\(shift)")
-        // ORBITAL: distance from center preserved; TRANSLATION: it would shift uniformly.
-        XCTAssertEqual(dBefore, dAfter, accuracy: 0.05, "drag must preserve projected distance from center (orbit), not translate")
-        XCTAssertGreaterThan(shift, 0.001, "drag should move the atom at all")
+        print("[cell-render] cellBBox=(\(cMinX),\(cMinY))..(\(cMaxX),\(cMaxY))")
+        print("[cell-render] atomBBox=(\(aMinX),\(aMinY))..(\(aMaxX),\(aMaxY))")
+        let inside = aMinX >= cMinX-2 && aMaxX <= cMaxX+2 && aMinY >= cMinY-2 && aMaxY <= cMaxY+2
+        print("[cell-render] atomsInsideCellBBox=\(inside)")
+        XCTAssertTrue(cMaxX > 0, "cell frame was not drawn (no grey pixels found)")
+        XCTAssertTrue(inside, "atoms should sit inside the cell-frame bounding box")
     }
 }

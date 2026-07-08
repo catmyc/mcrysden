@@ -33,6 +33,7 @@ MolEnvScene* parse_xsf  (const char *path);
 MolEnvScene* parse_axsf (const char *path, int frame_index);
 MolEnvScene* parse_xyz  (const char *path);
 MolEnvScene* parse_pdb  (const char *path);
+MolEnvScene* parse_pwi  (const char *path);
 void          molenv_scene_free(MolEnvScene*);
 const char*   molenv_last_error(void);
 

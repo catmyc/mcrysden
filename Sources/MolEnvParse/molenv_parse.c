@@ -1,5 +1,6 @@
 #include "molenv_parse.h"
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,7 +105,10 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
 
 static MolEnvScene* parse_xyz_impl(const char *path);
 
-MolEnvScene* parse_xyz(const char *path) { return parse_xyz_impl(path); }
+MolEnvScene* parse_xyz(const char *path) {
+    last_error[0] = '\0';
+    return parse_xyz_impl(path);
+}
 
 /* ----- XSF / AXSF ----- */
 
@@ -244,6 +248,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
 }
 
 MolEnvScene* parse_xsf(const char *path) {
+    last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
     MolEnvScene *s = new_scene(path);
@@ -278,6 +283,7 @@ MolEnvScene* parse_xsf(const char *path) {
 }
 
 MolEnvScene* parse_axsf(const char *path, int frame_index) {
+    last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
     char line[256], tok[64];
@@ -319,6 +325,7 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
 /* ----- PDB ----- */
 
 MolEnvScene* parse_pdb(const char *path) {
+    last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
     char line[1024];
@@ -389,6 +396,373 @@ MolEnvScene* parse_pdb(const char *path) {
     s->is_crystal = 0;
     s->periodic_dim = 0;
     snprintf(s->title,sizeof(s->title),"%s",title);
+    s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
+    return s;
+}
+
+/* ----- Quantum Espresso PWscf input (.pwi / .in / .inp) ----- */
+
+/* 1 Bohr in Angstroms (QE constant bohr_radius_angs). */
+#define BOHR_TO_ANG 0.529177210903f
+
+/* Port of QE's latgen.f90: given ibrav + celldm, fill cell[3][3] (row-major
+   lattice vectors, in Bohr). Returns 0 on success, -1 if ibrav unsupported. */
+static int latgen(int ibrav, const double celldm[6], double cell[3][3]) {
+    double a = celldm[1], b = celldm[1] * celldm[2], c = celldm[1] * celldm[3];
+    double cosbc = celldm[4], cosac = celldm[5], cosab = celldm[6];
+    double sqrt3 = sqrt(3.0), sq3 = sqrt3 / 2.0;
+    double t;
+    int i, j;
+    for (i = 0; i < 3; i++) for (j = 0; j < 3; j++) cell[i][j] = 0.0;
+    switch (ibrav) {
+    case 1: /* sc */
+        cell[0][0] = a; cell[1][1] = a; cell[2][2] = a; break;
+    case 2: /* fcc */
+        cell[0][0] = -a/2; cell[0][2] =  a/2;
+        cell[1][1] =  a/2; cell[1][2] =  a/2;
+        cell[2][0] = -a/2; cell[2][1] =  a/2; break;
+    case 3: /* bcc */
+        cell[0][0] =  a/2; cell[0][1] =  a/2; cell[0][2] =  a/2;
+        cell[1][0] = -a/2; cell[1][1] =  a/2; cell[1][2] =  a/2;
+        cell[2][0] = -a/2; cell[2][1] = -a/2; cell[2][2] =  a/2; break;
+    case 4: /* hexagonal */
+        cell[0][0] = a;
+        cell[1][0] = -a/2; cell[1][1] = a * sq3;
+        cell[2][2] = c; break;
+    case 5: { /* trigonal R, 3-fold along (111) */
+        t = sqrt((1.0 - cosbc) / 3.0);
+        cell[0][0] = a * t;
+        cell[0][1] = a * t / sqrt3;
+        cell[0][2] = a * sqrt(1.0 - 2.0*cosbc*cosbc) / sqrt3;
+        cell[1][0] = -a * t;
+        cell[1][1] = a * t / sqrt3;
+        cell[1][2] = a * sqrt(1.0 - 2.0*cosbc*cosbc) / sqrt3;
+        cell[2][0] = -a * t;
+        cell[2][1] = -a * t / sqrt3;
+        cell[2][2] = a * sqrt(1.0 - 2.0*cosbc*cosbc) / sqrt3;
+        /* rotate so 3-fold is along c: standard QE convention */
+        break;
+    }
+    case -5: { /* trigonal R, 3-fold along <111> (reverse) */
+        t = sqrt((1.0 - cosbc) / 3.0);
+        cell[0][0] = a * t * 2.0 / sqrt3;
+        cell[0][1] = 0.0;
+        cell[0][2] = a * sqrt(1.0 - cosbc*cosbc) / sqrt3;
+        cell[1][0] = -a * t / sqrt3;
+        cell[1][1] = a * t * sqrt(2.0);
+        cell[1][2] = a * sqrt(1.0 - cosbc*cosbc) / sqrt3;
+        cell[2][0] = -a * t / sqrt3;
+        cell[2][1] = -a * t * sqrt(2.0);
+        cell[2][2] = a * sqrt(1.0 - cosbc*cosbc) / sqrt3;
+        break;
+    }
+    case 6: /* tetragonal */
+        cell[0][0] = a; cell[1][1] = a; cell[2][2] = c; break;
+    case 7: /* tetragonal I (bct) */
+        cell[0][0] =  a/2; cell[0][1] = -a/2; cell[0][2] = c/2;
+        cell[1][0] =  a/2; cell[1][1] =  a/2; cell[1][2] = c/2;
+        cell[2][0] = -a/2; cell[2][1] = -a/2; cell[2][2] = c/2; break;
+    case 8: /* orthorhombic */
+        cell[0][0] = a; cell[1][1] = b; cell[2][2] = c; break;
+    case 9: /* orthorhombic base-centered */
+        cell[0][0] =  a/2; cell[0][1] =  b/2;
+        cell[1][0] = -a/2; cell[1][1] =  b/2;
+        cell[2][2] = c; break;
+    case -9: /* orthorhombic base-centered (alt) */
+        cell[0][0] =  a/2; cell[0][1] = -b/2;
+        cell[1][0] =  a/2; cell[1][1] =  b/2;
+        cell[2][2] = c; break;
+    case 91: /* orthorhombic one-face base-centered (A) */
+        cell[0][0] = a;
+        cell[1][0] =  b/2; cell[1][2] = -c/2;
+        cell[2][0] =  b/2; cell[2][2] =  c/2; break;
+    case 10: /* orthorhombic face-centered */
+        cell[0][0] =  a/2; cell[0][2] =  c/2;
+        cell[1][0] =  a/2; cell[1][1] =  b/2;
+        cell[2][1] =  b/2; cell[2][2] =  c/2; break;
+    case 11: /* orthorhombic body-centered */
+        cell[0][0] =  a/2; cell[0][1] =  b/2; cell[0][2] =  c/2;
+        cell[1][0] = -a/2; cell[1][1] =  b/2; cell[1][2] =  c/2;
+        cell[2][0] = -a/2; cell[2][1] = -b/2; cell[2][2] =  c/2; break;
+    case 12: /* monoclinic P, unique axis c */
+        cell[0][0] = a; cell[1][1] = b;
+        cell[2][0] = c * cosab; cell[2][2] = c * sin(acos(cosab)); break;
+    case -12: /* monoclinic P, unique axis b */
+        cell[0][0] = a; cell[2][2] = c;
+        cell[1][0] = b * cosab; cell[1][1] = b * sin(acos(cosab)); break;
+    case 13: /* monoclinic base-centered, unique axis c */
+        cell[0][0] =  a/2; cell[1][1] =  b/2;
+        cell[2][0] = -a/2; cell[2][1] =  b/2;
+        cell[2][0] = c * cosab; cell[2][2] = c * sin(acos(cosab)); break;
+    case 14: { /* triclinic */
+        double sinab = sin(acos(cosab));
+        double omega = a*b*c * sqrt(1.0 - cosab*cosab - cosac*cosac - cosbc*cosbc
+                                     + 2.0*cosab*cosac*cosbc);
+        cell[0][0] = a;
+        cell[1][0] = b * cosab;
+        cell[1][1] = b * sinab;
+        cell[2][0] = c * cosac;
+        cell[2][1] = c * (cosbc - cosac*cosab) / sinab;
+        cell[2][2] = omega / (a * b * sinab);
+        (void)omega; break;
+    }
+    default: return -1;
+    }
+    return 0;
+}
+
+/* Strip trailing digits from a QE species label to recover the element symbol
+   (e.g. "Fe1" -> "Fe", "O" -> "O"). QE labels the same element differently
+   across inequivalent sites this way. Writes the result into out (cap 4). */
+static void qe_element(const char *s, char *out) {
+    int i = 0;
+    while (s[i] && i < 3) { out[i] = s[i]; i++; }
+    /* walk back over trailing digits */
+    while (i > 0 && out[i-1] >= '0' && out[i-1] <= '9') i--;
+    out[i] = '\0';
+}
+
+/* Trim leading/trailing whitespace in place. */
+static void trim_in_place(char *s) {
+    char *a = s;
+    while (*a == ' ' || *a == '\t') a++;
+    if (a != s) { size_t n = strlen(a); memmove(s, a, n + 1); }
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = '\0';
+}
+
+/* Parse a celldm(N) key. Returns the index (1..6) or 0 if not celldm. */
+static int celldm_index(const char *key) {
+    if (strncmp(key, "celldm(", 7) != 0) return 0;
+    return atoi(key + 7);
+}
+
+MolEnvScene* parse_pwi(const char *path) {
+    last_error[0] = '\0';
+    FILE *fp = fopen(path, "r");
+    if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+
+    char line[1024];
+    int ln = 0;
+    int ibrav = 0, nat = 0, ntyp = 0;
+    double celldm[7] = {0}; /* 1-indexed: celldm[1..6] */
+    int in_system = 0;
+
+    /* Species table from ATOMIC_SPECIES: symbol -> Z (max 32 species). */
+    char species_sym[32][8];
+    int species_z[32];
+    int nspecies = 0;
+
+    /* Raw atom data + position unit (dynamically grown). */
+    int cap = 64, natoms = 0;
+    double *ax = malloc(cap * sizeof(double));
+    double *ay = malloc(cap * sizeof(double));
+    double *az = malloc(cap * sizeof(double));
+    char (*asym)[8] = malloc(cap * sizeof(*asym));
+    char pos_unit[16] = "alat"; /* default */
+
+    /* CELL_PARAMETERS (ibrav=0). */
+    double cellpar[3][3] = {{0}};
+    char cell_unit[16] = "alat";
+    int have_cellpar = 0;
+
+    if (!ax || !ay || !az || !asym) {
+        free(ax); free(ay); free(az); free(asym);
+        fclose(fp); set_error(path, 0, "out of memory"); return NULL;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        ln++;
+        /* Strip leading/trailing whitespace + newlines. */
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        size_t len = strlen(p);
+        while (len > 0 && (p[len-1] == ' ' || p[len-1] == '\t' ||
+                           p[len-1] == '\n' || p[len-1] == '\r')) p[--len] = '\0';
+
+        if (in_system) {
+            if (*p == '/') { in_system = 0; continue; }
+            /* key = value */
+            char *eq = strchr(p, '=');
+            if (!eq) continue;
+            char key[64];
+            int klen = (int)(eq - p);
+            if (klen >= (int)sizeof(key)) klen = (int)sizeof(key) - 1;
+            memcpy(key, p, klen); key[klen] = '\0';
+            while (klen > 0 && key[klen-1] == ' ') key[--klen] = '\0';
+            char *vp = eq + 1;
+            while (*vp == ' ') vp++;
+            size_t vlen = strlen(vp);
+            if (vlen >= 2 && ((vp[0]=='\'' && vp[vlen-1]=='\'') || (vp[0]=='"' && vp[vlen-1]=='"'))) {
+                vp[vlen-1] = '\0'; vp++;
+            }
+
+            int ci = celldm_index(key);
+            if (ci >= 1 && ci <= 6) {
+                celldm[ci] = atof(vp);
+            } else if (strcmp(key, "ibrav") == 0) {
+                ibrav = atoi(vp);
+            } else if (strcmp(key, "nat") == 0) {
+                nat = atoi(vp);
+            } else if (strcmp(key, "ntyp") == 0) {
+                ntyp = atoi(vp);
+            }
+            continue;
+        }
+
+        if (strcasecmp(p, "&SYSTEM") == 0) { in_system = 1; continue; }
+
+        if (strcmp(p, "ATOMIC_SPECIES") == 0) {
+            /* Read exactly ntyp species lines (skip blank/comment lines). */
+            while (nspecies < ntyp && fgets(line, sizeof(line), fp)) {
+                ln++;
+                char *q = line;
+                while (*q == ' ' || *q == '\t') q++;
+                if (*q == '\0' || *q == '#' || *q == '/') continue;
+                char sym[16], pp[256]; double mass;
+                if (sscanf(q, "%15s %lf %255s", sym, &mass, pp) < 2) continue;
+                snprintf(species_sym[nspecies], sizeof(species_sym[0]), "%s", sym);
+                char el[4]; qe_element(sym, el);
+                species_z[nspecies] = molenv_symbol_to_z(el[0] ? el : sym);
+                nspecies++;
+            }
+            continue;
+        }
+
+        if (strncmp(p, "ATOMIC_POSITIONS", 16) == 0) {
+            /* optional {unit} */
+            char *b = strchr(p, '{');
+            if (b) {
+                char *be = strchr(b, '}');
+                if (be) { *be = '\0'; snprintf(pos_unit, sizeof(pos_unit), "%s", b + 1); trim_in_place(pos_unit); }
+            }
+            /* Read exactly nat position lines. */
+            while (natoms < nat && fgets(line, sizeof(line), fp)) {
+                ln++;
+                char *q = line;
+                while (*q == ' ' || *q == '\t') q++;
+                if (*q == '\0' || *q == '#' || *q == '/') break;
+                char sym[16]; double x, y, z;
+                if (sscanf(q, "%15s %lf %lf %lf", sym, &x, &y, &z) < 4) break;
+                if (natoms >= cap) {
+                    cap *= 2;
+                    double *tx = realloc(ax, cap * sizeof(double));
+                    double *ty = realloc(ay, cap * sizeof(double));
+                    double *tz = realloc(az, cap * sizeof(double));
+                    char (*ts)[8] = realloc(asym, cap * sizeof(*asym));
+                    if (!tx || !ty || !tz || !ts) {
+                        free(tx ? tx : ax); free(ty ? ty : ay);
+                        free(tz ? tz : az); free(ts ? ts : asym);
+                        free(ax); free(ay); free(az); free(asym);
+                        fclose(fp); set_error(path, 0, "out of memory"); return NULL;
+                    }
+                    ax = tx; ay = ty; az = tz; asym = ts;
+                }
+                snprintf(asym[natoms], sizeof(asym[0]), "%s", sym);
+                ax[natoms] = x; ay[natoms] = y; az[natoms] = z;
+                natoms++;
+            }
+            continue;
+        }
+
+        if (strncasecmp(p, "CELL_PARAMETERS", 15) == 0) {
+            char *b = strchr(p, '{');
+            if (b) {
+                char *be = strchr(b, '}');
+                if (be) { *be = '\0'; snprintf(cell_unit, sizeof(cell_unit), "%s", b + 1); trim_in_place(cell_unit); }
+            } else {
+                /* bare form: CELL_PARAMETERS bohr / angstrom / alat */
+                char *u = p + 15;
+                while (*u == ' ' || *u == '\t') u++;
+                char *e = u;
+                while (*e && *e != ' ' && *e != '\t') e++;
+                *e = '\0';
+                if (*u) snprintf(cell_unit, sizeof(cell_unit), "%s", u);
+            }
+            int r = 0;
+            while (r < 3 && fgets(line, sizeof(line), fp)) {
+                ln++;
+                double u, v, w;
+                if (sscanf(line, "%lf %lf %lf", &u, &v, &w) < 3) continue;
+                cellpar[r][0] = u; cellpar[r][1] = v; cellpar[r][2] = w;
+                r++;
+            }
+            have_cellpar = (r == 3);
+            continue;
+        }
+
+        /* K_POINTS and anything else: skip. */
+    }
+    fclose(fp);
+
+    /* Validate. */
+    if (natoms == 0) {
+        free(ax); free(ay); free(az); free(asym);
+        set_error(path, 0, "no ATOMIC_POSITIONS found"); return NULL;
+    }
+
+    /* Build the cell in Angstroms. */
+    double cell[3][3];
+    if (ibrav == 0) {
+        if (!have_cellpar) {
+            free(ax); free(ay); free(az); free(asym);
+            set_error(path, 0, "ibrav=0 requires CELL_PARAMETERS"); return NULL;
+        }
+        /* cellpar is in cell_unit; convert to Ang. */
+        float scale = 1.0f;
+        if (strcmp(cell_unit, "bohr") == 0) scale = BOHR_TO_ANG;
+        else if (strcmp(cell_unit, "alat") == 0) scale = (float)(celldm[1] * BOHR_TO_ANG);
+        /* angstrom: scale=1 */
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) cell[i][j] = cellpar[i][j] * scale;
+    } else {
+        if (latgen(ibrav, celldm, cell) != 0) {
+            char buf[128]; snprintf(buf, sizeof(buf), "unsupported ibrav=%d", ibrav);
+            free(ax); free(ay); free(az); free(asym);
+            set_error(path, 0, buf); return NULL;
+        }
+        /* latgen returns Bohr -> convert to Ang. */
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) cell[i][j] *= BOHR_TO_ANG;
+    }
+
+    /* Convert atom positions to Cartesian Angstroms. */
+    float pos_scale = 1.0f;
+    int frac = 0;
+    if (strcmp(pos_unit, "bohr") == 0) pos_scale = BOHR_TO_ANG;
+    else if (strcmp(pos_unit, "alat") == 0) pos_scale = (float)(celldm[1] * BOHR_TO_ANG);
+    else if (strcmp(pos_unit, "crystal") == 0) frac = 1;
+    /* angstrom: scale=1 */
+
+    MolEnvScene *s = new_scene(path);
+    if (!s) { free(ax); free(ay); free(az); free(asym); return NULL; }
+    s->atoms = calloc(natoms, sizeof(MolEnvAtom));
+    if (!s->atoms) {
+        free(ax); free(ay); free(az); free(asym);
+        set_error(path, 0, "out of memory"); molenv_scene_free(s); return NULL;
+    }
+
+    for (int i = 0; i < natoms; i++) {
+        double px = ax[i], py = ay[i], pz = az[i];
+        double cx, cy, cz;
+        if (frac) {
+            cx = px*cell[0][0] + py*cell[1][0] + pz*cell[2][0];
+            cy = px*cell[0][1] + py*cell[1][1] + pz*cell[2][1];
+            cz = px*cell[0][2] + py*cell[1][2] + pz*cell[2][2];
+        } else {
+            cx = px * pos_scale; cy = py * pos_scale; cz = pz * pos_scale;
+        }
+        MolEnvAtom *a = &s->atoms[i];
+        a->coord[0] = (float)cx; a->coord[1] = (float)cy; a->coord[2] = (float)cz;
+        snprintf(a->label, sizeof(a->label), "%s", asym[i]);
+        char el[4]; qe_element(asym[i], el);
+        a->atomic_number = molenv_symbol_to_z(el[0] ? el : asym[i]);
+    }
+    free(ax); free(ay); free(az); free(asym);
+
+    s->natoms = natoms;
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) s->cell[i][j] = (float)cell[i][j];
+    s->is_crystal = 1;
+    s->periodic_dim = 3;
+    snprintf(s->title, sizeof(s->title), "%s", "QE structure");
     s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
     return s;
 }

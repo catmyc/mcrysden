@@ -23,20 +23,42 @@ struct LoadedScene {
     var title: String = ""
 }
 
+/// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
+/// When omitted, `Parser.load` falls back to the file extension.
+enum ParseFormat {
+    case xsf, axsf, xyz, pdb, pwi
+    /// Map a lowercased path extension to a format. Returns nil if unknown.
+    init?(ext: String) {
+        switch ext {
+        case "xsf": self = .xsf
+        case "axsf": self = .axsf
+        case "xyz": self = .xyz
+        case "pdb": self = .pdb
+        case "pwi", "in", "inp": self = .pwi
+        default: return nil
+        }
+    }
+}
+
 enum Parser {
-    static func load(_ url: URL) throws -> LoadedScene {
+    /// Load a structure file. When `format` is nil, the parser is chosen from
+    /// the URL's path extension; otherwise the forced format wins.
+    static func load(_ url: URL, as format: ParseFormat? = nil) throws -> LoadedScene {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
         let cPath = url.path.cString(using: .utf8)!
-        let ext = url.pathExtension.lowercased()
+        let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
+        guard let effective else {
+            throw ParseError.io(path: url.path, reason: "unknown extension \(url.pathExtension)")
+        }
         let scene: UnsafeMutablePointer<MolEnvScene>?
-        switch ext {
-        case "xsf": scene = parse_xsf(cPath)
-        case "xyz": scene = parse_xyz(cPath)
-        case "pdb": scene = parse_pdb(cPath)
-        case "axsf": scene = parse_axsf(cPath, 0)
-        default: throw ParseError.io(path: url.path, reason: "unknown extension \(ext)")
+        switch effective {
+        case .xsf: scene = parse_xsf(cPath)
+        case .xyz: scene = parse_xyz(cPath)
+        case .pdb: scene = parse_pdb(cPath)
+        case .axsf: scene = parse_axsf(cPath, 0)
+        case .pwi: scene = parse_pwi(cPath)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
