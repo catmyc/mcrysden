@@ -73,6 +73,24 @@ struct Camera: Codable {
 
 enum ProjectionMode: Codable { case perspective, ortho }
 
+enum BackgroundType: String, Codable {
+    case solid         // single flat color (`background`)
+    case gradient_top  // vertical gradient, `background` (top) → `backgroundBottom` (bottom)
+}
+
+/// Adjustable Phong-material lighting.  Kept in Scene so it can be driven by
+/// sidebar sliders and persisted in the state file.
+struct Lighting: Codable {
+    var ambient: Float = 0.35
+    var diffuse: Float = 0.65
+    var specular: Float = 0.0       // 0 == matty; >0 adds a specular highlight
+    var shininess: Float = 16.0
+    /// Spherical direction to the light (degrees); converted to a vector in the
+    /// renderer so the user never sees raw trigonometry.
+    var azimuth: Float = 225.0
+    var elevation: Float = 45.0
+}
+
 struct ColorScheme: Codable { var mode: String = "atomic" }
 
 struct Scene: Codable {
@@ -102,12 +120,16 @@ struct Scene: Codable {
     /// The result of the last explicit measurement (non-nil => locked: no
     /// new atoms can be selected until the user re-toggles a mode).
     var measurementResult: MeasurementResult?
+    var backgroundType: BackgroundType = .solid
     var background: String = "#101014"
+    var backgroundBottom: String = "#000000"   // gradient end color
+    var lighting: Lighting = Lighting()
     var showCellFrame: Bool = true
     var showAxes: Bool = true
     var showLabels: Bool = false
     var atomScale: Float = 0.35
     var bondRadius: Float = 0.10
+    var currentFrame: Int = 0      // AXSF animation frame index (GUI only)
     var camera: Camera = Camera()
 }
 
