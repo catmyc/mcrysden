@@ -48,16 +48,31 @@ final class MetalView: MTKView {
         guard let last = lastMouse else { lastMouse = p; return }
         let dx = Float(p.x - last.x), dy = Float(p.y - last.y)
         lastMouse = p
-        // Orbit around the camera's current up/right axes rather than world-
-        // fixed axes: a horizontal drag rotates around what is currently the
-        // vertical direction on screen, and a vertical drag rotates around the
-        // horizontal direction — the intuitive "follow your mouse" behavior.
+        // The camera's right/up axes in world space are the first two columns
+        // of its rotation matrix — the same basis the orbit path recomputes,
+        // shared here so pan and orbit never disagree about screen directions.
         let R = float4x4(self.world!.camera.rotation)
         let viewRight = (R * SIMD4<Float>(1, 0, 0, 0)).xyz   // camera right → world
         let viewUp    = (R * SIMD4<Float>(0, 1, 0, 0)).xyz   // camera up → world
-        let rotV = simd_quatf(angle: +dy * 0.01, axis: viewRight)
-        let rotH = simd_quatf(angle: -dx * 0.01, axis: viewUp)
-        world?.camera.rotation = rotH * rotV * world!.camera.rotation
+
+        if e.modifierFlags.contains(.option) {
+            // Option-drag = PAN: translate the look-at center in the camera's
+            // right/up plane so a grabbed point follows the mouse ("grab and
+            // drag" semantics). World units per pixel come from the projected
+            // visible height at the target plane (perspective fov = π/4).
+            let distance = max(1.0, world!.camera.distance)
+            let worldPerPixel = Float(2.0 * distance * tan(Float.pi / 8)) / Float(bounds.height)
+            world?.camera.center -= (viewRight * dx + viewUp * dy) * worldPerPixel
+        } else {
+            // Plain drag = ORBIT around the camera's current up/right axes rather
+            // than world-fixed axes: a horizontal drag rotates around what is
+            // currently the vertical direction on screen, and a vertical drag
+            // rotates around the horizontal direction — the intuitive "follow
+            // your mouse" behavior.
+            let rotV = simd_quatf(angle: +dy * 0.01, axis: viewRight)
+            let rotH = simd_quatf(angle: -dx * 0.01, axis: viewUp)
+            world?.camera.rotation = rotH * rotV * world!.camera.rotation
+        }
         world?.setNeedsRender()
     }
 

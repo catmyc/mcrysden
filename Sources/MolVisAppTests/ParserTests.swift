@@ -214,6 +214,288 @@ final class ParserTests: XCTestCase {
         }
     }
 
+    // ----- CIF -----
+
+    // Minimal crystal CIF: data_test block, full cell, one atom-site loop with
+    // fractional coords. The single Fe at (.25,.25,.25) maps to a frac->cart
+    // position of (0.25*a, ...) on a 5 A cubic cell.
+    func testCIFHappyPath() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("xtal.cif")
+        try """
+        data_test
+        _cell_length_a 5.0
+        _cell_length_b 5.0
+        _cell_length_c 5.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_type_symbol
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 Fe 0.25 0.25 0.25
+         O1  O 0.50 0.50 0.50
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let s = try Parser.load(tmp)
+        XCTAssertEqual(s.atoms.count, 2)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 26) // Fe
+        XCTAssertEqual(s.atoms[1].atomicNumber, 8)  // O
+        XCTAssertTrue(s.isCrystal)
+        XCTAssertNotNil(s.cell)
+        // cubic cell: a along x => cell.a.x == 5.0
+        XCTAssertEqual(s.cell!.a.x, 5.0, accuracy: 0.001)
+        XCTAssertEqual(s.cell!.b.y, 5.0, accuracy: 0.001)
+        // Fe at (0.25,.25,.25)*5 => (1.25,1.25,1.25)
+        XCTAssertEqual(s.atoms[0].coord.x, 1.25, accuracy: 0.001)
+        XCTAssertEqual(s.atoms[0].coord.y, 1.25, accuracy: 0.001)
+        XCTAssertGreaterThanOrEqual(s.bonds.count, 0)
+    }
+
+    // A molecule CIF has no _cell_* params: parsing must succeed and report
+    // isCrystal == false.
+    func testCIFMolecule() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("mol.cif")
+        try """
+        data_water
+        loop_
+        _atom_site_label
+        _atom_site_Cartn_x
+        _atom_site_Cartn_y
+        _atom_site_Cartn_z
+        O1  0.0000  0.0000  0.0000
+        H1  0.7572  0.5860  0.0000
+        H2 -0.7572  0.5860  0.0000
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let s = try Parser.load(tmp)
+        XCTAssertEqual(s.atoms.count, 3)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 8) // O
+        XCTAssertEqual(s.atoms[1].atomicNumber, 1) // H
+        XCTAssertFalse(s.isCrystal)
+        XCTAssertNil(s.cell)
+        // Cartesian coords: O at origin
+        XCTAssertEqual(s.atoms[0].coord.x, 0.0, accuracy: 0.001)
+        XCTAssertEqual(s.atoms[1].coord.x, 0.7572, accuracy: 0.001)
+    }
+
+    // ----- POSCAR -----
+
+    // VASP 5 style: comment, scale, lattice, species line, counts, Cartesian.
+    func testPOSCARHappyPath() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("si.poscar")
+        try """
+        Si dimer test
+        1.0
+         5.0 0.0 0.0
+         0.0 5.0 0.0
+         0.0 0.0 5.0
+        Si
+        2
+        Cartesian
+         0.0 0.0 0.0
+         2.0 0.0 0.0
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let s = try Parser.load(tmp)
+        XCTAssertEqual(s.atoms.count, 2)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 14) // Si
+        XCTAssertTrue(s.isCrystal)
+        XCTAssertNotNil(s.cell)
+        XCTAssertEqual(s.cell!.a.x, 5.0, accuracy: 0.001)
+        XCTAssertEqual(s.cell!.b.y, 5.0, accuracy: 0.001)
+        // Cartesian, scale 1.0 => stored exactly
+        XCTAssertEqual(s.atoms[1].coord.x, 2.0, accuracy: 0.001)
+        // Si-Si distance 2.0 A < 2*1.05*1.11 == 2.33 A => one bond
+        XCTAssertEqual(s.bonds.count, 1, "Si-Si dimer at 2.0 A should bond")
+    }
+
+    // VASP 4 style omits the species line; the counts line comes directly after
+    // the lattice. Dispatch must also work for the .contcar extension.
+    func testPOSCARVASP4() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("si.contcar")
+        try """
+        Si2 VASP4
+        1.0
+         5.43 0.0 0.0
+         0.0 5.43 0.0
+         0.0 0.0 5.43
+        2
+        Direct
+         0.00 0.00 0.00
+         0.25 0.25 0.25
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let s = try Parser.load(tmp)
+        XCTAssertEqual(s.atoms.count, 2)
+        // No species line => unknown element, Swift layer tolerates Z==0.
+        XCTAssertTrue(s.isCrystal)
+        XCTAssertEqual(s.cell!.a.x, 5.43, accuracy: 0.001)
+        // Direct (0.25,.25,.25)*5.43 => 1.3575 along each axis
+        XCTAssertEqual(s.atoms[1].coord.x, 0.25 * 5.43, accuracy: 0.001)
+    }
+
+    // VASP volume convention: a negative scaling factor is the target cell
+    // VOLUME, not a negative multiplier. Raw cell a=b=c=2 (volume 8), target
+    // volume 27 => per-axis scale (27/8)^(1/3) = 1.5 => final edges 3.0.
+    func testPOSCARNegativeScaleVolume() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("vol.poscar")
+        try """
+        vol test
+        -27.0
+         2.0 0.0 0.0
+         0.0 2.0 0.0
+         0.0 0.0 2.0
+        Al
+        1
+        Direct
+         0.0 0.0 0.0
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let s = try Parser.load(tmp)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 13) // Al
+        XCTAssertNotNil(s.cell)
+        XCTAssertEqual(s.cell!.a.x, 3.0, accuracy: 0.001, "neg-scale volume conv failed: got \(s.cell!.a.x)")
+    }
+
+    // The newly-completed element table must resolve species the old table
+    // silently dropped (Sc, Y, La, Hf, Og) — previously Z=0 => no color/radius.
+    // ----- Quantum Espresso output (.pwo) -----
+    //
+    // .pwo parsing reproduces the XCrySDen pwo2xsf.awk contract natively (no shell
+    // filter). Each ATOMIC_POSITIONS block is one ionic step; the latest
+    // CELL_PARAMETERS/crystal axes block supplies its cell; units resolve via alat.
+
+    func testPWOScfHappyPath() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si_scf.out")
+        let s = try Parser.load(url)
+        XCTAssertEqual(s.atoms.count, 2)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 14) // Si
+        XCTAssertTrue(s.isCrystal)
+        XCTAssertNotNil(s.cell)
+        // alat = 10.2 bohr * BOHR_TO_ANG ~ 5.3976 A; CELL_PARAMETERS(alat)=identity.
+        let a0 = Float(10.2 * 0.529177210903)
+        XCTAssertEqual(s.cell!.a.x, a0, accuracy: 0.001)
+        XCTAssertEqual(s.cell!.b.y, a0, accuracy: 0.001)
+        // ATOMIC_POSITIONS(crystal): Si at (0,0,0) and (.25,.25,.25)*a0.
+        XCTAssertEqual(s.atoms[0].coord.x, 0.0, accuracy: 0.001)
+        XCTAssertEqual(s.atoms[1].coord.x, 0.25 * a0, accuracy: 0.001)
+        XCTAssertEqual(s.atoms[1].coord.y, 0.25 * a0, accuracy: 0.001)
+        XCTAssertEqual(s.atoms[1].coord.z, 0.25 * a0, accuracy: 0.001)
+        // Single SCF step -> one frame.
+        XCTAssertEqual(Parser.frameCount(url), 1)
+    }
+
+    func testPWORelaxMultiStep() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si_relax.out")
+        // Two ATOMIC_POSITIONS blocks -> two frames.
+        XCTAssertEqual(Parser.frameCount(url), 2)
+        // Last frame is the "Begin final coordinates" geometry.
+        let final = try Parser.load(url, frameIndex: 1)
+        XCTAssertEqual(final.atoms.count, 2)
+        XCTAssertTrue(final.isCrystal)
+        // Final frame: CELL_PARAMETERS(angstrom)=5.43 cube, ATOMIC_POSITIONS(angstrom).
+        XCTAssertEqual(final.cell!.a.x, 5.43, accuracy: 0.001)
+        XCTAssertEqual(final.atoms[1].coord.x, 1.3575, accuracy: 0.001) // 0.25*5.43
+        XCTAssertEqual(final.atoms[1].coord.y, 1.3575, accuracy: 0.001)
+    }
+
+    func testPWOLastFrameIsFinalCoordinates() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si_relax.out")
+        // Two frames; both read CELL_PARAMETERS(angstrom)=5.43 as their cell (the
+        // latest cell block preceding each ATOMIC_POSITIONS — matching the awk,
+        // which overrides the crystal-axes lattice with CELL_PARAMETERS). They
+        // differ in coordinate UNITS: frame 0 = crystal (.25*5.43), frame 1 =
+        // angstrom (1.3575). A unit bug would blow up frame 1.
+        let f0 = try Parser.load(url, frameIndex: 0)
+        let f1 = try Parser.load(url, frameIndex: 1)
+        XCTAssertEqual(f0.cell!.a.x, 5.43, accuracy: 0.001, "frame0 cell = angstrom 5.43")
+        // frame 0 crystal coords: (.25,.25,.25)*5.43 = 1.3575
+        XCTAssertEqual(f0.atoms[1].coord.x, 1.3575, accuracy: 0.001)
+        // frame 1 angstrom coords: literal 1.3575 (NOT alat-scaled, which would be ~7.3)
+        XCTAssertEqual(f1.cell!.a.x, 5.43, accuracy: 0.001, "frame1 cell = angstrom 5.43")
+        XCTAssertEqual(f1.atoms[1].coord.x, 1.3575, accuracy: 0.001)
+        XCTAssertEqual(f1.atoms[1].coord.y, 1.3575, accuracy: 0.001)
+        XCTAssertEqual(f1.atoms[1].coord.z, 1.3575, accuracy: 0.001)
+    }
+
+    func testForcePwoFlag() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si_relax.out")
+        // Forced .pwo parser on an `.out` path succeeds; extension-based dispatch
+        // also succeeds because .out maps to .pwo.
+        let forced = try Parser.load(url, as: .pwo)
+        XCTAssertEqual(forced.atoms.count, 2)
+        XCTAssertEqual(Parser.frameCount(url), 2)
+    }
+
+    // The newly-completed element table must resolve species the old table
+    // silently dropped (Sc, Y, La, Hf, Og) — previously Z=0 => no color/radius.
+    func testNewElementsResolved() throws {
+        func z(_ sym: String) throws -> Int {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("el.poscar")
+            try """
+            el test
+            1.0
+             5 0 0
+             0 5 0
+             0 0 5
+            \(sym)
+            1
+            Direct
+             0 0 0
+            """.write(to: tmp, atomically: true, encoding: .utf8)
+            return try Parser.load(tmp).atoms[0].atomicNumber
+        }
+        XCTAssertEqual(try z("Sc"), 21)
+        XCTAssertEqual(try z("Y"), 39)
+        XCTAssertEqual(try z("La"), 57)
+        XCTAssertEqual(try z("Hf"), 72)
+        XCTAssertEqual(try z("Og"), 118)
+    }
+
+    // The `as:` flag must override extension dispatch: valid CIF content saved
+    // under a .xyz name parses only when forced to the CIF parser.
+    func testForceCifFlagOverridesExtension() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("renamed.xyz")
+        try """
+        data_mini
+        _cell_length_a 3.0
+        _cell_length_b 3.0
+        _cell_length_c 3.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Li1 0.0 0.0 0.0
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        // Forced CIF parser succeeds.
+        let s = try Parser.load(tmp, as: .cif)
+        XCTAssertEqual(s.atoms.count, 1)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 3) // Li
+        XCTAssertTrue(s.isCrystal)
+        // Extension-based dispatch (.xyz) must fail on CIF content.
+        XCTAssertThrowsError(try Parser.load(tmp)) { err in
+            guard case ParseError.parse = err else { return XCTFail("expected parse error") }
+        }
+    }
+
+    // The new AXSF frame-count helper must read the ANIMSTEPS header without
+    // loading a frame — the latch fixture has 2 frames, single-frame XSFs are
+    // not AXSF at all, and a molecule XYZ reports 0.
+    func testAXSFFrameCount() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        XCTAssertEqual(Parser.frameCount(dir.appendingPathComponent("Fixtures/si.latch.axsf")), 2)
+        XCTAssertEqual(Parser.frameCount(dir.appendingPathComponent("Fixtures/si110.xsf")), 0)
+        XCTAssertEqual(Parser.frameCount(dir.appendingPathComponent("Fixtures/h2o.xyz")), 0)
+    }
+
     // State store must never throw on a malformed scene payload (spec §9).
     func testStateLoadMalformedSceneFallsBack() throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("bad.mvis-state")
@@ -221,7 +503,7 @@ final class ParserTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: payload, options: []).write(to: tmp)
         var s = Scene()
         var c: Camera? = nil
-        try StateStore.load(&s, camera: &c, from: tmp)
+        try StateStore.load(into: &s, camera: &c, from: tmp)
         XCTAssertTrue(s.atoms.isEmpty)
         XCTAssertNil(c)
     }

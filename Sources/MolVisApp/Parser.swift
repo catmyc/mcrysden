@@ -26,7 +26,7 @@ struct LoadedScene {
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext {
@@ -35,6 +35,9 @@ enum ParseFormat {
         case "xyz": self = .xyz
         case "pdb": self = .pdb
         case "pwi", "in", "inp": self = .pwi
+        case "pwo", "out": self = .pwo
+        case "cif": self = .cif
+        case "poscar", "contcar", "vasp": self = .poscar
         default: return nil
         }
     }
@@ -43,6 +46,18 @@ enum ParseFormat {
 enum Parser {
     /// Load a structure file. When `format` is nil, the parser is chosen from
     /// the URL's path extension; otherwise the forced format wins.
+    /// Load a structure file, optionally forcing the parser format AND/OR a
+    /// specific AXSF animation frame. When `frameIndex > 0` the frame-indexed
+    /// AXSF path is used (format is ignored — animation is an AXSF-only feature);
+    /// otherwise `load(_:as:)` is used. This single entry point backs both the
+    /// GUI open path and the `--frame` CLI flag.
+    static func load(_ url: URL, as format: ParseFormat? = nil, frameIndex: Int = 0) throws -> LoadedScene {
+        if frameIndex > 0 {
+            return try load(url, frameIndex: frameIndex)
+        }
+        return try load(url, as: format)
+    }
+
     static func load(_ url: URL, as format: ParseFormat? = nil) throws -> LoadedScene {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
@@ -59,6 +74,9 @@ enum Parser {
         case .pdb: scene = parse_pdb(cPath)
         case .axsf: scene = parse_axsf(cPath, 0)
         case .pwi: scene = parse_pwi(cPath)
+        case .pwo: scene = parse_pwo(cPath, 0)
+        case .cif: scene = parse_cif(cPath)
+        case .poscar: scene = parse_poscar(cPath)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
@@ -80,12 +98,32 @@ enum Parser {
         return copyOut(scene.pointee)
     }
 
+    /// Number of animation frames in an animated file: ANIMSTEPS for AXSF, or
+    /// ATOMIC_POSITIONS-block count for QE .pwo output. 0 for any single-frame
+    /// / non-animated / unreadable file. Lets the GUI decide whether to show
+    /// the playback controls at all.
+    static func frameCount(_ url: URL) -> Int {
+        let cPath = url.path.cString(using: .utf8)!
+        switch ParseFormat(ext: url.pathExtension.lowercased()) {
+        case .pwo: return Int(molenv_pwo_frame_count(cPath))
+        default: return Int(molenv_axsf_frame_count(cPath))
+        }
+    }
+
     static func load(_ url: URL, frameIndex: Int) throws -> LoadedScene {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
         let cPath = url.path.cString(using: .utf8)!
-        guard let scene = parse_axsf(cPath, Int32(frameIndex)) else {
+        // Choose the per-format frame loader. AXSF is the original animated
+        // format; QE .pwo output adds ionic steps as frames via parse_pwo.
+        let scene: UnsafeMutablePointer<MolEnvScene>?
+        switch ParseFormat(ext: url.pathExtension.lowercased()) {
+        case .pwo: scene = parse_pwo(cPath, Int32(frameIndex))
+        case .axsf: scene = parse_axsf(cPath, Int32(frameIndex))
+        default: scene = parse_axsf(cPath, Int32(frameIndex))
+        }
+        guard let scene else {
             let msg = String(cString: molenv_last_error())
             var path = url.path, line = 0, reason = msg
             if let match = msg.range(of: #"^(.+):(\d+):\s?(.*)$"#, options: .regularExpression) {

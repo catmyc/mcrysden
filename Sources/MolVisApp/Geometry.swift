@@ -102,4 +102,92 @@ enum Geometry {
 
     /// Two vertices spanning +Y — basis for bond cylinders and line segments.
     static func unitLine() -> [SIMD3<Float>] { [SIMD3(0,0,0), SIMD3(0,1,0)] }
+
+    // MARK: - Polyhedral cells (Voronoi-like half-space intersection)
+
+    /// Build the convex polyhedron around `center` formed by intersecting, for
+    /// each neighbor, the half-space of points nearer to `center` than to that
+    /// neighbor (the perpendicular bisector plane). Returns a flat list of
+    /// triangle vertices (groups of 3) in world space, or nil if the cell is
+    /// degenerate (fewer than 3 usable neighbors, or unbounded within the
+    /// clamped neighbor set).
+    ///
+    /// Algorithm: a vertex lies at the intersection of three bisector planes
+    /// that satisfies ALL half-space constraints. We enumerate triples of planes,
+    /// solve the 3x3 system, keep the feasible points, then for each plane gather
+    /// the vertices lying on it and fan-triangulate the convex polygon they form.
+    /// This avoids a full 3D convex-hull pass. Neighbor count is clamped to
+    /// `maxNeighbors` (nearest first) to bound the O(n^3) triple loop to a few
+    /// hundred solves per atom — fine for the common few-hundred-atom case.
+    static func polyhedronFaces(center: SIMD3<Float>, neighbors: [SIMD3<Float>],
+                                maxNeighbors: Int = 12) -> [SIMD3<Float>]? {
+        let k = min(neighbors.count, maxNeighbors)
+        guard k >= 3 else { return nil }
+
+        // Plane i: dot(x, n_i) <= c_i, where n_i points toward neighbor i and
+        // c_i = dot(mid_i, n_i) = dot(center, n_i) + |neighbor-center|/2.
+        var planes: [(n: SIMD3<Float>, c: Float)] = []
+        planes.reserveCapacity(k)
+        var maxDist: Float = 0
+        for idx in 0..<k {
+            let d = neighbors[idx] - center
+            let len = length(d)
+            if len < 1e-6 { continue }
+            let n = d / len
+            planes.append((n, dot(center, n) + len * 0.5))
+            maxDist = max(maxDist, len)
+        }
+        guard planes.count >= 3 else { return nil }
+
+        let bound = maxDist * 3.0 + 1.0
+        let eps: Float = 1e-3
+        var verts: [SIMD3<Float>] = []
+        let m = planes.count
+        for a in 0..<m {
+            for b in (a + 1)..<m {
+                for c in (b + 1)..<m {
+                    let mat = simd_float3x3(rows: [planes[a].n, planes[b].n, planes[c].n])
+                    let det = mat.determinant
+                    if abs(det) < 1e-6 { continue }               // nearly coplanar planes
+                    let p = mat.inverse * SIMD3(planes[a].c, planes[b].c, planes[c].c)
+                    if length(p - center) > bound { continue }     // reject unbounded outliers
+                    // Feasibility: must satisfy every half-space (with slack).
+                    var ok = true
+                    for q in 0..<m {
+                        if dot(p, planes[q].n) > planes[q].c + eps { ok = false; break }
+                    }
+                    if ok { verts.append(p) }
+                }
+            }
+        }
+        // De-duplicate vertices that appear in multiple triples.
+        var uniq: [SIMD3<Float>] = []
+        for v in verts {
+            if !uniq.contains(where: { length($0 - v) < eps }) { uniq.append(v) }
+        }
+        guard uniq.count >= 4 else { return nil }
+
+        // Fan-triangulate each plane's face: gather the vertices lying on it,
+        // sort angularly around the face centroid in the plane's 2D basis, and
+        // emit a triangle fan. The plane normal is the (outward) face normal.
+        var tris: [SIMD3<Float>] = []
+        for i in 0..<m {
+            let nrm = planes[i].n
+            let cc = planes[i].c
+            let face = uniq.filter { abs(dot($0, nrm) - cc) < 3 * eps }
+            guard face.count >= 3 else { continue }
+            // Build an orthonormal 2D basis (u, v) spanning the plane.
+            let tangent = abs(nrm.x) < 0.9 ? SIMD3<Float>(1, 0, 0) : SIMD3<Float>(0, 1, 0)
+            let u = normalize(cross(tangent, nrm))
+            let v = cross(nrm, u)
+            let cen = face.reduce(SIMD3<Float>.zero, +) / Float(face.count)
+            let sorted = face.sorted {
+                atan2(dot($0 - cen, v), dot($0 - cen, u)) < atan2(dot($1 - cen, v), dot($1 - cen, u))
+            }
+            for j in 1..<(sorted.count - 1) {
+                tris.append(sorted[0]); tris.append(sorted[j]); tris.append(sorted[j + 1])
+            }
+        }
+        return tris.isEmpty ? nil : tris
+    }
 }

@@ -29,11 +29,24 @@ typedef struct {
     char       title[256];
 } MolEnvScene;
 
-MolEnvScene* parse_xsf  (const char *path);
-MolEnvScene* parse_axsf (const char *path, int frame_index);
-MolEnvScene* parse_xyz  (const char *path);
-MolEnvScene* parse_pdb  (const char *path);
-MolEnvScene* parse_pwi  (const char *path);
+MolEnvScene* parse_xsf   (const char *path);
+MolEnvScene* parse_axsf  (const char *path, int frame_index);
+/// Read the ANIMSTEPS count from an AXSF file's header WITHOUT loading a frame.
+/// Returns the frame count, or 0 if the file is not a valid/animated AXSF.
+/// Used by the GUI to size the animation scrubber and by --frame validation.
+int         molenv_axsf_frame_count(const char *path);
+MolEnvScene* parse_xyz   (const char *path);
+MolEnvScene* parse_pdb   (const char *path);
+MolEnvScene* parse_pwi   (const char *path);
+/// Read a single ionic step (0-based `frame_index`) from a QE PWscf .pwo output.
+/// Each ATOMIC_POSITIONS block is one frame; the latest CELL_PARAMETERS/crystal
+/// axes block supplies its cell. Returns NULL on failure (see molenv_last_error).
+MolEnvScene* parse_pwo   (const char *path, int frame_index);
+/// Number of ionic steps (ATOMIC_POSITIONS blocks) in a .pwo file, or 0 if the
+/// file is not a valid/parseable PWscf output. Sizes the animation scrubber.
+int          molenv_pwo_frame_count(const char *path);
+MolEnvScene* parse_cif   (const char *path);
+MolEnvScene* parse_poscar(const char *path);
 MolEnvBond*  molenv_make_bonds(const MolEnvScene *scene, float factor, int *out_nbonds);
 void         molenv_free_bonds(MolEnvBond *bonds);
 void         molenv_scene_free(MolEnvScene*);

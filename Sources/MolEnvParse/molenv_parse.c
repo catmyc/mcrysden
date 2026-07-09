@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef PI
+#define PI 3.14159265358979323846
+#endif
+
 static __thread char last_error[512];
 
 const char* molenv_last_error(void) { return last_error; }
@@ -28,14 +32,28 @@ static MolEnvScene* new_scene(const char *path) {
     return s;
 }
 
-/* Symbol -> atomic number (H..Og). C-local table; returns 0 if not found. */
+/* Symbol -> atomic number (H..Og, Z=1..118). C-local table; returns 0 if not
+   found. molenv_symbol_to_z() compares up to 3 chars, so every standard symbol
+   (all 1-2 letters) matches unambiguously. */
 static const struct { const char* sym; int z; } el[] = {
-  {"H",1},{"He",2},{"Li",3},{"Be",4},{"B",5},{"C",6},{"N",7},{"O",8},{"F",9},{"Ne",10},
-  {"Na",11},{"Mg",12},{"Al",13},{"Si",14},{"P",15},{"S",16},{"Cl",17},{"Ar",18},{"K",19},{"Ca",20},
-  {"Ti",22},{"V",23},{"Cr",24},{"Mn",25},{"Fe",26},{"Co",27},{"Ni",28},{"Cu",29},{"Zn",30},
-  {"Ga",31},{"Ge",32},{"As",33},{"Se",34},{"Br",35},{"Kr",36},{"Zr",40},{"Nb",41},{"Mo",42},
-  {"Tc",43},{"Ru",44},{"Rh",45},{"Pd",46},{"Ag",47},{"Cd",48},{"In",49},{"Sn",50},{"Sb",51},
-  {"Te",52},{"I",53},{"Xe",54},{"Pt",78},{"Au",79},{"Hg",80},{"Tl",81},{"Pb",82},{"Bi",83},{"U",92}
+  {"H",1},{"He",2},{"Li",3},{"Be",4},{"B",5},{"C",6},{"N",7},{"O",8},
+  {"F",9},{"Ne",10},{"Na",11},{"Mg",12},{"Al",13},{"Si",14},{"P",15},
+  {"S",16},{"Cl",17},{"Ar",18},{"K",19},{"Ca",20},{"Sc",21},{"Ti",22},
+  {"V",23},{"Cr",24},{"Mn",25},{"Fe",26},{"Co",27},{"Ni",28},{"Cu",29},
+  {"Zn",30},{"Ga",31},{"Ge",32},{"As",33},{"Se",34},{"Br",35},{"Kr",36},
+  {"Rb",37},{"Sr",38},{"Y",39},{"Zr",40},{"Nb",41},{"Mo",42},{"Tc",43},
+  {"Ru",44},{"Rh",45},{"Pd",46},{"Ag",47},{"Cd",48},{"In",49},{"Sn",50},
+  {"Sb",51},{"Te",52},{"I",53},{"Xe",54},{"Cs",55},{"Ba",56},{"La",57},
+  {"Ce",58},{"Pr",59},{"Nd",60},{"Pm",61},{"Sm",62},{"Eu",63},{"Gd",64},
+  {"Tb",65},{"Dy",66},{"Ho",67},{"Er",68},{"Tm",69},{"Yb",70},{"Lu",71},
+  {"Hf",72},{"Ta",73},{"W",74},{"Re",75},{"Os",76},{"Ir",77},{"Pt",78},
+  {"Au",79},{"Hg",80},{"Tl",81},{"Pb",82},{"Bi",83},{"Po",84},{"At",85},
+  {"Rn",86},{"Fr",87},{"Ra",88},{"Ac",89},{"Th",90},{"Pa",91},{"U",92},
+  {"Np",93},{"Pu",94},{"Am",95},{"Cm",96},{"Bk",97},{"Cf",98},{"Es",99},
+  {"Fm",100},{"Md",101},{"No",102},{"Lr",103},{"Rf",104},{"Db",105},
+  {"Sg",106},{"Bh",107},{"Hs",108},{"Mt",109},{"Ds",110},{"Rg",111},
+  {"Cn",112},{"Nh",113},{"Fl",114},{"Mc",115},{"Lv",116},{"Ts",117},
+  {"Og",118}
 };
 static int molenv_symbol_to_z(const char *s) {
     char t[4]={0}; for(int i=0;i<3 && s[i]; i++) t[i]=s[i];
@@ -326,6 +344,25 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
     s->is_crystal = have_cell ? 1 : 0;
     s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
     return s;
+}
+
+/// Scan only the header of an AXSF file and return its ANIMSTEPS count.
+/// Mirrors the first pass of parse_axsf so the count matches exactly what
+/// the parser will accept as valid frame indices. Returns 0 on any failure
+/// (not an AXSF, malformed, or single-frame).
+int molenv_axsf_frame_count(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) { return 0; }
+    char line[256], tok[64];
+    int nframes = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (first_tok(line, tok, sizeof(tok)) > 0 && strcmp(tok, "ANIMSTEPS") == 0) {
+            int n = 0;
+            if (sscanf(line, "%*s %d", &n) >= 1 && n > 0) nframes = n;
+        }
+    }
+    fclose(fp);
+    return nframes;
 }
 
 /* ----- PDB ----- */
@@ -769,6 +806,680 @@ MolEnvScene* parse_pwi(const char *path) {
     s->is_crystal = 1;
     s->periodic_dim = 3;
     snprintf(s->title, sizeof(s->title), "%s", "QE structure");
+    s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
+    return s;
+}
+
+/* ----- Quantum Espresso PWscf output (.pwo) -----
+   XCrySDen parses .pwo via scripts/pwo2xsf_anim.awk (+ pwo_xsf2xsf.f, which
+   only adds CONVVEC). mcrysden's philosophy is native parsers (no shell filter,
+   headless-friendly), so we reproduce the awk contract directly in C. Markers:
+
+     bravais-lattice index     = <n>          -> ibrav (informational only)
+     lattice parameter (alat)  = <val> a.u.   -> alat in Bohr
+     number of atoms/cell      = <n>          -> nat
+     crystal axes:  (cart. coord) ...         -> initial lattice (alat units)
+     CELL_PARAMETERS [alat|angstrom|bohr]    -> PRIMVEC (latest block wins)
+     ATOMIC_POSITIONS [alat|angstrom|bohr|crystal]  -> one block = one ionic step
+     Forces acting on atoms                   -> ignored (not rendered)
+
+   Each ATOMIC_POSITIONS block is a frame; the most recent CELL_PARAMETERS (or
+   crystal axes) block supplies its cell. Units resolve to Angstroms via alat
+   (celldm(1) bohr value) exactly as parse_pwi does. */
+
+/* Count ATOMIC_POSITIONS blocks (= number of ionic steps). */
+int molenv_pwo_frame_count(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    char line[1024];
+    int count = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (strncmp(p, "ATOMIC_POSITIONS", 16) == 0) count++;
+    }
+    fclose(fp);
+    return count;
+}
+
+/* Read the next 3 lines as a 3x3 matrix (row-major) into m[3][3]. Returns 0 on
+   success, -1 if fewer than 3 valid rows were found. */
+static int read_3x3(FILE *fp, double m[3][3], int *ln) {
+    int r = 0;
+    char line[1024];
+    while (r < 3 && fgets(line, sizeof(line), fp)) {
+        (*ln)++;
+        double a, b, c;
+        if (sscanf(line, "%lf %lf %lf", &a, &b, &c) < 3) continue;
+        m[r][0] = a; m[r][1] = b; m[r][2] = c;
+        r++;
+    }
+    return (r == 3) ? 0 : -1;
+}
+
+/* Dispatch a unit token (alat|angstrom|bohr|crystal). Sets *scale (multiplier to
+   Angstroms) and, for crystal, *frac=1. alat scales by alat_ang (Bohr->Å). */
+static void unit_scales(const char *unit, double alat_ang, double *scale, int *frac) {
+    *scale = 1.0; *frac = 0;
+    if (strcmp(unit, "bohr") == 0) *scale = BOHR_TO_ANG;
+    else if (strcmp(unit, "alat") == 0) *scale = alat_ang;
+    else if (strcmp(unit, "crystal") == 0) { *scale = 1.0; *frac = 1; }
+    /* angstrom: scale already 1 */
+}
+
+/* Parse frame `frame_index` (0-based) of a .pwo file. Mirrors parse_pwi's memory
+   discipline: dynamic atom arrays, frac->Cart via vectors-as-columns cell. */
+MolEnvScene* parse_pwo(const char *path, int frame_index) {
+    last_error[0] = '\0';
+    FILE *fp = fopen(path, "r");
+    if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+
+    char line[1024];
+    int ln = 0;
+    double alat_bohr = 0.0;     /* alat in Bohr; celldm(1) */
+    int nat = 0;
+    int have_alat = 0;
+
+    /* Current cell (row-major lattice vectors, Angstroms) sourced from the most
+       recent crystal-axes / CELL_PARAMETERS block. */
+    double cell[3][3] = {{0}};
+    int have_cell = 0;
+
+    int cap = 64, natoms = 0;
+    double *ax = malloc(cap * sizeof(double));
+    double *ay = malloc(cap * sizeof(double));
+    double *az = malloc(cap * sizeof(double));
+    char (*asym)[8] = malloc(cap * sizeof(*asym));
+    if (!ax || !ay || !az || !asym) {
+        free(ax); free(ay); free(az); free(asym);
+        fclose(fp); set_error(path, 0, "out of memory"); return NULL;
+    }
+
+    int step = 0;            /* ATOMIC_POSITIONS block counter */
+    int target_done = 0;     /* have we filled the requested frame? */
+
+    while (fgets(line, sizeof(line), fp)) {
+        ln++;
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+
+        /* alat (celldm(1) in Bohr). */
+        if (strncmp(p, "lattice parameter (alat)", 24) == 0) {
+            char *eq = strchr(p, '=');
+            if (eq) alat_bohr = atof(eq + 1);
+            have_alat = 1;
+            continue;
+        }
+        if (strncmp(p, "number of atoms/cell", 20) == 0) {
+            nat = atoi(strrchr(p, '=') ? strrchr(p, '=') + 1 : "0");
+            continue;
+        }
+
+        /* Initial lattice from crystal axes (alat units). */
+        if (strncmp(p, "crystal axes", 12) == 0) {
+            if (read_3x3(fp, cell, &ln) == 0 && have_alat) {
+                double alat_ang = alat_bohr * (double)BOHR_TO_ANG;
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++)
+                        cell[i][j] *= alat_ang;
+                have_cell = 1;
+            }
+            continue;
+        }
+
+        /* CELL_PARAMETERS block: latest overrides current cell. */
+        if (strncmp(p, "CELL_PARAMETERS", 15) == 0) {
+            char unit[16] = "alat";
+            char *op = strchr(p, '(');
+            if (op) {
+                char *cp = strchr(op, ')');
+                if (cp) { *cp = '\0'; snprintf(unit, sizeof(unit), "%s", op + 1); }
+            }
+            double raw[3][3];
+            if (read_3x3(fp, raw, &ln) == 0) {
+                double scale = 1.0; int frac_dummy = 0;
+                double alat_ang = have_alat ? alat_bohr * (double)BOHR_TO_ANG : 0.0;
+                unit_scales(unit, alat_ang, &scale, &frac_dummy);
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++)
+                        cell[i][j] = raw[i][j] * scale;
+                have_cell = 1;
+            }
+            continue;
+        }
+
+        /* ATOMIC_POSITIONS block = one ionic step. */
+        if (strncmp(p, "ATOMIC_POSITIONS", 16) == 0) {
+            char unit[16] = "alat";
+            char *op = strchr(p, '(');
+            if (op) {
+                char *cp = strchr(op, ')');
+                if (cp) { *cp = '\0'; snprintf(unit, sizeof(unit), "%s", op + 1); }
+            }
+            double scale = 1.0; int frac = 0;
+            double alat_ang = have_alat ? alat_bohr * (double)BOHR_TO_ANG : 0.0;
+            unit_scales(unit, alat_ang, &scale, &frac);
+
+            const int is_target = (step == frame_index);
+            int got = 0;
+            while (got < nat && fgets(line, sizeof(line), fp)) {
+                ln++;
+                char *q = line;
+                while (*q == ' ' || *q == '\t') q++;
+                if (*q == '\0' || *q == '#') break;
+                char sym[16]; double px, py, pz;
+                if (sscanf(q, "%15s %lf %lf %lf", sym, &px, &py, &pz) < 4) break;
+                if (!is_target) { got++; continue; }   /* skip non-target frames */
+                if (got >= cap) {
+                    cap *= 2;
+                    double *tx = realloc(ax, cap * sizeof(double));
+                    double *ty = realloc(ay, cap * sizeof(double));
+                    double *tz = realloc(az, cap * sizeof(double));
+                    char (*ts)[8] = realloc(asym, cap * sizeof(*asym));
+                    if (!tx || !ty || !tz || !ts) {
+                        free(tx?tx:ax); free(ty?ty:ay); free(tz?tz:az); free(ts?ts:asym);
+                        free(ax); free(ay); free(az); free(asym);
+                        fclose(fp); set_error(path, 0, "out of memory"); return NULL;
+                    }
+                    ax = tx; ay = ty; az = tz; asym = ts;
+                }
+                snprintf(asym[got], sizeof(asym[0]), "%s", sym);
+                if (frac) {
+                    /* crystal: fractional -> Cartesian, vectors-as-columns (cell[i][j]). */
+                    double cx = px*cell[0][0] + py*cell[1][0] + pz*cell[2][0];
+                    double cy = px*cell[0][1] + py*cell[1][1] + pz*cell[2][1];
+                    double cz = px*cell[0][2] + py*cell[1][2] + pz*cell[2][2];
+                    ax[got] = cx; ay[got] = cy; az[got] = cz;
+                } else {
+                    ax[got] = px * scale; ay[got] = py * scale; az[got] = pz * scale;
+                }
+                got++;
+            }
+            if (is_target) { natoms = got; target_done = 1; break; }
+            step++;
+            continue;
+        }
+        /* Everything else (Forces, energies, Dynamics...) is skipped. */
+    }
+    fclose(fp);
+
+    if (!target_done || natoms == 0) {
+        free(ax); free(ay); free(az); free(asym);
+        set_error(path, 0, "no (target) ATOMIC_POSITIONS found");
+        return NULL;
+    }
+
+    MolEnvScene *s = new_scene(path);
+    if (!s) { free(ax); free(ay); free(az); free(asym); return NULL; }
+    s->atoms = calloc(natoms, sizeof(MolEnvAtom));
+    if (!s->atoms) {
+        free(ax); free(ay); free(az); free(asym);
+        set_error(path, 0, "out of memory"); molenv_scene_free(s); return NULL;
+    }
+    for (int i = 0; i < natoms; i++) {
+        MolEnvAtom *a = &s->atoms[i];
+        a->coord[0] = (float)ax[i]; a->coord[1] = (float)ay[i]; a->coord[2] = (float)az[i];
+        snprintf(a->label, sizeof(a->label), "%s", asym[i]);
+        char el[4]; qe_element(asym[i], el);
+        a->atomic_number = molenv_symbol_to_z(el[0] ? el : asym[i]);
+    }
+    free(ax); free(ay); free(az); free(asym);
+
+    s->natoms = natoms;
+    if (have_cell) {
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++)
+            s->cell[i][j] = (float)cell[i][j];
+    }
+    s->is_crystal = have_cell;
+    s->periodic_dim = 3;
+    snprintf(s->title, sizeof(s->title), "%s", "QE PWscf output");
+    s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
+    return s;
+}
+
+/* ----- CIF ----- */
+
+/* Split a line into whitespace-delimited tokens, respecting single- and
+   double-quoted strings (a quoted value never splits on internal spaces).
+   Tokens point into the (mutated) line buffer. Returns token count. */
+static int split_tokens(char *p, char **toks, int maxtoks) {
+    int n = 0;
+    while (*p && n < maxtoks) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == '\0') break;
+        char *start;
+        if (*p == '\'' || *p == '"') {
+            char q = *p++; start = p;
+            while (*p && *p != q && *p != '\n' && *p != '\r') p++;
+            if (*p == q) *p++ = '\0';
+        } else {
+            start = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+            if (*p) { *p++ = '\0'; }
+        }
+        toks[n++] = start;
+    }
+    return n;
+}
+
+/* Parse a CIF numeric value, stripping a trailing esd "(12)" if present. */
+static double cif_float(const char *s) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s", s);
+    char *op = strchr(buf, '(');
+    if (op) *op = '\0';
+    return atof(buf);
+}
+
+/* Resolve an element symbol for a CIF atom label (e.g. "Fe1" -> "Fe",
+   "CA" -> "Ca"). Writes the canonical symbol into el (cap 4) and returns
+   its atomic number via molenv_symbol_to_z. Unknown -> el empty, Z 0. */
+static int cif_resolve_z(const char *label, char *el) {
+    char t[8] = {0};
+    int i = 0;
+    while (label[i] && i < 6) { t[i] = label[i]; i++; }
+    t[i] = '\0';
+    while (i > 0 && t[i - 1] >= '0' && t[i - 1] <= '9') t[--i] = '\0';
+    if (i == 0) { el[0] = '\0'; return 0; }
+    el[0] = (char)toupper((unsigned char)t[0]);
+    for (int k = 1; k < i; k++) el[k] = (char)tolower((unsigned char)t[k]);
+    el[i] = '\0';
+    return molenv_symbol_to_z(el);
+}
+
+/* Build a row-major 3x3 lattice from a,b,c,alpha,beta,gamma (degrees):
+   a along x, b in the xy-plane. */
+static void cif_build_cell(double a, double b, double c,
+                           double alpha, double beta, double gamma,
+                           float cell[3][3]) {
+    double gal = gamma * PI / 180.0;
+    double alr = alpha * PI / 180.0;
+    double ber = beta * PI / 180.0;
+    double cgal = cos(gal), sg = sin(gal), cber = cos(ber), cal = cos(alr);
+    if (sg < 1e-12) sg = 1e-12; /* guard a degenerate gamma */
+    double cx = c * cber;
+    double cy = c * (cal - cber * cgal) / sg;
+    double cz = sqrt(fmax(0.0, c * c - cx * cx - cy * cy));
+    cell[0][0] = (float)a; cell[0][1] = 0.0f; cell[0][2] = 0.0f;
+    cell[1][0] = (float)(b * cgal); cell[1][1] = (float)(b * sg); cell[1][2] = 0.0f;
+    cell[2][0] = (float)cx; cell[2][1] = (float)cy; cell[2][2] = (float)cz;
+}
+
+MolEnvScene* parse_cif(const char *path) {
+    last_error[0] = '\0';
+    FILE *fp = fopen(path, "r");
+    if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+
+    double len_a = 0, len_b = 0, len_c = 0;
+    double al_deg = 90.0, be_deg = 90.0, ga_deg = 90.0;
+    int in_block = 0;
+
+    /* Working atom buffer. We record a per-atom `frac` flag and the raw
+       (fractional) coordinates, then convert to Cartesian in a second pass
+       once the cell parameters are known — the cell tags can legally appear
+       before or after the atom loop. */
+    typedef struct { float coord[3]; int atomic_number; char label[8]; int frac; } Catom;
+    Catom *at = NULL;
+    int natoms = 0, acap = 0;
+    char title[256] = {0};
+
+    char line[2048], held[2048];
+    int have_held = 0, ln = 0;
+
+    enum { NORM, LOOP_HDRS, LOOP_DATA };
+    int state = NORM;
+    int col_label = -1, col_type = -1;
+    int col_fx = -1, col_fy = -1, col_fz = -1;
+    int col_cx = -1, col_cy = -1, col_cz = -1;
+    int ncols = 0;
+    int atom_loop = 0;
+
+    while (1) {
+        if (have_held) { strcpy(line, held); have_held = 0; }
+        else if (!fgets(line, sizeof(line), fp)) break;
+        ln++;
+
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t' ||
+                           line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (*p == '#') continue;
+        if (*p == '\0') { if (state == LOOP_DATA) state = NORM; continue; }
+
+        if (state == NORM) {
+            if (strncmp(p, "data_", 5) == 0) {
+                if (!in_block) {
+                    in_block = 1;
+                    snprintf(title, sizeof(title), "%s", p + 5);
+                } else {
+                    break; /* stop after the first data_ block */
+                }
+                continue;
+            }
+            if (!in_block) continue;               /* skip preamble */
+            if (strncmp(p, "loop_", 5) == 0) {
+                state = LOOP_HDRS;
+                col_label = col_type = -1;
+                col_fx = col_fy = col_fz = -1;
+                col_cx = col_cy = col_cz = -1;
+                ncols = 0;
+                atom_loop = 0;
+                continue;
+            }
+            /* single tag value: _tag value */
+            if (*p == '_') {
+                char *toks[4];
+                int nt = split_tokens(p, toks, 4);
+                if (nt >= 2) {
+                    double v = cif_float(toks[1]);
+                    if (strcmp(toks[0], "_cell_length_a") == 0)        len_a = v;
+                    else if (strcmp(toks[0], "_cell_length_b") == 0)   len_b = v;
+                    else if (strcmp(toks[0], "_cell_length_c") == 0)   len_c = v;
+                    else if (strcmp(toks[0], "_cell_angle_alpha") == 0) al_deg = v;
+                    else if (strcmp(toks[0], "_cell_angle_beta") == 0)  be_deg = v;
+                    else if (strcmp(toks[0], "_cell_angle_gamma") == 0) ga_deg = v;
+                }
+                continue;
+            }
+            continue;
+        }
+
+        if (state == LOOP_HDRS) {
+            if (*p == '_') {
+                ncols++;
+                if (strcmp(p, "_atom_site_label") == 0)            col_label = ncols - 1;
+                else if (strcmp(p, "_atom_site_type_symbol") == 0) col_type = ncols - 1;
+                else if (strcmp(p, "_atom_site_fract_x") == 0)     col_fx = ncols - 1;
+                else if (strcmp(p, "_atom_site_fract_y") == 0)     col_fy = ncols - 1;
+                else if (strcmp(p, "_atom_site_fract_z") == 0)     col_fz = ncols - 1;
+                else if (strcmp(p, "_atom_site_Cartn_x") == 0)     col_cx = ncols - 1;
+                else if (strcmp(p, "_atom_site_Cartn_y") == 0)     col_cy = ncols - 1;
+                else if (strcmp(p, "_atom_site_Cartn_z") == 0)     col_cz = ncols - 1;
+                continue;
+            }
+            /* first non-header line -> this is the start of loop data. */
+            atom_loop = (col_label >= 0 || col_type >= 0) &&
+                        ((col_fx >= 0 && col_fy >= 0 && col_fz >= 0) ||
+                         (col_cx >= 0 && col_cy >= 0 && col_cz >= 0));
+            state = LOOP_DATA;
+            /* fall through into LOOP_DATA handling for this same line */
+        }
+
+        if (state == LOOP_DATA) {
+            char *toks[64];
+            int nt = split_tokens(p, toks, 64);
+            if (nt != ncols || ncols == 0) {            /* loop ended */
+                state = NORM;
+                if (natoms > 0) break;
+                strcpy(held, line); have_held = 1;      /* re-dispatch in NORM */
+                continue;
+            }
+            if (atom_loop && (col_fx >= 0 || col_cx >= 0)) {
+                int is_frac = (col_fx >= 0);
+                int ci = is_frac ? col_fx : col_cx;
+                if (ci >= 0 && ci + 2 < nt) {
+                    double fx = cif_float(toks[ci]);
+                    double fy = cif_float(toks[ci + 1]);
+                    double fz = cif_float(toks[ci + 2]);
+                    const char *lbl = NULL;
+                    if (col_label >= 0 && col_label < nt) lbl = toks[col_label];
+                    char el[4] = {0};
+                    int z = lbl ? cif_resolve_z(lbl, el) : 0;
+                    if (z == 0 && col_type >= 0 && col_type < nt)
+                        z = cif_resolve_z(toks[col_type], el);
+                    if (natoms >= acap) {
+                        acap = acap ? acap * 2 : 16;
+                        Catom *t = realloc(at, acap * sizeof(Catom));
+                        if (!t) { free(at); fclose(fp); set_error(path, ln, "out of memory"); return NULL; }
+                        at = t;
+                    }
+                    Catom *a = &at[natoms];
+                    a->coord[0] = (float)fx;
+                    a->coord[1] = (float)fy;
+                    a->coord[2] = (float)fz;
+                    a->frac = is_frac;
+                    a->atomic_number = z;
+                    snprintf(a->label, sizeof(a->label), "%s", el[0] ? el : (lbl ? lbl : ""));
+                    natoms++;
+                }
+            }
+        }
+    }
+    fclose(fp);
+
+    if (natoms == 0) {
+        free(at);
+        set_error(path, 0, "no atom sites found");
+        return NULL;
+    }
+
+    int saw_cell = (len_a > 0 && len_b > 0 && len_c > 0);
+
+    /* Convert any fractional coordinates to Cartesian now that the cell is
+       known (cell tags may have come before or after the atom loop). */
+    float cell[3][3] = {{0}};
+    if (saw_cell) {
+        cif_build_cell(len_a, len_b, len_c, al_deg, be_deg, ga_deg, cell);
+        for (int i = 0; i < natoms; i++) {
+            if (!at[i].frac) continue;
+            double fx = at[i].coord[0], fy = at[i].coord[1], fz = at[i].coord[2];
+            at[i].coord[0] = (float)(fx*cell[0][0] + fy*cell[1][0] + fz*cell[2][0]);
+            at[i].coord[1] = (float)(fx*cell[0][1] + fy*cell[1][1] + fz*cell[2][1]);
+            at[i].coord[2] = (float)(fx*cell[0][2] + fy*cell[1][2] + fz*cell[2][2]);
+        }
+    }
+
+    MolEnvScene *s = new_scene(path);
+    if (!s) { free(at); return NULL; }
+    s->atoms = calloc(natoms, sizeof(MolEnvAtom));
+    if (!s->atoms) { free(at); set_error(path, 0, "out of memory"); molenv_scene_free(s); return NULL; }
+    for (int i = 0; i < natoms; i++) {
+        s->atoms[i].coord[0] = at[i].coord[0];
+        s->atoms[i].coord[1] = at[i].coord[1];
+        s->atoms[i].coord[2] = at[i].coord[2];
+        s->atoms[i].atomic_number = at[i].atomic_number;
+        memcpy(s->atoms[i].label, at[i].label, sizeof(s->atoms[i].label));
+    }
+    free(at);
+    s->natoms = natoms;
+    snprintf(s->title, sizeof(s->title), "%s", title);
+
+    if (saw_cell) {
+        memcpy(s->cell, cell, sizeof(s->cell));
+        s->is_crystal = 1;
+        s->periodic_dim = 3;
+    } else {
+        s->is_crystal = 0;
+        s->periodic_dim = 0;
+    }
+
+    s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
+    return s;
+}
+
+/* ----- POSCAR / CONTCAR / VASP ----- */
+
+MolEnvScene* parse_poscar(const char *path) {
+    last_error[0] = '\0';
+    FILE *fp = fopen(path, "r");
+    if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+
+    char line[1024], title[256] = {0};
+    int ln = 0;
+
+    /* line 1: comment / title */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp); set_error(path, 1, "unexpected end of file"); return NULL;
+    }
+    ln++;
+    size_t tlen = strlen(line);
+    while (tlen > 0 && (line[tlen-1] == '\n' || line[tlen-1] == '\r' || line[tlen-1] == ' ')) line[--tlen] = '\0';
+    snprintf(title, sizeof(title), "%s", line);
+
+    /* line 2: scaling factor */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp); set_error(path, ln, "unexpected end at scaling factor"); return NULL;
+    }
+    ln++;
+    double scale = 1.0;
+    sscanf(line, "%lf", &scale);
+
+    /* lines 3-5: lattice vectors, read RAW (unscaled) so we can apply the VASP
+       volume convention uniformly. */
+    double cellv[3][3];
+    for (int r = 0; r < 3; r++) {
+        if (!fgets(line, sizeof(line), fp)) {
+            fclose(fp); set_error(path, ln, "unexpected end in lattice"); return NULL;
+        }
+        ln++;
+        double u, v, w;
+        if (sscanf(line, "%lf %lf %lf", &u, &v, &w) < 3) {
+            fclose(fp); set_error(path, ln, "malformed lattice vector"); return NULL;
+        }
+        cellv[r][0] = u; cellv[r][1] = v; cellv[r][2] = w;
+    }
+
+    /* Resolve the effective (always-positive) per-axis lattice scale.
+       VASP convention: a negative scaling factor is the target CELL VOLUME,
+       not a negative multiplier. We scale the lattice so that det(cell) equals
+       the desired volume: s = (|targetVol| / |det(raw)|)^(1/3). A positive
+       factor stays a uniform multiplicative scale as before. */
+    double latScale = scale;
+    if (scale < 0.0) {
+        double det = cellv[0][0] * (cellv[1][1] * cellv[2][2] - cellv[2][1] * cellv[1][2])
+                   - cellv[0][1] * (cellv[1][0] * cellv[2][2] - cellv[2][0] * cellv[1][2])
+                   + cellv[0][2] * (cellv[1][0] * cellv[2][1] - cellv[2][0] * cellv[1][1]);
+        double v0 = fabs(det);
+        latScale = (v0 > 0.0) ? cbrt(fabs(scale) / v0) : 1.0;
+    }
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            cellv[r][c] *= latScale;
+
+    /* line 6: element symbols (VASP 5+) or counts (VASP 4) */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp); set_error(path, ln, "unexpected end at species"); return NULL;
+    }
+    ln++;
+    char *stoks[64];
+    int snt = split_tokens(line, stoks, 64);
+    int vasp5 = 0;
+    char species[32][8];
+    int nspecies = 0;
+    int counts[32] = {0};
+    int ncounts = 0;
+
+    /* VASP 5 carries a species line of non-numeric tokens; VASP 4 is all ints. */
+    if (snt > 0 && !(snt == 1 && isdigit((unsigned char)stoks[0][0]))) {
+        /* Heuristic: if the first token parses as a bare integer AND the line is
+           the only species line, treat it as VASP 4 counts instead. */
+        char *end = NULL;
+        long test = strtol(stoks[0], &end, 10);
+        (void)test;
+        if (end && *end == '\0') {
+            /* first token is a pure integer: VASP 4 counts line */
+            vasp5 = 0;
+        } else {
+            vasp5 = 1;
+        }
+    }
+
+    if (vasp5) {
+        for (int i = 0; i < snt && i < 32; i++) {
+            snprintf(species[i], sizeof(species[0]), "%s", stoks[i]);
+            nspecies++;
+        }
+        /* read the counts line */
+        if (!fgets(line, sizeof(line), fp)) {
+            fclose(fp); set_error(path, ln, "unexpected end at counts"); return NULL;
+        }
+        ln++;
+        int nt = split_tokens(line, stoks, 64);
+        for (int i = 0; i < nt && i < 32; i++) { counts[i] = atoi(stoks[i]); ncounts++; }
+    } else {
+        for (int i = 0; i < snt && i < 32; i++) { counts[i] = atoi(stoks[i]); ncounts++; };
+    }
+
+    int total = 0;
+    for (int i = 0; i < ncounts; i++) total += counts[i];
+    if (total <= 0) {
+        fclose(fp); set_error(path, ln, "no atoms in POSCAR"); return NULL;
+    }
+
+    /* Optional "Selective dynamics" line, then the coordinate mode line. */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp); set_error(path, ln, "unexpected end at coord mode"); return NULL;
+    }
+    ln++;
+    {
+        char *q = line;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == 'S' || *q == 's') { /* Selective dynamics -> next line is mode */
+            if (!fgets(line, sizeof(line), fp)) {
+                fclose(fp); set_error(path, ln, "unexpected end at coord mode"); return NULL;
+            }
+            ln++;
+        }
+    }
+    int is_frac = 1;
+    {
+        char *q = line;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == 'C' || *q == 'c' || *q == 'K' || *q == 'k') is_frac = 0; /* Cartesian */
+        /* D/d/F/f or anything else => fractional (Direct) */
+    }
+
+    MolEnvScene *s = new_scene(path);
+    if (!s) { fclose(fp); return NULL; }
+    s->atoms = calloc(total, sizeof(MolEnvAtom));
+    if (!s->atoms) { fclose(fp); set_error(path, 0, "out of memory"); molenv_scene_free(s); return NULL; }
+    snprintf(s->title, sizeof(s->title), "%s", title);
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) s->cell[i][j] = (float)cellv[i][j];
+    s->is_crystal = 1;
+    s->periodic_dim = 3;
+
+    int ai = 0;
+    for (int sp = 0; sp < ncounts; sp++) {
+        for (int k = 0; k < counts[sp]; k++) {
+            if (!fgets(line, sizeof(line), fp)) {
+                fclose(fp); set_error(path, ln, "unexpected end in coordinates");
+                molenv_scene_free(s); return NULL;
+            }
+            ln++;
+            char *ctoks[8];
+            int nt = split_tokens(line, ctoks, 8);
+            if (nt < 3) {
+                fclose(fp); set_error(path, ln, "malformed coordinate");
+                molenv_scene_free(s); return NULL;
+            }
+            double px = atof(ctoks[0]), py = atof(ctoks[1]), pz = atof(ctoks[2]);
+            double cx, cy, cz;
+            if (is_frac) {
+                cx = px*cellv[0][0] + py*cellv[1][0] + pz*cellv[2][0];
+                cy = px*cellv[0][1] + py*cellv[1][1] + pz*cellv[2][1];
+                cz = px*cellv[0][2] + py*cellv[1][2] + pz*cellv[2][2];
+            } else {
+                // Cartesian: scaled by the same positive lattice factor (the raw
+                // `scale` may be negative under the volume convention, hence
+                // latScale, which is always the effective positive multiplier).
+                cx = px * latScale; cy = py * latScale; cz = pz * latScale;
+            }
+            MolEnvAtom *a = &s->atoms[ai];
+            a->coord[0] = (float)cx; a->coord[1] = (float)cy; a->coord[2] = (float)cz;
+            if (vasp5 && sp < nspecies) {
+                snprintf(a->label, sizeof(a->label), "%s", species[sp]);
+                a->atomic_number = molenv_symbol_to_z(species[sp]);
+            } else {
+                snprintf(a->label, sizeof(a->label), "atom_%d", ai + 1);
+                a->atomic_number = 0;
+            }
+            ai++;
+        }
+    }
+    fclose(fp);
+    s->natoms = ai;
     s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
     return s;
 }

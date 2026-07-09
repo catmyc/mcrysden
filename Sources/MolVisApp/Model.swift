@@ -127,6 +127,9 @@ struct Scene: Codable {
     var showCellFrame: Bool = true
     var showAxes: Bool = true
     var showLabels: Bool = false
+    /// Overlay the Brillouin-zone wireframe (crystal only) as a scene layer,
+    /// drawn after the structure with depth so it sits correctly around it.
+    var showBrillouinZone: Bool = false
     var atomScale: Float = 0.35
     var bondRadius: Float = 0.10
     var currentFrame: Int = 0      // AXSF animation frame index (GUI only)

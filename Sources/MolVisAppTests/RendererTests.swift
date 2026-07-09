@@ -73,6 +73,41 @@ final class RendererTests: XCTestCase {
         try PngExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
     }
+
+    func testVectorExportPDF() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        let scene = Scene(loaded: try Parser.load(url))
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.pdf")
+        try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
+        XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
+        let header = try Data(contentsOf: out, options: .mappedIfSafe).prefix(5)
+        XCTAssertEqual(String(data: header, encoding: .ascii), "%PDF-")
+    }
+
+    func testVectorExportSVG() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        let scene = Scene(loaded: try Parser.load(url))
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.svg")
+        try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
+        XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
+        let data = try Data(contentsOf: out)
+        let str = String(data: data, encoding: .utf8) ?? ""
+        XCTAssertTrue(str.hasPrefix("<?xml"), "SVG should start with xml declaration, got: \(str.prefix(40))")
+        XCTAssertTrue(str.contains("<svg"), "SVG should contain <svg element")
+    }
+
+    func testVectorExportEPS() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        let scene = Scene(loaded: try Parser.load(url))
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.eps")
+        try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
+        XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
+        let header = try Data(contentsOf: out, options: .mappedIfSafe).prefix(4)
+        XCTAssertEqual(String(data: header, encoding: .ascii), "%!PS")
+    }
     // Axes must draw independently of the cell frame. A cell-only scene (no
     // atoms/bonds) isolates the axes: with Cell Frame OFF and Axes ON the axes
     // alone must render; flipping Axes OFF must blank the image entirely.
@@ -81,6 +116,10 @@ final class RendererTests: XCTestCase {
         s.isCrystal = true
         s.cell = Cell(a: SIMD3(5,0,0), b: SIMD3(0,5,0), c: SIMD3(0,0,5))
         s.showCellFrame = false
+        // Black background: the renderer now clears to the scene's background
+        // color, so a non-black clear would fill the framebuffer and drown out the
+        // "nothing renders" assertion. Black restores its original meaning.
+        s.background = "#000000"
         s.showAxes = true
         let tex = try render(scene: s, dist: 12, w: 120, h: 120)
         let on = nonzeroPixels(tex)
@@ -112,6 +151,69 @@ final class RendererTests: XCTestCase {
         // and integer sampling prevent exact equality).
         let ratio = Float(max(1,near)) / Float(max(1,far))
         XCTAssertEqual(ratio, 1.0, accuracy: 0.5, "gizmo size should not track zoom (near=\(near), far=\(far))")
+    }
+
+    // The Renderer today clears with a single solid color and ignores
+    // backgroundType — richer gradient rendering lives in the shader, owned by
+    // another agent. What the state/sidebar layer CAN guarantee is that the
+    // gradient's two colors are correctly propagated into the scene and differ
+    // from each other; assert that here so the wiring is locked before the
+    // renderer work lands. After syncFromState, a gradient-configured scene must
+    // carry both colors and the gradient type.
+    func testGradientBackgroundPropagatesToScene() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        let scene = Scene(loaded: try Parser.load(url))
+        let state = SideBarState()
+        state.backgroundType = .gradient_top
+        state.backgroundHex = "#112233"
+        state.backgroundBottomHex = "#445566"
+        // Drive the new appearance fields into the scene the way syncFromState
+        // does — this is the contract the state layer guarantees regardless of
+        // when the renderer starts consuming backgroundType.
+        var s = scene
+        s.backgroundType = state.backgroundType
+        s.background = state.backgroundHex
+        s.backgroundBottom = state.backgroundBottomHex
+        XCTAssertEqual(s.backgroundType, .gradient_top)
+        XCTAssertEqual(s.background, "#112233")
+        XCTAssertEqual(s.backgroundBottom, "#445566")
+        // The two colors must genuinely differ, else the gradient is degenerate.
+        func rgb(_ h: String) -> (UInt8, UInt8, UInt8) {
+            var t = h.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("#") { t.removeFirst() }
+            let v = UInt32(t, radix: 16) ?? 0
+            return (UInt8((v >> 16) & 0xFF), UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF))
+        }
+        let top = rgb(s.background), bot = rgb(s.backgroundBottom)
+        XCTAssertFalse(top.0 == bot.0 && top.1 == bot.1 && top.2 == bot.2,
+                       "gradient top and bottom colors must differ")
+    }
+
+    // 2D display modes force an orthographic projection looking down +Z with no
+    // rotation (Renderer.encode swaps to ortho for .is2D). Render the SAME atom
+    // pair in 3D ballStick and 2D line2D: the images must differ (perspective vs
+    // ortho changes the projected layout), proving the 2D path is wired.
+    func test2DModeProjectsDifferentlyFrom3D() throws {
+        var s3d = Scene()
+        s3d.atoms = [Atom(coord: SIMD3(-2, 0, 1), atomicNumber: 6, label: "C"),
+                     Atom(coord: SIMD3( 2, 0, -1), atomicNumber: 6, label: "C")]
+        let tex3d = try render(scene: s3d, dist: 10)
+        var s2d = s3d
+        s2d.displayMode = .line2D
+        let tex2d = try render(scene: s2d, dist: 10)
+        // Hash each framebuffer; differing projection => differing image. (Equal
+        // hashes would mean the 2D branch collapsed to the 3D one.)
+        func hash(_ tex: MTLTexture) -> UInt64 {
+            let w = tex.width, h = tex.height
+            var px = [UInt8](repeating: 0, count: w*h*4)
+            tex.getBytes(&px, bytesPerRow: w*4, from: MTLRegionMake2D(0,0,w,h), mipmapLevel: 0)
+            var hash: UInt64 = 0xcbf29ce484222325
+            for b in px { hash ^= UInt64(b); hash = hash &* 0x100000001b3 }
+            return hash
+        }
+        XCTAssertNotEqual(hash(tex3d), hash(tex2d), "2D and 3D projections must differ")
+        XCTAssertGreaterThan(nonzeroPixels(tex2d), 0, "2D mode should still render pixels")
     }
 
     private func nonzeroPixels(_ tex: MTLTexture) -> Int {

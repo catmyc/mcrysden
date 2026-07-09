@@ -24,6 +24,13 @@ extension Camera {
     }
 
     var aspectFromViewport: Float { 1.0 }   // overridden by caller via viewport size
+
+    /// World-space camera position (the "eye"): center + R*(0,0,distance). The
+    /// Blinn-Phong specular term needs this to build the view vector V.
+    func eyePosition() -> SIMD3<Float> {
+        let r = float4x4(rotation)
+        return center + (r * SIMD4<Float>(0, 0, distance, 1)).xyz
+    }
 }
 
 // MARK: - float4x4 extensions (synthesized; named ctors absent on this SDK)

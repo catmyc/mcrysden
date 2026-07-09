@@ -17,6 +17,15 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     var scene: Scene { didSet { renderer.scene = scene; renderer2D?.scene = scene } }
     var camera = Camera()
     let state: SideBarState
+    /// The on-disk source + forced format of the currently-loaded file, kept so
+    /// the animation controls can re-parse an arbitrary frame (AXSF animation
+    /// is re-decoded frame-by-frame; the parsed LoadedScene is otherwise
+    /// single-use). Nil for the empty opening viewer.
+    private var sourceURL: URL?
+    private var forcedFormat: ParseFormat?
+    /// Repeating timer driving AXSF playback. Held weakly by the runloop; we
+    /// recreate it on Play and invalidate on Pause/stop in `syncFromState`.
+    private var playTimer: Timer?
 
     init(scene: Scene) {
         self.scene = scene
@@ -74,6 +83,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         window.delegate = self
         state.onChange = { [weak self] in self?.syncFromState() }
         state.onResetView = { [weak self] in self?.resetView() }
+        state.onExportKPath = { [weak self] path, format in self?.exportKPath(path, format) }
         canvas.delegate = renderer
         canvas.world = self
         renderer.currentCamera = camera
@@ -88,11 +98,24 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     /// Apply a freshly-loaded scene: reframe the camera ONCE (spec §6 — the
     /// camera resets on file open) and sync the sidebar so the next sidebar
-    /// change does not clobber the loaded state with defaults.
-    func loadFile(_ scene: Scene) {
+    /// change does not clobber the loaded state with defaults. Records the
+    /// source URL/format so AXSF animation can re-parse individual frames, and
+    /// populates the animation controls (frameCount > 1 => show playback).
+    func loadFile(_ scene: Scene, from url: URL? = nil, format: ParseFormat? = nil, frameIndex: Int = 0) {
         self.scene = scene
+        self.sourceURL = url
+        self.forcedFormat = format
         state.syncFromScene(scene)
         applyCameraForNewSceneIfNeeded()
+        // Initialise the animation controls WITHOUT triggering onChange (which
+        // would otherwise try to reload frame 0 on top of this fresh load).
+        let saved = state.onChange
+        state.onChange = nil
+        state.frameIndex = frameIndex
+        state.frameCount = url.map { Parser.frameCount($0) } ?? 1
+        state.isPlaying = false
+        state.onChange = saved
+        stopPlayback()
         // The readout stays hidden until the user selects an atom.
     }
 
@@ -221,10 +244,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         setNeedsRender()
     }
 
-    /// Clear the active measurement result so the user can pick fresh atoms.
-    func clearMeasurement() {
+    /// Begin a measurement mode (or return to free selection when `mode ==
+    /// .none`). Clears any previous selection/result and records the mode in
+    /// `state` — the single source of truth — so it survives later sidebar
+    /// syncs. The state's onChange propagates the value into the scene.
+    func beginMeasurementMode(_ mode: MeasurementMode) {
         scene.measurementResult = nil
         scene.selectedAtoms = []
+        state.measurementMode = mode
         setNeedsRender()
     }
 
@@ -236,8 +263,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let cw = Float(canvas.bounds.width), ch = Float(canvas.bounds.height)
         guard cw > 0, ch > 0 else { labelOverlay.labels = []; return }
         let aspect = cw / ch
-        let view = camera.viewMatrix()
-        let proj = camera.projectionMatrix(aspect: aspect)
+        // Use the renderer's *effective* camera (which forces identity rotation
+        // + orthographic projection in 2D modes) so labels track the atoms
+        // exactly — `camera` alone would drift off in 2D.
+        let cam = renderCamera()
+        let view = cam.viewMatrix()
+        let proj = cam.projectionMatrix(aspect: aspect)
         // Atom element labels
         let labels: [LabelOverlayView.Label] = scene.atoms.compactMap { atom in
             let clip = proj * view * SIMD4<Float>(atom.coord.x, atom.coord.y, atom.coord.z, 1)
@@ -316,19 +347,80 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Reset the view: reframe the camera on the structure (center on the
     /// centroid, distance fit to the bounding sphere, rotation cleared) — the
     /// same framing a freshly-opened file gets (spec §6).
+    ///
+    /// NOTE (per user request): this intentionally resets the CAMERA only —
+    /// lighting, background and the display mode are preserved. The brief asked
+    /// for "reframe only", and other tests depend on resetView() not touching
+    /// appearance state. Reset lighting/background separately via the sidebar.
     func resetView() {
         camera.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         applyCameraForNewSceneIfNeeded()
     }
 
+    /// Reframe the camera when the display mode changes so the structure always
+    /// fills the viewport.  The 2D path uses a fixed identity rotation + orthographic
+    /// projection but keeps the user's distance/orientation, while 3D uses the
+    /// orbit camera — both derive their center and scale from the structure's
+    /// bounding sphere so a switch never produces a tiny off-centre blob.
+    private func reframeForDisplayMode(previous: DisplayMode) {
+        // No-op when toggling between two 2D modes or two 3D modes — only reframe
+        // on the 2D↔3D transition (or first load, when previous == current).
+        guard previous.is2D != scene.displayMode.is2D || previous == scene.displayMode else { return }
+        applyCameraForNewSceneIfNeeded()
+    }
+
     func syncFromState() {
+        // AXSF animation: a new frame index means the user scrubbed or stepped —
+        // decode that frame in full, re-applying the current view/UI state so the
+        // camera, supercell, slab, etc. survive the reload. reloadFrame keeps
+        // isReloadingFrame true so the state assignment it performs does not
+        // re-enter here.
+        if state.frameCount > 1 && state.frameIndex != scene.currentFrame {
+            reloadFrame(state.frameIndex)
+            return
+        }
+        // Guard the main path so that reloadFrame's own state.frameIndex
+        // assignment (which fires onChange) does not re-run the UI sync below.
+        guard !isReloadingFrame else { return }
+        // Guard re-entrancy: below we mirror scene-derived values back into
+        // `state` (isCrystal, kPathPoints), whose @Published didSet fires
+        // onChange -> syncFromState again. Without this guard a sidebar change
+        // (which already entered here via onChange) would assign state.* and
+        // recurse infinitely. The re-entrant call returns here doing nothing,
+        // since the original invocation already performed the mirroring.
+        guard !isSyncingState else { return }
+        isSyncingState = true
+        defer { isSyncingState = false }
+
+        let previousMode = scene.displayMode
         scene.displayMode = state.displayMode
+        // Reframe when crossing the 2D↔3D boundary so the structure always
+        // fills the viewport (otherwise the 3D distance carries over and the
+        // 2D view shows a tiny off-centre blob).
+        reframeForDisplayMode(previous: previousMode)
         scene.atomScale = state.atomScale
         scene.bondRadius = state.bondRadius
         scene.showCellFrame = state.showCellFrame
         scene.showAxes = state.showAxes
         scene.showLabels = state.showLabels
+        // User controls push state -> scene so the renderer reads the new value.
+        // (showBrillouinZone is the renderer's source of truth via scene.* .)
+        scene.showBrillouinZone = state.showBrillouinZone
         scene.measurementMode = state.measurementMode
+        // Scene-derived mirrors flow state <- scene purely to keep the sidebar
+        // indicators in sync; guarded above against re-entrant onChange.
+        state.isCrystal = scene.isCrystal
+        // Default high-symmetry k-path for the active crystal (crystal only).
+        // Regenerates when the scene changes so it always matches the structure.
+        state.kPathPoints = Self.makeDefaultKPath(for: scene)
+        // lighting + background — the renderer currently uses a fixed shader and
+        // solid clear color (the richer shader is owned by another agent); we
+        // mirror state into the scene here so the values persist via StateStore
+        // and are ready the moment the renderer starts consuming them.
+        scene.lighting = state.lighting
+        scene.backgroundType = state.backgroundType
+        scene.background = state.backgroundHex
+        scene.backgroundBottom = state.backgroundBottomHex
         // supercell
         let sc = SuperCell(n1: state.n1, n2: state.n2, n3: state.n3)
         if sc.total != scene.superCell.total {
@@ -342,11 +434,109 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                    planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
             : nil
         scene = scene.applySlab(slab)
-        // background
+        // background clear color (solid top color today; gradient rendering is
+        // pending on the shader work).
         if let c = colorFromHex(state.backgroundHex) {
             renderer.background = MTLClearColor(red: c.r, green: c.g, blue: c.b, alpha: 1)
         }
+        // Playback timer follows the Play/Pause toggle: started on play,
+        // torn down on pause or when not animating at all.
+        if state.isPlaying && playTimer == nil { startPlayback() }
+        if !state.isPlaying && playTimer != nil { stopPlayback() }
         setNeedsRender()
+    }
+
+    /// Default high-symmetry k-path for the active crystal (crystal only). Falls
+    /// back to a simple Gamma-X for non-cubic or molecule scenes so the editor
+    /// always has something to show/export.
+    static func makeDefaultKPath(for scene: Scene) -> [KPoint] {
+        guard let cell = scene.cell else { return [] }
+        return KPath.defaultPath(cell: cell, atoms: scene.baseAtoms.map { $0.coord }).points
+    }
+
+    /// Present a save panel and write the k-path text for the chosen format.
+    private func exportKPath(_ path: KPath, _ format: KPathExportFormat) {
+        guard !path.points.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "kpath.\(format.rawValue)"
+        panel.allowedContentTypes = [.plainText]
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do {
+                try KPathExport.export(path, as: format).write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                print("[mcrysden] k-path export failed: \(error)")
+            }
+        }
+    }
+
+    /// Guards the main syncFromState() path while reloadFrame assigns
+    /// state.frameIndex (which would otherwise fire onChange and re-enter).
+    private var isReloadingFrame = false
+    private var isSyncingState = false
+
+    /// Decode AXSF frame `index` and swap it into the current scene, preserving
+    /// the camera and all UI-controllable state (display mode, scales, lighting,
+    /// background, supercell, slab, show flags). Each frame is parsed fresh
+    /// from sourceURL via Parser.load(frameIndex:).
+    private func reloadFrame(_ index: Int) {
+        guard let url = sourceURL, index >= 0, index < state.frameCount else { return }
+        guard let loaded = try? Parser.load(url, frameIndex: index) else {
+            print("[mcrysden] failed to load frame \(index)"); return
+        }
+        // Start from the freshly parsed frame but carry the LIVE UI state over
+        // (not state.*, which lags by one onChange) so scrolling frames never
+        // resets the view, supercell, slab, or appearance settings.
+        var next = Scene(loaded: loaded)
+        next.camera = camera
+        next.displayMode = scene.displayMode
+        next.atomScale = scene.atomScale
+        next.bondRadius = scene.bondRadius
+        next.showCellFrame = scene.showCellFrame
+        next.showAxes = scene.showAxes
+        next.showLabels = scene.showLabels
+        next.lighting = state.lighting
+        next.backgroundType = state.backgroundType
+        next.background = state.backgroundHex
+        next.backgroundBottom = state.backgroundBottomHex
+        next.selectedAtoms = []                 // selection is per-frame
+        next.measurementResult = nil
+        next.measurementMode = .none
+        // Re-apply the current supercell and slab so the new frame matches the
+        // framing the user had before the reload.
+        next = next.widenSuperCell(SuperCell(n1: state.n1, n2: state.n2, n3: state.n3))
+        if state.slabEnabled {
+            let slab = Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
+                            planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
+            next = next.applySlab(slab)
+        }
+        next.currentFrame = index
+        isReloadingFrame = true
+        state.frameIndex = index     // keep the two in sync; guarded from re-entry
+        isReloadingFrame = false
+        self.scene = next
+        setNeedsRender()
+    }
+
+    /// Begin (or restart) the playback timer. Repeating at ~10 Hz; each tick
+    /// advances frameIndex by one, wrapping to 0 at the end (or stopping — here
+    /// we stop at the end and clear isPlaying for predictability).
+    private func startPlayback() {
+        stopPlayback()
+        playTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if self.state.frameIndex + 1 >= self.state.frameCount {
+                // Reached the last frame — stop rather than wrap.
+                self.state.isPlaying = false
+            } else {
+                self.state.frameIndex += 1
+            }
+        }
+    }
+
+    private func stopPlayback() {
+        playTimer?.invalidate()
+        playTimer = nil
     }
 
     private func colorFromHex(_ hex: String) -> (r: Double, g: Double, b: Double)? {
