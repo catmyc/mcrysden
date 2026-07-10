@@ -26,6 +26,9 @@ struct SideBar: View {
                 Toggle("Cell Frame", isOn: $state.showCellFrame)
                 Toggle("Axes", isOn: $state.showAxes)
                 Toggle("Element Labels", isOn: $state.showLabels)
+                // Projection: orthographic removes perspective foreshortening and is
+                // the conventional choice for crystal/molecule illustrations.
+                Toggle("Orthographic", isOn: $state.orthographic)
                 // Brillouin-zone wireframe (crystal only). Hidden for molecules,
                 // which have no reciprocal lattice.
                 Toggle("Brillouin Zone", isOn: $state.showBrillouinZone)

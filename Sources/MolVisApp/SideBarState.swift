@@ -14,6 +14,9 @@ final class SideBarState: ObservableObject {
     /// Overlay the Brillouin-zone wireframe (crystal only). Synced to
     /// scene.showBrillouinZone in syncFromState().
     @Published var showBrillouinZone: Bool = false { didSet { onChange?() } }
+    /// Projection mode toggle (bound to camera.perspective): checked =
+    /// orthographic, unchecked = perspective. Synced in syncFromState().
+    @Published var orthographic: Bool = false { didSet { onChange?() } }
     @Published var backgroundHex: String = "#101014" { didSet { onChange?() } }
     /// Second (bottom) background color; only meaningful when backgroundType is
     /// `.gradient_top`. Synced to scene.backgroundBottom in syncFromState().
@@ -82,6 +85,9 @@ final class SideBarState: ObservableObject {
         } else {
             slabEnabled = false
         }
+        // Projection mode: the live render camera's perspective flag is the
+        // source of truth, mirrored here so the toggle reflects the loaded view.
+        orthographic = !scene.camera.perspective
         onChange = saved
     }
 }

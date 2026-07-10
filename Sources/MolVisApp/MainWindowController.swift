@@ -406,6 +406,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // User controls push state -> scene so the renderer reads the new value.
         // (showBrillouinZone is the renderer's source of truth via scene.* .)
         scene.showBrillouinZone = state.showBrillouinZone
+        // Projection toggle: orthographic checked => perspective off. Bound to
+        // the live render camera (the renderer reads camera.perspective).
+        camera.perspective = !state.orthographic
         scene.measurementMode = state.measurementMode
         // Scene-derived mirrors flow state <- scene purely to keep the sidebar
         // indicators in sync; guarded above against re-entrant onChange.
