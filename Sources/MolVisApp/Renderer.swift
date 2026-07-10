@@ -55,8 +55,22 @@ final class Renderer: NSObject {
     private var depthTexture: MTLTexture?
     private var depthTextureSize: (Int, Int) = (0, 0)
 
-    var scene: Scene = Scene()
+    var scene: Scene = Scene() {
+        didSet { invalidateBrillouinZoneCache() }
+    }
     var currentCamera = Camera()
+
+    // Brillouin-zone cache. The BZ depends only on the conventional cell + its base
+    // atoms, which are static across render frames, so build it ONCE and reuse.
+    // Without this, drawBrillouinZone rebuilds an O(m^3) Wigner-Seitz cell every
+    // frame; a large G-star (GaAsH, ~164 vectors) makes mouse-drag seconds-laggy.
+    private var cachedBZ: BrillouinZone?
+    private var cachedBZKey: BZCacheKey?
+    private struct BZCacheKey: Equatable {
+        var cellA: SIMD3<Float>; var cellB: SIMD3<Float>; var cellC: SIMD3<Float>
+        var nBase: Int; var firstBaseZ: Int
+    }
+    private func invalidateBrillouinZoneCache() { cachedBZ = nil; cachedBZKey = nil }
     var background: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)
 
     /// Last computed world-space light direction — exposed so the orientation
@@ -852,9 +866,18 @@ final class Renderer: NSObject {
     private func drawBrillouinZone(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
         guard let cell = scene.cell else { return }
         // baseAtoms are the pristine atoms in the conventional cell; their
-        // fractional offsets reveal the centering so the BZ shape is right.
-        let bz = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms)
-        guard let bz else { return }
+        // fractional offsets reveal the centering so the BZ shape is right. The BZ
+        // is cached because it's purely a function of (cell, baseAtoms) and those
+        // don't change between frames — rebuilding the O(m^3) Wigner-Seitz cell
+        // every frame is what made dragging laggy for large G-stars.
+        let key = BZCacheKey(cellA: cell.a, cellB: cell.b, cellC: cell.c,
+                             nBase: scene.baseAtoms.count,
+                             firstBaseZ: scene.baseAtoms.first?.atomicNumber ?? 0)
+        if cachedBZ == nil || cachedBZKey != key {
+            cachedBZ = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms)
+            cachedBZKey = key
+        }
+        guard let bz = cachedBZ else { return }
         // The BZ lives in reciprocal space (units of 2pi/A). Scale it to a fixed
         // fraction of the structure's bounding sphere so it renders as a visible
         // cage around the atoms — an absolute normalisation would make it a
