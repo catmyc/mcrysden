@@ -50,6 +50,32 @@ final class App: NSObject, NSApplicationDelegate {
         return 0
     }
 
+    /// Parse a structure at the CLI frame, apply a companion state (which widens
+    /// the supercell, applies the slab, and may encode a saved animation frame),
+    /// then — if the state restored a saved frame — re-parse THAT frame and
+    /// re-apply the structural transforms. Without this, the saved currentFrame
+    /// would be metadata-only and the saved frame's geometry would never show.
+    private static func loadScene(from url: URL, format: ParseFormat?, cliFrame: Int,
+                                  stateURL: URL?) throws -> (scene: Scene, camera: Camera?) {
+        var scene = Scene(loaded: try Parser.load(url, as: format, frameIndex: cliFrame))
+        var camera: Camera? = nil
+        if let stateURL {
+            try StateStore.load(into: &scene, camera: &camera, from: stateURL)
+        }
+        // Honor a saved animation frame: re-parse it and rebuild the structure.
+        if scene.currentFrame > 0 && scene.currentFrame != cliFrame {
+            let sc = scene.superCell
+            let slab = scene.slab
+            let fc = Parser.frameCount(url, as: format)
+            if scene.currentFrame < fc {
+                scene = Scene(loaded: try Parser.load(url, as: format, frameIndex: scene.currentFrame))
+                if sc.total > 1 { scene = scene.widenSuperCell(sc) }
+                if let sl = slab { scene = scene.applySlab(sl) }
+            }
+        }
+        return (scene, camera)
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.mainMenu = buildMenu()
         NSApp.activate(ignoringOtherApps: true)         // bring to front so menu bar changes
@@ -67,11 +93,9 @@ final class App: NSObject, NSApplicationDelegate {
             let outURL = URL(fileURLWithPath: args[idx + 1])
             let inURL = URL(fileURLWithPath: input)
             do {
-                var scene = Scene(loaded: try Parser.load(inURL, as: format, frameIndex: frame))
-                var camera: Camera? = nil
-                if let stIdx = args.firstIndex(where: { $0.hasSuffix(".mvis-state") }), stIdx != idx {
-                    try StateStore.load(into: &scene, camera: &camera, from: URL(fileURLWithPath: args[stIdx]))
-                }
+                let stURL = args.firstIndex(where: { $0.hasSuffix(".mvis-state") })
+                    .map { URL(fileURLWithPath: args[$0]) }
+                let (scene, camera) = try Self.loadScene(from: inURL, format: format, cliFrame: frame, stateURL: stURL)
                 let exportSize = CGSize(width: 800, height: 800)
                 switch outURL.pathExtension.lowercased() {
                 case "pdf", "svg", "eps", "ps":
@@ -90,18 +114,16 @@ final class App: NSObject, NSApplicationDelegate {
         if let input = Self.inputFile(from: args) {
             let inURL = URL(fileURLWithPath: input)
             do {
-                var scene = Scene(loaded: try Parser.load(inURL, as: format, frameIndex: frame))
-                // If a companion .mvis-state was passed, load + apply it
-                // (final-review Minor #3: the GUI path used to ignore it).
-                var camera: Camera? = nil
-                if let stIdx = args.firstIndex(where: { $0.hasSuffix(".mvis-state") }) {
-                    try StateStore.load(into: &scene, camera: &camera, from: URL(fileURLWithPath: args[stIdx]))
-                }
+                let stURL = args.firstIndex(where: { $0.hasSuffix(".mvis-state") })
+                    .map { URL(fileURLWithPath: args[$0]) }
+                // loadScene honors a saved animation frame by re-parsing it (the
+                // saved frame becomes geometry, not just metadata).
+                let (scene, camera) = try Self.loadScene(from: inURL, format: format, cliFrame: frame, stateURL: stURL)
                 let wc = MainWindowController(scene: Scene())
                 mainWC = wc
-                // Pass the source url/format/frame so AXSF animation can re-parse
-                // frames and the scrubber opens on the right frame.
-                wc.loadFile(scene, from: inURL, format: format, frameIndex: frame)
+                // Pass the RESOLVED frame (clFrame, or the restored frame if the
+                // state encoded one) so the scrubber opens where the user left off.
+                wc.loadFile(scene, from: inURL, format: format, frameIndex: scene.currentFrame > 0 ? scene.currentFrame : frame)
                 if let camera {
                     wc.camera = camera
                     // Sync the orthographic toggle from the RESTORED camera (not the

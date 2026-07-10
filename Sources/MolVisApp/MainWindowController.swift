@@ -501,6 +501,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showCellFrame = scene.showCellFrame
         next.showAxes = scene.showAxes
         next.showLabels = scene.showLabels
+        next.showStructure = scene.showStructure
+        next.showBrillouinZone = scene.showBrillouinZone
         next.lighting = state.lighting
         next.backgroundType = state.backgroundType
         next.background = state.backgroundHex

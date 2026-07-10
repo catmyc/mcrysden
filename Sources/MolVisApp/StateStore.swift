@@ -69,20 +69,33 @@ enum StateStore {
         // supercell [n1,n2,n3]. Widen into atoms (not a bare field) so a saved
         // supercell is actually rendered — otherwise the restored view would show
         // only the base cell. baseAtoms is populated by Scene(loaded:) so the
-        // expansion has source atoms to replicate.
+        // expansion has source atoms to replicate. Validate first: negatives
+        // would trap Swift's `0..<neg` range, and huge values could overflow the
+        // atom-count multiplication, so clamp to [1, max] per the contract.
         if let sc = obj["supercell"] as? [Int], sc.count == 3 {
-            scene = scene.widenSuperCell(SuperCell(n1: sc[0], n2: sc[1], n3: sc[2]))
+            let dims = sc.map { max(1, $0) }
+            let total = dims[0] * dims[1] * dims[2]
+            if total <= 64, total * scene.atoms.count <= Scene.superCellAtomCap {
+                scene = scene.widenSuperCell(SuperCell(n1: dims[0], n2: dims[1], n3: dims[2]))
+            } else {
+                print("[mcrysden] warning: saved supercell (\(dims)) refused (would exceed atom cap)")
+            }
         }
-        // slab (optional).
+        // slab (optional). Assign the plane AND actually filter the atoms so a
+        // saved slab is rendered — in headless export the scene is drawn
+        // directly, so a bare field assignment would otherwise be ignored.
+        // widenSuperCell (above) has already populated preslabAtoms with the
+        // widened set that the slab should filter.
         if let slab = obj["slab"] as? [String: Any],
            let a = slab["planeA"] as? [String: Any], let b = slab["planeB"] as? [String: Any] {
-            scene.slab = Slab(
+            let sl = Slab(
                 planeA: Plane(h: a["h"] as? Int ?? 0, k: a["k"] as? Int ?? 1, l: a["l"] as? Int ?? 0,
                               distance: (a["distance"] as? Double).map(Float.init) ?? 0),
                 planeB: Plane(h: b["h"] as? Int ?? 0, k: b["k"] as? Int ?? -1, l: b["l"] as? Int ?? 0,
                               distance: (b["distance"] as? Double).map(Float.init) ?? 0))
+            scene = scene.applySlab(sl)
         } else {
-            scene.slab = nil
+            scene = scene.applySlab(nil)
         }
         // appearance.
         if let bg = obj["background"] as? String { scene.background = bg }

@@ -19,12 +19,17 @@ extension Cell {
     /// these form a SUPERSET of the true reciprocal lattice — use
     /// `primitiveReciprocal` (which needs the atomic centering) for the BZ.
     var reciprocalVectors: (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>) {
+        // Reciprocal basis as columns of v.inverse (NOT v.inverse.transpose).
+        // For the physics convention a_i · a*_j = 2π δ_ij, the reciprocal
+        // vectors are the columns of the inverse of the matrix whose rows are
+        // the direct vectors. The old `.transpose` only agreed for orthogonal
+        // (cubic) cells; skew cells gave b·a* ≠ 0.
         let v = simd_float3x3(rows: [a, b, c])
         let vol = v.determinant
         guard abs(vol) > 1e-12 else { return (.zero, .zero, .zero) }
-        let invT = v.inverse.transpose
+        let inv = v.inverse
         let scale = Float(2.0 * Double.pi)
-        return (a: invT.columns.0 * scale, b: invT.columns.1 * scale, c: invT.columns.2 * scale)
+        return (a: inv.columns.0 * scale, b: inv.columns.1 * scale, c: inv.columns.2 * scale)
     }
 }
 
