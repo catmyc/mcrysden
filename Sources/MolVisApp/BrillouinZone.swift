@@ -32,50 +32,37 @@ struct BrillouinZone {
     let specialPoints: [BZSpecialPoint]
     let reciprocal: (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>)
 
-    /// Build the BZ from the conventional cell + its base atoms. The atoms'
-    /// fractional offsets reveal centering so the primitive reciprocal lattice
-    /// (and hence the BZ shape) is correct for fcc/bcc, not just primitive
-    /// conventional cells. `starRadius` shells of G-vectors (2 = {-2..2}, the
-    /// wigner.f default) give the 14-face fcc truncated octahedron.
-    static func build(cell: Cell, atoms: [SIMD3<Float>], starRadius: Int = 2,
-                     shellCutoff: Float = 1.8) -> BrillouinZone? {
-        // True reciprocal generator (primitive = respects centering).
+    /// Build the BZ from the conventional cell + its base atoms. Centering is
+    /// detected from the atoms' fractional offsets (P/I/F) and reduced to the
+    /// true primitive direct basis, whose reciprocal generates a COMPLETE
+    /// per-direction G-star. No isotropic radius cap — the Wigner-Seitz cell is
+    /// the intersection of the bisectors of ALL G up to the first complete shell
+    /// in every direction. Correct for any lattice: fcc -> 14, slab -> 6, etc.
+    static func build(cell: Cell, atoms: [Atom]) -> BrillouinZone? {
+        // True reciprocal generator (primitive = respects centering), the dense
+        // lattice whose Wigner-Seitz cell is the first BZ.
         let (astar, bstar, cstar) = Lattice.primitiveReciprocal(cell: cell, atoms: atoms)
         guard astar != .zero else { return nil }
 
-        // G-star: integer combinations of reciprocal vectors, excluding origin.
-        // The Wigner-Seitz cell is defined by the nearest NEIGHBOR SHELL(S): a
-        // bisector plane only bounds the cell for G up to the first shell or two.
-        // We therefore COMPLETE whole shells (capped by a radius relative to the
-        // shortest |G|), never truncate mid-shell — a truncated shell injects
-        // stray bisectors that cut false corners (e.g. fcc 14 -> 12 faces).
+        // Complete per-direction G-star: along primitive reciprocal axis i we
+        // enumerate enough integer multiples to reach (at least) the longest
+        // primitive reciprocal |G| — guaranteeing a complete first shell in every
+        // direction. An isotropic radius cut would discard the dense directions of
+        // anisotropic cells (e.g. slabs) and leave too few planes to close the cell.
+        let nrm = [length(astar), length(bstar), length(cstar)]
+        let longest = max(nrm[0], max(nrm[1], nrm[2]))
+        let r0 = max(1, Int(ceil(longest / max(nrm[0], 1e-9))))
+        let r1 = max(1, Int(ceil(longest / max(nrm[1], 1e-9))))
+        let r2 = max(1, Int(ceil(longest / max(nrm[2], 1e-9))))
         var gstar: [SIMD3<Float>] = []
-        for i in -starRadius...starRadius {
-            for j in -starRadius...starRadius {
-                for k in -starRadius...starRadius {
-                    if i == 0 && j == 0 && k == 0 { continue }
-                    let g = Float(i)*astar + Float(j)*bstar + Float(k)*cstar
-                    gstar.append(g)
-                }
-            }
-        }
-        gstar.sort { dot($0, $0) < dot($1, $1) }
-        // Radius cap: keep all G within `shellCutoff`× the shortest |G|. The first
-        // complete shell(s) fully define the cell; including partial next shells
-        // is what corrupts the shape. starRadius=2 explores far enough that the
-        // cutoff decides, not the enumeration bound.
-        let shortest = length(gstar.first ?? .zero)
-        guard shortest > 1e-6 else { return nil }
-        let cutoff = shortest * shellCutoff
-        gstar = gstar.filter { length($0) <= cutoff }
-        // Bisector planes (outward normal n, offset cc) for the WS cell.
-        var planes: [(n: SIMD3<Float>, cc: Float)] = []
-        for g in gstar {
-            let len = length(g)
-            if len < 1e-6 { continue }
-            planes.append((g / len, len * 0.5))
-        }
-        guard planes.count >= 4 else { return nil }
+        for i in -r0...r0 { for j in -r1...r1 { for k in -r2...r2 {
+            if i == 0 && j == 0 && k == 0 { continue }
+            gstar.append(Float(i)*astar + Float(j)*bstar + Float(k)*cstar)
+        }}}
+        guard gstar.count >= 4 else { return nil }
+
+        // Bisector planes (outward normal n, offset cc = |G|/2) for the WS cell.
+        let planes: [(n: SIMD3<Float>, cc: Float)] = gstar.map { g in (g / length(g), length(g) * 0.5) }
 
         guard let tris = Geometry.polyhedronFaces(center: .zero, neighbors: gstar,
                                                    maxNeighbors: gstar.count) else {

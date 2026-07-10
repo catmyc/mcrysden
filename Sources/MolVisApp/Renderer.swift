@@ -853,13 +853,19 @@ final class Renderer: NSObject {
         guard let cell = scene.cell else { return }
         // baseAtoms are the pristine atoms in the conventional cell; their
         // fractional offsets reveal the centering so the BZ shape is right.
-        let bz = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms.map { $0.coord })
+        let bz = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms)
         guard let bz else { return }
-        // Normalise the BZ so its largest dimension spans ~1.0 in model space.
+        // The BZ lives in reciprocal space (units of 2pi/A). Scale it to a fixed
+        // fraction of the structure's bounding sphere so it renders as a visible
+        // cage around the atoms — an absolute normalisation would make it a
+        // microscopic speck for large cells (e.g. GaAsH, ~20 A wide) and hide it
+        // among the front atoms. Centered on the structure centroid.
         var extent: Float = 0
         for face in bz.faces { for v in face { extent = max(extent, length(v)) } }
         guard extent > 1e-5 else { return }
-        let inv = 0.9 / extent
+        let (_, radius) = scene.boundingSphere()
+        let targetExtent = max(1.0, radius) * 0.45
+        let inv = targetExtent / extent
         let center = sceneCentroid()
         let bzColor = SIMD3<Float>(0.85, 0.30, 0.95)
         for face in bz.faces {

@@ -41,6 +41,10 @@ extension Cell {
 // primitive basis by shortest-vector reduction over (int combo + offset), then
 // the primitive reciprocal generates the correct BZ G-star.
 
+/// Conventional-lattice centering (Bravais type). Only P/I/F need primitive
+/// reduction for the BZ; everything else (molecular, A/C/R/H) is treated as P.
+enum LatticeCentering { case primitive, body, face }
+
 /// Reduce a conventional cell to its primitive direct basis using the fractional
 /// atomic offsets (the "basis") that reveal centering. Returns the conventional
 /// basis unchanged if only the trivial (0,0,0) offset is present.
@@ -57,52 +61,69 @@ enum Lattice {
         return atoms.map { m.inverse * $0 }
     }
 
+    /// Fractional part in [0,1) via floor. NOT .rounded(): Swift sends 0.5->1,
+    /// making centering offsets asymmetric and breaking centering detection.
+    private static func vfrac(_ p: SIMD3<Float>) -> SIMD3<Float> { p - floor(p) }
+
     /// Unique fractional offsets (mod 1, excluding ~0) that describe the basis.
+    /// Accepts either Cartesian coords or `[Atom]`.
+    static func basisCoords(_ atoms: [Atom], cell: Cell) -> [SIMD3<Float>] {
+        return fractional(atoms.map { $0.coord }, cell: cell)
+    }
     static func basisOffsets(_ atoms: [SIMD3<Float>], cell: Cell) -> [SIMD3<Float>] {
         let eps: Float = 1e-2
         var offs: [SIMD3<Float>] = []
         for f in fractional(atoms, cell: cell) {
-            var g = f
-            g.x -= g.x.rounded(); g.y -= g.y.rounded(); g.z -= g.z.rounded()
+            let g = vfrac(f)
             if length(g) < eps { continue }
             if !offs.contains(where: { length($0 - g) < eps }) { offs.append(g) }
         }
         return offs
     }
 
-    /// Primitive direct basis found by shortest-vector reduction over lattice
-    /// points = (int combo of a,b,c) + offset, for each fractional offset.
-    static func primitiveBasis(cell: Cell, offsets: [SIMD3<Float>]) -> (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>) {
-        let a = cell.a, b = cell.b, c = cell.c
-        var cand: [SIMD3<Float>] = []
-        for i in -2...2 { for j in -2...2 { for k in -2...2 {
-            let base = Float(i)*a + Float(j)*b + Float(k)*c
-            cand.append(base)                                 // offset 0
-            for o in offsets {
-                // fractional offset in Cartesian: o.x*a + o.y*b + o.z*c
-                cand.append(base + o.x*a + o.y*b + o.z*c)
-            }
-        }}}
-        cand = cand.filter { length($0) > 1e-3 }
-        cand.sort { length2($0) < length2($1) }
-        // Greedy shortest non-coplanar triple.
-        var picked: [SIMD3<Float>] = []
-        for v in cand {
-            picked.append(v)
-            if picked.count == 3 {
-                if abs(simd_float3x3(rows: picked).determinant) > 1e-3 { break }
-                picked.removeLast()
-            }
+    /// Centering of a conventional lattice from its atoms: an offset is a genuine
+    /// lattice translation iff shifting EVERY atom (mod 1) lands on an identical
+    /// species. Basis atoms near ½ fail; only true centering passes. Molecules /
+    /// unrecognized centering fall back to primitive (P).
+    static func detectCentering(_ atoms: [Atom], cell: Cell) -> LatticeCentering {
+        let fracs = fractional(atoms.map { $0.coord }, cell: cell).map(vfrac)
+        let syms = atoms.map { $0.atomicNumber }
+        let eps: Float = 1e-2
+        // nearest offset modulo 1, wrapped into [-0.5, 0.5).
+        func near(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Bool {
+            func d(_ x: Float) -> Float { var z = x - floor(x); if z > 0.5 { z -= 1 }; return z }
+            return abs(d(a.x - b.x)) < eps && abs(d(a.y - b.y)) < eps && abs(d(a.z - b.z)) < eps
         }
-        if picked.count != 3 { return (a, b, c) }
-        return (picked[0], picked[1], picked[2])
+        func isCentering(_ off: SIMD3<Float>) -> Bool {
+            for (i, f) in fracs.enumerated() {
+                let t = vfrac(f + off)
+                guard fracs.enumerated().contains(where: { (j, g) in syms[j] == syms[i] && near(g, t) }) else { return false }
+            }
+            return true
+        }
+        if isCentering(SIMD3(0.5, 0.5, 0.5)) { return .body }
+        if [SIMD3(0.5,0.5,0), SIMD3(0.5,0,0.5), SIMD3(0,0.5,0.5)].allSatisfy(isCentering) { return .face }
+        return .primitive
     }
 
-    /// Reciprocal vectors (2pi convention) of the primitive direct basis from
-    /// the atomic centering — the correct generator for the BZ G-star.
-    static func primitiveReciprocal(cell: Cell, atoms: [SIMD3<Float>]) -> (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>) {
-        let offs = basisOffsets(atoms, cell: cell)
-        let p = primitiveBasis(cell: cell, offsets: offs)
+    /// Canonical primitive direct vectors by centering type (crystallographic
+    /// standard). Avoids greedy shortest-vector reduction, which over-reduces when
+    /// basis atoms sit closer than a lattice translation (e.g. GaAsH slab).
+    static func primitiveDirect(centering: LatticeCentering, _ conv: Cell)
+        -> (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>) {
+        let a = conv.a, b = conv.b, c = conv.c
+        switch centering {
+        case .body:      return (0.5*(-a+b+c), 0.5*(a-b+c), 0.5*(a+b-c))
+        case .face:      return (0.5*(b+c), 0.5*(a+c), 0.5*(a+b))
+        case .primitive: return (a, b, c)
+        }
+    }
+
+    /// Reciprocal vectors (2pi convention) of the primitive direct basis — the
+    /// correct generator for the BZ G-star. Centering is detected from atoms.
+    static func primitiveReciprocal(cell: Cell, atoms: [Atom]) -> (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>) {
+        let centering = detectCentering(atoms, cell: cell)
+        let p = primitiveDirect(centering: centering, cell)
         return Cell(a: p.a, b: p.b, c: p.c).reciprocalVectors
     }
 }
