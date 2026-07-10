@@ -68,7 +68,9 @@ struct Camera: Codable {
     var center: SIMD3<Float> = SIMD3(0,0,0)
     var distance: Float = 20
     var rotation: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-    var perspective: Bool = true
+    // Orthographic is the default: it removes perspective foreshortening and is
+    // the conventional projection for crystal/molecule illustrations.
+    var perspective: Bool = false
 }
 
 enum ProjectionMode: Codable { case perspective, ortho }
@@ -127,6 +129,9 @@ struct Scene: Codable {
     var showCellFrame: Bool = true
     var showAxes: Bool = true
     var showLabels: Bool = false
+    /// Hide the atomic structure (atoms/bonds/polyhedra), keeping the cell
+    /// frame, axes and Brillouin-zone overlay. Lets the user focus on the BZ.
+    var showStructure: Bool = true
     /// Overlay the Brillouin-zone wireframe (crystal only) as a scene layer,
     /// drawn after the structure with depth so it sits correctly around it.
     var showBrillouinZone: Bool = false

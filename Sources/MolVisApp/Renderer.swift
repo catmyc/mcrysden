@@ -372,20 +372,25 @@ final class Renderer: NSObject {
             drawGradient(enc)
         }
 
-        if scene.displayMode.is2D {
-            // True 2D: flat screen-space atom discs + 1px bond lines. The cell
-            // frame and axes already draw correctly in 2D and stay on.
-            drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h)
-            drawBonds2D(enc, frameBuffer: frameBuffer)
-        } else if scene.displayMode == .polyhedral {
-            // Polyhedral: hide spheres/bonds, build+draw convex cells.
-            drawPolyhedral(enc, frameBuffer: frameBuffer)
-        } else {
-            // Atoms (instanced spheres)
-            drawAtoms(enc, frameBuffer: frameBuffer)
+        // The atomic structure (atoms/bonds/polyhedra) can be hidden so the user
+        // can focus on the cell frame, axes, or Brillouin-zone overlay. The
+        // frame/axes/BZ branches below draw regardless.
+        if scene.showStructure {
+            if scene.displayMode.is2D {
+                // True 2D: flat screen-space atom discs + 1px bond lines. The cell
+                // frame and axes already draw correctly in 2D and stay on.
+                drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h)
+                drawBonds2D(enc, frameBuffer: frameBuffer)
+            } else if scene.displayMode == .polyhedral {
+                // Polyhedral: hide spheres/bonds, build+draw convex cells.
+                drawPolyhedral(enc, frameBuffer: frameBuffer)
+            } else {
+                // Atoms (instanced spheres)
+                drawAtoms(enc, frameBuffer: frameBuffer)
 
-            // Bonds (instanced cylinders)
-            drawBonds(enc, frameBuffer: frameBuffer)
+                // Bonds (instanced cylinders)
+                drawBonds(enc, frameBuffer: frameBuffer)
+            }
         }
 
         // Cell frame + axes

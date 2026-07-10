@@ -31,6 +31,7 @@ enum StateStore {
         payload["showAxes"] = scene.showAxes
         payload["showLabels"] = scene.showLabels
         payload["showBrillouinZone"] = scene.showBrillouinZone
+        payload["showStructure"] = scene.showStructure
         payload["atomScale"] = scene.atomScale
         payload["bondRadius"] = scene.bondRadius
         payload["lighting"] = [
@@ -88,6 +89,7 @@ enum StateStore {
         if let v = obj["showAxes"] as? Bool { scene.showAxes = v }
         if let v = obj["showLabels"] as? Bool { scene.showLabels = v }
         if let v = obj["showBrillouinZone"] as? Bool { scene.showBrillouinZone = v }
+        if let v = obj["showStructure"] as? Bool { scene.showStructure = v }
         if let v = obj["atomScale"] as? Double { scene.atomScale = Float(v) }
         if let v = obj["bondRadius"] as? Double { scene.bondRadius = Float(v) }
         if let light = obj["lighting"] as? [String: Any] {

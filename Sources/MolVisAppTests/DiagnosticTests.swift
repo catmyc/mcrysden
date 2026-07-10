@@ -15,8 +15,12 @@ final class CellRenderDiag: XCTestCase {
         let s = try fixture("si110.xsf")
         let r = try Renderer(device: device)
         r.scene = s
+        // Pin perspective: this diagnostic asserts screen-space cell-frame
+        // enclosure of the atoms, which is projection-dependent; the default
+        // projection is orthographic, so set it explicitly here.
         r.currentCamera.center = SIMD3<Float>(1.35, 1.35, 1.35)
         r.currentCamera.distance = 12
+        r.currentCamera.perspective = true
         let w = 200, h = 200
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm; desc.width = w; desc.height = h

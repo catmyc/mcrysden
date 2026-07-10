@@ -409,6 +409,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Projection toggle: orthographic checked => perspective off. Bound to
         // the live render camera (the renderer reads camera.perspective).
         camera.perspective = !state.orthographic
+        // Hide-structure toggle: suppress atoms/bonds/polyhedra, keep frame/axes/BZ.
+        scene.showStructure = state.showStructure
         scene.measurementMode = state.measurementMode
         // Scene-derived mirrors flow state <- scene purely to keep the sidebar
         // indicators in sync; guarded above against re-entrant onChange.
