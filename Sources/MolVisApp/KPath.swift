@@ -27,12 +27,16 @@ extension KPath {
         var out: [SIMD3<Float>] = []
         for i in 0..<pts.count - 1 {
             let n = max(2, total > 0 ? Int(round(Float(perSeg) * segLens[i] / total)) : perSeg)
-            for j in 0..<n {
+            // Half-open segments: emit the start point only for the first
+            // segment; subsequent segments skip j=0 (the shared endpoint that
+            // closed the previous segment). No trailing append — the last
+            // segment's j=n-1 already lands on pts.last.
+            let j0 = (i == 0) ? 0 : 1
+            for j in j0..<n {
                 let t = Float(j) / Float(n - 1)
                 out.append(pts[i] * (1 - t) + pts[i + 1] * t)
             }
         }
-        out.append(pts.last!)
         return out
     }
 }

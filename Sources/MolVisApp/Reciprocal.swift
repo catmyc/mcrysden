@@ -42,11 +42,14 @@ extension Cell {
 enum Lattice {
     /// Fractional coordinates of Cartesian `atoms` in the conventional cell.
     static func fractional(_ atoms: [SIMD3<Float>], cell: Cell) -> [SIMD3<Float>] {
-        let inv = simd_float3x3(rows: [cell.a, cell.b, cell.c]).inverse
-        guard abs(simd_float3x3(rows: [cell.a, cell.b, cell.c]).determinant) > 1e-9 else {
+        // Fractional f solves p = f_a*a + f_b*b + f_c*c, i.e. basis vectors as
+        // COLUMNS (not rows) of the inverted matrix. Rows would only be correct
+        // for orthogonal (cubic) cells; this is right for any lattice.
+        let m = simd_float3x3(columns: (cell.a, cell.b, cell.c))
+        guard abs(m.determinant) > 1e-9 else {
             return atoms.map { _ in SIMD3<Float>.zero }
         }
-        return atoms.map { inv * $0 }
+        return atoms.map { m.inverse * $0 }
     }
 
     /// Unique fractional offsets (mod 1, excluding ~0) that describe the basis.

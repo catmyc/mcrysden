@@ -22,7 +22,9 @@ enum DisplayMode: String, Codable, CaseIterable {
     var is2D: Bool { self == .line2D || self == .point2D || self == .ballStick2D }
 }
 
-struct SuperCell: Codable { var n1: Int = 1; var n2: Int = 1; var n3: Int = 1
+// Equatable is synthesized (all fields are Int) so replication DIRECTION is
+// compared, not just total count — 2×1×1 vs 1×2×1 must differ.
+struct SuperCell: Codable, Equatable { var n1: Int = 1; var n2: Int = 1; var n3: Int = 1
     var total: Int { n1 * n2 * n3 }
 }
 

@@ -104,6 +104,10 @@ final class App: NSObject, NSApplicationDelegate {
                 wc.loadFile(scene, from: inURL, format: format, frameIndex: frame)
                 if let camera {
                     wc.camera = camera
+                    // Sync the orthographic toggle from the RESTORED camera (not the
+                    // scene.camera that syncFromScene already mirrored), else the
+                    // next sidebar touch re-syncs projection from a stale flag.
+                    wc.state.orthographic = !camera.perspective
                     wc.setNeedsRender()
                 }
             } catch {
@@ -233,7 +237,7 @@ final class App: NSObject, NSApplicationDelegate {
           mcrysden <file.xsf|xyz|pdb|axsf|pwi>      # open a structure
           mcrysden <file> <state.mvis-state>         # open with saved state
           mcrysden <file> <state> --export out.png  # headless raster render
-          mcrysden <file> <state> --export out.pdf  # vector render (pdf, svg, eps, ps)
+          mcrysden <file> <state> --export out.pdf  # raster render in a vector container (pdf, svg, eps, ps)
           mcrysden --help
         Input formats are chosen by extension (.xsf .xyz .pdb .axsf .pwi .pwo .in
         .inp .out .cif .poscar .contcar .vasp).

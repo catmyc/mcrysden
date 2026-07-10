@@ -19,7 +19,7 @@ final class SceneTests: XCTestCase {
     func testAXSFFrameSelection() throws {
         let s0 = try Parser.load(fixture("si.latch.axsf"))
         XCTAssertEqual(s0.atoms.count, 2)
-        let s1 = try Parser.load(fixture("si.latch.axsf"), frameIndex: 1)
+        let s1 = try Parser.load(fixture("si.latch.axsf"), as: nil, frameIndex: 1)
         XCTAssertEqual(s1.atoms.count, 2)
         XCTAssertNotEqual(s1.atoms[0].coord.x, s0.atoms[0].coord.x, accuracy: 0.0001)
     }

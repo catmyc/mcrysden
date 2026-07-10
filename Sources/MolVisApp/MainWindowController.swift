@@ -112,7 +112,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let saved = state.onChange
         state.onChange = nil
         state.frameIndex = frameIndex
-        state.frameCount = url.map { Parser.frameCount($0) } ?? 1
+        state.frameCount = url.map { Parser.frameCount($0, as: format) } ?? 1
         state.isPlaying = false
         state.onChange = saved
         stopPlayback()
@@ -426,9 +426,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.backgroundType = state.backgroundType
         scene.background = state.backgroundHex
         scene.backgroundBottom = state.backgroundBottomHex
-        // supercell
+        // supercell — compare the (n1,n2,n3) tuple, not just total, so changing
+        // replication DIRECTION (e.g. 2×1×1 → 1×2×1, same total) re-widen happens.
         let sc = SuperCell(n1: state.n1, n2: state.n2, n3: state.n3)
-        if sc.total != scene.superCell.total {
+        if sc != scene.superCell {
             scene = scene.widenSuperCell(sc)
         }
         // slab — build the Slab then run the scene through applySlab so the
@@ -486,7 +487,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// from sourceURL via Parser.load(frameIndex:).
     private func reloadFrame(_ index: Int) {
         guard let url = sourceURL, index >= 0, index < state.frameCount else { return }
-        guard let loaded = try? Parser.load(url, frameIndex: index) else {
+        guard let loaded = try? Parser.load(url, frameIndex: index, as: forcedFormat) else {
             print("[mcrysden] failed to load frame \(index)"); return
         }
         // Start from the freshly parsed frame but carry the LIVE UI state over

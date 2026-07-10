@@ -66,9 +66,12 @@ enum StateStore {
         if let mode = obj["displayMode"] as? String {
             scene.displayMode = DisplayMode(rawValue: mode) ?? .ballStick
         }
-        // supercell [n1,n2,n3].
+        // supercell [n1,n2,n3]. Widen into atoms (not a bare field) so a saved
+        // supercell is actually rendered — otherwise the restored view would show
+        // only the base cell. baseAtoms is populated by Scene(loaded:) so the
+        // expansion has source atoms to replicate.
         if let sc = obj["supercell"] as? [Int], sc.count == 3 {
-            scene.superCell = SuperCell(n1: sc[0], n2: sc[1], n3: sc[2])
+            scene = scene.widenSuperCell(SuperCell(n1: sc[0], n2: sc[1], n3: sc[2]))
         }
         // slab (optional).
         if let slab = obj["slab"] as? [String: Any],

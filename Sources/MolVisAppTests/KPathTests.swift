@@ -18,11 +18,21 @@ final class KPathTests: XCTestCase {
     func testExportQE() {
         let path = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
                                   KPoint(SIMD3(0.5,0,0), "X"),
-                                  KPoint(SIMD3(0.5,0.5,0), "M")], pointsPerSegment: 4)
+                                  KPoint(SIMD3(0.5,0.5,0), "M")], pointsPerSegment: 10)
         let out = KPathExport.qeKPointsCrystal(path)
         let lines = out.split(separator: "\n").filter { !$0.isEmpty }
-        XCTAssertGreaterThan(lines.dropFirst().count, 3, "expected >3 interpolated points")
+        // count line + interpolated points; with interior samples we expect many.
+        XCTAssertGreaterThan(lines.dropFirst().count, 3, "expected several interpolated points")
         XCTAssertTrue(out.contains("0.500"), "export should contain the X coordinate")
+        // The F5 fix: no adjacent duplicate k-points (shared segment endpoints
+        // emitted once). Verify directly on the interpolated list.
+        let pts = path.interpolated()
+        for i in 1..<pts.count {
+            XCTAssertNotEqual(pts[i], pts[i-1], "adjacent k-points must not duplicate (F5)")
+        }
+        // All special points are present in order.
+        XCTAssertEqual(pts.first, SIMD3(0,0,0))
+        XCTAssertEqual(pts.last, SIMD3(0.5,0.5,0))
     }
 
     func testExportKPF() {

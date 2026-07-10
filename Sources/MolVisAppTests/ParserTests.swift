@@ -391,7 +391,7 @@ final class ParserTests: XCTestCase {
         // Two ATOMIC_POSITIONS blocks -> two frames.
         XCTAssertEqual(Parser.frameCount(url), 2)
         // Last frame is the "Begin final coordinates" geometry.
-        let final = try Parser.load(url, frameIndex: 1)
+        let final = try Parser.load(url, as: nil, frameIndex: 1)
         XCTAssertEqual(final.atoms.count, 2)
         XCTAssertTrue(final.isCrystal)
         // Final frame: CELL_PARAMETERS(angstrom)=5.43 cube, ATOMIC_POSITIONS(angstrom).
@@ -408,8 +408,8 @@ final class ParserTests: XCTestCase {
         // which overrides the crystal-axes lattice with CELL_PARAMETERS). They
         // differ in coordinate UNITS: frame 0 = crystal (.25*5.43), frame 1 =
         // angstrom (1.3575). A unit bug would blow up frame 1.
-        let f0 = try Parser.load(url, frameIndex: 0)
-        let f1 = try Parser.load(url, frameIndex: 1)
+        let f0 = try Parser.load(url, as: nil, frameIndex: 0)
+        let f1 = try Parser.load(url, as: nil, frameIndex: 1)
         XCTAssertEqual(f0.cell!.a.x, 5.43, accuracy: 0.001, "frame0 cell = angstrom 5.43")
         // frame 0 crystal coords: (.25,.25,.25)*5.43 = 1.3575
         XCTAssertEqual(f0.atoms[1].coord.x, 1.3575, accuracy: 0.001)

@@ -53,7 +53,9 @@ enum Parser {
     /// GUI open path and the `--frame` CLI flag.
     static func load(_ url: URL, as format: ParseFormat? = nil, frameIndex: Int = 0) throws -> LoadedScene {
         if frameIndex > 0 {
-            return try load(url, frameIndex: frameIndex)
+            // Honor a forced format for animated files too (e.g. a renamed
+            // .pwo passed as --pwo --frame 1); otherwise fall back to extension.
+            return try load(url, frameIndex: frameIndex, as: format)
         }
         return try load(url, as: format)
     }
@@ -101,24 +103,28 @@ enum Parser {
     /// Number of animation frames in an animated file: ANIMSTEPS for AXSF, or
     /// ATOMIC_POSITIONS-block count for QE .pwo output. 0 for any single-frame
     /// / non-animated / unreadable file. Lets the GUI decide whether to show
-    /// the playback controls at all.
-    static func frameCount(_ url: URL) -> Int {
+    /// the playback controls at all. `format` forces the parser when the
+    /// extension is ambiguous or was renamed.
+    static func frameCount(_ url: URL, as format: ParseFormat? = nil) -> Int {
         let cPath = url.path.cString(using: .utf8)!
-        switch ParseFormat(ext: url.pathExtension.lowercased()) {
+        let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
+        switch effective {
         case .pwo: return Int(molenv_pwo_frame_count(cPath))
         default: return Int(molenv_axsf_frame_count(cPath))
         }
     }
 
-    static func load(_ url: URL, frameIndex: Int) throws -> LoadedScene {
+    static func load(_ url: URL, frameIndex: Int, as format: ParseFormat? = nil) throws -> LoadedScene {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
         let cPath = url.path.cString(using: .utf8)!
-        // Choose the per-format frame loader. AXSF is the original animated
-        // format; QE .pwo output adds ionic steps as frames via parse_pwo.
+        // Choose the per-format frame loader honoring a forced format. AXSF is
+        // the original animated format; QE .pwo output adds ionic steps as
+        // frames via parse_pwo.
+        let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
         let scene: UnsafeMutablePointer<MolEnvScene>?
-        switch ParseFormat(ext: url.pathExtension.lowercased()) {
+        switch effective {
         case .pwo: scene = parse_pwo(cPath, Int32(frameIndex))
         case .axsf: scene = parse_axsf(cPath, Int32(frameIndex))
         default: scene = parse_axsf(cPath, Int32(frameIndex))
