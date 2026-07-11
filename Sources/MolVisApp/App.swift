@@ -249,7 +249,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.1"
+    static let appVersion = "1.1.2"
 
     static func printHelp() {
         print("""
