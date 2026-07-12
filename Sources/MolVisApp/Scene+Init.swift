@@ -39,6 +39,7 @@ extension Scene {
         self.scalarField = loaded.scalarField
         self.fermiSurface = loaded.fermiSurface
         self.bandStructure = loaded.bandStructure
+        self.grid2D = loaded.grid2D
         self.baseAtoms = loaded.atoms
         self.baseBonds = loaded.bonds
     }

@@ -84,6 +84,14 @@ struct SideBar: View {
                     Toggle("Show Fermi Surface", isOn: $state.showFermiSurface)
                 }
             }
+            // --- Color plane (2D scalar grid) --------------------------------
+            // Shown only when the loaded file carried a DATAGRID_2D block. The
+            // colormap + contour view swaps in for the 3D canvas while toggled on.
+            if state.hasGrid2D {
+                Section("Color Plane") {
+                    Toggle("Show Color Plane", isOn: $state.showColorPlane)
+                }
+            }
             // --- k-path (crystal only): Brillouin-zone overlay + band path. -----
             // The scene exposes cell + base atoms; the controller builds the
             // default high-symmetry path and writes the chosen export via a save

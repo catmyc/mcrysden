@@ -66,3 +66,54 @@ final class CellRenderDiag: XCTestCase {
         XCTAssertTrue(inside, "atoms should sit inside the cell-frame bounding box")
     }
 }
+
+// Draws the ColorPlaneView with a loaded 2D grid and asserts the colormap
+// actually renders: the frame must contain non-background pixels AND real
+// color variation (the field spans a wide range, so a viridis map is not flat).
+// This exercises the view end-to-end, not just the parser bridge.
+final class ColorPlaneDiag: XCTestCase {
+    func testColorPlaneRendersColormap() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let loaded = try Parser.load(dir.appendingPathComponent("Fixtures/mol-urea2D.xsf"))
+        guard let grid = loaded.grid2D else { throw Thrown.msg("no grid2D parsed") }
+
+        let w = 240, h = 240
+        let view = ColorPlaneView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        view.grid = grid.values
+        view.zLabel = grid.ident
+        view.contourLevels = [grid.minValue + (grid.maxValue - grid.minValue) * 0.5]
+
+        // Render the view into a bitmap context (same path the scaffold draw() uses).
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { throw Thrown.msg("no ctx") }
+        // ColorPlaneView.isFlipped == true; CGContext is not, so mirror so the
+        // height-preserving layout the view assumes matches what we read back.
+        ctx.translateBy(x: 0, y: CGFloat(h))
+        ctx.scaleBy(x: 1, y: -1)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+        view.draw(view.bounds)
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let data = ctx.data else { throw Thrown.msg("no pixels") }
+        let px = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        var nonBackground = 0
+        var distinctR = Set<UInt8>()
+        for i in stride(from: 0, to: w*h*4, by: 4) {
+            let r = px[i], g = px[i+1], b = px[i+2]
+            // The scaffold fills white first; colored (viridis) pixels differ.
+            if !(r > 235 && g > 235 && b > 235) { nonBackground += 1 }
+            distinctR.insert(r)
+        }
+        print("[colorplane] nonBackgroundPx=\(nonBackground) distinctR=\(distinctR.count)")
+        // The field spans a real range, so the colormap must paint a large area.
+        XCTAssertGreaterThan(nonBackground, w * h / 4,
+                             "color plane drew almost nothing (\(nonBackground) non-white px)")
+        // Viridis maps distinct values to distinct hues → many distinct red levels.
+        XCTAssertGreaterThan(distinctR.count, 8,
+                             "colormap was nearly flat (\(distinctR.count) distinct red levels)")
+    }
+}

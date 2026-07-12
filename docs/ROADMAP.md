@@ -53,12 +53,12 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 | 8 | **Orca `.out` reader** | `pbe.accOpt.AsF2-C2C2.out` via header sniff (ORCA banner; checked AFTER PWSCF marker) |
 | 9 | **FHI-aims / FHI98MD reader** | `GaAsSurface_coord.out` (lattice + species blocks; Bohr→Å) via 3-numeric-lattice-line sniff |
 | 5 | **Band-structure extraction** (QE `bands (ev):` k-point + eigenvalue blocks → line graph) | `CH3Rh111.out` (56 k-points × 69 bands via `--bands`); 2D Grapher (Fermi line, k-path, energy axes) swaps in for the 3D canvas |
+| 4 | **Color-plane / 2D-contour rendering** (DATAGRID_2D → viridis colormap + marching-squares contours; anisotropic dims; GUI toggle swaps canvas) | `mol-urea2D.xsf` (41×42 charge-density-difference plane); rendered to 56994 non-white px / 176 distinct hues |
 
 ### Remaining Tier A (still TODO)
 
 | # | Feature | Test fixtures on disk | Blocker / notes |
 |---|---------|-----------------------|-----------------|
-| 4 | **Color-plane / 2D-contour rendering** (slice a 3D field along a plane) | `mol-urea2D.xsf` (2D grid) | Needs a new slice renderer (field engine #1 exists). |
 | 10 | **Force / stress / energy readouts + force arrows** | `CH3Rh111.out` has per-atom forces, Total force, total energy | `Atom` stores no force vector — needs a struct change + readout + arrow rendering. |
 
 ### Tier B — needs another engine first

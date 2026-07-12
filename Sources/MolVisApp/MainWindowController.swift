@@ -11,6 +11,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let canvas: MetalView
     let labelOverlay: LabelOverlayView
     let bandGrapher: BandGrapherView    // 2D band-structure diagram (shown when bandStructure != nil)
+    let colorPlane: ColorPlaneView      // color-plane / 2D-contour overlay (shown when grid2D != nil and toggled)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
     let renderer: Renderer
@@ -44,6 +45,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         bandGrapher.autoresizingMask = [.width, .height]
         bandGrapher.isHidden = true
         canvas.addSubview(bandGrapher)
+        colorPlane = ColorPlaneView(frame: .zero)
+        colorPlane.autoresizingMask = [.width, .height]
+        colorPlane.isHidden = true
+        canvas.addSubview(colorPlane)
         let info = NSTextView(frame: .zero)
         info.isEditable = false
         info.isSelectable = true
@@ -119,6 +124,18 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if hasBands {
             bandGrapher.bandStructure = scene.bandStructure
             bandGrapher.highSymmetryIndices = []   // parsed labels go here once k-labels are read
+        }
+        // A 2D scalar grid: the color-plane overlay is available. On load we push
+        // the grid data and show the plane by default (the canvas is hidden so the
+        // plane fills the viewport); the sidebar toggle drives showColorPlane.
+        if let grid = scene.grid2D {
+            colorPlane.grid = grid.values
+            colorPlane.zLabel = grid.ident
+            colorPlane.contourLevels = defaultContourLevels(for: grid)
+            if state.showColorPlane { colorPlane.isHidden = false; canvas.isHidden = true }
+        } else {
+            colorPlane.grid = nil
+            if state.showColorPlane { colorPlane.isHidden = true }
         }
         // Initialise the animation controls WITHOUT triggering onChange (which
         // would otherwise try to reload frame 0 on top of this fresh load).
@@ -432,6 +449,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Fermi surface: written unconditionally; the renderer gates the draw on
         // `scene.fermiSurface != nil`.
         scene.showFermiSurface = state.showFermiSurface
+        // Color-plane overlay: a 2D grid may coexist with the 3D structure. The
+        // canvas shows EITHER the 3D scene or the color plane, never both — so the
+        // plane wins only while the toggle is on AND a grid is present.
+        let showPlane = state.showColorPlane && scene.grid2D != nil
+        colorPlane.isHidden = !showPlane
+        canvas.isHidden = showPlane || scene.bandStructure != nil
+        if showPlane { colorPlane.needsDisplay = true }
         scene.measurementMode = state.measurementMode
         // Scene-derived mirrors flow state <- scene purely to keep the sidebar
         // indicators in sync; guarded above against re-entrant onChange.
@@ -495,6 +519,16 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 print("[mcrysden] k-path export failed: \(error)")
             }
         }
+    }
+
+    /// Pick a small set of iso-contour levels spanning the grid's value range,
+    /// for the color-plane's marching-squares contour trace. Six levels keeps the
+    /// plot legible without overcrowding it.
+    private func defaultContourLevels(for grid: Grid2D) -> [Float] {
+        let lo = grid.minValue, hi = grid.maxValue
+        guard hi > lo else { return [] }
+        let n = 6
+        return (1..<n).map { i in lo + (hi - lo) * Float(i) / Float(n) }
     }
 
     /// Guards the main syncFromState() path while reloadFrame assigns

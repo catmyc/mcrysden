@@ -19,6 +19,22 @@ import simd
 ///     origin + vec[0]*i/(nx-1) + vec[1]*j/(ny-1) + vec[2]*k/(nz-1).
 /// This is exactly the XCrySDen `DATAGRID_3D` convention (`struct DATAGRID`
 /// in `struct.h`: `orig`, `vec[3][3]`, `n[3]`).
+/// A rectilinear 2D scalar grid (a `DATAGRID_2D` block read from an XSF file).
+/// This is the color-plane source: `values` is row-major `values[row][col]`,
+/// `row` == the slow axis (C index j), `col` == the fast axis (C index i). The
+/// grid lives in a plane of world (Cartesian, Å) space spanned by `vec[0..1]`
+/// from `origin`; the sample at (col,row) sits at
+///     origin + vec[0]*col/(cols-1) + vec[1]*row/(rows-1).
+struct Grid2D: Codable {
+    let cols: Int, rows: Int
+    let origin: SIMD3<Float>
+    let vec: [SIMD3<Float>]          // [col-axis, row-axis] (2 span vectors)
+    let values: [[Float]]            // [row][col] — matches ColorPlaneView.grid
+    let minValue: Float
+    let maxValue: Float
+    let ident: String                // human-readable label from the block header
+}
+
 struct ScalarField: Codable {
     let nx: Int, ny: Int, nz: Int
     let origin: SIMD3<Float>

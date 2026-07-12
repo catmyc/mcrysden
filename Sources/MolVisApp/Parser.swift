@@ -24,6 +24,7 @@ struct LoadedScene {
     var scalarField: ScalarField?
     var fermiSurface: FermiSurface?
     var bandStructure: BandStructure?
+    var grid2D: Grid2D?
 }
 
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
@@ -277,7 +278,14 @@ enum Parser {
         }
         out.atoms = readAtoms(s)
         out.bonds = readBonds(s)
-        out.scalarField = readGrid(s)
+        // A DATAGRID block is either 3D (a volumetric ScalarField) or 2D (a flat
+        // color-plane grid). The C parser records which in g.dim; bridge each to
+        // its own field so the right renderer/overlay wins.
+        if let gPtr = s.grid {
+            let dim = gPtr.pointee.dim
+            if dim == 2 { out.grid2D = readGrid2D(gPtr.pointee) }
+            else { out.scalarField = readGrid(gPtr.pointee) }
+        }
         if s.is_crystal != 0 {
             let cell = withUnsafePointer(to: &s.cell) { ptr in
                 ptr.withMemoryRebound(to: Float.self, capacity: 9) {
@@ -313,12 +321,10 @@ enum Parser {
         return buf.map { Bond(i: Int($0.i), j: Int($0.j)) }
     }
 
-    /// Bridge a C `MolEnvGrid` (a DATAGRID block) into a Swift `ScalarField`.
-    /// Returns nil when the scene carries no grid. The grid index layout in C is
-    /// x-fastest (i + nx*(j + ny*k)), matching `ScalarField.index`.
-    private static func readGrid(_ s: MolEnvScene) -> ScalarField? {
-        guard let gPtr = s.grid else { return nil }
-        let g = gPtr.pointee
+    /// Bridge a C `MolEnvGrid` (a 3D `DATAGRID_3D` block) into a Swift
+    /// `ScalarField`. The grid index layout in C is x-fastest (i + nx*(j + ny*k)),
+    /// matching `ScalarField.index`.
+    private static func readGrid(_ g: MolEnvGrid) -> ScalarField? {
         guard let valuesPtr = g.values else { return nil }
         // C fixed-size arrays surface in Swift as tuples, so fields like `g.n`
         // and `g.orig` are addressed by `.0/.1/.2` rather than subscripts.
@@ -334,6 +340,35 @@ enum Parser {
         ]
         return ScalarField(nx: nx, ny: ny, nz: nz, origin: orig, vec: vec,
                            values: values, minValue: g.minval, maxValue: g.maxval)
+    }
+
+    /// Bridge a C `MolEnvGrid` whose `dim == 2` (a `DATAGRID_2D` block) into a
+    /// Swift `Grid2D` for the color-plane overlay. The 2D grid is stored in C as
+    /// nx*ny (nz==1), x-fastest; we reshape it to row-major `values[row][col]`.
+    private static func readGrid2D(_ g: MolEnvGrid) -> Grid2D? {
+        guard let valuesPtr = g.values else { return nil }
+        let cols = Int(g.n.0), rows = Int(g.n.1)
+        guard cols > 0, rows > 0 else { return nil }
+        let flat = UnsafeBufferPointer(start: valuesPtr, count: cols * rows).map { $0 }
+        var values: [[Float]] = []
+        values.reserveCapacity(rows)
+        for r in 0..<rows {
+            let start = r * cols
+            values.append(Array(flat[start..<start + cols]))
+        }
+        let orig = SIMD3<Float>(g.orig.0, g.orig.1, g.orig.2)
+        let vec = [
+            SIMD3<Float>(g.vec.0.0, g.vec.0.1, g.vec.0.2),
+            SIMD3<Float>(g.vec.1.0, g.vec.1.1, g.vec.1.2),
+        ]
+        // C fixed-size char arrays surface as tuples; rebind to read a C string.
+        var g = g
+        let ident = withUnsafePointer(to: &g.ident) { ptr in
+            String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+        }
+        return Grid2D(cols: cols, rows: rows, origin: orig, vec: vec,
+                      values: values, minValue: g.minval, maxValue: g.maxval,
+                      ident: ident)
     }
 
     // Gaussian "cube" format (Gaussian, Q-Chem, ...): a text header in Bohr

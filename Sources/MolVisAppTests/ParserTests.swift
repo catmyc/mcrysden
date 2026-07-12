@@ -531,4 +531,28 @@ final class ParserTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(d[i], d[i - 1], "k-distances not monotonic at \(i)")
         }
     }
+
+    // An XSF file carrying a `DATAGRID_2D` block must bridge to a `Grid2D` (not a
+    // 3D ScalarField): 41 cols x 42 rows of charge-density-difference values, a
+    // real span-vector plane, and a non-trivial value range for the colormap.
+    func testGrid2DParse() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/mol-urea2D.xsf")
+        let loaded = try Parser.load(url)
+        guard let grid = loaded.grid2D else {
+            return XCTFail("no grid2D parsed from DATAGRID_2D fixture")
+        }
+        XCTAssertNil(loaded.scalarField, "a 2D grid must not also become a ScalarField")
+        XCTAssertEqual(grid.cols, 41, "expected 41 grid columns")
+        XCTAssertEqual(grid.rows, 42, "expected 42 grid rows")
+        XCTAssertEqual(grid.values.count, 42, "row-major values must have 42 rows")
+        XCTAssertEqual(grid.values.first?.count, 41, "each row must have 41 columns")
+        // The grid spans a real plane in world space (non-degenerate span vectors).
+        XCTAssertEqual(grid.vec.count, 2, "Grid2D carries two span vectors")
+        let zero = grid.vec[0] * 0
+        XCTAssertTrue(grid.vec[0] != zero || grid.vec[1] != zero, "span vectors must be non-zero")
+        // Value range must be non-trivial so the colormap has something to show.
+        XCTAssertGreaterThan(grid.maxValue, grid.minValue, "flat field is not a useful colormap")
+        XCTAssertFalse(grid.ident.isEmpty, "grid ident label should be populated")
+    }
 }

@@ -162,6 +162,10 @@ struct Scene: Codable {
     /// carried `bands (ev):` data (QE PWscf output). Gated in the UI on its
     /// presence; when set, the 2D Grapher replaces the 3D canvas.
     var bandStructure: BandStructure?
+    /// An optional 2D scalar grid (a `DATAGRID_2D` block), the color-plane source.
+    /// Gated in the UI on its presence; when the color-plane is toggled on, the
+    /// 2D ColorPlaneView replaces the 3D canvas with a value→color map + contours.
+    var grid2D: Grid2D?
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

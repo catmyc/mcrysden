@@ -161,20 +161,37 @@ static int atom_line_p(const char *line) {
     return (c>='0'&&c<='9') || c=='+' || c=='-';
 }
 
+/* True if `line` (first whitespace-delimited token, uppercased) opens a DATAGRID
+   block in any of the forms parse_xsf's scanner recognizes. Lets the ATOMS branch
+   hand a trailing grid to read_datagrid_block without the held line being lost
+   into the trailing scan (which would mis-position the cursor and fail the rigid
+   comment-then-ident read). */
+static int is_datagrid_opener(const char *line, char *tok) {
+    if (first_tok(line, tok, 64) == 0) return 0;
+    return strncmp(tok,"BEGIN_DATAGRID",14)==0 ||
+           strncmp(tok,"DATAGRID_",8)==0 ||
+           strcmp(tok,"DATAGRID_3D")==0 || strcmp(tok,"DATAGRID_2D")==0 ||
+           strcmp(tok,"DATAGRID3D")==0 || strcmp(tok,"DATAGRID2D")==0 ||
+           strncmp(tok,"BEGIN_BLOCK_DATAGRID",20)==0;
+}
+
 /* Read a single DATAGRID block's body. On entry `fp` is positioned right after
    the BEGIN_BLOCK_DATAGRID_3D/2D line (the caller consumes that keyword). The
    body is:
         <comment line>
-        BEGIN_DATAGRID_3D_<ident>   (or _2D)
-        nx ny nz
+        BEGIN_DATAGRID_3D_<ident>   (or _2D; also the bare form without BEGIN_)
+        nx ny [nz]                 (nz for 3D; 2D writes only nx ny)
         ox oy oz                   (origin)
         v0x v0y v0z                (i-axis span)
         v1x v1y v1z                (j-axis span)
-        v2x v2y v2z                (k-axis span; for 2D == 0,0,0)
+        v2x v2y v2z                (k-axis span; 3D only — 2D spans a plane)
         <nx*ny*nz floats, x-fastest>
         END_DATAGRID_3D
-   Returns 0 and fills `g` on success, -1 on failure (error set). The grid is left
-   in `g` as-is on failure (caller frees in molenv_scene_free). */
+   The vector count is driven by g->dim: a 2D grid writes two span vectors (it
+   spans a plane) and the value stream follows immediately after, so an
+   unconditional 3-vector read would mis-align the values. Returns 0 and fills
+   `g` on success, -1 on failure (error set). The grid is left in `g` as-is on
+   failure (caller frees in molenv_scene_free). */
 static int read_datagrid_block(FILE *fp, MolEnvGrid *g, const char *path, int *ln) {
     char line[256], tok[64];
     memset(g, 0, sizeof(*g));
@@ -186,13 +203,21 @@ static int read_datagrid_block(FILE *fp, MolEnvGrid *g, const char *path, int *l
     snprintf(g->ident, sizeof(g->ident), "%.*s", (int)(sizeof(g->ident)-1), line);
     g->ident[strcspn(g->ident,"\r\n")] = '\0';
 
-    /* BEGIN_DATAGRID_3D_<ident> */
+    /* ident line: "BEGIN_DATAGRID_3D_<ident>" (XCrySDen's own form) or the bare
+       "DATAGRID_3D_<ident>"/"DATAGRID_2D_<ident>" some generators emit. Accept
+       both by stripping a leading "BEGIN_" if present. */
     if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
     (*ln)++;
-    if (first_tok(line, tok, sizeof(tok))==0 || strncmp(tok,"BEGIN_DATAGRID",14)!=0) {
-        set_error(path,*ln,"expected BEGIN_DATAGRID_3D"); return -1;
+    if (first_tok(line, tok, sizeof(tok))==0) { set_error(path,*ln,"expected DATAGRID ident line"); return -1; }
+    const char *id = tok;
+    if (strncmp(tok,"BEGIN_",6)==0) id = tok + 6;
+    /* Match only the "DATAGRID_" prefix: the ident token continues with the
+       user's label (e.g. "DATAGRID_2D_Charge_Density_Difference"), so a fixed-
+       width compare of the whole literal would fail past the dim digit. */
+    if (strncmp(id,"DATAGRID_",9)!=0) {
+        set_error(path,*ln,"expected DATAGRID_3D/DATAGRID_2D ident line"); return -1;
     }
-    if (strstr(tok,"_2D")!=0) g->dim = 2;
+    g->dim = (id[9]=='2') ? 2 : 3;   /* "DATAGRID_2D" vs "DATAGRID_3D" */
 
     /* dimensions */
     if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
@@ -211,8 +236,10 @@ static int read_datagrid_block(FILE *fp, MolEnvGrid *g, const char *path, int *l
         set_error(path,*ln,"malformed DATAGRID origin"); return -1;
     }
 
-    /* three span vectors */
-    for (int ax=0; ax<3; ax++) {
+    /* span vectors: two for a 2D grid (it spans a plane), three for 3D. Reading
+       three unconditionally would consume the first value line of a 2D grid. */
+    int nvec = (g->dim == 2) ? 2 : 3;
+    for (int ax=0; ax<nvec; ax++) {
         if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
         (*ln)++;
         if (sscanf(line,"%f %f %f",&g->vec[ax][0],&g->vec[ax][1],&g->vec[ax][2])<3) {
@@ -336,6 +363,18 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             free(*atoms);
             *atoms = at; *natoms = na;
             saw_primcoord = 1;
+            // A DATAGRID block can follow the atoms (e.g. a molecule's color-plane
+            // grid, DATAGRID_2D after ATOMS). The held line holds its opener; capture
+            // it here with the cursor on the comment line — exactly where the grid
+            // path below expects to be — so the trailing scan isn't left hunting
+            // from a mis-positioned cursor. Without this the rigid comment-then-ident
+            // read fails and the 2D grid is silently lost.
+            if (have_held && is_datagrid_opener(held, tok) && gridOut && *gridOut == NULL) {
+                MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
+                if (!g) { set_error(path,*ln,"out of memory for DATAGRID"); return -1; }
+                if (read_datagrid_block(fp, g, path, ln) < 0) { free(g); return -1; }
+                *gridOut = g;
+            }
             break;
         }
         if (strncmp(tok,"BEGIN_DATAGRID",14)==0 ||

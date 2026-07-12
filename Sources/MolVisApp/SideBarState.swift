@@ -59,6 +59,12 @@ final class SideBarState: ObservableObject {
     /// Toggle the Fermi-surface overlay. Synced to scene.showFermiSurface in
     /// syncFromState(); meaningful only when hasFermiSurface is true.
     @Published var showFermiSurface: Bool = true { didSet { onChange?() } }
+    /// True when a 2D scalar grid (DATAGRID_2D) is present — the sidebar gates the
+    /// Color Plane section on this so structure-only files show no empty controls.
+    var hasGrid2D: Bool = false
+    /// Toggle the color-plane overlay. Synced in syncFromState(); when on, the
+    /// 2D ColorPlaneView replaces the 3D canvas. Meaningful only when hasGrid2D.
+    @Published var showColorPlane: Bool = true { didSet { onChange?() } }
     /// AXSF animation playback state. frameCount is 1 for non-animated files
     /// (the playback UI is hidden in that case). isPlaying drives a timer in
     /// MainWindowController; frameIndex advances it and reloads the frame.
@@ -118,6 +124,8 @@ final class SideBarState: ObservableObject {
         }
         hasFermiSurface = (scene.fermiSurface != nil)
         showFermiSurface = scene.showFermiSurface
+        hasGrid2D = (scene.grid2D != nil)
+        showColorPlane = scene.grid2D != nil   // default to shown when a grid is present
         onChange = saved
     }
 }
