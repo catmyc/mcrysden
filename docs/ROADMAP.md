@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-11 (v1.1.2 shipped)**.
+Last updated: **2026-07-12 (v1.1.3 shipped)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -39,41 +39,43 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [~] **Save-state menu item** — `StateStore.save` writer is implemented and load is wired to the CLI and headless export, but there is **no menu item or button** to trigger a save from the GUI. A one-line UI hook onto the existing writer.
 - [~] **`--pwo` / `--out` to AXSF conversion reuse** — `.pwo` already produces animation frames; could back a `pwo2xsf`-style command.
 
-## Next up — prioritized by available test fixtures
+## Tier A — implementation status
 
-Ranked so that every item can be **tested immediately** from example files that already exist on disk (project `Assets/` + the XCrySDen example suite under this machine's `metal_restruct_xcrysden/examples/`). Features with no local fixture are deferred further down.
+### Done in v1.1.3
 
-### Tier A — ready to test today (input files on hand)
+| # | Feature | Test fixtures verified on |
+|---|---------|---------------------------|
+| 1 | **Volumetric isosurface engine** (un-reject `DATAGRID_3D`/`2D` in XSF; marching cubes; iso-value slider; gradient normals; two-shell outside/inside surface) | `Assets/volumetric_grid.xsf` (rendered, frame-spanning), `CO_homo.xsf.gz`, `oxirane_homo.xsf.gz`, `mol-urea.xsf.gz`, `Si datagrid` render test |
+| 2 | **Gaussian `.cube` / `.g98` reader** | `N2O_homo+lumo.cube` (19×19×31 grid, 3 atoms, Bohr→Å) reuses the field buffer |
+| 3 | **Fermi-surface reader** (BXSF, multi-band shell at the Fermi level; `.gz` peeling) | `MgB2.bxsf` (3 bands, Fermi 0.523), `RhBulkFcc.bxsf` (negative vectors); PNG + PDF/SVG/EPS/PS export |
+| 6 | **WIEN2k `.struct` reader** | 24 files (Bohr→Å, fractional atoms, multi-position sites + rotation matrices) |
+| 7 | **CRYSTAL `.r1` reader** | 16 files (all crystal systems via space group → lattice params + angles; trigonal/hexagonal/monoclinic) |
+| 8 | **Orca `.out` reader** | `pbe.accOpt.AsF2-C2C2.out` via header sniff (ORCA banner; checked AFTER PWSCF marker) |
+| 9 | **FHI-aims / FHI98MD reader** | `GaAsSurface_coord.out` (lattice + species blocks; Bohr→Å) via 3-numeric-lattice-line sniff |
 
-| # | Feature | Test fixtures on disk | Notes |
-|---|---------|-----------------------|-------|
-| 1 | **Volumetric isosurface engine** (un-reject `DATAGRID_3D` in XSF; marching-cubes/tetrahedra; iso-value slider; gradient normals; transparency; clip) | `Assets/volumetric_grid.xsf` (3D Si charge density — already in the repo, currently rejected), `CO_homo.xsf.gz`, `CO_lumo.xsf.gz`, `oxirane_homo.xsf.gz`, `mol-urea.xsf.gz` (molecular orbitals), `mol-urea2D.xsf` (2D grid) | Biggest visual gap. The fixture in the repo makes the first milestone (parse a 3D grid into a float buffer) testable with a shipped file. |
-| 2 | **Gaussian `.cube` / `.g98` reader** | `N2O_homo+lumo.cube.gz`, `benzene.g98_out`, `benzene-6CH3-OCH3.g98` (+ reference script `g98cube.tcl`) | `.cube` is the lingua franca of volumetric chem data; reuses the field buffer from #1. |
-| 3 | **Fermi-surface reader** (BXSF binary, crop-to-Brillouin-zone, multi-surface) | `MgB2.bxsf.gz`, `RhBulkFcc.bxsf.gz` | Clean binary format; a 2-band case and a metallic bulk case. |
-| 4 | **Color-plane / 2D-contour rendering** (slice a 3D field along a plane) | `mol-urea2D.xsf` (2D grid), reference scripts `colorplane_animation.tcl`, `contours.tcl` | Falls out once the datagrid + field buffer from #1 exist. |
-| 5 | **Band-structure extraction** (QE k-point + eigenvalue block → line graph) | `CH3Rh111.out`, `EthAl001-2x2.out` both contain `bands (ev):` eigenvalue blocks | Needs a dedicated band reader (the `.pwo` parser reads geometry, not bands) plus a 2D line-graph layer. |
-| 6 | **WIEN2k `.struct` reader** | 24 files (`gaas.struct`, `si111.struct`, `cr2o3.struct`, `mos2.struct`, …) | Dominant solids DFT code; broad chemistry coverage. |
-| 7 | **CRYSTAL `.r1` reader** | 16 files (`Pt322`, `ZnS`, `corundum`, `graphite`, `rutile`, `calcite`, `urea`, `zro2`, …) | Periodic quantum-chem code. |
-| 8 | **Orca `.out` reader** | `pbe.accOpt.AsF2-C2C2.out.gz` | Key quantum-chem code; one sample to start. |
-| 9 | **FHI-aims / FHI98MD reader** | `GaAsSurface_coord.out` + `GaAs_inp.ini`, `GaAsSurface_inp.ini` | Format documentation bundled. |
-| 10 | **Force / stress / energy readouts + force arrows** | `CH3Rh111.out` carries per-atom `Forces acting on atoms`, `Total force`, `! total energy` | `Atom` stores no force field — needs a struct change + readout + arrow rendering. |
+### Remaining Tier A (still TODO)
+
+| # | Feature | Test fixtures on disk | Blocker / notes |
+|---|---------|-----------------------|-----------------|
+| 4 | **Color-plane / 2D-contour rendering** (slice a 3D field along a plane) | `mol-urea2D.xsf` (2D grid) | Needs a new slice renderer (field engine #1 exists). |
+| 5 | **Band-structure extraction** (QE k-point + eigenvalue block → line graph) | `CH3Rh111.out`, `EthAl001-2x2.out` contain `bands (ev):` blocks | Needs a dedicated band reader + a 2D line-graph (Grapher) layer. No graph layer exists yet. |
+| 10 | **Force / stress / energy readouts + force arrows** | `CH3Rh111.out` has per-atom forces, Total force, total energy | `Atom` stores no force vector — needs a struct change + readout + arrow rendering. |
 
 ### Tier B — needs another engine first
 
 | # | Feature | Blocker |
 |---|---------|---------|
-| 11 | **Density of states (DOS)** plot (total + projected) | Needs #5's band/DOS reader **and** the 2D Grapher layer. No local `projwfc`/`dos.x` output to test against (would have to be generated/downloaded). |
+| 11 | **Density of states (DOS)** plot (total + projected) | Needs #5's band/DOS reader **and** the 2D Grapher layer. No local `projwfc`/`dos.x` output. |
 
-### Tier C — no local test fixtures (capability / UI, validated by interaction)
+### Tier C — validated by interaction, not files
 
-These are real gaps but can't be driven from an example file; they're validated by operating the UI.
-- [ ] **Structure editing**: cut cluster/molecule; substitute / remove / insert / displace atoms; elastic cell deformation; multi-slab; undo-redo stack (ref `Tcl/menu.tcl`).
-- [ ] **On-screen bond distance labels** — live distance text above each bond (no code yet).
-- [ ] **Image/gradient background: image variant** — only `solid` + `gradient_top` exist; picture-background not implemented.
+- [ ] **Structure editing**: cut cluster/molecule; substitute/remove/insert/displace atoms; elastic cell deformation; multi-slab; undo-redo stack.
+- [ ] **On-screen bond distance labels** — live distance text above each bond.
+- [ ] **Image-background variant** — only `solid` + `gradient_top` exist.
 - [ ] **Print** of the view (`NSPrintOperation`).
 - [ ] **Stereo / anaglyph** rendering.
-- [ ] **Tcl scripting engine** — the `.xcrysden`/`.tcl` files are *output* (saved state / usage illustrations), so they can't re-run as test specs; validating an interpreter needs a written test suite.
-- [ ] **External-code converters** (`pwi2xsf`, `pwo2xsf`, `struct2xsf`, …) — the programs that produce XSF for formats mcrysden can't read natively.
+- [ ] **Tcl scripting engine** — validating an interpreter needs a written test suite.
+- [ ] **External-code converters** (`pwi2xsf`, `pwo2xsf`, `struct2xsf`, …).
 
 ## Reference: what XCrySDen implements
 
