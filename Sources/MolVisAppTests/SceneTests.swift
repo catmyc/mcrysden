@@ -77,6 +77,42 @@ final class SceneTests: XCTestCase {
         XCTAssertGreaterThan(mesh.triangleCount, 0)
     }
 
+    // WIEN2k .struct: parse lattice (Bohr->Ang) + fractional atoms into a crystal.
+    // Verified on the real GaAs (2 atoms, fcc) and Pt (1 atom, fcc) fixtures.
+    func testWIEN2kStructLoadsCrystal() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let gaas = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/gaas.struct"), as: .struct_))
+        XCTAssertTrue(gaas.isCrystal)
+        XCTAssertEqual(gaas.atoms.count, 2)
+        XCTAssertEqual(gaas.atoms[0].atomicNumber, 31)  // Ga
+        XCTAssertEqual(gaas.atoms[1].atomicNumber, 33)  // As
+        XCTAssertNotNil(gaas.cell)
+        // cubic fcc: a=b=c ~10.684 Bohr -> 5.654 Ang
+        let a = simd_length(gaas.cell!.a)
+        XCTAssertEqual(a, 10.684 * 0.52917721067, accuracy: 0.01)
+        // As sits at (¼,¼,¼) fractional -> cartesian (a/4)(1,1,1)
+        let asCart = gaas.atoms[1].coord
+        XCTAssertEqual(asCart.x, a / 4, accuracy: 0.01)
+        XCTAssertEqual(asCart.y, a / 4, accuracy: 0.01)
+        XCTAssertEqual(asCart.z, a / 4, accuracy: 0.01)
+
+        let pt = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/pt.struct"), as: .struct_))
+        XCTAssertEqual(pt.atoms.count, 1)
+        XCTAssertEqual(pt.atoms[0].atomicNumber, 78)  // Pt
+
+        // MoS2: site Mo MULT=2 (2 pos) + site S MULT=4 (4 pos) => 6 atoms total.
+        // The fixture has multiple position lines per site (the ATOM= line plus
+        // m-1 follow-ups), carried on unmarked "<i>:" lines.
+        let mos2 = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/mos2.struct"), as: .struct_))
+        XCTAssertTrue(mos2.isCrystal)
+        XCTAssertEqual(mos2.atoms.count, 6)
+        XCTAssertNotNil(mos2.cell)
+        let mos2Mo = mos2.atoms.filter { $0.atomicNumber == 42 }.count
+        let mos2S  = mos2.atoms.filter { $0.atomicNumber == 16 }.count
+        XCTAssertEqual(mos2Mo, 2)
+        XCTAssertEqual(mos2S, 4)
+    }
+
     // Fermi-surface BXSF: parse the Fermi energy + per-band grids, then build a
     // surface at the Fermi level. Verified on the real MgB2 fixture.
     func testBXSFParsesBandsAndFermiEnergy() throws {

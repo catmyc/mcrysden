@@ -9,7 +9,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     /// Force-format flags (take no value).
     private static let formatFlags: Set<String> =
-        ["--xsf", "--xyz", "--pdb", "--axsf", "--pwi", "--pwo", "--cif", "--poscar", "--bxsf"]
+        ["--xsf", "--xyz", "--pdb", "--axsf", "--pwi", "--pwo", "--cif", "--poscar", "--bxsf", "--struct"]
 
     /// Resolve a forced parser format from the CLI args, if any.
     private static func forcedFormat(from args: [String]) -> ParseFormat? {
@@ -22,6 +22,7 @@ final class App: NSObject, NSApplicationDelegate {
         if args.contains("--cif") { return .cif }
         if args.contains("--poscar") { return .poscar }
         if args.contains("--bxsf") { return .bxsf }
+        if args.contains("--struct") { return .struct_ }
         return nil
     }
 
@@ -196,7 +197,8 @@ final class App: NSObject, NSApplicationDelegate {
                                       .init(filenameExtension: "poscar")!,
                                       .init(filenameExtension: "contcar")!,
                                       .init(filenameExtension: "vasp")!,
-                                      .init(filenameExtension: "cube")!].compactMap { $0 }
+                                      .init(filenameExtension: "cube")!,
+                                      .init(filenameExtension: "struct")!].compactMap { $0 }
         panel.beginSheetModal(for: wc.window) { result in
             guard result == .OK, let url = panel.url else { return }
             do {
@@ -264,8 +266,9 @@ final class App: NSObject, NSApplicationDelegate {
           mcrysden <file> <state> --export out.pdf  # raster render in a vector container (pdf, svg, eps, ps)
           mcrysden --help
         Input formats are chosen by extension (.xsf .xyz .pdb .axsf .pwi .pwo .in
-        .inp .out .cif .poscar .contcar .vasp).
+        .inp .out .cif .poscar .contcar .vasp .cube .bxsf .struct).
         Override with a flag:  --xsf  --xyz  --pdb  --axsf  --pwi  --pwo  --cif  --poscar
+          --cube  --bxsf  --struct
         For animated files (AXSF ANIMSTEPS, or QE .pwo ionic steps), open a
         specific frame with:
           mcrysden file.pwo --frame N      # 0-based frame index

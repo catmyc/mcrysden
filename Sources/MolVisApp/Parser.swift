@@ -28,7 +28,7 @@ struct LoadedScene {
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext {
@@ -42,6 +42,7 @@ enum ParseFormat {
         case "poscar", "contcar", "vasp": self = .poscar
         case "cube": self = .cube
         case "bxsf": self = .bxsf
+        case "struct": self = .struct_
         default: return nil
         }
     }
@@ -82,6 +83,11 @@ enum Parser {
         if effective == .bxsf {
             return try loadBXSF(url)
         }
+        // WIEN2k .struct: a crystal structure in WIEN2k's own text layout — parsed
+        // in Swift (XCrySDen shells to an external struct2xsf for this format).
+        if effective == .struct_ {
+            return try loadWIEN2kStruct(url)
+        }
         let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
@@ -95,6 +101,7 @@ enum Parser {
         case .poscar: scene = parse_poscar(cPath)
         case .cube: scene = nil   // Gaussian cube is parsed in Swift (see loadCube)
         case .bxsf: scene = nil   // Fermi-surface BXSF is parsed in Swift (see loadBXSF)
+        case .struct_: scene = nil   // WIEN2k .struct is parsed in Swift (see loadWIEN2kStruct)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
@@ -247,6 +254,140 @@ enum Parser {
         return out
     }
 
+    /// WIEN2k .struct crystal structure. Layout (verified against XCrySDen's
+    /// struct2xsf and the 24-fixture WIEN2k example set):
+    ///   <title>
+    ///   <F|P|C>   LATTICE,NONEQUIV. ATOMS  <natoms>
+    ///   MODE OF CALC=RELA|NONREL|...
+    ///   <a> <b> <c> <alpha> <beta> <gamma>      (a,b,c in Bohr, angles degrees)
+    ///   [per atom:]
+    ///   ATOM= <i>: X=<x> Y=<y> Z=<z>          (fractional)
+    ///          MULT= <m>  ISPLIT= <s>
+    ///   <Element>   NPT= <> R0= <> RMT= <> Z: <Z>
+    ///   [optional 3x3 local-rotation matrix, 3 lines]
+    ///   [ <nsym> SYMMETRY OPERATIONS: ... ]
+    /// a,b,c are converted Bohr->Angstrom. Fractional atoms are cartesianized via
+    /// the cell; MULT replicates a site m times to consecutive atoms (all same Z).
+    private static func loadWIEN2kStruct(_ url: URL) throws -> LoadedScene {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        let lines = raw.components(separatedBy: "\n")
+        enum E: Error { case malformed(String) }
+        func tok(_ s: String) -> [String] {
+            s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        }
+        var idx = 0
+        func nextLine() -> String? { guard idx < lines.count else { return nil }; defer { idx += 1 }; return lines[idx] }
+
+        // title (first line, may be blank)
+        _ = nextLine()
+
+        // lattice line: "<F|P|C>   LATTICE,NONEQUIV. ATOMS  <nat>"
+        guard let latLine = nextLine() else { throw E.malformed("empty") }
+        let latToks = tok(latLine)
+        guard let natoms = latToks.last.flatMap(Int.init), natoms > 0 else {
+            throw E.malformed("bad atom count: \(latLine)")
+        }
+        _ = nextLine()   // MODE OF CALC=...
+
+        // lattice params
+        guard let pLine = nextLine() else { throw E.malformed("no cell") }
+        // WIEN2k's Fortran cell-param line can glue adjacent floats when a field
+        // overflows (e.g. "90.000000120.000000") and may run to several lines, so
+        // scan for the first 6 floats rather than whitespace-splitting.
+        func scanFloats(_ s: String) -> [Float] {
+            var out: [Float] = []
+            let pattern = #"[+-]?\d+\.?\d*(?:[eE][+-]?\d+)?"#
+            if let rx = try? NSRegularExpression(pattern: pattern) {
+                let ns = s as NSString
+                for m in rx.matches(in: s, range: NSRange(location:0, length:ns.length)) {
+                    if let v = Float(ns.substring(with: m.range)) { out.append(v) }
+                }
+            }
+            return out
+        }
+        var params = scanFloats(pLine)
+        while params.count < 6, let more = nextLine() { params += scanFloats(more) }
+        guard params.count >= 6 else { throw E.malformed("bad cell params") }
+        let (a, b, c) = (params[0], params[1], params[2])
+        let (alpha, beta, gamma) = (params[3], params[4], params[5])
+        let cell = Cell.fromLattice(a: a * b2a, b: b * b2a, c: c * b2a,
+                                    alpha: alpha, beta: beta, gamma: gamma)
+
+        // Read atom SITES. Each site:
+        //   "ATOM= <i>: X=.. Y=.. Z=.."   (or "Atom <i>: ...")  <- 1st position
+        //   MULT= <m>  ISPLIT= <s>
+        //   [m-1 further "<i>: X=.. Y=.. Z=.." position lines]  <- same site
+        //   <Element>  NPT=<> R0=<> RMT=<> Z: <Z>                 <- element
+        //   [optional LOCAL ROT MATRIX: 3 lines of 3 numbers]
+        // WIEN2k emits m distinct positions per site (the ATOM line + m-1 follow-ups);
+        // we emit each once. (MULT=1 => just the ATOM line.)
+        var atoms: [Atom] = []
+        func parseVal(_ key: String, _ t: [String]) -> Float? {
+            for (i, tok) in t.enumerated() where tok.hasPrefix(key) {
+                let rest = tok.dropFirst(key.count)
+                if let v = Float(rest) { return v }            // "X=0.333" (attached)
+                if rest.isEmpty, i + 1 < t.count {              // "X= .333" (space after =)
+                    return Float(t[i + 1])
+                }
+            }
+            return nil
+        }
+        func parseInt(_ key: String, _ t: [String]) -> Int? {
+            for i in 0..<t.count where t[i] == key && i+1 < t.count { return Int(t[i+1]) }
+            return nil
+        }
+        while let line = nextLine() {
+            let t = tok(line)
+            // site start: "ATOM= <i>:" / "Atom <i>:" (first position line)
+            let firstIsAtom = (!t.isEmpty && (t[0] == "ATOM=" || t[0] == "Atom" || t[0] == "ATOM"))
+            guard firstIsAtom, let x = parseVal("X=", t), let y = parseVal("Y=", t),
+                  let z = parseVal("Z=", t) else {
+                // not a site-start line (symmetry ops, stray text) -> skip
+                continue
+            }
+            var positions = [SIMD3<Float>(x, y, z)]
+            // MULT line directly follows the first position line
+            let mult = parseInt("MULT=", tok(nextLine() ?? "")) ?? 1
+            // read the remaining (m-1) position lines, each "<i>: X=.. Y=.. Z=.."
+            while positions.count < mult, let pline = nextLine() {
+                let pt = tok(pline)
+                if let px = parseVal("X=", pt), let py = parseVal("Y=", pt), let pz = parseVal("Z=", pt) {
+                    positions.append(SIMD3<Float>(px, py, pz))
+                }
+            }
+            // element + Z line
+            let elemLine = nextLine() ?? ""
+            let eTok = tok(elemLine)
+            var Z = 0
+            for (i, tk) in eTok.enumerated() where tk == "Z:" && i+1 < eTok.count {
+                Z = Int(Float(eTok[i+1]) ?? 0)   // "78.0" -> Float -> Int
+            }
+            let symbol = eTok.first ?? ""
+            // skip optional 3x3 rotation matrix (3 lines, each 3 pure numbers)
+            let saved = idx
+            var steps = 0
+            for _ in 0..<3 {
+                guard idx < lines.count, tok(lines[idx]).count == 3,
+                      tok(lines[idx]).compactMap({ Float($0) }).count == 3 else { break }
+                idx += 1; steps += 1
+            }
+            if steps != 3 { idx = saved }
+
+            if Z == 0 { Z = Table.z(symbol) }
+            let sym = symbol.isEmpty ? Table.id(Z) : symbol
+            for frac in positions {
+                atoms.append(Atom(coord: cell.cartesian(frac), atomicNumber: Z, label: sym))
+            }
+        }
+
+        var out = LoadedScene()
+        out.atoms = atoms
+        out.cell = cell
+        out.isCrystal = true
+        out.title = url.lastPathComponent
+        return out
+    }
+
     private static let b2a: Float = 0.52917721067
 
     private static func loadCube(_ url: URL) throws -> LoadedScene {
@@ -325,12 +466,22 @@ enum Parser {
     }
 }
 
-// Minimal element-symbol helper used by the cube reader (avoids ElementTable's
-// full API which needs the renderer).
+// Minimal element-symbol helper used by the cube + WIEN2k readers (avoids
+// ElementTable's full API which needs the renderer).
 enum Table {
     static func id(_ z: Int) -> String {
         let sym = ["H","He","Li","Be","B","C","N","O","F","Ne","Na","Mg","Al","Si","P","S","Cl","Ar",
                    "K","Ca","Sc","Ti","V","Cr","Mn","Fe","Co","Ni","Cu","Zn","Ga","Ge","As","Se","Br","Kr"]
         return (z >= 1 && z <= sym.count) ? sym[z-1] : "\(z)"
+    }
+    /// Parse an element symbol to atomic number; returns 0 if unknown.
+    static func z(_ s: String) -> Int {
+        let table: [String: Int] = [
+            "H":1,"HE":2,"LI":3,"BE":4,"B":5,"C":6,"N":7,"O":8,"F":9,"NE":10,"NA":11,"MG":12,
+            "AL":13,"SI":14,"P":15,"S":16,"CL":17,"AR":18,"K":19,"CA":20,"SC":21,"TI":22,
+            "V":23,"CR":24,"MN":25,"FE":26,"CO":27,"NI":28,"CU":29,"ZN":30,"GA":31,"GE":32,
+            "AS":33,"SE":34,"BR":35,"KR":36,"RB":37,"SR":38,"Y":39,"ZR":40,"NB":41,"MO":42
+        ]
+        return table[s.uppercased()] ?? 0
     }
 }

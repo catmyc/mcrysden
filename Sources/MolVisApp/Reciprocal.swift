@@ -31,6 +31,27 @@ extension Cell {
         let scale = Float(2.0 * Double.pi)
         return (a: inv.columns.0 * scale, b: inv.columns.1 * scale, c: inv.columns.2 * scale)
     }
+
+    /// Build the direct cell vectors from lattice parameters (a,b,c in Å, angles
+    /// alpha/beta/gamma in degrees). Standard convention: a along x, b in the xy
+    /// plane, c completing the right-handed system.
+    static func fromLattice(a: Float, b: Float, c: Float,
+                            alpha: Float, beta: Float, gamma: Float) -> Cell {
+        let ca = cos(alpha * .pi / 180), cb = cos(beta * .pi / 180), cg = cos(gamma * .pi / 180)
+        let sa = sin(alpha * .pi / 180)
+        let aVec = SIMD3<Float>(a, 0, 0)
+        let bVec = SIMD3<Float>(b * cg, b * sa, 0)
+        let cX = c * cb
+        let cY = c * (ca - cb * cg) / sa
+        let cZ = sqrt(max(0, c * c - cX * cX - cY * cY))
+        let cVec = SIMD3<Float>(cX, cY, cZ)
+        return Cell(a: aVec, b: bVec, c: cVec)
+    }
+
+    /// Cartesian position of a fractional coordinate (frac in [0,1)) using this cell.
+    func cartesian(_ frac: SIMD3<Float>) -> SIMD3<Float> {
+        return a * frac.x + b * frac.y + c * frac.z
+    }
 }
 
 // Centered-lattice handling.
