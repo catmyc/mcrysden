@@ -28,7 +28,7 @@ struct LoadedScene {
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext {
@@ -44,6 +44,7 @@ enum ParseFormat {
         case "bxsf": self = .bxsf
         case "struct": self = .struct_
         case "r1": self = .crystal
+        case "orca": self = .orca
         default: return nil
         }
     }
@@ -93,6 +94,12 @@ enum Parser {
         if effective == .crystal {
             return try loadCRYSCALr1(url)
         }
+        // Orca .out geometry-optimization log: parsed in Swift. Each optimization
+        // cycle is a CARTESIAN COORDINATES (ANGSTROEM) block => multi-frame; the
+        // single-frame path here returns the FINAL (last) geometry.
+        if effective == .orca {
+            return try loadOrca(url, frameIndex: -1)
+        }
         let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
@@ -108,6 +115,7 @@ enum Parser {
         case .bxsf: scene = nil   // Fermi-surface BXSF is parsed in Swift (see loadBXSF)
         case .struct_: scene = nil   // WIEN2k .struct is parsed in Swift (see loadWIEN2kStruct)
         case .crystal: scene = nil   // CRYSCAL .r1 is parsed in Swift (see loadCRYSCALr1)
+        case .orca: scene = nil   // Orca .out is parsed in Swift (see loadOrca)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
@@ -139,6 +147,7 @@ enum Parser {
         let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
         switch effective {
         case .pwo: return Int(molenv_pwo_frame_count(cPath))
+        case .orca: return orcaCycleCount(url)
         default: return Int(molenv_axsf_frame_count(cPath))
         }
     }
@@ -152,6 +161,11 @@ enum Parser {
         // the original animated format; QE .pwo output adds ionic steps as
         // frames via parse_pwo.
         let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
+        // Orca is parsed in Swift (its own multi-frame path) — route it before
+        // the C parsers so frameIndex reaches loadOrca.
+        if effective == .orca {
+            return try loadOrca(url, frameIndex: frameIndex)
+        }
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
         case .pwo: scene = parse_pwo(cPath, Int32(frameIndex))
@@ -597,4 +611,67 @@ enum Table {
         ]
         return table[s.uppercased()] ?? 0
     }
+}
+
+// Orca geometry-optimization(.out) log: a sequence of CARTESIAN COORDINATES
+// (ANGSTROEM) blocks, one per optimization cycle => multi-frame molecule. Each
+// atom line is "Symbol x y z" in Angstrom (Cartesian, no cell). Mirrors how QE
+// .pwo treats ionic steps as frames: frameIndex -1 => last (final) geometry,
+// 0..<count => that cycle's snapshot.
+enum OrcaParser {
+    private static let coordHeader = "CARTESIAN COORDINATES (ANGSTROEM)"
+    private static let coordSeparator = "---"
+
+    /// Count coordinate blocks (= optimization cycles).
+    static func cycleCount(_ url: URL) -> Int {
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return 0 }
+        return raw.components(separatedBy: "\n").filter { $0.contains(coordHeader) }.count
+    }
+
+    /// Parse one coordinate block into a molecule. frameIndex -1 => last block.
+    static func load(_ url: URL, frameIndex: Int) throws -> LoadedScene {
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
+            enum E: Error { case io }
+            throw E.io
+        }
+        let lines = raw.components(separatedBy: "\n")
+        // Collect the start line of every coordinate block.
+        var blockStarts: [Int] = []
+        for (i, line) in lines.enumerated() where line.contains(coordHeader) { blockStarts.append(i) }
+        guard !blockStarts.isEmpty else { enum E: Error { case noCoords }; throw E.noCoords }
+        let target = frameIndex < 0 ? blockStarts.count - 1 : min(max(0, frameIndex), blockStarts.count - 1)
+        let start = blockStarts[target]
+
+        // The block begins after the "-------------------" separator following the
+        // header; atom lines run until a blank line or another section header.
+        var idx = start
+        // advance past header + separator
+        while idx < lines.count, !(lines[idx].contains(coordSeparator)) { idx += 1 }
+        idx += 1   // first atom line (or beyond if file is malformed)
+        var atoms: [Atom] = []
+        while idx < lines.count {
+            let line = lines[idx].trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { break }
+            let toks = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard toks.count >= 4, let x = Float(toks[1]), let y = Float(toks[2]),
+                  let z = Float(toks[3]) else { break }   // next section reached
+            let Z = ElementTable.atomicNumber(toks[0])
+            let sym = Z == 0 ? toks[0] : ElementTable.symbol(Z)
+            atoms.append(Atom(coord: SIMD3<Float>(x, y, z), atomicNumber: Z, label: sym))
+            idx += 1
+        }
+        var out = LoadedScene()
+        out.atoms = atoms
+        out.isCrystal = false
+        out.title = url.lastPathComponent
+        return out
+    }
+}
+
+// Bridge used by Parser.load — matches the frame-aware dispatch above.
+internal func loadOrca(_ url: URL, frameIndex: Int) throws -> LoadedScene {
+    try OrcaParser.load(url, frameIndex: frameIndex)
+}
+internal func orcaCycleCount(_ url: URL) -> Int {
+    OrcaParser.cycleCount(url)
 }

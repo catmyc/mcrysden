@@ -113,6 +113,28 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(mos2S, 4)
     }
 
+    // Orca .out geometry-optimization log: multi-frame molecule. Each CARTESIAN
+    // COORDINATES (ANGSTROEM) block is one optimization cycle; final geometry is
+    // the last block.
+    func testOrcaLogLoadsFrames() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/orca.orca")
+        XCTAssertEqual(Parser.frameCount(url, as: .orca), 15, "orca log has 15 opt cycles")
+        // final geometry (-1) is a molecule of 33 atoms.
+        let final = try Scene(loaded: Parser.load(url, as: .orca))
+        XCTAssertFalse(final.isCrystal)
+        XCTAssertEqual(final.atoms.count, 33)
+        // first frame also loads and differs atom positions (it's a relaxation).
+        let first = try Scene(loaded: Parser.load(url, frameIndex: 0, as: .orca))
+        XCTAssertEqual(first.atoms.count, 33)
+        XCTAssertNotEqual(final.atoms[0].coord.x, first.atoms[0].coord.x, accuracy: 1e-4)
+        // every frame parses.
+        for i in 0..<15 {
+            let s = try Scene(loaded: Parser.load(url, frameIndex: i, as: .orca))
+            XCTAssertEqual(s.atoms.count, 33, "frame \(i) atom count")
+        }
+    }
+
     // CRYSCAL .r1: crystal input across crystal systems. The space group sets the
     // lattice-param count + cell angles; lattice constants are in Angstrom.
     func testCRYSCALr1LoadsCrystal() throws {

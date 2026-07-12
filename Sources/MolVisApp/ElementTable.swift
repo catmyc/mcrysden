@@ -9,6 +9,15 @@ enum ElementTable {
     static func vdwRadius(_ z: Int) -> Float { vdw[clamp(z)] }
     static func symbol(_ z: Int) -> String { symbols[clamp(z)] }
 
+    /// Reverse lookup: an element symbol ("C", "Cl", "AS"...) to atomic number.
+    /// Case-insensitive; returns 0 for an unknown symbol so callers fall back to
+    /// the dummy element rather than crashing (ParseError principle).
+    static func atomicNumber(_ symbolStr: String) -> Int {
+        let s = symbolStr.trimmingCharacters(in: .whitespaces).capitalized
+        for z in 1..<symbols.count where symbols[z] == s { return z }
+        return 0
+    }
+
     // Shared capacity across all per-element arrays (Z=0..118). Each array is
     // padded to this length so a single clamp against capacity-1 is safe; see
     // Important #1 of the final review (out-of-bounds crash on heavy elements).
