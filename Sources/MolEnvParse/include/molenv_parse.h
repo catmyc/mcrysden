@@ -1,6 +1,7 @@
 #ifndef MOLENV_PARSE_H
 #define MOLENV_PARSE_H
 
+#include <float.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -18,6 +19,21 @@ typedef struct {
     int j;
 } MolEnvBond;
 
+/* A rectilinear scalar grid (XCrySDen `DATAGRID_3D`/`DATAGRID_2D` block as read
+   from an XSF file). The grid occupies world (Cartesian, Å) space: sample
+   (i,j,k) sits at origin + vec[0]*i/(nx-1) + vec[1]*j/(ny-1) + vec[2]*k/(nz-1),
+   with `values` in x-fastest order (index = i + nx*(j + ny*k)). A scene carries
+   at most one grid (the first DATAGRID block wins); `values == NULL` means none. */
+typedef struct {
+    int    dim;              // 3 for DATAGRID_3D, 2 for DATAGRID_2D
+    int    n[3];             // sample counts (for dim==2, n[2]==1)
+    float  orig[3];          // world-space origin corner
+    float  vec[3][3];        // [axis][xyz]; axis vectors spanning the grid
+    float  *values;          // nx*ny*nz floats, x-fastest; NULL if no grid
+    float  minval, maxval;   // value range for UI normalization
+    char   ident[64];        // human-readable label from the block header
+} MolEnvGrid;
+
 typedef struct {
     int        natoms;
     MolEnvAtom *atoms;
@@ -27,6 +43,7 @@ typedef struct {
     int        is_crystal;   // 1 if cell is set
     int        periodic_dim; // 0..3
     char       title[256];
+    MolEnvGrid *grid;        // first DATAGRID block, or NULL
 } MolEnvScene;
 
 MolEnvScene* parse_xsf   (const char *path);
@@ -49,6 +66,7 @@ MolEnvScene* parse_cif   (const char *path);
 MolEnvScene* parse_poscar(const char *path);
 MolEnvBond*  molenv_make_bonds(const MolEnvScene *scene, float factor, int *out_nbonds);
 void         molenv_free_bonds(MolEnvBond *bonds);
+void         molenv_grid_free(MolEnvGrid *g);
 void         molenv_scene_free(MolEnvScene*);
 const char*  molenv_last_error(void);
 

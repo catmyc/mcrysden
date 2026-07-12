@@ -117,6 +117,9 @@ struct Scene: Codable {
     /// on a previously-filtered result.
     var preslabAtoms: [Atom] = []
     var slab: Slab?
+    /// An optional volumetric scalar grid (a DATAGRID block read from an XSF file).
+    /// Feeds the isosurface engine; nil for structure-only files.
+    var scalarField: ScalarField?
     /// Indices (into `atoms`) of atoms the user has selected by clicking.
     var selectedAtoms: [Int] = []
     /// Active measurement mode (drives selection cap + what labels show).
@@ -141,6 +144,12 @@ struct Scene: Codable {
     var bondRadius: Float = 0.10
     var currentFrame: Int = 0      // AXSF animation frame index (GUI only)
     var camera: Camera = Camera()
+
+    // Isosurface controls. `isoLevel` is an absolute field value; the sidebar
+    /// slider runs over the field's [minValue, maxValue] range. `showIsoSurface`
+    /// is gated in the UI on the presence of a scalarField.
+    var showIsoSurface: Bool = true
+    var isoLevel: Float = 0
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

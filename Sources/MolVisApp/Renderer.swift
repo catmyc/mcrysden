@@ -56,7 +56,11 @@ final class Renderer: NSObject {
     private var depthTextureSize: (Int, Int) = (0, 0)
 
     var scene: Scene = Scene() {
-        didSet { invalidateBrillouinZoneCache() }
+        didSet {
+            invalidateBrillouinZoneCache()
+            cachedIsoBuffer = nil
+            cachedIsoKey = nil
+        }
     }
     var currentCamera = Camera()
 
@@ -71,6 +75,19 @@ final class Renderer: NSObject {
         var nBase: Int; var firstBaseZ: Int
     }
     private func invalidateBrillouinZoneCache() { cachedBZ = nil; cachedBZKey = nil }
+
+    // Isosurface cache. Marching cubes over a large grid is comparable in cost to
+    // the BZ build (cubic in the sample counts); the result depends only on the
+    // scalar field + the iso level, so build once and replay the vertex buffer.
+    private var cachedIsoBuffer: MTLBuffer?
+    private var cachedIsoKey: IsoCacheKey?
+    private var cachedIsoColor: SIMD3<Float> = SIMD3<Float>(0.3, 0.6, 1.0)
+    private struct IsoCacheKey: Equatable {
+        var nx: Int, ny: Int, nz: Int
+        var origin: SIMD3<Float>, vec0: SIMD3<Float>, vec1: SIMD3<Float>, vec2: SIMD3<Float>
+        var isoLevel: Float
+        var sign: Float
+    }
     var background: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)
 
     /// Last computed world-space light direction — exposed so the orientation
@@ -416,6 +433,10 @@ final class Renderer: NSObject {
         if scene.showBrillouinZone {
             drawBrillouinZone(enc, frameBuffer: frameBuffer)
         }
+
+        // Isosurface over a volumetric scalar field (DATAGRID / .cube), drawn as a
+        // depth-tested lit surface so it sits correctly among the atoms.
+        drawIsosurface(enc, frameBuffer: frameBuffer)
 
         // Screen-space orientation gizmo (fixed-size x/y/z arrows pinned to the
         // corner; rotates with the camera, never scales with zoom).
@@ -916,6 +937,39 @@ final class Renderer: NSObject {
                            enc: enc, frameBuffer: frameBuffer)
         }
     }
+
+    // MARK: - Isosurface
+
+    /// Draw the isosurface (marching-cubes mesh over the scene's scalar field) as
+    /// a depth-tested triangle surface. Two complementary shells are drawn when a
+    /// field is present: an "outside" shell (field > iso) and an "inside" shell
+    /// (field < iso), tinted differently, so a charge-density blob reads as a
+    /// solid surface. The mesh is cached per (field signature + iso level).
+    private func drawIsosurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
+        guard let field = scene.scalarField, scene.showIsoSurface else { return }
+        let iso = scene.isoLevel
+        let key = IsoCacheKey(nx: field.nx, ny: field.ny, nz: field.nz,
+                              origin: field.origin,
+                              vec0: field.vec[0], vec1: field.vec[1], vec2: field.vec[2],
+                              isoLevel: iso, sign: 1)
+        let needsBuild = cachedIsoBuffer == nil || cachedIsoKey != key
+        if needsBuild {
+            let mesh = IsoMesh(field: field, isoLevel: iso, sign: 1, color: SIMD3<Float>(0.30, 0.62, 0.95))
+            cachedIsoBuffer = mesh.triangleCount > 0
+                ? device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: [])
+                : nil
+            cachedIsoKey = key
+            cachedIsoTriangleCount = mesh.triangleCount
+        }
+        guard let buf = cachedIsoBuffer, cachedIsoTriangleCount > 0 else { return }
+        enc.setRenderPipelineState(polyPipeline)
+        enc.setVertexBuffer(buf, offset: 0, index: 0)
+        enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)   // FrameData (lighting)
+        enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cachedIsoTriangleCount * 3)
+    }
+
+    private var cachedIsoTriangleCount: Int = 0
 
     /// Centroid of the (super)atom set, used to center overlays.
     private func sceneCentroid() -> SIMD3<Float> {

@@ -18,10 +18,17 @@ static void set_error(const char *path, int line, const char *reason) {
     else          snprintf(last_error, sizeof(last_error), "%s: %s", path, reason);
 }
 
+void molenv_grid_free(MolEnvGrid *g) {
+    if (!g) return;
+    free(g->values);
+}
+
 void molenv_scene_free(MolEnvScene *s) {
     if (!s) return;
     free(s->atoms);
     free(s->bonds);
+    molenv_grid_free(s->grid);
+    free(s->grid);
     free(s);
 }
 
@@ -154,12 +161,95 @@ static int atom_line_p(const char *line) {
     return (c>='0'&&c<='9') || c=='+' || c=='-';
 }
 
+/* Read a single DATAGRID block's body. On entry `fp` is positioned right after
+   the BEGIN_BLOCK_DATAGRID_3D/2D line (the caller consumes that keyword). The
+   body is:
+        <comment line>
+        BEGIN_DATAGRID_3D_<ident>   (or _2D)
+        nx ny nz
+        ox oy oz                   (origin)
+        v0x v0y v0z                (i-axis span)
+        v1x v1y v1z                (j-axis span)
+        v2x v2y v2z                (k-axis span; for 2D == 0,0,0)
+        <nx*ny*nz floats, x-fastest>
+        END_DATAGRID_3D
+   Returns 0 and fills `g` on success, -1 on failure (error set). The grid is left
+   in `g` as-is on failure (caller frees in molenv_scene_free). */
+static int read_datagrid_block(FILE *fp, MolEnvGrid *g, const char *path, int *ln) {
+    char line[256], tok[64];
+    memset(g, 0, sizeof(*g));
+    g->dim = 3;
+
+    /* comment line */
+    if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
+    (*ln)++;
+    snprintf(g->ident, sizeof(g->ident), "%.*s", (int)(sizeof(g->ident)-1), line);
+    g->ident[strcspn(g->ident,"\r\n")] = '\0';
+
+    /* BEGIN_DATAGRID_3D_<ident> */
+    if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
+    (*ln)++;
+    if (first_tok(line, tok, sizeof(tok))==0 || strncmp(tok,"BEGIN_DATAGRID",14)!=0) {
+        set_error(path,*ln,"expected BEGIN_DATAGRID_3D"); return -1;
+    }
+    if (strstr(tok,"_2D")!=0) g->dim = 2;
+
+    /* dimensions */
+    if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
+    (*ln)++;
+    {
+        int nx=0, ny=0, nz=0;
+        if (sscanf(line,"%d %d %d",&nx,&ny,&nz)<1) { set_error(path,*ln,"malformed DATAGRID dims"); return -1; }
+        if (g->dim==2) { g->n[0]=nx>0?nx:1; g->n[1]=ny>0?ny:1; g->n[2]=1; }
+        else           { g->n[0]=nx>0?nx:1; g->n[1]=ny>0?ny:1; g->n[2]=nz>0?nz:1; }
+    }
+
+    /* origin */
+    if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
+    (*ln)++;
+    if (sscanf(line,"%f %f %f",&g->orig[0],&g->orig[1],&g->orig[2])<3) {
+        set_error(path,*ln,"malformed DATAGRID origin"); return -1;
+    }
+
+    /* three span vectors */
+    for (int ax=0; ax<3; ax++) {
+        if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
+        (*ln)++;
+        if (sscanf(line,"%f %f %f",&g->vec[ax][0],&g->vec[ax][1],&g->vec[ax][2])<3) {
+            set_error(path,*ln,"malformed DATAGRID vector"); return -1;
+        }
+    }
+
+    /* values — x-fastest, any whitespace run. Read with fscanf so line breaks
+       don't matter (grid may be a single long line or many). */
+    long count = (long)g->n[0]*g->n[1]*g->n[2];
+    g->values = malloc(count * sizeof(float));
+    if (!g->values) { set_error(path,*ln,"out of memory for DATAGRID values"); return -1; }
+    g->minval = FLT_MAX; g->maxval = -FLT_MAX;
+    for (long i=0; i<count; i++) {
+        float v;
+        if (fscanf(fp, "%f", &v)!=1) { set_error(path,*ln,"short DATAGRID values"); return -1; }
+        g->values[i] = v;
+        if (v < g->minval) g->minval = v;
+        if (v > g->maxval) g->maxval = v;
+    }
+
+    /* advance to END_DATAGRID_3D line */
+    while (fgets(line, sizeof(line), fp)) {
+        (*ln)++;
+        first_tok(line, tok, sizeof(tok));
+        if (strcmp(tok,"END_DATAGRID_3D")==0 || strcmp(tok,"END_DATAGRID_2D")==0) break;
+    }
+    return 0;
+}
+
 /* Read one PRIMCOORD structure chunk from the current file position.
    Reads an optional preceding structure keyword + PRIMVEC. Returns atom
    count on success, -1 on error. `*atoms` is reallocated; any prior value
    is freed (so callers can iterate frames on a single buffer). */
 static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
-                      MolEnvAtom **atoms, int *natoms, const char *path, int *ln) {
+                      MolEnvAtom **atoms, int *natoms, MolEnvGrid **gridOut,
+                      const char *path, int *ln) {
     char line[256], tok[64];
     char held[256]; int have_held = 0;
     int saw_primcoord = 0;
@@ -253,8 +343,22 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             strcmp(tok,"DATAGRID_3D")==0 || strcmp(tok,"DATAGRID_2D")==0 ||
             strcmp(tok,"DATAGRID3D")==0 || strcmp(tok,"DATAGRID2D")==0 ||
             strncmp(tok,"BEGIN_BLOCK_DATAGRID",20)==0) {
-            set_error(path,*ln,"DATAGRID not supported in v1");
-            return -1;
+            /* Capture the first DATAGRID block into the scene (subsequent ones
+               are skipped by advancing past the END_DATAGRID line). */
+            if (gridOut && *gridOut == NULL) {
+                MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
+                if (!g) { set_error(path,*ln,"out of memory for DATAGRID"); return -1; }
+                if (read_datagrid_block(fp, g, path, ln) < 0) { free(g); return -1; }
+                *gridOut = g;
+            } else {
+                /* skip the block body so the structure scan can continue */
+                while (fgets(line,sizeof(line),fp)) {
+                    (*ln)++;
+                    if (first_tok(line,tok,sizeof(tok))>0 &&
+                        (strcmp(tok,"END_DATAGRID_3D")==0 || strcmp(tok,"END_DATAGRID_2D")==0)) break;
+                }
+            }
+            continue;
         }
         if (strcmp(tok,"INFO")==0 || strcmp(tok,"BEGIN_INFO")==0) {
             while (fgets(line,sizeof(line),fp)) {
@@ -279,25 +383,35 @@ MolEnvScene* parse_xsf(const char *path) {
     if (!s) { fclose(fp); return NULL; }
     float cell[3][3]={{0}}; int pd=3, have_cell=0, ln=0;
     MolEnvAtom *atoms=NULL; int natoms=0;
-    int rc = read_chunk(fp, cell,&pd,&have_cell,&atoms,&natoms,path,&ln);
+    MolEnvGrid *grid=NULL;
+    int rc = read_chunk(fp, cell,&pd,&have_cell,&atoms,&natoms,&grid,path,&ln);
     if (rc < 0) { fclose(fp); molenv_scene_free(s); return NULL; }
     s->atoms = atoms; s->natoms = natoms;
+    s->grid = grid;
     memcpy(s->cell, cell, sizeof(s->cell));
     s->periodic_dim = pd;
     s->is_crystal = have_cell ? 1 : 0;
 
-    /* Scan the remainder for DATAGRID blocks (v2; v1 must reject). */
-    char line[256], tok[64];
-    while (fgets(line,sizeof(line),fp)) {
-        ln++;
-        if (first_tok(line,tok,sizeof(tok))>0 && tok[0]!='#' &&
-            (strncmp(tok,"BEGIN_DATAGRID",14)==0 ||
-             strncmp(tok,"DATAGRID_",8)==0 ||
-             strcmp(tok,"DATAGRID_3D")==0 || strcmp(tok,"DATAGRID_2D")==0 ||
-             strcmp(tok,"DATAGRID3D")==0 || strcmp(tok,"DATAGRID2D")==0 ||
-             strncmp(tok,"BEGIN_BLOCK_DATAGRID",20)==0)) {
-            fclose(fp); set_error(path,ln,"DATAGRID not supported in v1");
-            molenv_scene_free(s); return NULL;
+    /* A grid that follows the structure block is not seen by read_chunk (it
+       breaks after PRIMCOORD/ATOMS). Scan the remaining lines and capture the
+       first trailing DATAGRID block. */
+    if (s->grid == NULL) {
+        char line[256], tok[64];
+        while (fgets(line, sizeof(line), fp)) {
+            ln++;
+            if (first_tok(line, tok, sizeof(tok)) == 0 || tok[0]=='#') continue;
+            if (strncmp(tok,"BEGIN_DATAGRID",14)==0 ||
+                strncmp(tok,"DATAGRID_",8)==0 ||
+                strcmp(tok,"DATAGRID_3D")==0 || strcmp(tok,"DATAGRID_2D")==0 ||
+                strncmp(tok,"BEGIN_BLOCK_DATAGRID",20)==0) {
+                MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
+                if (!g) { fclose(fp); set_error(path,ln,"out of memory for DATAGRID");
+                           molenv_scene_free(s); return NULL; }
+                if (read_datagrid_block(fp, g, path, &ln) < 0) { free(g);
+                    fclose(fp); molenv_scene_free(s); return NULL; }
+                s->grid = g;
+                break;
+            }
         }
     }
     fclose(fp);
@@ -328,17 +442,20 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
     if (!s) { fclose(fp); return NULL; }
     float cell[3][3]={{0}}; int pd=3, have_cell=0, lnb=0;
     MolEnvAtom *atoms=NULL; int natoms=0;
+    MolEnvGrid *grid=NULL;
     int current = 0;
     while (current <= frame_index) {
-        int rc = read_chunk(fp, cell,&pd,&have_cell,&atoms,&natoms,path,&lnb);
+        int rc = read_chunk(fp, cell,&pd,&have_cell,&atoms,&natoms,&grid,path,&lnb);
         if (rc < 0) { fclose(fp); molenv_scene_free(s); return NULL; }
         if (current == frame_index) break;
-        /* discard this frame's atoms; keep cell/is_crystal */
+        /* discard this frame's atoms (and grid); keep cell/is_crystal */
         free(atoms); atoms=NULL; natoms=0;
+        molenv_grid_free(grid); free(grid); grid=NULL;
         current++;
     }
     fclose(fp);
     s->atoms = atoms; s->natoms = natoms;
+    s->grid = grid;
     memcpy(s->cell, cell, sizeof(s->cell));
     s->periodic_dim = pd;
     s->is_crystal = have_cell ? 1 : 0;

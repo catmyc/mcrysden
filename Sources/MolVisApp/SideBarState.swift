@@ -45,6 +45,14 @@ final class SideBarState: ObservableObject {
     /// k-path state (crystal only). points carry fractional coords + labels; when
     /// empty the editor offers the default high-symmetry path for the structure.
     @Published var kPathPoints: [KPoint] = [] { didSet { onChange?() } }
+    /// Isosurface controls (only meaningful when the scene carries a scalarField).
+    /// sliderRange is set by the controller from the field's [minValue, maxValue].
+    @Published var showIsoSurface: Bool = true { didSet { onChange?() } }
+    @Published var isoLevel: Float = 0 { didSet { onChange?() } }
+    var isoRange: ClosedRange<Float> = 0...1
+    /// True when a volumetric field is present — the sidebar gates the
+    /// Isosurface section on this so structure-only files show no empty controls.
+    var hasScalarField: Bool = false
     /// AXSF animation playback state. frameCount is 1 for non-animated files
     /// (the playback UI is hidden in that case). isPlaying drives a timer in
     /// MainWindowController; frameIndex advances it and reloads the frame.
@@ -92,6 +100,16 @@ final class SideBarState: ObservableObject {
         // source of truth, mirrored here so the toggle reflects the loaded view.
         orthographic = !scene.camera.perspective
         showStructure = scene.showStructure
+        // Isosurface: the slider range follows the loaded field; default the iso
+        // level to the field's midpoint so a surface is visible on first load.
+        if let field = scene.scalarField {
+            hasScalarField = true
+            isoRange = field.minValue...field.maxValue
+            isoLevel = scene.isoLevel != 0 ? scene.isoLevel : (field.minValue + field.maxValue) * 0.5
+            showIsoSurface = scene.showIsoSurface
+        } else {
+            hasScalarField = false
+        }
         onChange = saved
     }
 }

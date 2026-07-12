@@ -21,12 +21,13 @@ struct LoadedScene {
     var isCrystal: Bool = false
     var periodicDim: Int = 3
     var title: String = ""
+    var scalarField: ScalarField?
 }
 
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext {
@@ -38,6 +39,7 @@ enum ParseFormat {
         case "pwo", "out": self = .pwo
         case "cif": self = .cif
         case "poscar", "contcar", "vasp": self = .poscar
+        case "cube": self = .cube
         default: return nil
         }
     }
@@ -64,11 +66,16 @@ enum Parser {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
-        let cPath = url.path.cString(using: .utf8)!
         let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
         guard let effective else {
             throw ParseError.io(path: url.path, reason: "unknown extension \(url.pathExtension)")
         }
+        // Gaussian cube is a pure-text volumetric format parsed entirely in Swift
+        // (it produces atoms + a scalarField but no C MolEnvScene).
+        if effective == .cube {
+            return try loadCube(url)
+        }
+        let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
         case .xsf: scene = parse_xsf(cPath)
@@ -79,6 +86,7 @@ enum Parser {
         case .pwo: scene = parse_pwo(cPath, 0)
         case .cif: scene = parse_cif(cPath)
         case .poscar: scene = parse_poscar(cPath)
+        case .cube: scene = nil   // Gaussian cube is parsed in Swift (see loadCube)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
@@ -155,6 +163,7 @@ enum Parser {
         }
         out.atoms = readAtoms(s)
         out.bonds = readBonds(s)
+        out.scalarField = readGrid(s)
         if s.is_crystal != 0 {
             let cell = withUnsafePointer(to: &s.cell) { ptr in
                 ptr.withMemoryRebound(to: Float.self, capacity: 9) {
@@ -188,5 +197,120 @@ enum Parser {
         guard nbonds > 0, let bondsPtr = s.bonds else { return [] }
         let buf = UnsafeBufferPointer(start: bondsPtr, count: nbonds)
         return buf.map { Bond(i: Int($0.i), j: Int($0.j)) }
+    }
+
+    /// Bridge a C `MolEnvGrid` (a DATAGRID block) into a Swift `ScalarField`.
+    /// Returns nil when the scene carries no grid. The grid index layout in C is
+    /// x-fastest (i + nx*(j + ny*k)), matching `ScalarField.index`.
+    private static func readGrid(_ s: MolEnvScene) -> ScalarField? {
+        guard let gPtr = s.grid else { return nil }
+        let g = gPtr.pointee
+        guard let valuesPtr = g.values else { return nil }
+        // C fixed-size arrays surface in Swift as tuples, so fields like `g.n`
+        // and `g.orig` are addressed by `.0/.1/.2` rather than subscripts.
+        let nx = Int(g.n.0), ny = Int(g.n.1), nz = Int(g.n.2)
+        guard nx > 0, ny > 0, nz > 0 else { return nil }
+        let count = nx * ny * nz
+        let values = UnsafeBufferPointer(start: valuesPtr, count: count).map { $0 }
+        let orig = SIMD3<Float>(g.orig.0, g.orig.1, g.orig.2)
+        let vec = [
+            SIMD3<Float>(g.vec.0.0, g.vec.0.1, g.vec.0.2),
+            SIMD3<Float>(g.vec.1.0, g.vec.1.1, g.vec.1.2),
+            SIMD3<Float>(g.vec.2.0, g.vec.2.1, g.vec.2.2),
+        ]
+        return ScalarField(nx: nx, ny: ny, nz: nz, origin: orig, vec: vec,
+                           values: values, minValue: g.minval, maxValue: g.maxval)
+    }
+
+    // Gaussian "cube" format (Gaussian, Q-Chem, ...): a text header in Bohr
+    // describing a rectilinear grid + atom list, then x-fastest volumetric values.
+    // We read atoms + the scalar grid into a LoadedScene. Same ordering
+    // convention as DATAGRID_3D (x fastest, v(i) = (n(i)-1)*dx(i)), confirmed by
+    // XCrySDen's cube2xsf.f. Units are Bohr -> convert to Angstrom (B2A).
+    private static let b2a: Float = 0.52917721067
+
+    private static func loadCube(_ url: URL) throws -> LoadedScene {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        var lines = raw.components(separatedBy: "\n")
+        // tolerate files that lack a trailing newline by trimming empties between
+        // records but KEEP blank comment lines (lines 0-1) — index by reading.
+        func nextTokenLine() -> [String]? {
+            while !lines.isEmpty {
+                let line = lines.removeFirst()
+                // only skip truly-empty separator lines; keep lines with content
+                // (even if just whitespace) as they may carry tokens.
+                if line.isEmpty { continue }
+                return line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            }
+            return nil
+        }
+        // two comment lines (discard)
+        _ = nextTokenLine(); _ = nextTokenLine()
+
+        // natoms, origin (Bohr). If natoms < 0 there are multiple orbitals.
+        guard let h = nextTokenLine(), let nAtomsT = Int(h[0]) else {
+            throw ParseError.parse(path: url.path, line: 3, reason: "bad cube header")
+        }
+        let multiOrb = nAtomsT < 0
+        let natoms = abs(nAtomsT)
+        let originBohr = SIMD3<Float>(Float(h[1]) ?? 0, Float(h[2]) ?? 0, Float(h[3]) ?? 0)
+        let origin = originBohr * b2a
+
+        // axis counts + step vectors (Bohr)
+        var nAxis = [0, 0, 0]
+        var dx = [SIMD3<Float>(0,0,0), SIMD3<Float>(0,0,0), SIMD3<Float>(0,0,0)]
+        for i in 0..<3 {
+            guard let t = nextTokenLine(), let ni = Int(t[0]) else { throw ParseError.parse(path: url.path, line: 4+i, reason: "bad cube axis") }
+            nAxis[i] = ni
+            dx[i] = SIMD3<Float>(Float(t[1]) ?? 0, Float(t[2]) ?? 0, Float(t[3]) ?? 0) * b2a
+        }
+        let nx = nAxis[0], ny = nAxis[1], nz = nAxis[2]
+        // spanning vectors v(i) = (n(i)-1)*dx(i)
+        let vec = [dx[0]*Float(max(1,nx)-1), dx[1]*Float(max(1,ny)-1), dx[2]*Float(max(1,nz)-1)]
+
+        // atom records: Z, charge, x, y, z (Bohr)
+        var atoms: [Atom] = []
+        for _ in 0..<natoms {
+            guard let t = nextTokenLine(), let Z = Int(t[0]) else { throw ParseError.parse(path: url.path, line: 0, reason: "short cube atoms") }
+            let p = SIMD3<Float>(Float(t[2]) ?? 0, Float(t[3]) ?? 0, Float(t[4]) ?? 0) * b2a
+            atoms.append(Atom(coord: p, atomicNumber: Z, label: Table.id(Z)))
+        }
+        // optional MO record if multiple orbitals: consume the MO-count/indices
+        // line so its integer tokens aren't mistaken for grid values.
+        if multiOrb {
+            _ = nextTokenLine()
+        }
+
+        // remaining tokens are the grid values, x-fastest, flattened across all
+        // sub-grids (orbitals). Take the first nx*ny*nz block as the field; any
+        // further orbitals are ignored (single isosurface per file for now).
+        let needed = nx * ny * nz
+        var values: [Float] = []
+        values.reserveCapacity(needed)
+        while values.count < needed, let tok = nextTokenLine() {
+            for s in tok { if values.count < needed, let v = Float(s) { values.append(v) } }
+        }
+        guard values.count == needed else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "cube grid short (\(values.count)/\(needed))")
+        }
+        var minV = values[0], maxV = values[0]
+        for v in values { if v < minV { minV = v }; if v > maxV { maxV = v } }
+
+        var out = LoadedScene()
+        out.atoms = atoms
+        out.scalarField = ScalarField(nx: nx, ny: ny, nz: nz, origin: origin, vec: vec,
+                                      values: values, minValue: minV, maxValue: maxV)
+        out.title = url.lastPathComponent
+        return out
+    }
+}
+
+// Minimal element-symbol helper used by the cube reader (avoids ElementTable's
+// full API which needs the renderer).
+enum Table {
+    static func id(_ z: Int) -> String {
+        let sym = ["H","He","Li","Be","B","C","N","O","F","Ne","Na","Mg","Al","Si","P","S","Cl","Ar",
+                   "K","Ca","Sc","Ti","V","Cr","Mn","Fe","Co","Ni","Cu","Zn","Ga","Ge","As","Se","Br","Kr"]
+        return (z >= 1 && z <= sym.count) ? sym[z-1] : "\(z)"
     }
 }

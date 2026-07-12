@@ -411,6 +411,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         camera.perspective = !state.orthographic
         // Hide-structure toggle: suppress atoms/bonds/polyhedra, keep frame/axes/BZ.
         scene.showStructure = state.showStructure
+        // Isosurface: only the slider + toggle are meaningful when a field is
+        // present, but writing the values unconditionally is harmless (the renderer
+        // gates the draw on `scene.scalarField != nil`).
+        scene.showIsoSurface = state.showIsoSurface
+        scene.isoLevel = state.isoLevel
         scene.measurementMode = state.measurementMode
         // Scene-derived mirrors flow state <- scene purely to keep the sidebar
         // indicators in sync; guarded above against re-entrant onChange.

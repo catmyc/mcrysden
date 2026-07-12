@@ -194,7 +194,8 @@ final class App: NSObject, NSApplicationDelegate {
                                       .init(filenameExtension: "cif")!,
                                       .init(filenameExtension: "poscar")!,
                                       .init(filenameExtension: "contcar")!,
-                                      .init(filenameExtension: "vasp")!].compactMap { $0 }
+                                      .init(filenameExtension: "vasp")!,
+                                      .init(filenameExtension: "cube")!].compactMap { $0 }
         panel.beginSheetModal(for: wc.window) { result in
             guard result == .OK, let url = panel.url else { return }
             do {

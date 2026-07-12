@@ -77,4 +77,31 @@ final class BzCacheTests: XCTestCase {
         }
         XCTAssertEqual(bz.faces.count, 14, "fcc BZ = truncated octahedron = 14 faces")
     }
+
+    // The isosurface must actually render: a field-carrying XSF drawn with the
+    // surface on MUST differ from the surface off, and toggling the iso level
+    // must change the surface. (loading the real asset proves the C bridge.)
+    func testIsosurfaceRendersForSlabViaRenderer() throws {
+        let assets = URL(fileURLWithPath: "/Users/mao/dev/mcrysden/Assets")
+        var scene = Scene(loaded: try Parser.load(assets.appendingPathComponent("volumetric_grid.xsf")))
+        guard scene.scalarField != nil else { return XCTFail("expected a scalar field") }
+        scene.displayMode = .ballStick
+        scene.isoLevel = 30
+        scene.showIsoSurface = false
+        let off = try render(scene)
+        scene.showIsoSurface = true
+        let on = try render(scene)
+        let d = diff(off, on)
+        print("[isocache] volumetric_grid iso on vs off: \(d) changed pixels")
+        XCTAssertGreaterThan(d, 50, "isosurface must visibly change the render")
+
+        // Gating: a structure-only file must NOT draw a surface.
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        var plain = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf")))
+        plain.showIsoSurface = true
+        XCTAssertNil(plain.scalarField, "si110 has no field")
+        let pOff = try render(plain)
+        let pOn = try render(plain)   // still no field -> even with flag on, nothing draws
+        XCTAssertEqual(diff(pOff, pOn), 0, "no field => no surface regardless of toggle")
+    }
 }

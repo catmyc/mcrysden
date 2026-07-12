@@ -63,6 +63,18 @@ struct SideBar: View {
                 Slider(value: $state.lighting.azimuth, in: degRange) { Text("Light Azimuth: \(Int(state.lighting.azimuth))°") }
                 Slider(value: $state.lighting.elevation, in: -90...90) { Text("Light Elevation: \(Int(state.lighting.elevation))°") }
             }
+            // --- Isosurface (volumetric scalar field) ---------------------------
+            // Shown only when the loaded file carried a DATAGRID/.cube-style 3D
+            // scalar grid. The slider sweeps the iso level over the field's value
+            // range; the surface is drawn as a depth-tested lit shell.
+            if state.hasScalarField {
+                Section("Isosurface") {
+                    Toggle("Show Surface", isOn: $state.showIsoSurface)
+                    Slider(value: $state.isoLevel, in: state.isoRange) {
+                        Text("Iso level: \(state.isoLevel, specifier: "%.3f")")
+                    }
+                }
+            }
             // --- k-path (crystal only): Brillouin-zone overlay + band path. -----
             // The scene exposes cell + base atoms; the controller builds the
             // default high-symmetry path and writes the chosen export via a save
