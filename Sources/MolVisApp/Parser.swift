@@ -23,12 +23,13 @@ struct LoadedScene {
     var title: String = ""
     var scalarField: ScalarField?
     var fermiSurface: FermiSurface?
+    var bandStructure: BandStructure?
 }
 
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi, bands
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext.lowercased() {
@@ -51,6 +52,7 @@ enum ParseFormat {
         case "r1": self = .crystal
         case "orca": self = .orca
         case "fhi", "coord": self = .fhi
+        case "bands": self = .bands
         default: return nil
         }
     }
@@ -170,6 +172,11 @@ enum Parser {
         if effective == .fhi {
             return try loadFHIaims(url)
         }
+        // QE PWscf band structure: parsed in Swift into a BandStructure for the
+        // 2D Grapher (no atoms/cell -> no C MolEnvScene).
+        if effective == .bands {
+            return try loadBands(url)
+        }
         let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
@@ -187,6 +194,7 @@ enum Parser {
         case .crystal: scene = nil   // CRYSCAL .r1 is parsed in Swift (see loadCRYSCALr1)
         case .orca: scene = nil   // Orca .out is parsed in Swift (see loadOrca)
         case .fhi: scene = nil   // FHI-aims coord.out is parsed in Swift (see loadFHIaims)
+        case .bands: scene = nil   // QE bands are parsed in Swift (see loadBands)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
@@ -835,6 +843,21 @@ internal func loadFHIaims(_ url: URL) throws -> LoadedScene {
     out.atoms = atoms
     out.cell = cell
     out.isCrystal = true
+    out.title = url.lastPathComponent
+    return out
+}
+
+/// QE PWscf band structure (`.bands` file, or a `.out` forced with `--bands`):
+/// parse the `bands (ev):` k-point blocks in Swift into a BandStructure and wrap
+/// it in a band-only LoadedScene (no atoms/cell). The MainWindowController swaps
+/// the 3D canvas for the 2D Grapher when scene.bandStructure != nil.
+internal func loadBands(_ url: URL) throws -> LoadedScene {
+    let raw = try String(contentsOf: url, encoding: .utf8)
+    guard let bands = BandParser.parse(raw) else {
+        throw ParseError.parse(path: url.path, line: 0, reason: "no `bands (ev):` block found")
+    }
+    var out = LoadedScene()
+    out.bandStructure = bands
     out.title = url.lastPathComponent
     return out
 }

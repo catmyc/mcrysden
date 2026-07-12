@@ -38,6 +38,7 @@ extension Scene {
         self.periodicDim = loaded.periodicDim
         self.scalarField = loaded.scalarField
         self.fermiSurface = loaded.fermiSurface
+        self.bandStructure = loaded.bandStructure
         self.baseAtoms = loaded.atoms
         self.baseBonds = loaded.bonds
     }

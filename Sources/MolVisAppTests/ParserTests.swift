@@ -507,4 +507,28 @@ final class ParserTests: XCTestCase {
         XCTAssertTrue(s.atoms.isEmpty)
         XCTAssertNil(c)
     }
+
+    // A QE PWscf `.out` carrying `bands (ev):` blocks must parse (forced with
+    // `--bands`, i.e. as `.bands`) into a BandStructure: 56 k-points, uniform
+    // 69 bands each, and an empty atom set (the grapher is shown, not the canvas).
+    func testBandsParseQE() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/CH3Rh111.out")
+        let loaded = try Parser.load(url, as: .bands)
+        guard let bands = loaded.bandStructure else {
+            return XCTFail("no bandStructure parsed")
+        }
+        XCTAssertEqual(bands.nKPoints, 56, "expected 56 k-points")
+        XCTAssertEqual(bands.nBands, 69, "expected 69 bands per k-point")
+        XCTAssertTrue(loaded.atoms.isEmpty, "a bands file carries no atoms")
+        // Every k-point must report the same (deduced) band count.
+        for (ik, kp) in bands.kPoints.enumerated() {
+            XCTAssertEqual(kp.energies.count, 69, "k-point \(ik) band count mismatch")
+        }
+        // kDistances must be non-decreasing (monotonic path).
+        let d = bands.kDistances
+        for i in 1..<d.count {
+            XCTAssertGreaterThanOrEqual(d[i], d[i - 1], "k-distances not monotonic at \(i)")
+        }
+    }
 }

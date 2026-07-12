@@ -31,6 +31,7 @@ final class App: NSObject, NSApplicationDelegate {
         FormatInfo(flag: "--crystal", extensions: ["r1"],                        format: .crystal),
         FormatInfo(flag: "--orca",    extensions: ["orca"],                      format: .orca),
         FormatInfo(flag: "--fhi",     extensions: ["fhi", "coord"],              format: .fhi),
+        FormatInfo(flag: "--bands",   extensions: ["bands"],                     format: .bands),
     ]
     /// Force-format flags (take no value).
     private static let formatFlags: Set<String> = Set(formatTable.map { $0.flag })
@@ -313,7 +314,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.3"
+    static let appVersion = "1.1.4"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

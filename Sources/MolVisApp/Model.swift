@@ -158,6 +158,10 @@ struct Scene: Codable {
     /// in the UI on the presence of a fermiSurface and drawn separately from the
     /// scalar-field isosurface so it can be toggled independently.
     var showFermiSurface: Bool = true
+    /// A parsed band structure (k-points + eigenvalues), when the loaded file
+    /// carried `bands (ev):` data (QE PWscf output). Gated in the UI on its
+    /// presence; when set, the 2D Grapher replaces the 3D canvas.
+    var bandStructure: BandStructure?
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

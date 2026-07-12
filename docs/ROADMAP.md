@@ -52,20 +52,20 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 | 7 | **CRYSTAL `.r1` reader** | 16 files (all crystal systems via space group → lattice params + angles; trigonal/hexagonal/monoclinic) |
 | 8 | **Orca `.out` reader** | `pbe.accOpt.AsF2-C2C2.out` via header sniff (ORCA banner; checked AFTER PWSCF marker) |
 | 9 | **FHI-aims / FHI98MD reader** | `GaAsSurface_coord.out` (lattice + species blocks; Bohr→Å) via 3-numeric-lattice-line sniff |
+| 5 | **Band-structure extraction** (QE `bands (ev):` k-point + eigenvalue blocks → line graph) | `CH3Rh111.out` (56 k-points × 69 bands via `--bands`); 2D Grapher (Fermi line, k-path, energy axes) swaps in for the 3D canvas |
 
 ### Remaining Tier A (still TODO)
 
 | # | Feature | Test fixtures on disk | Blocker / notes |
 |---|---------|-----------------------|-----------------|
 | 4 | **Color-plane / 2D-contour rendering** (slice a 3D field along a plane) | `mol-urea2D.xsf` (2D grid) | Needs a new slice renderer (field engine #1 exists). |
-| 5 | **Band-structure extraction** (QE k-point + eigenvalue block → line graph) | `CH3Rh111.out`, `EthAl001-2x2.out` contain `bands (ev):` blocks | Needs a dedicated band reader + a 2D line-graph (Grapher) layer. No graph layer exists yet. |
 | 10 | **Force / stress / energy readouts + force arrows** | `CH3Rh111.out` has per-atom forces, Total force, total energy | `Atom` stores no force vector — needs a struct change + readout + arrow rendering. |
 
 ### Tier B — needs another engine first
 
 | # | Feature | Blocker |
 |---|---------|---------|
-| 11 | **Density of states (DOS)** plot (total + projected) | Needs #5's band/DOS reader **and** the 2D Grapher layer. No local `projwfc`/`dos.x` output. |
+| 11 | **Density of states (DOS)** plot (total + projected) | Needs a DOS/projwfc reader (the 2D Grapher layer from #5 now exists). No local `projwfc`/`dos.x` output. |
 
 ### Tier C — validated by interaction, not files
 

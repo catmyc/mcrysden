@@ -10,6 +10,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let sidebar: NSHostingView<SideBar>
     let canvas: MetalView
     let labelOverlay: LabelOverlayView
+    let bandGrapher: BandGrapherView    // 2D band-structure diagram (shown when bandStructure != nil)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
     let renderer: Renderer
@@ -39,6 +40,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         labelOverlay = LabelOverlayView(frame: .zero)
         canvas.addSubview(labelOverlay)
         labelOverlay.autoresizingMask = [.width, .height]
+        bandGrapher = BandGrapherView(frame: .zero)
+        bandGrapher.autoresizingMask = [.width, .height]
+        bandGrapher.isHidden = true
+        canvas.addSubview(bandGrapher)
         let info = NSTextView(frame: .zero)
         info.isEditable = false
         info.isSelectable = true
@@ -107,6 +112,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         self.forcedFormat = format
         state.syncFromScene(scene)
         applyCameraForNewSceneIfNeeded()
+        // A band-structure file has no atoms: hide the 3D canvas and show the grapher.
+        let hasBands = scene.bandStructure != nil
+        bandGrapher.isHidden = !hasBands
+        canvas.isHidden = hasBands
+        if hasBands {
+            bandGrapher.bandStructure = scene.bandStructure
+            bandGrapher.highSymmetryIndices = []   // parsed labels go here once k-labels are read
+        }
         // Initialise the animation controls WITHOUT triggering onChange (which
         // would otherwise try to reload frame 0 on top of this fresh load).
         let saved = state.onChange
