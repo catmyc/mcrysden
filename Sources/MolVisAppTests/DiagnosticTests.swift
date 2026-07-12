@@ -116,4 +116,56 @@ final class ColorPlaneDiag: XCTestCase {
         XCTAssertGreaterThan(distinctR.count, 8,
                              "colormap was nearly flat (\(distinctR.count) distinct red levels)")
     }
+
+    // Pure marching-squares geometry: top edge sampled 0 (left) and 3 (right),
+    // level 1. Linear interpolation puts the top crossing at u=1/3, NOT the
+    // midpoint 1/2. Verifies the interpolated crossing position directly.
+    func testContourInterpolates() throws {
+        let segs = ColorPlaneView.contourSegments(tl: 0, tr: 3, br: 3, bl: 3, level: 1)
+        XCTAssertEqual(segs.count, 1, "one plain cell -> one segment")
+        // The top-edge crossing should sit at u=(1-0)/(3-0)=1/3 along the top.
+        let top = segs[0][0].y == 0 ? segs[0][0] : segs[0][1]
+        XCTAssertEqual(top.y, 0, "crossing should lie on the top edge (v=0)")
+        XCTAssertEqual(Double(top.x), 1.0 / 3.0, accuracy: 1e-6,
+                       "top crossing at interpolated u=1/3, not midpoint 1/2")
+    }
+
+    // Saddle cell: four crossings -> exactly TWO segments. The original bug drew
+    // only seg[0]->seg[1] and dropped the rest, so a saddle produced one segment.
+    // We use an asymmetric field (tl,br high; tr,bl low) so the asymptotic decider
+    // is unambiguous, and assert: two segments, each on distinct edges, covering
+    // all four edges (no crossing is lost).
+    func testContourSaddleTopology() throws {
+        let level: Float = 0
+        let segs = ColorPlaneView.contourSegments(tl: 2, tr: -1, br: 2, bl: -1, level: level)
+        XCTAssertEqual(segs.count, 2, "saddle cell must yield two segments (not one)")
+        // Each segment's two endpoints should each lie on a different cell edge
+        // (u==0/u==1/v==0/v==1), i.e. crossings are on edges not floating inside.
+        let onEdge: (SIMD2<Float>) -> Bool = { p in
+            let eps: Float = 1e-3
+            return p.x < eps || abs(p.x - 1) < eps || p.y < eps || abs(p.y - 1) < eps
+        }
+        var usedEdges = Set<Int>()
+        for seg in segs {
+            for p in seg {
+                XCTAssertTrue(onEdge(p), "crossing must sit on a cell edge")
+                if p.y < 1e-3 { usedEdges.insert(0) }      // top
+                else if abs(p.x - 1) < 1e-3 { usedEdges.insert(1) }   // right
+                else if abs(p.y - 1) < 1e-3 { usedEdges.insert(2) }   // bottom
+                else if p.x < 1e-3 { usedEdges.insert(3) }   // left
+            }
+        }
+        // All four edges must be touched — no crossing dropped, confirming the two
+        // segments together use all four edge crossings.
+        XCTAssertEqual(usedEdges.count, 4, "contour must use all four edge crossings")
+    }
+
+    // A one-cell-interpolation sanity check at the opposite extreme: level exactly
+    // at a corner value still yields a crossing at the cell boundary (t clamped).
+    func testContourClampsToEdge() throws {
+        let segs = ColorPlaneView.contourSegments(tl: 0, tr: 1, br: 2, bl: 1, level: 1)
+        XCTAssertEqual(segs.count, 1, "mid-range cell -> one segment")
+        XCTAssertFalse(segs[0].contains { $0.x.isNaN || $0.y.isNaN }, "no NaN crossings")
+    }
+
 }

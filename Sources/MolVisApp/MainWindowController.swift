@@ -132,6 +132,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             colorPlane.grid = grid.values
             colorPlane.zLabel = grid.ident
             colorPlane.contourLevels = defaultContourLevels(for: grid)
+            // Preserve the plane's physical aspect ratio (world-space span) so an
+            // anisotropic or skew grid is not stretched to the window shape.
+            let w = simd_length(grid.vec[0])
+            let h = simd_length(grid.vec[1])
+            colorPlane.physicalAspect = (h > 0) ? CGFloat(w / h) : 1
             if state.showColorPlane { colorPlane.isHidden = false; canvas.isHidden = true }
         } else {
             colorPlane.grid = nil

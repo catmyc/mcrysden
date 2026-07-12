@@ -84,11 +84,15 @@ final class BandGrapherView: NSView {
         drawLabel("Ef", at: NSPoint(x: f1.x + 3, y: f1.y), font: axisFont, color: .red, rightAligned: false)
 
         // --- high-symmetry k-point gridlines + labels ---
+        // Markers are placed at the k-point's CUMULATIVE path distance, not its
+        // uniform index — with nonuniform k-spacing the two differ, and an index-
+        // based x would misalign the marker from its band.
         NSColor.lightGray.withAlphaComponent(0.5).setStroke()
         let grid = NSBezierPath()
         grid.lineWidth = 0.5
         for ix in highSymmetryIndices where ix >= 0 && ix < bs.nKPoints {
-            let gx = origin.x + plotW * CGFloat(ix) / CGFloat(bs.nKPoints - 1)
+            let fx = xMin == xMax ? 0 : CGFloat((distances[ix] - xMin) / (xMax - xMin))
+            let gx = origin.x + plotW * fx
             grid.move(to: NSPoint(x: gx, y: origin.y))
             grid.line(to: NSPoint(x: gx, y: origin.y - plotH))
         }

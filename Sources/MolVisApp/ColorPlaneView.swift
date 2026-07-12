@@ -10,6 +10,10 @@ final class ColorPlaneView: NSView {
     var grid: [[Float]]? {
         didSet { needsDisplay = true }
     }
+    /// The grid's physical aspect ratio (width/height in world units), from its
+    /// span vectors. Drives aspect-preserving layout; if nil the bitmap fills the
+    /// view (legacy behaviour for slice grids without stored geometry).
+    var physicalAspect: CGFloat = 1
     /// Optional iso-contour levels to trace over the colormap.
     var contourLevels: [Float] = []
     var zLabel: String = ""
@@ -26,10 +30,12 @@ final class ColorPlaneView: NSView {
         guard let cg = renderBitmap(grid, rows: rows, cols: cols) else {
             NSColor.white.setFill(); dirtyRect.fill(); return
         }
-        // Draw the bitmap to fill the view.
-        ctx.draw(cg, in: bounds)
+        // Draw the bitmap preserving the grid's physical aspect ratio, centered
+        // with letterbox bars — stretching to an arbitrary window size would skew
+        // an anisotropic or skew plane.
+        ctx.draw(cg, in: aspectFitRect(nativeW: cols, nativeH: rows, aspect: physicalAspect))
 
-        // Contour lines on top.
+        // Contour lines on top, mapped into the same aspect-fit rect.
         if !contourLevels.isEmpty {
             NSColor.white.withAlphaComponent(0.6).setStroke()
             for level in contourLevels {
@@ -37,6 +43,23 @@ final class ColorPlaneView: NSView {
             }
         }
         drawTitle()
+    }
+
+    /// Rectangle (in view coordinates) that fits a native-aspect rectangle of the
+    /// given aspect ratio into the view bounds, centered.
+    private func aspectFitRect(nativeW: Int, nativeH: Int, aspect: CGFloat) -> CGRect {
+        let viewW = bounds.width, viewH = bounds.height
+        guard viewW > 0, viewH > 0, nativeW > 0, nativeH > 0, aspect > 0
+        else { return bounds }
+        // Pixel spacing is uniform; the data has (cols) samples across and (rows)
+        // down, so the sample grid's physical aspect is `aspect` (world units).
+        let targetAspect = aspect
+        var w = viewW
+        var h = w / targetAspect
+        if h > viewH { h = viewH; w = h * targetAspect }
+        let x = (viewW - w) / 2
+        let y = (viewH - h) / 2
+        return CGRect(x: x, y: y, width: w, height: h)
     }
 
     /// Render the grid as a colormap bitmap via a viridis-style transfer.
@@ -75,29 +98,74 @@ final class ColorPlaneView: NSView {
         return (UInt8(r*255.5), UInt8(gr*255.5), UInt8(b*255.5))
     }
 
-    /// Marching-squares contour trace for a single iso level, drawn in view coordinates.
+    /// Marching-squares contour trace for a single iso level, drawn in view coords.
+    ///
+    /// Crossing positions are LINEARLY INTERPOLATED between the two corner values
+    /// on each edge (not placed at fixed midpoints). Cell size uses (cols-1) and
+    /// (rows-1) since `cols` samples span `cols-1` intervals. Four-crossing saddle
+    /// cells produce TWO segments; pairing them by the center value resolves the
+    /// saddle ambiguity instead of dropping one. Geometry is computed by the pure
+    /// `contourSegments` helper (unit-tested directly) and mapped into view space.
     private func traceContour(_ g: [[Float]], rows: Int, cols: Int, level: Float) {
-        let W = bounds.width, H = bounds.height
-        let cellW = W / CGFloat(cols), cellH = H / CGFloat(rows)
+        // Map grid samples into the same aspect-fit rect the colormap is drawn in.
+        let rect = aspectFitRect(nativeW: cols, nativeH: rows, aspect: physicalAspect)
+        guard rect.width > 0, rect.height > 0, cols > 1, rows > 1 else { return }
+        let cellW = rect.width / CGFloat(cols - 1)
+        let cellH = rect.height / CGFloat(rows - 1)
+        // Normalized cell coordinate (u,v in 0..1 across the cell) to view point.
+        func P(_ u: CGFloat, _ v: CGFloat) -> NSPoint {
+            NSPoint(x: rect.origin.x + u * cellW, y: rect.origin.y + v * cellH)
+        }
         let path = NSBezierPath()
         path.lineWidth = 0.8
         for y in 0..<(rows - 1) {
             for x in 0..<(cols - 1) {
-                let tl = g[y][x], tr = g[y][x + 1], br = g[y + 1][x + 1], bl = g[y + 1][x]
-                func pt(_ gx: Int, _ gy: Int) -> NSPoint {
-                    NSPoint(x: (CGFloat(gx) + 0.5) * cellW, y: (CGFloat(gy) + 0.5) * cellH)
-                }
-                var seg: [NSPoint] = []
-                if (tl < level) != (tr < level) { seg.append(NSPoint(x: pt(x + 1, y).x, y: pt(x, y).y)) }
-                if (tr < level) != (br < level) { seg.append(pt(x + 1, y + 1)) }
-                if (br < level) != (bl < level) { seg.append(NSPoint(x: pt(x, y + 1).x, y: pt(x + 1, y + 1).y)) }
-                if (bl < level) != (tl < level) { seg.append(pt(x, y)) }
-                if seg.count >= 2 {
-                    path.move(to: seg[0]); path.line(to: seg[1])
+                let tl = g[y][x], tr = g[y][x + 1], br = g[y + 1][ x + 1], bl = g[y + 1][x]
+                for seg in ColorPlaneView.contourSegments(tl: tl, tr: tr, br: br, bl: bl, level: level) {
+                    path.move(to: P(CGFloat(seg[0].x), CGFloat(seg[0].y)))
+                    path.line(to: P(CGFloat(seg[1].x), CGFloat(seg[1].y)))
                 }
             }
         }
         path.stroke()
+    }
+
+    /// Pure marching-squares geometry for one cell: given the four corner values
+    /// (tl, tr, br, bl) and an iso level, returns the contour segment(s) as pairs of
+    /// points in normalized cell coordinates (u,v in 0..1, origin top-left).
+    ///
+    /// Edge crossings are interpolated linearly between corner values. The four
+    /// edges are sampled clockwise (top, right, bottom, left); a 2-crossing cell
+    /// yields one segment, a 4-crossing (saddle) cell yields two, paired by the
+    /// center value to resolve the topological ambiguity.
+    static func contourSegments(tl: Float, tr: Float, br: Float, bl: Float, level: Float)
+        -> [[SIMD2<Float>]] {
+        // Crossing parameter t in 0..1 along the edge from value a to value b.
+        func crossT(_ a: Float, _ b: Float) -> Float {
+            let d = b - a
+            return abs(d) < 1e-9 ? 0.5 : (level - a) / d
+        }
+        let top = SIMD2<Float>(crossT(tl, tr), 0)          // u in 0..1 along top (v=0)
+        let right = SIMD2<Float>(1, crossT(tr, br))        // v in 0..1 along right (u=1)
+        let bottom = SIMD2<Float>(1 - crossT(bl, br), 1)    // u in 1..0 along bottom (v=1)
+        let left = SIMD2<Float>(0, 1 - crossT(tl, bl))      // v in 1..0 along left (u=0)
+        var pts: [SIMD2<Float>] = []
+        if (tl < level) != (tr < level) { pts.append(top) }
+        if (tr < level) != (br < level) { pts.append(right) }
+        if (br < level) != (bl < level) { pts.append(bottom) }
+        if (bl < level) != (tl < level) { pts.append(left) }
+        if pts.count == 2 {
+            return [pts]
+        } else if pts.count == 4 {
+            let center = (tl + tr + br + bl) / 4
+            // Pair by center value: high-center joins top-right & bottom-left, etc.
+            if center >= level {
+                return [[pts[0], pts[1]], [pts[2], pts[3]]]
+            } else {
+                return [[pts[0], pts[3]], [pts[1], pts[2]]]
+            }
+        }
+        return []
     }
 
     private func drawEmpty() {

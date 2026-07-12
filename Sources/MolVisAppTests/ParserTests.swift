@@ -509,8 +509,10 @@ final class ParserTests: XCTestCase {
     }
 
     // A QE PWscf `.out` carrying `bands (ev):` blocks must parse (forced with
-    // `--bands`, i.e. as `.bands`) into a BandStructure: 56 k-points, uniform
-    // 69 bands each, and an empty atom set (the grapher is shown, not the canvas).
+    // `--bands`, i.e. as `.bands`) into a BandStructure. The fixture holds SEVEN
+    // SCF iterations of 8 k-points each: the parser must return ONLY the final
+    // complete iteration (8 points), not the concatenation (56). Band count is
+    // deduced from the mode; the Fermi energy is read from the file, not forged.
     func testBandsParseQE() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/CH3Rh111.out")
@@ -518,10 +520,12 @@ final class ParserTests: XCTestCase {
         guard let bands = loaded.bandStructure else {
             return XCTFail("no bandStructure parsed")
         }
-        XCTAssertEqual(bands.nKPoints, 56, "expected 56 k-points")
+        // Final iteration only: 8 k-points, not all 56.
+        XCTAssertEqual(bands.nKPoints, 8, "expected the final iteration's 8 k-points")
         XCTAssertEqual(bands.nBands, 69, "expected 69 bands per k-point")
         XCTAssertTrue(loaded.atoms.isEmpty, "a bands file carries no atoms")
-        // Every k-point must report the same (deduced) band count.
+        // Every surviving k-point must match the modal band count exactly — no
+        // zero-padded short records.
         for (ik, kp) in bands.kPoints.enumerated() {
             XCTAssertEqual(kp.energies.count, 69, "k-point \(ik) band count mismatch")
         }
@@ -529,6 +533,16 @@ final class ParserTests: XCTestCase {
         let d = bands.kDistances
         for i in 1..<d.count {
             XCTAssertGreaterThanOrEqual(d[i], d[i - 1], "k-distances not monotonic at \(i)")
+        }
+        // The real Fermi energy of the final iteration, not a fabricated zero.
+        XCTAssertEqual(bands.fermiEnergy, 4.6341, accuracy: 0.01,
+                       "Fermi energy should be parsed from the file")
+        // And it must fall within the final iteration's eigenvalue window, i.e.
+        // the grapher's red Fermi line actually intersects the plotted bands.
+        let allE = bands.kPoints.flatMap { $0.energies }
+        if let lo = allE.min(), let hi = allE.max() {
+            XCTAssertGreaterThanOrEqual(bands.fermiEnergy, lo)
+            XCTAssertLessThanOrEqual(bands.fermiEnergy, hi)
         }
     }
 
