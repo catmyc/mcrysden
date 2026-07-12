@@ -338,11 +338,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     }
 
     func applyCameraForNewSceneIfNeeded() {
-        // Frame on atoms AND any volumetric grid (scalar field / Fermi surface) so
-        // structure-less files (BXSF) don't collapse to a zero-radius point.
-        let (c, r) = scene.framingSphere()
-        camera.center = c
-        camera.distance = max(8, r * 3)
+        // The scene owns the canonical default-framing rule (atoms AND grid); use it
+        // so the window, PNG export and vector export all agree on framing.
+        camera = scene.defaultCamera()
         setNeedsRender()
     }
 
@@ -513,6 +511,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showLabels = scene.showLabels
         next.showStructure = scene.showStructure
         next.showBrillouinZone = scene.showBrillouinZone
+        // Volumetric-surface settings: without these, scrubbing an animated scalar
+        // field or Fermi surface resets the iso level / visibility to defaults.
+        next.showIsoSurface = scene.showIsoSurface
+        next.isoLevel = scene.isoLevel
+        next.showFermiSurface = scene.showFermiSurface
         next.lighting = state.lighting
         next.backgroundType = state.backgroundType
         next.background = state.backgroundHex

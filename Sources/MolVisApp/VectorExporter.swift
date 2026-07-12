@@ -24,7 +24,11 @@ enum RasterExportError: Error {
 /// This is raster-in-a-vector-wrapper, not true primitive (GL2PS-style)
 /// vector output — the name reflects that honestly.
 enum RasterExporter {
-    static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws {
+    /// Render the scene to a vector container (PDF/SVG/EPS/PS) at `size`. Returns the
+    /// CGImage raster that was wrapped, so a caller can validate pixel content (used by
+    // the export tests) across all formats — not just the written file's byte size.
+    @discardableResult
+    static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
         let ext = url.pathExtension.lowercased()
         let w = Int(size.width.rounded()), h = Int(size.height.rounded())
         let cg = try render(scene: scene, camera: camera, w: w, h: h)
@@ -34,6 +38,7 @@ enum RasterExporter {
         case "eps", "ps": try emitEPS(cgImage: cg, w: w, h: h, to: url)
         default: throw RasterExportError.unsupported
         }
+        return cg
     }
 
     // MARK: Metal → CGImage (mirrors PngExporter, reused for all formats)
@@ -51,12 +56,9 @@ enum RasterExporter {
         guard let tex = device.makeTexture(descriptor: desc) else { throw RasterExportError.noTex }
         let cb = device.makeCommandQueue()!.makeCommandBuffer()!
         renderer.background = PngExporter.clearColor(scene.background)
-        var cam = camera ?? {
-            var c = Camera()
-            let (cen, r) = scene.boundingSphere()
-            c.center = cen; c.distance = max(8, r * 3)
-            return c
-        }()
+        // No camera supplied (headless export)? Fall back to the scene's canonical
+        // default framing, which matches what the GUI shows.
+        var cam = camera ?? scene.defaultCamera()
         if cam.rotation == simd_quatf(ix: 0, iy: 0, iz: 0, r: 0) {
             cam.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         }

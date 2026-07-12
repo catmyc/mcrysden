@@ -301,9 +301,12 @@ enum BXSFLoader {
             let pipe = Pipe()
             p.standardOutput = pipe
             try p.run()
+            // Read BEFORE waiting: a full pipe buffer would otherwise deadlock gunzip
+            // (it blocks on write while we block on waitUntilExit) — the Rh fixture is
+            // ~500KB, far past the pipe capacity.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
             guard p.terminationStatus == 0 else { throw E.decompress("gunzip exit \(p.terminationStatus)") }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             text = String(data: data, encoding: .utf8) ?? ""
         } else {
             text = try String(contentsOf: url, encoding: .utf8)

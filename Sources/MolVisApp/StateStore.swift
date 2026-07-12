@@ -34,6 +34,7 @@ enum StateStore {
         payload["showStructure"] = scene.showStructure
         payload["showIsoSurface"] = scene.showIsoSurface
         payload["isoLevel"] = scene.isoLevel
+        payload["showFermiSurface"] = scene.showFermiSurface
         payload["atomScale"] = scene.atomScale
         payload["bondRadius"] = scene.bondRadius
         payload["lighting"] = [
@@ -126,6 +127,7 @@ enum StateStore {
         if let v = obj["showStructure"] as? Bool { scene.showStructure = v }
         if let v = obj["showIsoSurface"] as? Bool { scene.showIsoSurface = v }
         if let v = obj["isoLevel"] as? Double { scene.isoLevel = Float(v) }
+        if let v = obj["showFermiSurface"] as? Bool { scene.showFermiSurface = v }
         if let v = obj["atomScale"] as? Double { scene.atomScale = Float(v) }
         if let v = obj["bondRadius"] as? Double { scene.bondRadius = Float(v) }
         if let light = obj["lighting"] as? [String: Any] {

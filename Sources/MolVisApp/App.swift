@@ -80,49 +80,73 @@ final class App: NSObject, NSApplicationDelegate {
     /// would be metadata-only and the saved frame's geometry would never show.
     private static func loadScene(from url: URL, format: ParseFormat?, cliFrame: Int,
                                   stateURL: URL?) throws -> (scene: Scene, camera: Camera?) {
+        // The frame the initial load actually shows: cliFrame is -1 (default open) or an
+        // explicit --frame N (>= 0). Record it on the scene so the GUI scrubber and the
+        // displayed geometry agree -- without this the scene always reports frame 0 no
+        // matter which cycle is shown.
+        let loadedFrame = cliFrame < 0 ? 0 : cliFrame
         var scene = Scene(loaded: try Parser.load(url, as: format, frameIndex: cliFrame))
+        scene.currentFrame = loadedFrame
         var camera: Camera? = nil
         if let stateURL {
             try StateStore.load(into: &scene, camera: &camera, from: stateURL)
         }
-        // Honor a saved animation frame: re-parse it and rebuild the structure.
-        if scene.currentFrame > 0 && scene.currentFrame != cliFrame {
-            let fc = Parser.frameCount(url, as: format)
-            if scene.currentFrame < fc {
-                // Snapshot the appearance/control state the StateStore just restored —
-                // a fresh Scene(loaded:) would otherwise wipe display mode, colors,
-                // lighting, visibility flags, isosurface settings and currentFrame.
-                let restoredAppearance = scene
-                scene = Scene(loaded: try Parser.load(url, as: format, frameIndex: scene.currentFrame))
-                if restoredAppearance.superCell.total > 1 {
-                    scene = scene.widenSuperCell(restoredAppearance.superCell)
-                }
-                if let sl = restoredAppearance.slab { scene = scene.applySlab(sl) }
-                // re-apply the appearance fields (kept while only geometry changed)
-                scene.displayMode = restoredAppearance.displayMode
-                scene.background = restoredAppearance.background
-                scene.backgroundBottom = restoredAppearance.backgroundBottom
-                scene.backgroundType = restoredAppearance.backgroundType
-                scene.lighting = restoredAppearance.lighting
-                scene.showCellFrame = restoredAppearance.showCellFrame
-                scene.showAxes = restoredAppearance.showAxes
-                scene.showLabels = restoredAppearance.showLabels
-                scene.showStructure = restoredAppearance.showStructure
-                scene.showBrillouinZone = restoredAppearance.showBrillouinZone
-                scene.showIsoSurface = restoredAppearance.showIsoSurface
-                scene.isoLevel = restoredAppearance.isoLevel
-                scene.atomScale = restoredAppearance.atomScale
-                scene.bondRadius = restoredAppearance.bondRadius
-                scene.selectedAtoms = restoredAppearance.selectedAtoms
-                scene.measurementMode = restoredAppearance.measurementMode
-                scene.measurementResult = restoredAppearance.measurementResult
-                scene.currentFrame = restoredAppearance.currentFrame
-                // Do NOT restore scalarField/fermiSurface from the initial scene: the
-                // freshly parsed frame carries its own volumetric data, and an animated
-                // XSF can have frame-specific grids. Keep the new frame's fields.
-            }
-        }
+        // Resolve the displayed frame (clamp a saved frame + reparse it) via the shared
+        // helper so the GUI path and the frame-state tests run IDENTICAL logic.
+        let fc = Parser.frameCount(url, as: format)
+        try resolveAnimationFrame(scene: &scene, from: url, format: format,
+                                  loadedFrame: loadedFrame, fc: fc)
         return (scene, camera)
+    }
+
+    /// Resolve which animation frame a scene (just loaded, and optionally state-restored)
+    /// should display. A saved `currentFrame` is clamped into `0..<fc` (and warned on); if
+    /// it differs from the frame we initially loaded, that cycle is re-parsed and the
+    /// appearance/structural settings restored from state are carried over. INTERNAL so
+    /// the frame-state tests exercise the EXACT production logic instead of a mirror.
+    static func resolveAnimationFrame(scene: inout Scene, from url: URL, format: ParseFormat?,
+                                      loadedFrame: Int, fc: Int) throws {
+        if fc == 0 {
+            // Non-animated file: a malformed saved state or --frame N must never leave a
+            // stale nonzero/negative index in the scene (it would desync the scrubber).
+            if scene.currentFrame != 0 {
+                print("[mcrysden] warning: saved frame \(scene.currentFrame) on a non-animated file; reset to 0")
+                scene.currentFrame = 0
+            }
+        } else if scene.currentFrame < 0 || scene.currentFrame >= fc {
+            // Animated file: clamp a saved index into the valid range.
+            let clamped = min(max(0, scene.currentFrame), fc - 1)
+            print("[mcrysden] warning: saved frame \(scene.currentFrame) out of range (0..<\(fc)); clamped to \(clamped)")
+            scene.currentFrame = clamped
+        }
+        // Honor a saved frame that differs from what we loaded (a saved 0 overrides --frame N).
+        if scene.currentFrame != loadedFrame, scene.currentFrame < fc {
+            let restored = scene
+            scene = Scene(loaded: try Parser.load(url, as: format, frameIndex: scene.currentFrame))
+            if restored.superCell.total > 1 { scene = scene.widenSuperCell(restored.superCell) }
+            if let sl = restored.slab { scene = scene.applySlab(sl) }
+            // carry over appearance/structural settings (kept while only geometry changes)
+            scene.displayMode = restored.displayMode
+            scene.background = restored.background
+            scene.backgroundBottom = restored.backgroundBottom
+            scene.backgroundType = restored.backgroundType
+            scene.lighting = restored.lighting
+            scene.showCellFrame = restored.showCellFrame
+            scene.showAxes = restored.showAxes
+            scene.showLabels = restored.showLabels
+            scene.showStructure = restored.showStructure
+            scene.showBrillouinZone = restored.showBrillouinZone
+            scene.showIsoSurface = restored.showIsoSurface
+            scene.isoLevel = restored.isoLevel
+            scene.atomScale = restored.atomScale
+            scene.bondRadius = restored.bondRadius
+            scene.selectedAtoms = restored.selectedAtoms
+            scene.measurementMode = restored.measurementMode
+            scene.measurementResult = restored.measurementResult
+            scene.currentFrame = restored.currentFrame
+            // Do NOT restore scalarField/fermiSurface from the initial scene: the freshly
+            // parsed frame carries its own volumetric data; keep the new frame's fields.
+        }
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -172,7 +196,10 @@ final class App: NSObject, NSApplicationDelegate {
                 mainWC = wc
                 // Pass the RESOLVED frame (clFrame, or the restored frame if the
                 // state encoded one) so the scrubber opens where the user left off.
-                wc.loadFile(scene, from: inURL, format: format, frameIndex: scene.currentFrame > 0 ? scene.currentFrame : frame)
+                // The scene's currentFrame is now accurate (>= 0) whether it came from
+                // the CLI --frame, a saved state, or the default-open frame 0 -- so the
+                // scrubber initializes in sync with what's actually displayed.
+                wc.loadFile(scene, from: inURL, format: format, frameIndex: scene.currentFrame)
                 if let camera {
                     wc.camera = camera
                     // Sync the orthographic toggle from the RESTORED camera (not the

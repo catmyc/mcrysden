@@ -31,7 +31,7 @@ enum ParseFormat {
     case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
-        switch ext {
+        switch ext.lowercased() {
         case "xsf": self = .xsf
         case "axsf": self = .axsf
         case "xyz": self = .xyz
@@ -54,6 +54,52 @@ enum ParseFormat {
         default: return nil
         }
     }
+
+    /// Resolve a format from a URL, peeling a trailing `.gz` layer so gzip-wrapped
+    /// formats (`.bxsf.gz`) dispatch to their own parser. `pathExtension` alone would
+    /// yield only `gz`; when it is, we look one layer deeper at the stem's extension.
+    static func from(url: URL) -> ParseFormat? {
+        let ext = url.pathExtension.lowercased()
+        if let f = ParseFormat(ext: ext) {
+            // `.out` is ambiguous: QE PWscf, ORCA and FHI-aims all use it. When the
+            // extension alone can't decide, sniff the header and let content win.
+            if ext == "out", let detected = sniffOutFormat(url) { return detected }
+            return f
+        }
+        if ext == "gz", let f = ParseFormat(ext: url.deletingPathExtension().pathExtension.lowercased()) {
+            return f
+        }
+        return nil
+    }
+
+    /// Peek the first lines of an `.out` file to tell QE / Orca / FHI-aims apart. CHECK
+    /// QE FIRST: a QE output can mention "orca" (e.g. in a methods comparison) within its
+    /// first 4 KB, so the broad substring must not pre-empt the authoritative PWSCF marker.
+    ///   - QE PWscf: opens with "Program PWSCF".
+    ///   - Orca: the spaced "O   R   C   A" banner (matched literally — not the bare word
+    ///     "orca", which false-positives on incidental mentions in other codes' output).
+    ///   - FHI-aims COORD.OUT: starts directly with three lattice-vector float-triples.
+    /// Anything else falls back to QE (the most common .out producer).
+    private static func sniffOutFormat(_ url: URL) -> ParseFormat? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 4096), let head = String(data: data, encoding: .utf8) else { return nil }
+        // 1) QE first — it is the common case and can mention other code names.
+        if head.contains("Program PWSCF") || head.contains("PWSCF") { return .pwo }
+        // 2) Orca by its specific spaced banner only.
+        if head.contains("O   R   C   A") { return .orca }
+        // 3) FHI-aims: first three non-blank lines must each be exactly three floats.
+        let lines = head.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if lines.count >= 3 && lines[0...2].allSatisfy({ isNumericTriple($0) }) { return .fhi }
+        return nil   // leave as the extension default (.pwo) chosen by the caller
+    }
+
+    /// True if `s` is exactly three whitespace-separated floats (a lattice-vector row).
+    private static func isNumericTriple(_ s: String) -> Bool {
+        let toks = s.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard toks.count == 3 else { return false }
+        return toks.allSatisfy { Float($0) != nil }
+    }
 }
 
 enum Parser {
@@ -73,7 +119,7 @@ enum Parser {
             // renamed .pwo passed as --pwo --frame 1) and route to the per-format
             // frame loader (only orca/pwo/axsf are multi-frame; for anything else the
             // index is simply ignored by the single-frame path below).
-            let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
+            let effective = format ?? ParseFormat.from(url: url)
             switch effective {
             case .orca, .pwo, .axsf:
                 return try load(url, frameIndex: frameIndex, as: format)
@@ -88,7 +134,7 @@ enum Parser {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
-        let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
+        let effective = format ?? ParseFormat.from(url: url)
         guard let effective else {
             throw ParseError.io(path: url.path, reason: "unknown extension \(url.pathExtension)")
         }
@@ -169,7 +215,7 @@ enum Parser {
     /// extension is ambiguous or was renamed.
     static func frameCount(_ url: URL, as format: ParseFormat? = nil) -> Int {
         let cPath = url.path.cString(using: .utf8)!
-        let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
+        let effective = format ?? ParseFormat.from(url: url)
         switch effective {
         case .pwo: return Int(molenv_pwo_frame_count(cPath))
         case .orca: return orcaCycleCount(url)
@@ -185,7 +231,7 @@ enum Parser {
         // Choose the per-format frame loader honoring a forced format. AXSF is
         // the original animated format; QE .pwo output adds ionic steps as
         // frames via parse_pwo.
-        let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
+        let effective = format ?? ParseFormat.from(url: url)
         // Orca is parsed in Swift (its own multi-frame path) — route it before
         // the C parsers so frameIndex reaches loadOrca.
         if effective == .orca {

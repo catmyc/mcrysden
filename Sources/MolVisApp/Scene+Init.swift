@@ -69,9 +69,16 @@ extension Scene {
             minCorner = min(minCorner, a.coord); maxCorner = max(maxCorner, a.coord); hasAny = true
         }
         func incorporate(_ o: SIMD3<Float>, _ v: [SIMD3<Float>]) {
-            // grid spans the parallelepiped o .. o+v[0]+v[1]+v[2]
-            let far = o + v[0] + v[1] + v[2]
-            minCorner = min(minCorner, min(o, far)); maxCorner = max(maxCorner, max(o, far)); hasAny = true
+            // The grid occupies the parallelepiped whose 8 corners are
+            // o + i*v[0] + j*v[1] + k*v[2] for i,j,k in {0,1}. When a span vector has
+            // negative components (e.g. RhBulkFcc) the min corner is NOT origin but
+            // origin plus the summed negative extents, so accumulate per-axis.
+            var mn = o, mx = o
+            for corner in [(0,0,0),(1,0,0),(0,1,0),(0,0,1),(1,1,0),(1,0,1),(0,1,1),(1,1,1)] {
+                let p = o + v[0]*Float(corner.0) + v[1]*Float(corner.1) + v[2]*Float(corner.2)
+                mn = min(mn, p); mx = max(mx, p)
+            }
+            minCorner = min(minCorner, mn); maxCorner = max(maxCorner, mx); hasAny = true
         }
         if let f = scalarField { incorporate(f.origin, f.vec) }
         if let fs = fermiSurface, let b = fs.bands.first { incorporate(b.origin, b.vec) }
@@ -79,6 +86,20 @@ extension Scene {
         let center = (minCorner + maxCorner) * 0.5
         let radius = distance(maxCorner, minCorner) * 0.5
         return (center, radius)
+    }
+
+    /// Camera that frames both atoms AND any volumetric grid, used as the single
+    /// source of truth by the live window and both exporters. Atomic scenes are in
+    /// Å (floored at 8); reciprocal-space grids (BXSF) span only ~0.2 units, so the
+    /// floor would leave the camera way too far and the surface invisibly small — fit
+    /// those tightly. This guarantees a structure-less BXSF exports at the framing it
+    /// displays as in the GUI.
+    func defaultCamera() -> Camera {
+        var c = Camera()
+        let (cen, r) = framingSphere()
+        c.center = cen
+        c.distance = atoms.isEmpty ? max(0.5, r * 3) : max(8, r * 3)
+        return c
     }
 
     static let superCellAtomCap = 500_000

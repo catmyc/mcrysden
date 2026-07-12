@@ -6,7 +6,10 @@ import simd
 enum PngExportError: Error { case noGPU, noTex, noCGImage, noPNG }
 
 enum PngExporter {
-    static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws {
+    /// Render the scene to PNG at `size`. Returns the rendered CGImage so a caller can
+    /// validate pixel content (used by the export tests) in addition to the written file.
+    @discardableResult
+    static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
         guard let device = MTLCreateSystemDefaultDevice() else { throw PngExportError.noGPU }
         let renderer = try Renderer(device: device)
         renderer.scene = scene
@@ -20,12 +23,9 @@ enum PngExporter {
         let q = device.makeCommandQueue()!
         let cb = q.makeCommandBuffer()!
         renderer.background = PngExporter.clearColor(scene.background)
-        var cam = camera ?? {
-            var c = Camera()
-            let (cen, r) = scene.boundingSphere()
-            c.center = cen; c.distance = max(8, r*3)
-            return c
-        }()
+        // No camera supplied (headless export)? Fall back to the scene's canonical
+        // default framing, which matches what the GUI shows.
+        var cam = camera ?? scene.defaultCamera()
         if cam.rotation == simd_quatf(ix:0,iy:0,iz:0,r:0) { cam.rotation = simd_quatf(ix:0,iy:0,iz:0,r:1) }
         let viewport = MTLViewport(originX: 0, originY: 0, width: Double(size.width), height: Double(size.height), znear: 0, zfar: 1)
         renderer.encode(to: cb, target: tex, viewport: viewport, camera: cam)
@@ -40,6 +40,7 @@ enum PngExporter {
         let rep = NSBitmapImageRep(cgImage: cg)
         guard let png = rep.representation(using: .png, properties: [:]) else { throw PngExportError.noPNG }
         try png.write(to: url)
+        return cg
     }
     static func clearColor(_ hex: String) -> MTLClearColor {
         var s = hex.trimmingCharacters(in: .whitespaces)
