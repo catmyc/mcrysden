@@ -75,13 +75,29 @@ enum StateStore {
         // would trap Swift's `0..<neg` range, and huge values could overflow the
         // atom-count multiplication, so clamp to [1, max] per the contract.
         if let sc = obj["supercell"] as? [Int], sc.count == 3 {
-            let dims = sc.map { max(1, $0) }
-            let total = dims[0] * dims[1] * dims[2]
-            if total <= 64, total * scene.atoms.count <= Scene.superCellAtomCap {
-                scene = scene.widenSuperCell(SuperCell(n1: dims[0], n2: dims[1], n3: dims[2]))
-            } else {
-                print("[mcrysden] warning: saved supercell (\(dims)) refused (would exceed atom cap)")
+            // Clamp both bounds BEFORE multiplying so huge JSON ints can't overflow
+            // the unchecked Int products (the old lower-only clamp still wrapped).
+            // Validate per-axis limits separately (matching the sidebar steppers at
+            // 1..6), THEN check total*atomCount against the atom cap. The old code
+            // compared the raw product against 64, so a valid 6x6x6 (=216) supercell
+            // was refused even though it's well under the cap.
+            let perAxisMin = 1, perAxisMax = 6
+            let dims = sc.map { min(perAxisMax, max(perAxisMin, $0)) }
+            // Saturating multiply so malformed huge JSON ints can't trap Swift's
+            // `Int` before the cap check runs.
+            let d01 = dims[0].multipliedReportingOverflow(by: dims[1])
+            let d012 = d01.partialValue.multipliedReportingOverflow(by: dims[2])
+            guard !d01.overflow, !d012.overflow else {
+                print("[mcrysden] warning: saved supercell (\(dims)) refused (overflow)")
+                return
             }
+            let total = d012.partialValue
+            guard !total.multipliedReportingOverflow(by: scene.atoms.count).overflow,
+                  total * scene.atoms.count <= Scene.superCellAtomCap else {
+                print("[mcrysden] warning: saved supercell (\(dims)) refused (would exceed atom cap)")
+                return
+            }
+            scene = scene.widenSuperCell(SuperCell(n1: dims[0], n2: dims[1], n3: dims[2]))
         }
         // slab (optional). Assign the plane AND actually filter the atoms so a
         // saved slab is rendered — in headless export the scene is drawn

@@ -53,6 +53,12 @@ final class SideBarState: ObservableObject {
     /// True when a volumetric field is present — the sidebar gates the
     /// Isosurface section on this so structure-only files show no empty controls.
     var hasScalarField: Bool = false
+    /// True when a Fermi surface (BXSF) is present — the sidebar gates the
+    /// Fermi Surface section on this so structure-only files show no empty controls.
+    var hasFermiSurface: Bool = false
+    /// Toggle the Fermi-surface overlay. Synced to scene.showFermiSurface in
+    /// syncFromState(); meaningful only when hasFermiSurface is true.
+    @Published var showFermiSurface: Bool = true { didSet { onChange?() } }
     /// AXSF animation playback state. frameCount is 1 for non-animated files
     /// (the playback UI is hidden in that case). isPlaying drives a timer in
     /// MainWindowController; frameIndex advances it and reloads the frame.
@@ -110,6 +116,8 @@ final class SideBarState: ObservableObject {
         } else {
             hasScalarField = false
         }
+        hasFermiSurface = (scene.fermiSurface != nil)
+        showFermiSurface = scene.showFermiSurface
         onChange = saved
     }
 }

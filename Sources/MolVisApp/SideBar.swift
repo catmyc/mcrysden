@@ -75,6 +75,15 @@ struct SideBar: View {
                     }
                 }
             }
+            // --- Fermi surface (BXSF) ----------------------------------------
+            // Shown only when the loaded file carried a Fermi-surface grid. Each
+            // band is surfaced at the Fermi energy; the toggle hides/shows the
+            // whole multi-band cage independently of the scalar isosurface.
+            if state.hasFermiSurface {
+                Section("Fermi Surface") {
+                    Toggle("Show Fermi Surface", isOn: $state.showFermiSurface)
+                }
+            }
             // --- k-path (crystal only): Brillouin-zone overlay + band path. -----
             // The scene exposes cell + base atoms; the controller builds the
             // default high-symmetry path and writes the chosen export via a save

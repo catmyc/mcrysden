@@ -338,7 +338,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     }
 
     func applyCameraForNewSceneIfNeeded() {
-        let (c, r) = scene.boundingSphere()
+        // Frame on atoms AND any volumetric grid (scalar field / Fermi surface) so
+        // structure-less files (BXSF) don't collapse to a zero-radius point.
+        let (c, r) = scene.framingSphere()
         camera.center = c
         camera.distance = max(8, r * 3)
         setNeedsRender()
@@ -416,6 +418,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // gates the draw on `scene.scalarField != nil`).
         scene.showIsoSurface = state.showIsoSurface
         scene.isoLevel = state.isoLevel
+        // Fermi surface: written unconditionally; the renderer gates the draw on
+        // `scene.fermiSurface != nil`.
+        scene.showFermiSurface = state.showFermiSurface
         scene.measurementMode = state.measurementMode
         // Scene-derived mirrors flow state <- scene purely to keep the sidebar
         // indicators in sync; guarded above against re-entrant onChange.

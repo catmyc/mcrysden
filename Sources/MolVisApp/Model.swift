@@ -154,6 +154,10 @@ struct Scene: Codable {
     /// is gated in the UI on the presence of a scalarField.
     var showIsoSurface: Bool = true
     var isoLevel: Float = 0
+    /// Overlay a Fermi surface (one isosurface per band at the Fermi level). Gated
+    /// in the UI on the presence of a fermiSurface and drawn separately from the
+    /// scalar-field isosurface so it can be toggled independently.
+    var showFermiSurface: Bool = true
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

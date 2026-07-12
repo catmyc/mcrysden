@@ -7,27 +7,43 @@ final class App: NSObject, NSApplicationDelegate {
     /// Quit automatically when the user closes the last window (issue 1).
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
 
+    /// A single source of truth for every supported format: its force-flag, the file
+    /// extensions (primary first) the Open panel offers, and the parser to use.
+    /// `formatFlags`, `forcedFormat`, the Open panel and --help are all derived from
+    /// this table so they can never drift apart.
+    private struct FormatInfo {
+        let flag: String
+        let extensions: [String]
+        let format: ParseFormat
+    }
+    private static let formatTable: [FormatInfo] = [
+        FormatInfo(flag: "--xsf",     extensions: ["xsf"],                       format: .xsf),
+        FormatInfo(flag: "--axsf",    extensions: ["axsf"],                      format: .axsf),
+        FormatInfo(flag: "--xyz",     extensions: ["xyz"],                       format: .xyz),
+        FormatInfo(flag: "--pdb",     extensions: ["pdb"],                       format: .pdb),
+        FormatInfo(flag: "--pwi",     extensions: ["pwi", "in", "inp"],          format: .pwi),
+        FormatInfo(flag: "--pwo",     extensions: ["pwo", "out"],                format: .pwo),
+        FormatInfo(flag: "--cif",     extensions: ["cif"],                       format: .cif),
+        FormatInfo(flag: "--poscar",  extensions: ["poscar", "contcar", "vasp"], format: .poscar),
+        FormatInfo(flag: "--cube",    extensions: ["cube"],                      format: .cube),
+        FormatInfo(flag: "--bxsf",    extensions: ["bxsf", "bxsf.gz"],           format: .bxsf),
+        FormatInfo(flag: "--struct",  extensions: ["struct"],                    format: .struct_),
+        FormatInfo(flag: "--crystal", extensions: ["r1"],                        format: .crystal),
+        FormatInfo(flag: "--orca",    extensions: ["orca"],                      format: .orca),
+        FormatInfo(flag: "--fhi",     extensions: ["fhi", "coord"],              format: .fhi),
+    ]
     /// Force-format flags (take no value).
-    private static let formatFlags: Set<String> =
-        ["--xsf", "--xyz", "--pdb", "--axsf", "--pwi", "--pwo", "--cif", "--poscar", "--bxsf", "--struct", "--crystal", "--orca", "--fhi"]
+    private static let formatFlags: Set<String> = Set(formatTable.map { $0.flag })
 
     /// Resolve a forced parser format from the CLI args, if any.
     private static func forcedFormat(from args: [String]) -> ParseFormat? {
-        if args.contains("--xsf") { return .xsf }
-        if args.contains("--xyz") { return .xyz }
-        if args.contains("--pdb") { return .pdb }
-        if args.contains("--axsf") { return .axsf }
-        if args.contains("--pwi") { return .pwi }
-        if args.contains("--pwo") { return .pwo }
-        if args.contains("--cif") { return .cif }
-        if args.contains("--poscar") { return .poscar }
-        if args.contains("--bxsf") { return .bxsf }
-        if args.contains("--struct") { return .struct_ }
-        if args.contains("--crystal") { return .crystal }
-        if args.contains("--orca") { return .orca }
-        if args.contains("--fhi") { return .fhi }
+        for info in formatTable where args.contains(info.flag) { return info.format }
         return nil
     }
+
+    /// All extensions the Open panel should offer, in display order (primary
+    /// extension of each format first, then alternates).
+    private static let openPanelExtensions: [String] = formatTable.flatMap { $0.extensions }
 
     /// Find the input structure file: the first arg that is not a known flag and
     /// is not consumed by `--export <path>`. Allows the force-format flags to be
@@ -45,14 +61,16 @@ final class App: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    /// Parse `--frame N`: the AXSF animation frame to open at launch (>= 0;
-    /// clamped to the file's actual frame count downstream). 0 means "default
-    /// first frame". Consumed but ignored for non-AXSF files.
+    /// Parse `--frame N`: the animation frame to open at launch. Returns the
+    /// requested index (>= 0) when --frame is present, or -1 (sentinel) when it is
+    /// absent, so the loader can distinguish "default open" (cycle 0) from an
+    /// explicit --frame 0 (also cycle 0) -- both now route correctly. The per-format
+    /// frame loader clamps the value to the file's actual count downstream.
     private static func frameIndex(from args: [String]) -> Int {
         if let idx = args.firstIndex(of: "--frame"), idx + 1 < args.count, let n = Int(args[idx + 1]) {
             return max(0, n)
         }
-        return 0
+        return -1   // no --frame specified: default-open sentinel
     }
 
     /// Parse a structure at the CLI frame, apply a companion state (which widens
@@ -69,13 +87,39 @@ final class App: NSObject, NSApplicationDelegate {
         }
         // Honor a saved animation frame: re-parse it and rebuild the structure.
         if scene.currentFrame > 0 && scene.currentFrame != cliFrame {
-            let sc = scene.superCell
-            let slab = scene.slab
             let fc = Parser.frameCount(url, as: format)
             if scene.currentFrame < fc {
+                // Snapshot the appearance/control state the StateStore just restored —
+                // a fresh Scene(loaded:) would otherwise wipe display mode, colors,
+                // lighting, visibility flags, isosurface settings and currentFrame.
+                let restoredAppearance = scene
                 scene = Scene(loaded: try Parser.load(url, as: format, frameIndex: scene.currentFrame))
-                if sc.total > 1 { scene = scene.widenSuperCell(sc) }
-                if let sl = slab { scene = scene.applySlab(sl) }
+                if restoredAppearance.superCell.total > 1 {
+                    scene = scene.widenSuperCell(restoredAppearance.superCell)
+                }
+                if let sl = restoredAppearance.slab { scene = scene.applySlab(sl) }
+                // re-apply the appearance fields (kept while only geometry changed)
+                scene.displayMode = restoredAppearance.displayMode
+                scene.background = restoredAppearance.background
+                scene.backgroundBottom = restoredAppearance.backgroundBottom
+                scene.backgroundType = restoredAppearance.backgroundType
+                scene.lighting = restoredAppearance.lighting
+                scene.showCellFrame = restoredAppearance.showCellFrame
+                scene.showAxes = restoredAppearance.showAxes
+                scene.showLabels = restoredAppearance.showLabels
+                scene.showStructure = restoredAppearance.showStructure
+                scene.showBrillouinZone = restoredAppearance.showBrillouinZone
+                scene.showIsoSurface = restoredAppearance.showIsoSurface
+                scene.isoLevel = restoredAppearance.isoLevel
+                scene.atomScale = restoredAppearance.atomScale
+                scene.bondRadius = restoredAppearance.bondRadius
+                scene.selectedAtoms = restoredAppearance.selectedAtoms
+                scene.measurementMode = restoredAppearance.measurementMode
+                scene.measurementResult = restoredAppearance.measurementResult
+                scene.currentFrame = restoredAppearance.currentFrame
+                // Do NOT restore scalarField/fermiSurface from the initial scene: the
+                // freshly parsed frame carries its own volumetric data, and an animated
+                // XSF can have frame-specific grids. Keep the new frame's fields.
             }
         }
         return (scene, camera)
@@ -187,24 +231,7 @@ final class App: NSObject, NSApplicationDelegate {
     @objc private func openDocument(_ sender: Any?) {
         guard let wc = mainWC else { return }
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.init(filenameExtension: "xsf")!,
-                                      .init(filenameExtension: "xyz")!,
-                                      .init(filenameExtension: "pdb")!,
-                                      .init(filenameExtension: "axsf")!,
-                                      .init(filenameExtension: "pwi")!,
-                                      .init(filenameExtension: "pwo")!,
-                                      .init(filenameExtension: "in")!,
-                                      .init(filenameExtension: "inp")!,
-                                      .init(filenameExtension: "out")!,
-                                      .init(filenameExtension: "cif")!,
-                                      .init(filenameExtension: "poscar")!,
-                                      .init(filenameExtension: "contcar")!,
-                                      .init(filenameExtension: "vasp")!,
-                                      .init(filenameExtension: "cube")!,
-                                      .init(filenameExtension: "struct")!,
-                                      .init(filenameExtension: "r1")!,
-                                      .init(filenameExtension: "orca")!,
-                                      .init(filenameExtension: "fhi")!].compactMap { $0 }
+        panel.allowedContentTypes = Self.openPanelExtensions.compactMap { .init(filenameExtension: $0) }
         panel.beginSheetModal(for: wc.window) { result in
             guard result == .OK, let url = panel.url else { return }
             do {
@@ -262,22 +289,25 @@ final class App: NSObject, NSApplicationDelegate {
     static let appVersion = "1.1.2"
 
     static func printHelp() {
+        // Help text is GENERATED from the format table so flags, extensions and the
+        // units note can never drift out of sync with the parser.
+        let exts = formatTable.map { $0.extensions.first! }.joined(separator: " ")
+        let flags = formatTable.map { $0.flag }.joined(separator: " ")
         print("""
         mcrysden v\(appVersion) — native macOS crystal/molecule viewer (Metal).
         Usage:
-          mcrysden                                  # empty viewer
-          mcrysden <file.xsf|xyz|pdb|axsf|pwi>      # open a structure
-          mcrysden <file> <state.mvis-state>         # open with saved state
-          mcrysden <file> <state> --export out.png  # headless raster render
-          mcrysden <file> <state> --export out.pdf  # raster render in a vector container (pdf, svg, eps, ps)
+          mcrysden                                    # empty viewer
+          mcrysden <file>                             # open a structure (by extension)
+          mcrysden <file> <state.mvis-state>           # open with saved state
+          mcrysden <file> --export out.png             # headless raster render
+          mcrysden <file> --export out.pdf             # raster render in a vector container (pdf, svg, eps, ps)
           mcrysden --help
-        Input formats are chosen by extension (.xsf .xyz .pdb .axsf .pwi .pwo .in
-        .inp .out .cif .poscar .contcar .vasp .cube .bxsf .struct).
-        Override with a flag:  --xsf  --xyz  --pdb  --axsf  --pwi  --pwo  --cif  --poscar
-          --cube  --bxsf  --struct
-        For animated files (AXSF ANIMSTEPS, or QE .pwo ionic steps), open a
-        specific frame with:
-          mcrysden file.pwo --frame N      # 0-based frame index
+        Input formats are chosen by extension (\(exts)). Angstrom-based input
+        (.cube/.bxsf/.struct) is kept in Angstrom; Bohr-based input is converted.
+        Override the extension with a flag (any one):
+          \(flags)
+        For animated files (AXSF ANIMSTEPS, QE .pwo ionic steps, Orca opt cycles),
+        open a specific frame with --frame N (0-based frame index).
         Export format is chosen by extension: .png (raster) or .pdf/.svg/.eps/.ps (vector).
         """)
     }

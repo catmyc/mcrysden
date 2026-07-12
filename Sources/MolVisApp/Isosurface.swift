@@ -90,19 +90,26 @@ struct IsoMesh {
             (0,4),(1,5),(2,6),(3,7),  // verticals
         ]
         // For each edge, how to interpolate a world position + fractional grid
-        // coords from the two endpoint corners.
-        func edgePoint(_ e: Int, _ iso: Float) -> (SIMD3<Float>, SIMD3<Float>) {
+        // coords from the two endpoint corners. `ox,oy,oz` is the current cube's
+        // origin in grid indices (the ix,iy,iz loop vars) so the corner is looked
+        // up at its ABSOLUTE position and the vertex is placed in world space where
+        // that cube actually sits — without this, every cube's surface collapses
+        // into the first grid cell near the origin.
+        func edgePoint(_ e: Int, _ iso: Float, _ ox: Int, _ oy: Int, _ oz: Int) -> (SIMD3<Float>, SIMD3<Float>) {
             let (a, b) = edgeEnds[e]
             let (ax, ay, az) = cornerPos[a]
             let (bx, by, bz) = cornerPos[b]
-            let va = field.value(ax, ay, az)
-            let vb = field.value(bx, by, bz)
+            let va = field.value(ox + ax, oy + ay, oz + az)
+            let vb = field.value(ox + bx, oy + by, oz + bz)
             let denom = vb - va
             let t = (abs(denom) > 1e-9) ? (iso - va) / denom : 0.5
-            let cx = Float(ax) + t * Float(bx - ax)
-            let cy = Float(ay) + t * Float(by - ay)
-            let cz = Float(az) + t * Float(bz - az)
-            let frac = SIMD3<Float>(cx / Float(nx - 1), cy / Float(ny - 1), cz / Float(nz - 1))
+            let lx = Float(ax) + t * Float(bx - ax)
+            let ly = Float(ay) + t * Float(by - ay)
+            let lz = Float(az) + t * Float(bz - az)
+            // fractional coord of the (possibly interpolated) grid index over the grid
+            let frac = SIMD3<Float>((Float(ox) + lx) / Float(nx - 1),
+                                    (Float(oy) + ly) / Float(ny - 1),
+                                    (Float(oz) + lz) / Float(nz - 1))
             let world = field.origin
                 + field.vec[0] * frac.x
                 + field.vec[1] * frac.y
@@ -144,7 +151,7 @@ struct IsoMesh {
                     // Interpolate (and cache) the vertices on the cut edges.
                     for e in 0..<12 {
                         if edges & (1 << UInt16(e)) != 0 {
-                            if vert[e] == nil { let (w, f) = edgePoint(e, isoLevel); vert[e] = w; frac[e] = f }
+                            if vert[e] == nil { let (w, f) = edgePoint(e, isoLevel, ix, iy, iz); vert[e] = w; frac[e] = f }
                         }
                     }
 

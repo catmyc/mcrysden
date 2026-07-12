@@ -77,6 +77,37 @@ final class SceneTests: XCTestCase {
         XCTAssertGreaterThan(mesh.triangleCount, 0)
     }
 
+    // Regression for review P1#1: the isosurface must span the WHOLE grid, not
+    // collapse into the first cell near the origin. Checking only that vertices lie
+    // inside the global bounding box is NOT enough -- the old first-cell-only output
+    // also passed that test (all its vertices sat near the origin, well inside the
+    // box). The real invariant is that the mesh's own bounding box spans a large
+    // fraction of the cell in every dimension: a collapsed mesh covers ~1 voxel; a
+    // correct one covers most of the cell.
+    func testMarchingCubesSpansWholeGrid() throws {
+        let url = fixture("N2O.cube")
+        let scene = Scene(loaded: try Parser.load(url, as: .cube))
+        guard let field = scene.scalarField else { return XCTFail("expected a scalar field") }
+        let mesh = IsoMesh(field: field, isoLevel: 0.005, sign: 1)
+        XCTAssertGreaterThan(mesh.triangleCount, 0)
+        let o = field.origin
+        let maxCorner = o + field.vec[0] + field.vec[1] + field.vec[2]
+        var loV = SIMD3<Float>(repeating: Float.greatestFiniteMagnitude)
+        var hiV = SIMD3<Float>(repeating: -Float.greatestFiniteMagnitude)
+        for i in stride(from: 0, to: mesh.vertices.count, by: 9) {
+            let p = SIMD3<Float>(mesh.vertices[i], mesh.vertices[i+1], mesh.vertices[i+2])
+            loV = min(loV, p); hiV = max(hiV, p)
+        }
+        for a in 0..<3 {
+            let cellSpan = abs(maxCorner[a] - o[a])
+            let meshSpan = hiV[a] - loV[a]
+            // A correct surface spans a large fraction of the cell; a first-cell
+            // collapse spans ~1 voxel (a few percent of the cell).
+            XCTAssertGreaterThan(meshSpan, cellSpan * 0.4,
+                "mesh must span the cell, not collapse into the first voxel (dim \(a): \(meshSpan) vs \(cellSpan))")
+        }
+    }
+
     // WIEN2k .struct: parse lattice (Bohr->Ang) + fractional atoms into a crystal.
     // Verified on the real GaAs (2 atoms, fcc) and Pt (1 atom, fcc) fixtures.
     func testWIEN2kStructLoadsCrystal() throws {
@@ -140,14 +171,19 @@ final class SceneTests: XCTestCase {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/orca.orca")
         XCTAssertEqual(Parser.frameCount(url, as: .orca), 15, "orca log has 15 opt cycles")
-        // final geometry (-1) is a molecule of 33 atoms.
-        let final = try Scene(loaded: Parser.load(url, as: .orca))
-        XCTAssertFalse(final.isCrystal)
-        XCTAssertEqual(final.atoms.count, 33)
-        // first frame also loads and differs atom positions (it's a relaxation).
-        let first = try Scene(loaded: Parser.load(url, frameIndex: 0, as: .orca))
+        // Default-open (no frameIndex) now returns the FIRST cycle, like AXSF/pwo,
+        // so the scrubber (which starts at frame 0) and the open view agree.
+        let first = try Scene(loaded: Parser.load(url, as: .orca))
+        XCTAssertFalse(first.isCrystal)
         XCTAssertEqual(first.atoms.count, 33)
-        XCTAssertNotEqual(final.atoms[0].coord.x, first.atoms[0].coord.x, accuracy: 1e-4)
+        // An explicit --frame 0 is the SAME first cycle (the bug made it final).
+        let explicitZero = try Scene(loaded: Parser.load(url, frameIndex: 0, as: .orca))
+        XCTAssertEqual(explicitZero.atoms[0].coord.x, first.atoms[0].coord.x, accuracy: 1e-4,
+                       "explicit --frame 0 must equal default-open (first cycle)")
+        // an explicit late frame differs from the first cycle (it's a relaxation).
+        let late = try Scene(loaded: Parser.load(url, frameIndex: 14, as: .orca))
+        XCTAssertEqual(late.atoms.count, 33)
+        XCTAssertNotEqual(late.atoms[0].coord.x, first.atoms[0].coord.x, accuracy: 1e-4)
         // every frame parses.
         for i in 0..<15 {
             let s = try Scene(loaded: Parser.load(url, frameIndex: i, as: .orca))

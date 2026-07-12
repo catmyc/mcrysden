@@ -997,7 +997,7 @@ final class Renderer: NSObject {
     /// Fermi energy, tinted per band. Depth-tested so the bands interleave
     /// correctly as the user orbits.
     private func drawFermiSurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        guard let fs = scene.fermiSurface, scene.showIsoSurface else { return }
+        guard let fs = scene.fermiSurface, scene.showFermiSurface else { return }
         // rebuild the per-band buffers when the band count changes
         if cachedFermiBuffers.count != fs.bands.count {
             var bufs: [MTLBuffer?] = []
@@ -1016,8 +1016,10 @@ final class Renderer: NSObject {
             enc.setVertexBuffer(buf, offset: 0, index: 0)
             enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
             enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
-            let triCount = buf.length / (9 * MemoryLayout<Float>.stride)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: triCount * 3)
+            // buf.length / (9 floats/vertex) is already the vertex count (3 per
+            // triangle) — drawing triCount*3 reads past the populated buffer.
+            let vertexCount = buf.length / (9 * MemoryLayout<Float>.stride)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
         }
     }
 

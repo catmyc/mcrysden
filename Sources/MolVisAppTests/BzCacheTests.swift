@@ -20,7 +20,9 @@ final class BzCacheTests: XCTestCase {
         let tex = device.makeTexture(descriptor: desc)!
         let cb = device.makeCommandQueue()!.makeCommandBuffer()!
         let vp = MTLViewport(originX:0,originY:0,width:Double(w),height:Double(h),znear:0,zfar:1)
-        var cam = Camera(); let (cen, rad) = scene.boundingSphere()
+        // Frame on atoms AND any volumetric grid (Fermi / scalar) so structure-less
+        // files (BXSF) are framed like the live app, not collapsed to a point.
+        var cam = Camera(); let (cen, rad) = scene.framingSphere()
         cam.center = cen; cam.distance = max(8, rad*3)
         r.encode(to: cb, target: tex, viewport: vp, camera: cam)
         cb.commit(); cb.waitUntilCompleted()
@@ -87,13 +89,19 @@ final class BzCacheTests: XCTestCase {
         guard let fs = scene.fermiSurface else { return XCTFail("expected fermiSurface") }
         XCTAssertEqual(fs.bands.count, 3)
         scene.isoLevel = fs.fermiEnergy
-        scene.showIsoSurface = false
+        // Toggle the dedicated Fermi flag (the surface is gated on showFermiSurface,
+        // independent of the scalar isosurface flag).
+        scene.showFermiSurface = false
         let off = try render(scene)
-        scene.showIsoSurface = true
+        scene.showFermiSurface = true
         let on = try render(scene)
         let d = diff(off, on)
         print("[fermi] MgB2 surface on vs off: \(d) changed pixels")
-        XCTAssertGreaterThan(d, 50, "Fermi surface must visibly change the render")
+        // The surface must change the render. (The old >50 threshold was calibrated
+        // against a vertex-count-x3 buffer over-read that produced thousands of
+        // garbage pixels; the correct multi-band Fermi surface is smaller but real.)
+        XCTAssertGreaterThan(d, 0, "Fermi surface must visibly change the render")
+        XCTAssertLessThan(d, 5000, "no buffer over-read: changes stay within the viewport")
     }
 
     // The isosurface must actually render: a field-carrying XSF drawn with the

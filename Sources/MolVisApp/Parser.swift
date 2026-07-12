@@ -37,6 +37,11 @@ enum ParseFormat {
         case "xyz": self = .xyz
         case "pdb": self = .pdb
         case "pwi", "in", "inp": self = .pwi
+        // NOTE (.out collision): `.out` maps to QE's .pwo — XCrySDen's own convention,
+        // and QE output commonly uses .out. Orca/FHI output (which also use .out) are
+        // reachable via their dedicated .orca/.fhi extensions and the --orca/--fhi
+        // flags. Removing `.out`->.pwo would break legitimate QE .out files, so the
+        // collision is accepted; a user with an Orca/FHI .out must rename or use the flag.
         case "pwo", "out": self = .pwo
         case "cif": self = .cif
         case "poscar", "contcar", "vasp": self = .poscar
@@ -55,15 +60,26 @@ enum Parser {
     /// Load a structure file. When `format` is nil, the parser is chosen from
     /// the URL's path extension; otherwise the forced format wins.
     /// Load a structure file, optionally forcing the parser format AND/OR a
-    /// specific AXSF animation frame. When `frameIndex > 0` the frame-indexed
-    /// AXSF path is used (format is ignored — animation is an AXSF-only feature);
-    /// otherwise `load(_:as:)` is used. This single entry point backs both the
-    /// GUI open path and the `--frame` CLI flag.
-    static func load(_ url: URL, as format: ParseFormat? = nil, frameIndex: Int = 0) throws -> LoadedScene {
-        if frameIndex > 0 {
-            // Honor a forced format for animated files too (e.g. a renamed
-            // .pwo passed as --pwo --frame 1); otherwise fall back to extension.
-            return try load(url, frameIndex: frameIndex, as: format)
+    /// specific animation frame. A negative `frameIndex` means "no frame was
+    /// explicitly requested" (the default-open path): for the animated formats
+    /// the single-frame path is used (ORCA shows its final geometry, AXSF/pwo show
+    /// cycle 0). A non-negative index ( INCLUDING zero) means a specific cycle was
+    /// requested via --frame N and is always routed through the indexed loader, so
+    /// --frame 0 returns the first cycle rather than ORCA's final geometry. This is
+    /// what lets the open view, the scrubber and --frame N agree on frame N.
+    static func load(_ url: URL, as format: ParseFormat? = nil, frameIndex: Int = -1) throws -> LoadedScene {
+        if frameIndex >= 0 {
+            // An explicit frame was requested -- honor the forced format too (e.g. a
+            // renamed .pwo passed as --pwo --frame 1) and route to the per-format
+            // frame loader (only orca/pwo/axsf are multi-frame; for anything else the
+            // index is simply ignored by the single-frame path below).
+            let effective = format ?? ParseFormat(ext: url.pathExtension.lowercased())
+            switch effective {
+            case .orca, .pwo, .axsf:
+                return try load(url, frameIndex: frameIndex, as: format)
+            default:
+                break   // non-animated format: fall through to the single-frame path
+            }
         }
         return try load(url, as: format)
     }
@@ -96,10 +112,12 @@ enum Parser {
             return try loadCRYSCALr1(url)
         }
         // Orca .out geometry-optimization log: parsed in Swift. Each optimization
-        // cycle is a CARTESIAN COORDINATES (ANGSTROEM) block => multi-frame; the
-        // single-frame path here returns the FINAL (last) geometry.
+        // cycle is a CARTESIAN COORDINATES (ANGSTROEM) block => multi-frame. The
+        // indexed loader (reached via load(_:frameIndex:)) honors an explicit cycle;
+        // the default-open path shows the first cycle, matching AXSF/pwo so the
+        // scrubber (which starts at frame 0) and the open view agree on frame N.
         if effective == .orca {
-            return try loadOrca(url, frameIndex: -1)
+            return try loadOrca(url, frameIndex: 0)
         }
         // FHI-aims coord.out: a structure file (lattice vectors + species blocks)
         // parsed in Swift (XCrySDen shells to an external fhi_coord2xcr for this).
@@ -276,7 +294,9 @@ enum Parser {
         let fs = try BXSFLoader.load(from: url)
         var out = LoadedScene()
         out.title = url.lastPathComponent
-        out.scalarField = fs.bands.first
+        // Do NOT also set scalarField to the first band: drawFermiSurface already
+        // surfaces every band at the Fermi level, and the iso pipeline would draw
+        // that one band again at the sidebar midpoint — a duplicate, wrong shell.
         out.fermiSurface = fs
         return out
     }
@@ -453,15 +473,18 @@ enum Parser {
             return 0
         }()
 
-        // crystal system -> lattice-param count + angles. We only need the count and
-        // whether gamma is 120 (hexagonal/trigonal-R uses the hexagonal setting,
-        // which all our trigonal fixtures do: a=b != c, gamma=120).
+        // crystal system -> lattice-param count + cell angles, per the standard
+        // crystallographic convention (International Tables) that CRYSCAL's r1 line
+        // encodes: one free length for cubic, two (a,c) for hexagonal/tetragonal,
+        // three (a,b,c) for orthorhombic, four (a,b,c,beta) for monoclinic, six
+        // (a,b,c,alpha,beta,gamma) for triclinic. The trigonal fixtures here use the
+        // hexagonal setting (a,c, gamma=120).
         enum System { case cubic, tetragonal, orthorhombic, trigonal, hexagonal, mono, tri }
         let system: System = {
             switch spgNumber {
             case 195...230: return .cubic
             case 168...194: return .hexagonal
-            case 143...167: return .trigonal            // fixtures use hexagonal setting
+            case 143...167: return .trigonal
             case 75...142:  return .tetragonal
             case 16...74:   return .orthorhombic
             case 3...15:    return .mono
@@ -469,11 +492,14 @@ enum Parser {
             default: return spgNumber == 53 ? .orthorhombic : .cubic
             }
         }()
+        // how many numbers the lattice-parameter line carries for this system
         let nLat: Int = { switch system {
-            case .cubic: return 1; case .tetragonal, .trigonal, .hexagonal, .mono: return 2
-            case .orthorhombic, .tri: return 3
+            case .cubic: return 1
+            case .tetragonal, .trigonal, .hexagonal: return 2
+            case .orthorhombic: return 3
+            case .mono: return 4                 // a, b, c, beta
+            case .tri: return 6                  // a, b, c, alpha, beta, gamma
         }}()
-        let gamma: Float = (system == .hexagonal || system == .trigonal) ? 120 : 90
 
         // lattice constants across possibly several lines — take the first nLat floats.
         var lats: [Float] = []
@@ -484,13 +510,21 @@ enum Parser {
 
         let cell: Cell = {
             switch system {
-            case .cubic: return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[0], alpha: 90, beta: 90, gamma: 90)
-            case .tetragonal, .trigonal, .hexagonal:
+            case .cubic:
+                return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[0], alpha: 90, beta: 90, gamma: 90)
+            case .tetragonal, .hexagonal:
+                let gamma: Float = (system == .hexagonal) ? 120 : 90
                 return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[1], alpha: 90, beta: 90, gamma: gamma)
-            case .mono:
-                return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[1], alpha: 90, beta: 90, gamma: 90)
-            case .orthorhombic, .tri:
+            case .trigonal:
+                // hexagonal setting: a=b, gamma=120 (the form the fixtures use).
+                return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[1], alpha: 90, beta: 90, gamma: 120)
+            case .orthorhombic:
                 return Cell.fromLattice(a: lats[0], b: lats[1], c: lats[2], alpha: 90, beta: 90, gamma: 90)
+            case .mono:
+                // standard setting: unique axis b, beta = lats[3]; a,b,c = lats[0..3].
+                return Cell.fromLattice(a: lats[0], b: lats[1], c: lats[2], alpha: 90, beta: lats[3], gamma: 90)
+            case .tri:
+                return Cell.fromLattice(a: lats[0], b: lats[1], c: lats[2], alpha: lats[3], beta: lats[4], gamma: lats[5])
             }
         }()
 
@@ -548,26 +582,40 @@ enum Parser {
         }
         let multiOrb = nAtomsT < 0
         let natoms = abs(nAtomsT)
-        let originBohr = SIMD3<Float>(Float(h[1]) ?? 0, Float(h[2]) ?? 0, Float(h[3]) ?? 0)
-        let origin = originBohr * b2a
+        // origin is in the same units as the axes; the per-axis unit flag (above)
+        // decides the conversion. Use Bohr default when there are no axes to read.
+        let originRaw = SIMD3<Float>(Float(h[1]) ?? 0, Float(h[2]) ?? 0, Float(h[3]) ?? 0)
 
-        // axis counts + step vectors (Bohr)
+        // axis counts + step vectors. Gaussian cube writes a SIGNED voxel count per
+        // axis: the magnitude is the sample count and the sign is the unit flag
+        // (negative = Angstrom, positive = Bohr). All three axes must agree on the
+        // unit (mixed signs are rejected); the origin, atoms and grid vectors are all
+        // converted Bohr->Angstrom only when the file is in Bohr units.
         var nAxis = [0, 0, 0]
         var dx = [SIMD3<Float>(0,0,0), SIMD3<Float>(0,0,0), SIMD3<Float>(0,0,0)]
+        var bohrUnits: Bool? = nil
         for i in 0..<3 {
             guard let t = nextTokenLine(), let ni = Int(t[0]) else { throw ParseError.parse(path: url.path, line: 4+i, reason: "bad cube axis") }
-            nAxis[i] = ni
-            dx[i] = SIMD3<Float>(Float(t[1]) ?? 0, Float(t[2]) ?? 0, Float(t[3]) ?? 0) * b2a
+            let axisBohr = ni >= 0
+            if let prev = bohrUnits, prev != axisBohr {
+                throw ParseError.parse(path: url.path, line: 4+i, reason: "mixed-sign cube axes (units must agree)")
+            }
+            bohrUnits = axisBohr
+            nAxis[i] = abs(ni)
+            dx[i] = SIMD3<Float>(Float(t[1]) ?? 0, Float(t[2]) ?? 0, Float(t[3]) ?? 0)
         }
+        let scale = (bohrUnits ?? true) ? b2a : 1.0
+        dx = dx.map { $0 * scale }
         let nx = nAxis[0], ny = nAxis[1], nz = nAxis[2]
         // spanning vectors v(i) = (n(i)-1)*dx(i)
         let vec = [dx[0]*Float(max(1,nx)-1), dx[1]*Float(max(1,ny)-1), dx[2]*Float(max(1,nz)-1)]
 
-        // atom records: Z, charge, x, y, z (Bohr)
+        // atom records: Z, charge, x, y, z (in the same units as the axes)
+        let origin = originRaw * scale
         var atoms: [Atom] = []
         for _ in 0..<natoms {
             guard let t = nextTokenLine(), let Z = Int(t[0]) else { throw ParseError.parse(path: url.path, line: 0, reason: "short cube atoms") }
-            let p = SIMD3<Float>(Float(t[2]) ?? 0, Float(t[3]) ?? 0, Float(t[4]) ?? 0) * b2a
+            let p = SIMD3<Float>(Float(t[2]) ?? 0, Float(t[3]) ?? 0, Float(t[4]) ?? 0) * scale
             atoms.append(Atom(coord: p, atomicNumber: Z, label: Table.id(Z)))
         }
         // optional MO record if multiple orbitals: consume the MO-count/indices

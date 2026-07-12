@@ -56,6 +56,31 @@ extension Scene {
         return (c, r)
     }
 
+    /// Camera framing sphere that covers BOTH the atoms AND any volumetric grid
+    /// (scalar field or Fermi surface). A structure-less file (e.g. a BXSF with
+    /// only a Fermi grid) would otherwise frame a zero-radius point at the origin
+    /// and the surface would render invisibly tiny. The grid extent is derived
+    /// from its span vectors: sample (0,0,0)==origin, (nx,ny,nz)==origin+sum(vec).
+    func framingSphere() -> (center: SIMD3<Float>, radius: Float) {
+        var minCorner = SIMD3<Float>(repeating: Float.greatestFiniteMagnitude)
+        var maxCorner = SIMD3<Float>(repeating: -Float.greatestFiniteMagnitude)
+        var hasAny = false
+        for a in atoms {
+            minCorner = min(minCorner, a.coord); maxCorner = max(maxCorner, a.coord); hasAny = true
+        }
+        func incorporate(_ o: SIMD3<Float>, _ v: [SIMD3<Float>]) {
+            // grid spans the parallelepiped o .. o+v[0]+v[1]+v[2]
+            let far = o + v[0] + v[1] + v[2]
+            minCorner = min(minCorner, min(o, far)); maxCorner = max(maxCorner, max(o, far)); hasAny = true
+        }
+        if let f = scalarField { incorporate(f.origin, f.vec) }
+        if let fs = fermiSurface, let b = fs.bands.first { incorporate(b.origin, b.vec) }
+        guard hasAny else { return (SIMD3<Float>.zero, 0) }
+        let center = (minCorner + maxCorner) * 0.5
+        let radius = distance(maxCorner, minCorner) * 0.5
+        return (center, radius)
+    }
+
     static let superCellAtomCap = 500_000
 
     func widenSuperCell(_ sc: SuperCell) -> Scene {
