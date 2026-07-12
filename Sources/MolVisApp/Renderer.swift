@@ -60,6 +60,7 @@ final class Renderer: NSObject {
             invalidateBrillouinZoneCache()
             cachedIsoBuffer = nil
             cachedIsoKey = nil
+            cachedFermiBuffers = []
         }
     }
     var currentCamera = Camera()
@@ -437,6 +438,10 @@ final class Renderer: NSObject {
         // Isosurface over a volumetric scalar field (DATAGRID / .cube), drawn as a
         // depth-tested lit surface so it sits correctly among the atoms.
         drawIsosurface(enc, frameBuffer: frameBuffer)
+
+        // Fermi surface: one isosurface per band, all at the Fermi energy, tinted
+        // per band. Drawn after the scalar iso so both can coexist.
+        drawFermiSurface(enc, frameBuffer: frameBuffer)
 
         // Screen-space orientation gizmo (fixed-size x/y/z arrows pinned to the
         // corner; rotates with the camera, never scales with zoom).
@@ -970,6 +975,51 @@ final class Renderer: NSObject {
     }
 
     private var cachedIsoTriangleCount: Int = 0
+
+    // MARK: - Fermi surface (multi-band isosurface at the Fermi level)
+
+    /// Per-band Fermi-surface mesh cache. Each band has identical geometry but
+    /// different values, so its surface shape differs; cache each band's vertex
+    /// buffer once (the Fermi level is fixed for a given file).
+    private var cachedFermiBuffers: [MTLBuffer] = []
+
+    /// A small per-band color palette so the overlapping bands read distinctly.
+    private static let fermiPalette: [SIMD3<Float>] = [
+        SIMD3<Float>(0.95, 0.30, 0.30),  // red
+        SIMD3<Float>(0.30, 0.85, 0.40),  // green
+        SIMD3<Float>(0.35, 0.55, 0.95),  // blue
+        SIMD3<Float>(0.95, 0.75, 0.20),  // amber
+        SIMD3<Float>(0.75, 0.35, 0.95),  // violet
+        SIMD3<Float>(0.30, 0.85, 0.85),  // teal
+    ]
+
+    /// Draw each band of a Fermi surface as an independent isosurface at the
+    /// Fermi energy, tinted per band. Depth-tested so the bands interleave
+    /// correctly as the user orbits.
+    private func drawFermiSurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
+        guard let fs = scene.fermiSurface, scene.showIsoSurface else { return }
+        // rebuild the per-band buffers when the band count changes
+        if cachedFermiBuffers.count != fs.bands.count {
+            var bufs: [MTLBuffer?] = []
+            for (idx, band) in fs.bands.enumerated() {
+                let color = Renderer.fermiPalette[idx % Renderer.fermiPalette.count]
+                let mesh = IsoMesh(field: band, isoLevel: fs.fermiEnergy, sign: 1, color: color)
+                let buf = mesh.triangleCount > 0
+                    ? device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: [])
+                    : nil
+                bufs.append(buf)
+            }
+            cachedFermiBuffers = bufs.compactMap { $0 }
+        }
+        enc.setRenderPipelineState(polyPipeline)
+        for buf in cachedFermiBuffers {
+            enc.setVertexBuffer(buf, offset: 0, index: 0)
+            enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
+            enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
+            let triCount = buf.length / (9 * MemoryLayout<Float>.stride)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: triCount * 3)
+        }
+    }
 
     /// Centroid of the (super)atom set, used to center overlays.
     private func sceneCentroid() -> SIMD3<Float> {

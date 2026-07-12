@@ -22,12 +22,13 @@ struct LoadedScene {
     var periodicDim: Int = 3
     var title: String = ""
     var scalarField: ScalarField?
+    var fermiSurface: FermiSurface?
 }
 
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext {
@@ -40,6 +41,7 @@ enum ParseFormat {
         case "cif": self = .cif
         case "poscar", "contcar", "vasp": self = .poscar
         case "cube": self = .cube
+        case "bxsf": self = .bxsf
         default: return nil
         }
     }
@@ -75,6 +77,11 @@ enum Parser {
         if effective == .cube {
             return try loadCube(url)
         }
+        // Fermi-surface BXSF: parsed in Swift into bands (a FermiSurface) that
+        // Renderer surfaces is the Fermi level — no C MolEnvScene needed.
+        if effective == .bxsf {
+            return try loadBXSF(url)
+        }
         let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
@@ -87,6 +94,7 @@ enum Parser {
         case .cif: scene = parse_cif(cPath)
         case .poscar: scene = parse_poscar(cPath)
         case .cube: scene = nil   // Gaussian cube is parsed in Swift (see loadCube)
+        case .bxsf: scene = nil   // Fermi-surface BXSF is parsed in Swift (see loadBXSF)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
@@ -227,6 +235,18 @@ enum Parser {
     // We read atoms + the scalar grid into a LoadedScene. Same ordering
     // convention as DATAGRID_3D (x fastest, v(i) = (n(i)-1)*dx(i)), confirmed by
     // XCrySDen's cube2xsf.f. Units are Bohr -> convert to Angstrom (B2A).
+    /// Bridge a Fermi-surface BXSF into a LoadedScene: the bands become scene.fermiSurface
+    /// and the first band is also exposed as scalarField so the existing iso pipeline
+    /// has a default surface; the FermiSurface drives multi-band rendering.
+    private static func loadBXSF(_ url: URL) throws -> LoadedScene {
+        let fs = try BXSFLoader.load(from: url)
+        var out = LoadedScene()
+        out.title = url.lastPathComponent
+        out.scalarField = fs.bands.first
+        out.fermiSurface = fs
+        return out
+    }
+
     private static let b2a: Float = 0.52917721067
 
     private static func loadCube(_ url: URL) throws -> LoadedScene {

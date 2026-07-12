@@ -77,6 +77,24 @@ final class SceneTests: XCTestCase {
         XCTAssertGreaterThan(mesh.triangleCount, 0)
     }
 
+    // Fermi-surface BXSF: parse the Fermi energy + per-band grids, then build a
+    // surface at the Fermi level. Verified on the real MgB2 fixture.
+    func testBXSFParsesBandsAndFermiEnergy() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let fs = try BXSFLoader.load(from: dir.appendingPathComponent("Fixtures/MgB2.bxsf"))
+        XCTAssertEqual(fs.fermiEnergy, 0.52304, accuracy: 1e-4)
+        XCTAssertEqual(fs.bands.count, 3, "MgB2 has 3 bands")
+        for b in fs.bands {
+            XCTAssertEqual(b.nx, 13); XCTAssertEqual(b.ny, 13); XCTAssertEqual(b.nz, 10)
+            XCTAssertEqual(b.values.count, 13*13*10)
+        }
+        // iso at the Fermi energy must emit a surface for each band.
+        for b in fs.bands {
+            let mesh = IsoMesh(field: b, isoLevel: fs.fermiEnergy, sign: 1)
+            XCTAssertGreaterThan(mesh.triangleCount, 0, "every band surfaces at Fermi level")
+        }
+    }
+
     // Marching cubes over the bridged field must emit a closed-ish triangle
     // surface with in-range normals at a sensible iso level.
     func testMarchingCubesProducesSurface() throws {

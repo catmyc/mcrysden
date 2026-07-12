@@ -9,7 +9,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     /// Force-format flags (take no value).
     private static let formatFlags: Set<String> =
-        ["--xsf", "--xyz", "--pdb", "--axsf", "--pwi", "--pwo", "--cif", "--poscar"]
+        ["--xsf", "--xyz", "--pdb", "--axsf", "--pwi", "--pwo", "--cif", "--poscar", "--bxsf"]
 
     /// Resolve a forced parser format from the CLI args, if any.
     private static func forcedFormat(from args: [String]) -> ParseFormat? {
@@ -21,6 +21,7 @@ final class App: NSObject, NSApplicationDelegate {
         if args.contains("--pwo") { return .pwo }
         if args.contains("--cif") { return .cif }
         if args.contains("--poscar") { return .poscar }
+        if args.contains("--bxsf") { return .bxsf }
         return nil
     }
 

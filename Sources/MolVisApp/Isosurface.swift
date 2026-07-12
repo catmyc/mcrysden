@@ -1,3 +1,4 @@
+import Foundation
 import simd
 
 // Volumetric scalar field + marching-cubes isosurface. This is the keystone for
@@ -185,3 +186,122 @@ private func normalFromGradient(_ field: ScalarField, _ f: SIMD3<Float>) -> SIMD
 private extension Array where Element == Float {
     static func += (lhs: inout [Float], rhs: [Float]) { lhs.append(contentsOf: rhs) }
 }
+
+// MARK: - Fermi-surface parsing (BXSF)
+
+/// A parsed Fermi-surface file: the Fermi energy (the iso level) plus one scalar
+/// grid per band. Each band surfaces as an independent IsoMesh at `fermiEnergy`
+/// (exactly the XCrySDen convention). BXSF's per-band grid shares the DATAGRID
+/// layout — full-span `vec`, x-fastest values — so each band is a `ScalarField`.
+struct FermiSurface: Codable {
+    var fermiEnergy: Float
+    var bands: [ScalarField]       // index == band number (parallel to orig file)
+
+    /// Parse a text-format `.bxsf` file (NOT gzipped — decompress first; use
+    /// `BXSFLoader.load(from:)` which shells out to `/usr/bin/gunzip` for `.gz`).
+    /// The Fermi energy is read from the `Fermi Energy:` header line. The block
+    /// after `BEGIN_BLOCK_BANDGRID_3D` follows XCrySDen's ReadBandGrid layout:
+    ///    nband  nx ny nz  ox oy oz  v0  v1  v2  [BAND:<i> <nx*ny*nz floats>]*
+    static func parse(_ raw: String) throws -> FermiSurface {
+        enum E: Error { case malformed(String) }
+        let lines = raw.components(separatedBy: "\n")
+        func tokens(_ s: String) -> [String] {
+            s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        }
+
+        // 1) Fermi energy from the header line.
+        var fermi: Float = 0
+        for line in lines {
+            guard line.lowercased().contains("fermi") && line.lowercased().contains("energy") else { continue }
+            let toks = tokens(line)
+            // the value is the last numeric token on the line
+            for t in toks.reversed() {
+                let clean = t.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+                if let v = Float(clean) { fermi = v; break }
+            }
+            break
+        }
+
+        // 2) Open the BANDGRID block and read the common header.
+        guard let beginIdx = lines.firstIndex(where: {
+            $0.contains("BEGIN_BLOCK_BANDGRID3D") || $0.contains("BEGIN_BLOCK_BANDGRID_3D")
+        }) else { throw E.malformed("no BEGIN_BLOCK_BANDGRID_3D block") }
+
+        // Build a stream of numeric tokens (and "BAND" markers) from the body,
+        // skipping the comment line and the BANDGRID_3D_BANDS ident line.
+        enum Tok { case num(Float); case band(Int) }
+        var stream: [Tok] = []
+        for line in lines[(beginIdx+1)...] {
+            if line.contains("END_BANDGRID") { break }   // END_BANDGRID_3D / END_BANDGRID3D
+            let toks = tokens(line)
+            guard !toks.isEmpty else { continue }
+            if toks[0].hasPrefix("BAND") {
+                // "BAND:" <index>
+                if toks.count >= 2, let bi = Int(toks[1]) { stream.append(.band(bi)) }
+                continue
+            }
+            // skip non-numeric lines (comment / ident)
+            if toks.compactMap({ Float($0) }).count != toks.count { continue }
+            for t in toks { if let v = Float(t) { stream.append(.num(v)) } }
+        }
+
+        var p = 0
+        func nextNum() -> Float? { guard p < stream.count else { return nil }; defer { p += 1 };
+            if case .num(let v) = stream[p] { return v } else { return nil } }
+
+        guard let nband = nextNum().map(Int.init), nband > 0 else { throw E.malformed("bad nband") }
+        guard let nx = nextNum().map(Int.init), let ny = nextNum().map(Int.init),
+              let nz = nextNum().map(Int.init) else { throw E.malformed("bad dims") }
+        guard let ox = nextNum(), let oy = nextNum(), let oz = nextNum() else { throw E.malformed("bad origin") }
+        var vec = [SIMD3<Float>](repeating: .zero, count: 3)
+        for a in 0..<3 {
+            guard let vx = nextNum(), let vy = nextNum(), let vz = nextNum() else { throw E.malformed("bad vec") }
+            vec[a] = SIMD3<Float>(vx, vy, vz)
+        }
+
+        // 3) Per-band grids. The stream now reads: [BAND i, <nx*ny*nz floats>]*.
+        var bands: [ScalarField] = []
+        let needed = nx * ny * nz
+        while p < stream.count {
+            // expect a BAND marker (and ignore any stray floats before it)
+            if case .band(_) = stream[p] { p += 1 }
+            var vals: [Float] = []
+            while vals.count < needed, p < stream.count {
+                if case .num(let v) = stream[p] { vals.append(v); p += 1 }
+                else { break }
+            }
+            guard vals.count == needed else { break }
+            var mn = vals[0], mx = vals[0]
+            for v in vals { if v < mn { mn = v }; if v > mx { mx = v } }
+            bands.append(ScalarField(nx: nx, ny: ny, nz: nz, origin: SIMD3<Float>(ox, oy, oz),
+                                     vec: vec, values: vals, minValue: mn, maxValue: mx))
+        }
+        return FermiSurface(fermiEnergy: fermi, bands: bands)
+    }
+}
+
+/// File-based BXSF loader that transparently decompresses `.gz` (shelling out to
+/// `/usr/bin/gunzip`, matching XCrySDen's gunzipXSF) before parsing.
+enum BXSFLoader {
+    static func load(from url: URL) throws -> FermiSurface {
+        enum E: Error { case decompress(String) }
+        let needsGunzip = url.pathExtension.lowercased() == "gz"
+        let text: String
+        if needsGunzip {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
+            p.arguments = ["-c", url.path]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            try p.run()
+            p.waitUntilExit()
+            guard p.terminationStatus == 0 else { throw E.decompress("gunzip exit \(p.terminationStatus)") }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            text = String(data: data, encoding: .utf8) ?? ""
+        } else {
+            text = try String(contentsOf: url, encoding: .utf8)
+        }
+        return try FermiSurface.parse(text)
+    }
+}
+

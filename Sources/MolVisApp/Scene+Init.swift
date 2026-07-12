@@ -37,6 +37,7 @@ extension Scene {
         self.isCrystal = loaded.isCrystal
         self.periodicDim = loaded.periodicDim
         self.scalarField = loaded.scalarField
+        self.fermiSurface = loaded.fermiSurface
         self.baseAtoms = loaded.atoms
         self.baseBonds = loaded.bonds
     }

@@ -78,6 +78,24 @@ final class BzCacheTests: XCTestCase {
         XCTAssertEqual(bz.faces.count, 14, "fcc BZ = truncated octahedron = 14 faces")
     }
 
+    // The Fermi surface renders each band as an isosurface at the Fermi energy:
+    // surface-on must differ from surface-off, and loading the real MgB2 fixture
+    // proves the BXSF parser end-to-end.
+    func testFermiSurfaceRendersBands() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        var scene = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/MgB2.bxsf"), as: .bxsf))
+        guard let fs = scene.fermiSurface else { return XCTFail("expected fermiSurface") }
+        XCTAssertEqual(fs.bands.count, 3)
+        scene.isoLevel = fs.fermiEnergy
+        scene.showIsoSurface = false
+        let off = try render(scene)
+        scene.showIsoSurface = true
+        let on = try render(scene)
+        let d = diff(off, on)
+        print("[fermi] MgB2 surface on vs off: \(d) changed pixels")
+        XCTAssertGreaterThan(d, 50, "Fermi surface must visibly change the render")
+    }
+
     // The isosurface must actually render: a field-carrying XSF drawn with the
     // surface on MUST differ from the surface off, and toggling the iso level
     // must change the surface. (loading the real asset proves the C bridge.)

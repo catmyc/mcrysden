@@ -120,6 +120,10 @@ struct Scene: Codable {
     /// An optional volumetric scalar grid (a DATAGRID block read from an XSF file).
     /// Feeds the isosurface engine; nil for structure-only files.
     var scalarField: ScalarField?
+    /// An optional Fermi surface (a parsed BXSF file): Fermi energy plus one grid
+    /// per band, each surfaced as an isosurface AT the Fermi level. Rendered as a
+    /// multi-band cage; nil for non-fermionic files.
+    var fermiSurface: FermiSurface?
     /// Indices (into `atoms`) of atoms the user has selected by clicking.
     var selectedAtoms: [Int] = []
     /// Active measurement mode (drives selection cap + what labels show).
