@@ -9,7 +9,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     /// Force-format flags (take no value).
     private static let formatFlags: Set<String> =
-        ["--xsf", "--xyz", "--pdb", "--axsf", "--pwi", "--pwo", "--cif", "--poscar", "--bxsf", "--struct", "--crystal", "--orca"]
+        ["--xsf", "--xyz", "--pdb", "--axsf", "--pwi", "--pwo", "--cif", "--poscar", "--bxsf", "--struct", "--crystal", "--orca", "--fhi"]
 
     /// Resolve a forced parser format from the CLI args, if any.
     private static func forcedFormat(from args: [String]) -> ParseFormat? {
@@ -25,6 +25,7 @@ final class App: NSObject, NSApplicationDelegate {
         if args.contains("--struct") { return .struct_ }
         if args.contains("--crystal") { return .crystal }
         if args.contains("--orca") { return .orca }
+        if args.contains("--fhi") { return .fhi }
         return nil
     }
 
@@ -202,7 +203,8 @@ final class App: NSObject, NSApplicationDelegate {
                                       .init(filenameExtension: "cube")!,
                                       .init(filenameExtension: "struct")!,
                                       .init(filenameExtension: "r1")!,
-                                      .init(filenameExtension: "orca")!].compactMap { $0 }
+                                      .init(filenameExtension: "orca")!,
+                                      .init(filenameExtension: "fhi")!].compactMap { $0 }
         panel.beginSheetModal(for: wc.window) { result in
             guard result == .OK, let url = panel.url else { return }
             do {

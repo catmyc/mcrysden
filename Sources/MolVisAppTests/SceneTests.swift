@@ -113,6 +113,26 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(mos2S, 4)
     }
 
+    // FHI-aims coord.out structure: lattice vectors (Bohr->Ang) + species blocks
+    // of [count name (x y z flag)*count]. Verified on the GaAs-surface slab:
+    // 4 species (Ga x6, As x6, H x1, H x1) = 14 atoms. Reference converter
+    // (XCrySDen F/fhi_coord2xcr.f) multiplies both lattice and coords by BOHR.
+    func testFHIaimsLoadsStructure() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let scene = try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/fhi_gaas_surface.fhi"), as: .fhi))
+        XCTAssertTrue(scene.isCrystal)
+        XCTAssertEqual(scene.atoms.count, 14)
+        XCTAssertNotNil(scene.cell)
+        let ga = scene.atoms.filter { $0.atomicNumber == 31 }.count
+        let ar = scene.atoms.filter { $0.atomicNumber == 33 }.count
+        let h  = scene.atoms.filter { $0.atomicNumber == 1 }.count
+        XCTAssertEqual(ga, 6)
+        XCTAssertEqual(ar, 6)
+        XCTAssertEqual(h, 2)
+        // lattice vectors were in Bohr: 10.44 Bohr -> 5.52 Ang.
+        XCTAssertEqual(simd_length(scene.cell!.a), 10.44 * 0.529177, accuracy: 0.01)
+    }
+
     // Orca .out geometry-optimization log: multi-frame molecule. Each CARTESIAN
     // COORDINATES (ANGSTROEM) block is one optimization cycle; final geometry is
     // the last block.

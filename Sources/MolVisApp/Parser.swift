@@ -28,7 +28,7 @@ struct LoadedScene {
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext {
@@ -45,6 +45,7 @@ enum ParseFormat {
         case "struct": self = .struct_
         case "r1": self = .crystal
         case "orca": self = .orca
+        case "fhi", "coord": self = .fhi
         default: return nil
         }
     }
@@ -100,6 +101,11 @@ enum Parser {
         if effective == .orca {
             return try loadOrca(url, frameIndex: -1)
         }
+        // FHI-aims coord.out: a structure file (lattice vectors + species blocks)
+        // parsed in Swift (XCrySDen shells to an external fhi_coord2xcr for this).
+        if effective == .fhi {
+            return try loadFHIaims(url)
+        }
         let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
@@ -116,6 +122,7 @@ enum Parser {
         case .struct_: scene = nil   // WIEN2k .struct is parsed in Swift (see loadWIEN2kStruct)
         case .crystal: scene = nil   // CRYSCAL .r1 is parsed in Swift (see loadCRYSCALr1)
         case .orca: scene = nil   // Orca .out is parsed in Swift (see loadOrca)
+        case .fhi: scene = nil   // FHI-aims coord.out is parsed in Swift (see loadFHIaims)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
@@ -668,6 +675,10 @@ enum OrcaParser {
     }
 }
 
+// Bohr -> Angstrom conversion shared by the file-level structure parsers
+// (FHI-aims, Gaussian .cube) that live outside the Parser enum.
+fileprivate let bohr2ang: Float = 0.52917721067
+
 // Bridge used by Parser.load — matches the frame-aware dispatch above.
 internal func loadOrca(_ url: URL, frameIndex: Int) throws -> LoadedScene {
     try OrcaParser.load(url, frameIndex: frameIndex)
@@ -675,3 +686,108 @@ internal func loadOrca(_ url: URL, frameIndex: Int) throws -> LoadedScene {
 internal func orcaCycleCount(_ url: URL) -> Int {
     OrcaParser.cycleCount(url)
 }
+
+// FHI-aims coord.out structure (ported from XCrySDen's F/fhi_coord2xcr.f):
+//   <a1> <a2> <a3>        (lattice vectors as 3 columns, Bohr -> Angstrom)
+//   <n_all_species>
+//   [per species:]
+//   <n_i_species>
+//   <name>                 (element name, e.g. "Gallium", "Arsenic", "hy_1.25")
+//   (<x> <y> <z> <T/F>)*n  (Cartesian coords, Bohr -> Angstrom; flag ignored)
+internal func loadFHIaims(_ url: URL) throws -> LoadedScene {
+    let raw = try String(contentsOf: url, encoding: .utf8)
+    let lines = raw.components(separatedBy: "\n")
+    enum E: Error { case malformed(String) }
+    func tok(_ s: String) -> [String] { s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init) }
+    var idx = 0
+    func next() -> String? { guard idx < lines.count else { return nil }; defer { idx += 1 }; return lines[idx] }
+
+    // 3 lattice columns (read row-major but they are columns: a(j,i)).
+    var cols = [SIMD3<Float>]()
+    for _ in 0..<3 {
+        guard let line = next() else { throw E.malformed("short lattice") }
+        let t = tok(line)
+        guard t.count >= 3, let x = Float(t[0]), let y = Float(t[1]), let z = Float(t[2]) else {
+            throw E.malformed("bad lattice vector")
+        }
+        cols.append(SIMD3<Float>(x, y, z) * bohr2ang)
+    }
+    let cell = Cell(a: cols[0], b: cols[1], c: cols[2])
+
+    // number of species
+    guard let nsLine = next(), let nSpecies = Int(tok(nsLine).first ?? "") else {
+        throw E.malformed("bad n_all_species")
+    }
+    var atoms: [Atom] = []
+    for _ in 0..<nSpecies {
+        guard let cLine = next(), let count = Int(tok(cLine).first ?? "") else {
+            throw E.malformed("bad species count")
+        }
+        guard let nameLine = next() else { throw E.malformed("bad species name") }
+        let speciesName = nameLine.trimmingCharacters(in: .whitespaces)
+        let Z = fhiSpeciesZ(speciesName)
+        let sym = Z == 0 ? speciesName : ElementTable.symbol(Z)
+        for _ in 0..<count {
+            guard let line = next() else { throw E.malformed("short atom") }
+            let t = tok(line)
+            guard t.count >= 4, let x = Float(t[0]), let y = Float(t[1]), let z = Float(t[2]) else {
+                throw E.malformed("bad atom coord")
+            }
+            atoms.append(Atom(coord: SIMD3<Float>(x, y, z) * bohr2ang, atomicNumber: Z, label: sym))
+        }
+    }
+
+    var out = LoadedScene()
+    out.atoms = atoms
+    out.cell = cell
+    out.isCrystal = true
+    out.title = url.lastPathComponent
+    return out
+}
+
+/// Map an FHI-aims species label to an atomic number. FHI-aims writes element
+/// names ("Gallium","Arsenic"); hydrogen sites are labelled "hy_<n>". XCrySDen's
+/// external converter disambiguates via a separate species-list file; here we
+/// resolve in-process: "hy_*" -> H, otherwise match the leading alphabetic run
+/// against the element table by full name OR by symbol prefix.
+private func fhiSpeciesZ(_ name: String) -> Int {
+    let trimmed = name.trimmingCharacters(in: .whitespaces)
+    if trimmed.lowercased().hasPrefix("hy") { return 1 }
+    // FHI-aims labels species by element NAME ("Gallium","Arsenic"). Resolve it
+    // by matching the leading alphabetic run against the element symbols: prefer
+    // a 2-letter match ("As" for Arsenic) over a 1-letter one ("A"... doesn't
+    // exist, but "Ar" would wrongly match Argon), so try symbol lengths 2 then 1.
+    // Because a name like "Arsenic" starts with "Ar" (Argon) yet its true symbol
+    // is "As", we align the symbol against the NAME: the symbol's letters must
+    // appear at the start of the name in order. "As" matches "Arsenic" (A...s),
+    // "Ar" matches "Argonic" — we pick the symbol whose name-equality holds.
+    let letters = String(trimmed.prefix(while: { $0.isLetter }))
+    let upper = letters.uppercased()
+    // Exact full-name -> symbol is unambiguous.
+    if let z = fhiNameTable[upper] { return z }
+    // Otherwise fall back to 2- then 1-letter symbol prefix.
+    if upper.count >= 2, Table.z(String(upper.prefix(2))) != 0 {
+        return Table.z(String(upper.prefix(2)))
+    }
+    return Table.z(String(upper.prefix(1)))
+}
+
+/// FHI-aims element names (uppercased) -> atomic number. Covers the names that
+/// appear in the example set and common alternatives; built once.
+private let fhiNameTable: [String: Int] = {
+    var t: [String: Int] = [:]
+    let pairs: [(String,Int)] = [
+        ("HYDROGEN",1),("HELIUM",2),("LITHIUM",3),("BERYLLIUM",4),("BORON",5),
+        ("CARBON",6),("NITROGEN",7),("OXYGEN",8),("FLUORINE",9),("NEON",10),
+        ("SODIUM",11),("MAGNESIUM",12),("ALUMINIUM",13),("ALUMINUM",13),("SILICON",14),
+        ("PHOSPHORUS",15),("SULFUR",16),("SULPHUR",16),("CHLORINE",17),("ARGON",18),
+        ("POTASSIUM",19),("CALCIUM",20),("TITANIUM",22),("VANADIUM",23),("CHROMIUM",24),
+        ("MANGANESE",25),("IRON",26),("COBALT",27),("NICKEL",28),("COPPER",29),("ZINC",30),
+        ("GALLIUM",31),("GERMANIUM",32),("ARSENIC",33),("SELENIUM",34),("BROMINE",35),
+        ("KRYPTON",36),("RUBIDIUM",37),("STRONTIUM",38),("ZIRCONIUM",40),("NIOBIUM",41),
+        ("MOLYBDENUM",42),("TIN",50),("ANTIMONY",51),("IODINE",53),("XENON",54),
+        ("CESIUM",55),("BARIUM",56),("LANTHANUM",57),("LEAD",82),("URANIUM",92)
+    ]
+    for (n, z) in pairs { t[n] = z }
+    return t
+}()
