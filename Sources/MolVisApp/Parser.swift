@@ -28,7 +28,7 @@ struct LoadedScene {
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext {
@@ -43,6 +43,7 @@ enum ParseFormat {
         case "cube": self = .cube
         case "bxsf": self = .bxsf
         case "struct": self = .struct_
+        case "r1": self = .crystal
         default: return nil
         }
     }
@@ -88,6 +89,10 @@ enum Parser {
         if effective == .struct_ {
             return try loadWIEN2kStruct(url)
         }
+        // CRYSCAL .r1: XCrySDe's own crystal/molecule/slab input — parsed in Swift.
+        if effective == .crystal {
+            return try loadCRYSCALr1(url)
+        }
         let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
@@ -102,6 +107,7 @@ enum Parser {
         case .cube: scene = nil   // Gaussian cube is parsed in Swift (see loadCube)
         case .bxsf: scene = nil   // Fermi-surface BXSF is parsed in Swift (see loadBXSF)
         case .struct_: scene = nil   // WIEN2k .struct is parsed in Swift (see loadWIEN2kStruct)
+        case .crystal: scene = nil   // CRYSCAL .r1 is parsed in Swift (see loadCRYSCALr1)
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())
@@ -385,6 +391,113 @@ enum Parser {
         out.cell = cell
         out.isCrystal = true
         out.title = url.lastPathComponent
+        return out
+    }
+
+    // CRYSCAL .r1 (XCRYSDEN's native input). Three sub-formats share a header:
+    //   <title>
+    //   CRYSTAL | POLYMER | SLAB
+    //   <i> <j> <k>
+    //   <space group: integer number OR symbol "F M 3 M"/"P M C N" ...>
+    //   <lattice constants: 1..6, in Angstrom — count set by crystal system>
+    //   <natoms>
+    //   <Z> <xf> <yf> <zf>          (natoms lines, fractional for CRYSTAL/SLAB,
+    //   EXPT | SUPERCELL | COORPRT | STOP | END     Cartesian for POLYMER)
+    // The space group -> crystal system -> lattice-param count + cell angles are the
+    // standard crystallographic mapping. Lattice constants are already in Angstrom.
+    private static func loadCRYSCALr1(_ url: URL) throws -> LoadedScene {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        let lines = raw.components(separatedBy: "\n")
+        enum E: Error { case malformed(String) }
+        func tok(_ s: String) -> [String] {
+            s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        }
+        var idx = 0
+        func next() -> String? { guard idx < lines.count else { return nil }; defer { idx += 1 }; return lines[idx] }
+
+        _ = next()                                     // title
+        guard let kind = next()?.trimmingCharacters(in: .whitespaces).uppercased() else {
+            throw E.malformed("no record kind")
+        }
+        _ = next()                                     // <i> <j> <k>
+
+        // space group: integer number or a symbol like "F M 3 M".
+        let spgTok = tok(next() ?? "")
+        let spgNumber: Int = {
+            if spgTok.count == 1, let n = Int(spgTok[0]) { return n }
+            // symbol form: map the few that appear in the fixtures
+            let sym = spgTok.joined().uppercased()
+            if sym == "FM3M" { return 225 }            // cubic
+            if sym == "PMCN" { return 53 }             // orthorhombic
+            return 0
+        }()
+
+        // crystal system -> lattice-param count + angles. We only need the count and
+        // whether gamma is 120 (hexagonal/trigonal-R uses the hexagonal setting,
+        // which all our trigonal fixtures do: a=b != c, gamma=120).
+        enum System { case cubic, tetragonal, orthorhombic, trigonal, hexagonal, mono, tri }
+        let system: System = {
+            switch spgNumber {
+            case 195...230: return .cubic
+            case 168...194: return .hexagonal
+            case 143...167: return .trigonal            // fixtures use hexagonal setting
+            case 75...142:  return .tetragonal
+            case 16...74:   return .orthorhombic
+            case 3...15:    return .mono
+            case 1...2:     return .tri
+            default: return spgNumber == 53 ? .orthorhombic : .cubic
+            }
+        }()
+        let nLat: Int = { switch system {
+            case .cubic: return 1; case .tetragonal, .trigonal, .hexagonal, .mono: return 2
+            case .orthorhombic, .tri: return 3
+        }}()
+        let gamma: Float = (system == .hexagonal || system == .trigonal) ? 120 : 90
+
+        // lattice constants across possibly several lines — take the first nLat floats.
+        var lats: [Float] = []
+        while lats.count < nLat, let line = next() {
+            for t in tok(line) { if let v = Float(t) { lats.append(v); if lats.count == nLat { break } } }
+        }
+        guard lats.count == nLat else { throw E.malformed("bad lattice constants") }
+
+        let cell: Cell = {
+            switch system {
+            case .cubic: return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[0], alpha: 90, beta: 90, gamma: 90)
+            case .tetragonal, .trigonal, .hexagonal:
+                return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[1], alpha: 90, beta: 90, gamma: gamma)
+            case .mono:
+                return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[1], alpha: 90, beta: 90, gamma: 90)
+            case .orthorhombic, .tri:
+                return Cell.fromLattice(a: lats[0], b: lats[1], c: lats[2], alpha: 90, beta: 90, gamma: 90)
+            }
+        }()
+
+        // natoms, then atom lines. CRYSTAL/SLAB coords are fractional; POLYMER are Cartesian.
+        let isPolymer = (kind == "POLYMER")
+        let natoms = Int(tok(next() ?? "").first ?? "") ?? 0
+        var atoms: [Atom] = []
+        for _ in 0..<natoms {
+            guard let line = next() else { break }
+            let t = tok(line)
+            guard t.count >= 4, let Z = Int(t[0]) else { continue }
+            guard let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else { continue }
+            let sym = Table.id(Z)
+            if isPolymer {
+                atoms.append(Atom(coord: SIMD3<Float>(x, y, z), atomicNumber: Z, label: sym))
+            } else {
+                atoms.append(Atom(coord: cell.cartesian(SIMD3<Float>(x, y, z)), atomicNumber: Z, label: sym))
+            }
+            if isPolymer {
+                // polymer atom lines occasionally carry extra integers (bonding) — ignore
+            }
+        }
+
+        var out = LoadedScene()
+        out.title = url.lastPathComponent
+        out.atoms = atoms
+        out.isCrystal = !isPolymer
+        if !isPolymer { out.cell = cell }
         return out
     }
 

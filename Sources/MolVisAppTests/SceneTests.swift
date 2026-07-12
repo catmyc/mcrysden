@@ -113,6 +113,51 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(mos2S, 4)
     }
 
+    // CRYSCAL .r1: crystal input across crystal systems. The space group sets the
+    // lattice-param count + cell angles; lattice constants are in Angstrom.
+    func testCRYSCALr1LoadsCrystal() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        func load(_ name: String) throws -> Scene {
+            try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/\(name)"), as: .crystal))
+        }
+        // ZnS: cubic (spg 216), 1 lattice const; 2 atoms. The file writes an extra
+        // spurious 2.96 param that nLat=1 correctly ignores.
+        let zns = try load("crystal_ZnS.r1")
+        XCTAssertTrue(zns.isCrystal)
+        XCTAssertEqual(zns.atoms.count, 2)
+        XCTAssertNotNil(zns.cell)
+        XCTAssertEqual(simd_length(zns.cell!.a), 5.42, accuracy: 0.01)
+
+        // rutile: tetragonal (spg 136), a,c; 2 atoms.
+        let rutile = try load("crystal_rutile.r1")
+        XCTAssertEqual(rutile.atoms.count, 2)
+        XCTAssertEqual(simd_length(rutile.cell!.a), 4.59, accuracy: 0.01)
+        XCTAssertEqual(simd_length(rutile.cell!.c), 2.96, accuracy: 0.01)
+
+        // graphite: hexagonal (spg 194), a,c gamma=120; 2 atoms.
+        let graphite = try load("crystal_graphite.r1")
+        XCTAssertEqual(graphite.atoms.count, 2)
+        XCTAssertEqual(simd_length(graphite.cell!.a), 2.46, accuracy: 0.01)
+        XCTAssertEqual(simd_length(graphite.cell!.c), 6.70, accuracy: 0.01)
+
+        // corundum: trigonal R (spg 167, hexagonal setting) gamma=120; 2 atoms.
+        let corundum = try load("crystal_corundum.r1")
+        XCTAssertEqual(corundum.atoms.count, 2)
+        XCTAssertEqual(simd_length(corundum.cell!.a), 4.7602, accuracy: 0.01)
+        XCTAssertEqual(simd_length(corundum.cell!.c), 12.9933, accuracy: 0.01)
+
+        // chabazite: trigonal (spg 166); 5 atoms.
+        let chaba = try load("crystal_chabazite.r1")
+        XCTAssertEqual(chaba.atoms.count, 5)
+
+        // argonite: orthorhombic (Pmcn, spg 53), 3 lattice consts; 4 atoms.
+        let argonite = try load("crystal_argonite.r1")
+        XCTAssertEqual(argonite.atoms.count, 4)
+        XCTAssertEqual(simd_length(argonite.cell!.a), 4.9616, accuracy: 0.01)
+        XCTAssertEqual(simd_length(argonite.cell!.b), 7.9705, accuracy: 0.01)
+        XCTAssertEqual(simd_length(argonite.cell!.c), 5.7394, accuracy: 0.01)
+    }
+
     // Fermi-surface BXSF: parse the Fermi energy + per-band grids, then build a
     // surface at the Fermi level. Verified on the real MgB2 fixture.
     func testBXSFParsesBandsAndFermiEnergy() throws {

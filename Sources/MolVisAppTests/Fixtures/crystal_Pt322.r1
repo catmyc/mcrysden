@@ -1,0 +1,13 @@
+InputFile by XCrystal 1.0
+CRYSTAL
+1 0 0
+F M 3 M
+3.92      
+1
+78 0.0 0.0 0.0
+SLAB
+3 2 2
+1 10
+EXTPRT
+STOP
+
