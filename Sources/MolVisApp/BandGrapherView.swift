@@ -109,22 +109,25 @@ final class BandGrapherView: NSView {
 
         // --- band lines ---
         // A uniform-weight sampling mesh is NOT a band path, so its points must not
-        // be connected; render it as disconnected dots instead.
+        // be connected; render it as disconnected dots instead. Plot EVERY band: a
+        // mesh holds spectra at all bands, not just the first.
         if bs.isMesh {
             NSColor.systemBlue.set()
-            let cell = NSSize(width: 3, height: 3)
             for ik in 0..<bs.kPoints.count {
-                let p = proj(ik, bs.kPoints[ik].energies[0])
-                let rect = NSRect(x: p.x - 1.5, y: p.y - 1.5, width: cell.width, height: cell.height)
-                NSBezierPath(ovalIn: rect).fill()
+                for ib in 0..<bs.nBands {
+                    let p = proj(ik, bs.kPoints[ik].energies[ib])
+                    let rect = NSRect(x: p.x - 1.5, y: p.y - 1.5, width: 3, height: 3)
+                    NSBezierPath(ovalIn: rect).fill()
+                }
             }
         } else {
             // Each spin channel is an ordered sub-path; draw them separately so the
             // grapher never connects the end of one channel to the start of the next.
+            // Distinct colours + a legend identify the channels.
             let palette: [NSColor] = [.systemBlue, .systemRed]
             for s in 0..<bs.nSpin {
                 let base = s * bs.kPointsPerSpin
-                NSColor.systemBlue.setStroke()
+                palette[s % palette.count].setStroke()
                 let line = NSBezierPath()
                 line.lineWidth = 1.0
                 for ib in 0..<bs.nBands {
@@ -136,7 +139,16 @@ final class BandGrapherView: NSView {
                     }
                     line.stroke()
                 }
-                _ = palette
+            }
+            // Channel legend (bottom-right), one entry per spin channel.
+            let labels = ["spin ↑", "spin ↓"]
+            for s in 0..<bs.nSpin {
+                let color = palette[s % palette.count]
+                color.set()
+                let attr = NSAttributedString(string: labels[s % labels.count],
+                                              attributes: [.font: axisFont, .foregroundColor: color])
+                let yPos = bounds.height - 16 - CGFloat(s) * 14
+                attr.draw(at: NSPoint(x: bounds.width - 64, y: yPos))
             }
         }
 

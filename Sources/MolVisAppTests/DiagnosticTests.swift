@@ -238,12 +238,13 @@ final class ColorPlaneDiag: XCTestCase {
     }
 
     // Regression for the reviewer's exact counterexample: level 0, tl=10, tr=-2,
-    // br=0.1, bl=-2. The bilinear centre value is (10 - 2 + 0.1 - 2)/4 = 1.525 > 0,
-    // so the asymptotic decider pairs top-right & bottom-left. This IS the
-    // topologically correct pairing: the high corners tl(10) and br(0.1) are on the
-    // same side of the level and the contour arcs each wrap a low corner (tr, bl).
-    // The reviewer suggested a determinant criterion that pairs the OPPOSITE way for
-    // this case — that criterion is wrong here. We assert the centre-value result.
+    // br=0.1, bl=-2. The naive centre average is (10 - 2 + 0.1 - 2)/4 = 1.525 > 0,
+    // but the bilinear SADDLE value is f* = a - bc/d = -0.213 < 0. The centre value
+    // and the saddle value DISAGREE here, and the saddle value gives the correct
+    // topology: the contour arcs pair (top,left) and (right,bottom). We verified this
+    // by explicit branch tracing of the bilinear zero contour. This is the case that
+    // exposed why the asymptotic decider must use the bilinear saddle point, not the
+    // cell centre. Asserts the saddle-decider result.
     func testContourSaddleReviewerCase() throws {
         let level: Float = 0
         let segs = ColorPlaneView.contourSegments(tl: 10, tr: -2, br: 0.1, bl: -2, level: level)
@@ -256,15 +257,16 @@ final class ColorPlaneDiag: XCTestCase {
             return "?"
         }
         let labelled = segs.map { seg in seg.map(edge) }
-        // Centre value 1.525 > level -> pair (top,right) and (bottom,left): each arc
-        // encloses one of the low corners tr and bl.
-        XCTAssertTrue(labelled.contains { $0.sorted() == ["right", "top"] },
-                      "centre>level must pair top-right (got \(labelled))")
-        XCTAssertTrue(labelled.contains { $0.sorted() == ["bottom", "left"] },
-                      "centre>level must pair bottom-left (got \(labelled))")
-        // Sanity: the centre value really is above level (the decider's premise).
-        let center = (Float(10) + Float(-2) + Float(0.1) + Float(-2)) / 4
-        XCTAssertGreaterThan(center, level, "premise: centre value exceeds level")
+        // Saddle value f* = -0.213 < level -> pair (top,left) and (right,bottom).
+        XCTAssertTrue(labelled.contains { $0.sorted() == ["left", "top"] },
+                      "saddle<level must pair top-left (got \(labelled))")
+        XCTAssertTrue(labelled.contains { $0.sorted() == ["bottom", "right"] },
+                      "saddle<level must pair bottom-right (got \(labelled))")
+        // Sanity: the bilinear saddle value is genuinely below level.
+        let a = Float(10), b = Float(-2) - Float(10), c = Float(-2) - Float(10)
+        let d = Float(0.1) - Float(-2) - Float(-2) + Float(10)
+        let fSaddle = a - b * c / d
+        XCTAssertLessThan(fSaddle, level, "premise: bilinear saddle value is below level")
     }
 
     // Cell-offset bug: P() maps a cell LOCAL (u,v). Without adding the cell's (x,y),

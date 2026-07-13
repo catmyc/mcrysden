@@ -197,19 +197,6 @@ enum BandParser {
         }
         guard !chosen.kPoints.isEmpty else { return nil }
 
-        // Spin channels: a spin-polarized run prints each unique k-point's eigenvalue
-        // block once per spin, so per-iteration eigBlockCount = nSpin * kListCount.
-        // When kListCount is 0 (no k-list parsed) assume a single channel.
-        let nSpin: Int
-        let kPointsPerSpin: Int
-        if globalKListCount > 0 && chosen.eigBlockCount % globalKListCount == 0 {
-            nSpin = chosen.eigBlockCount / globalKListCount
-            kPointsPerSpin = globalKListCount
-        } else {
-            nSpin = 1
-            kPointsPerSpin = chosen.kPoints.count
-        }
-
         // Uniform-weight k-points are a Monkhorst-Pack sampling mesh, not an ordered
         // band path: connecting them is physically meaningless, so flag for scatter.
         let isMesh = detectUniformMesh(globalWeights)
@@ -221,6 +208,19 @@ enum BandParser {
         let bandCount = modalValue(counts) ?? counts.max() ?? 0
         let filtered = chosen.kPoints.filter { $0.energies.count == bandCount }
         guard !filtered.isEmpty else { return nil }
+
+        // Spin channels and per-spin count are recomputed from the FILTERED array:
+        // removing non-modal records changes the total, so deriving nSpin/kPointsPerSpin
+        // from the pre-filter counts would over-run the array in kDistances/grapher.
+        let nSpin: Int
+        let kPointsPerSpin: Int
+        if globalKListCount > 0 && filtered.count % globalKListCount == 0 {
+            nSpin = filtered.count / globalKListCount
+            kPointsPerSpin = globalKListCount
+        } else {
+            nSpin = 1
+            kPointsPerSpin = filtered.count
+        }
         return BandStructure(kPoints: filtered, fermiEnergy: chosen.fermi, nSpin: nSpin,
                              reciprocal: reciprocal, kPointsAreCrystal: globalIsCrystal,
                              kPointsPerSpin: kPointsPerSpin, isMesh: isMesh)

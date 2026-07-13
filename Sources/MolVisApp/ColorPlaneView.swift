@@ -229,12 +229,24 @@ final class ColorPlaneView: NSView {
         if pts.count == 2 {
             return [pts]
         } else if pts.count == 4 {
-            let center = (tl + tr + br + bl) / 4
-            // Pair by center value: high-center joins top-right & bottom-left, etc.
-            if center >= level {
-                return [[pts[0], pts[1]], [pts[2], pts[3]]]
+            // Saddle cell: two segments. Resolve the ambiguity with the bilinear
+            // ASYMPTOTIC DECIDER — the value of the bilinear interpolant at its saddle
+            // point (where the gradient vanishes), NOT the cell-centre average. The
+            // centre value coincides with the saddle value only for symmetric saddles;
+            // for asymmetric fields (e.g. tl=10,tr=-2,br=0.1,bl=-2 at level 0) they
+            // disagree and the centre value gives the WRONG connectivity. The bilinear
+            // f(u,v) = a + bu + cv + duv has saddle at u*=-c/d, v*=-b/d with value
+            // f* = a - bc/d; comparing f* to the level picks the correct pairing.
+            let a = tl
+            let b = tr - tl
+            let c = bl - tl
+            let d = br - tr - bl + tl
+            let useSaddle = abs(d) > 1e-6
+            let fSaddle = useSaddle ? (a - b * c / d) : (a + b + c + d) / 4  // fallback to centre
+            if fSaddle >= level {
+                return [[pts[0], pts[1]], [pts[2], pts[3]]]   // (top,right),(bottom,left)
             } else {
-                return [[pts[0], pts[3]], [pts[1], pts[2]]]
+                return [[pts[0], pts[3]], [pts[1], pts[2]]]   // (top,left),(right,bottom)
             }
         }
         return []
