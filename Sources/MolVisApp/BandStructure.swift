@@ -203,11 +203,16 @@ enum BandParser {
             // Eigenvalue block. QE orders bands as (k1_up,k2_up,...,kN_up, k1_down,...);
             // position = index % kListCount, spin = index / kListCount. blockCount advances
             // for EVERY recognized header, so an empty/malformed block (not appended) can't
-            // shift later assignments. When the file has no k-list header (kListCount == 0),
-            // fall back to a unique sequential position per record and a single spin.
+            // shift later assignments.
+            //
+            // The effective per-channel count is max(parsed k-list lines, header number):
+            // when a section prints "number of k points= 3" but no k(...) ... wk list,
+            // curMeta.count is 0 yet we know there are 3 k-points — using it lets positions
+            // wrap correctly (0,1,2,0,1,2) and assigns spin = idx/3. Falling back to
+            // sequential positions would misassign every block.
             cur.blockCount += 1
             let idx = cur.blockCount - 1
-            let kListCount = curMeta.count
+            let kListCount = max(curMeta.count, curMeta.headerCount)
             let position = kListCount > 0 ? idx % kListCount : idx
             let spin = kListCount > 0 ? idx / kListCount : 0
             let widx = kListCount > 0 ? idx % kListCount : -1
@@ -269,9 +274,18 @@ enum BandParser {
         // Spin channels derived from blockCount (total headers incl. empty ones), not
         // records.count: a missing spin-down block is then visible as a divisibility
         // failure rather than being silently reinterpreted as spinless. Expect
-        // blockCount = nSpin * kListCount, validated ONLY when real k-list metadata exists;
-        // without metadata the layout is treated as a single channel (nSpin = 1).
-        let divisible = hasKListMeta && kListCount > 0 && chosen.blockCount % kListCount == 0
+        // blockCount = nSpin * kListCount.
+        //
+        // When k-list metadata EXISTS and the layout does NOT divide cleanly, the spin
+        // structure is genuinely truncated/malformed — flattening it to a single channel
+        // would falsely connect the end of one spin channel to the start of the next
+        // (e.g. k3_up → k1_down), producing a scientifically invalid path. We REJECT such
+        // a calculation (return nil) rather than emit a misleading result. Only when there
+        // is NO metadata at all (single-spin, unknown layout) do we treat it as one channel.
+        let divisible = kListCount > 0 && chosen.blockCount % kListCount == 0
+        if hasKListMeta && !divisible {
+            return nil   // truncated spin layout: reject, don't cross-connect channels
+        }
         let nSpin: Int = divisible ? chosen.blockCount / kListCount : 1
 
         // A Monhkorst-Pack sampling mesh is identified by uniform integration weights,
@@ -280,29 +294,25 @@ enum BandParser {
         // a diagonal Γ-Χ, whose points are equally spaced on two axes yet lie on a line.
         let isMesh = detectUniformMesh(meta.weights, records: chosen.records)
 
-        // Band filtering. For a CLEANLY divisible multi-channel layout we drop incomplete
-        // channel groups (positions missing a record in some spin). For a non-divisible
-        // (truncated/malformed) layout the position-wrapping filter would misleadingly
-        // pare the data down to a few "complete" points, so in that case we emit ALL
-        // records as a single flat channel in parse order — never faking a clean subset.
+        // Band filtering. A cleanly divisible multi-channel layout drops incomplete groups
+        // (positions missing a record in some spin); the single-channel case keeps all.
         let counts = chosen.records.map { $0.energies.count }
         let bandCount = modalValue(counts) ?? counts.max() ?? 0   // most common eigenvalue count
         let bandOk = chosen.records.filter { $0.energies.count == bandCount }
         let filteredRecords: [BandParserRecord]
-        if divisible {
+        if nSpin > 1 {
             var perPosSpinCount: [Int: Int] = [:]
             for r in bandOk { perPosSpinCount[r.position, default: 0] += 1 }
             let completePositions = Set(perPosSpinCount.filter { $0.value == nSpin }.keys)
             filteredRecords = bandOk.filter { completePositions.contains($0.position) }
         } else {
-            filteredRecords = bandOk   // truncated: keep everything, single channel
+            filteredRecords = bandOk   // single channel: keep everything
         }
         // Re-sort into channel-major order (all of spin 0, then spin 1, ...), each
-        // channel ordered by k-point position, so the grapher reads them correctly. For a
-        // non-divisible (truncated) layout nSpin == 1, so emit all records in parse order —
-        // filtering by spin == 0 would wrongly discard records that wrapped to spin 1.
+        // channel ordered by k-point position, so the grapher reads them correctly. For the
+        // single-channel case (nSpin == 1) emit in parse order.
         let filtered: [BandKPoint]
-        if divisible {
+        if nSpin > 1 {
             filtered = (0..<nSpin).flatMap { s in
                 filteredRecords.filter { $0.spin == s }.sorted { $0.position < $1.position }
                     .map { BandKPoint(k: $0.k, weight: $0.weight, label: "", energies: $0.energies) }
@@ -319,25 +329,32 @@ enum BandParser {
                              kPointsPerSpin: kPointsPerSpin, isMesh: isMesh)
     }
 
-    /// A Monkhorst-Pack sampling mesh is identified by BOTH uniform integration
-    /// weights AND coordinates that lie on a regular grid (equal spacing along each
-    /// fractional axis). Weights alone are insufficient — a uniform band path can
-    /// share them — so the grid structure is the discriminating signature.
-    private static func detectUniformMesh(_ weights: [Float], records: [BandParserRecord]) -> Bool {
+    /// A Monkhorst-Pack sampling mesh is identified by uniform integration weights AND a
+    /// grid-like k-point layout (equal per-axis spacing, spanning ≥2 dimensions, and a
+    /// row-uniform factorization of the total). Weights alone are insufficient — a uniform
+    /// band path can share them — so the grid structure is the discriminating signature.
+    /// Testable directly (see DiagnosticTests).
+    static func detectUniformMesh(_ weights: [Float], records: [BandParserRecord]) -> Bool {
         guard weights.count > 1, records.count > 1 else { return false }
         let first = weights[0]
         let uniformWeights = weights.allSatisfy { abs($0 - first) < 1e-4 }
         guard uniformWeights else { return false }
-        return formsRegularGrid(records.map { $0.k })
+        return formsMultipartGrid(records.map { $0.k })
     }
 
-    /// True if the k-point coordinates describe a regular sampling grid — the signature
-    /// of a Monkhorst-Pack mesh. Requires (a) equal spacing along every non-degenerate
-    /// axis, (b) at least TWO non-degenerate axes, AND (c) the points are NOT collinear.
-    /// Condition (c) is the key fix: a diagonal band path such as (0,0,0)→(0.5,0.5,0)→
-    /// (1,1,0) is equally spaced on two axes yet lies on a single line, and must NOT be
-    /// classified as a mesh. A genuine mesh spans an area/volume (non-collinear).
-    private static func formsRegularGrid(_ points: [SIMD3<Float>]) -> Bool {
+    /// True if the k-point coordinates form the signature layout of a Monkhorst-Pack
+    /// sampling mesh. Combines three independent checks:
+    ///   (a) EQUALLY SPACED per non-degenerate axis (no random scatter);
+    ///   (b) AT LEAST TWO non-degenerate axes (a 1D line of points is not a mesh);
+    ///   (c) the points are NOT COLLINEAR (a diagonal Γ-Χ is spaced on two axes yet lies
+    ///       on a line and must be rejected);
+    ///   (d) UNIFORM-ROW FACTORIZATION: the total point count factors as
+    ///       nRows × nCols (both ≥ 2) along some axis, i.e. every distinct coordinate on
+    ///       that axis is hit the same number of times. This is the key distinguisher over
+    ///       an L-shaped band path, whose total can't factor that way. The CH3Rh111 slab
+    ///       fixture factors 8 = 2 × 4 (mesh); an L-path of 5 points does not.
+    /// (a)–(d) together admit regular and slab-like meshes while rejecting band paths.
+    static func formsMultipartGrid(_ points: [SIMD3<Float>]) -> Bool {
         guard points.count > 1 else { return false }
         let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]
         var nonDegenerateAxes = 0
@@ -351,13 +368,35 @@ enum BandParser {
                 if abs((unique[i] - unique[i - 1]) - step) > 1e-3 { return false }
             }
         }
-        guard nonDegenerateAxes >= 2 else { return false }
-        return !areCollinear(points)
+        guard nonDegenerateAxes >= 2, !areCollinear(points) else { return false }
+        return hasUniformRowFactorization(points)
+    }
+
+    /// True if the points factor into uniform rows: there is some axis on which every
+    /// distinct coordinate value is visited the SAME number of times, and that count
+    /// multiplies back to the total (nDistinct × perRow == nPoints, perRow ≥ 2, nDistinct ≥ 2).
+    /// A Monkhorst-Pack mesh (including the irregular 2×4 slab fixture) satisfies this; an
+    /// L-shaped or diagonal band path does not. Tolerance accounts for float rounding.
+    static func hasUniformRowFactorization(_ points: [SIMD3<Float>]) -> Bool {
+        guard points.count >= 4 else { return false }
+        let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]
+        for axis in axes {
+            var freq: [Int: Int] = [:]
+            for v in axis { let k = Int((v * 1000).rounded()); freq[k, default: 0] += 1 }
+            let distinct = freq.count
+            guard distinct >= 2 else { continue }
+            let perRow = freq.values.first!
+            let uniform = perRow >= 2 && distinct * perRow == points.count
+                && freq.values.allSatisfy { $0 == perRow }
+            guard uniform else { continue }
+            return true
+        }
+        return false
     }
 
     /// True if all points lie on a single line (within tolerance). Collinear points form
-    /// a band path, never a mesh, even if spaced equally on multiple axes.
-    private static func areCollinear(_ points: [SIMD3<Float>]) -> Bool {
+    /// a band path, never a mesh, even if spaced equally on multiple axes. Testable.
+    static func areCollinear(_ points: [SIMD3<Float>]) -> Bool {
         guard points.count > 2 else { return true }
         // Find two distinct points to define the line direction.
         guard let p0 = points.first, let idx = points.firstIndex(where: { $0 != p0 }) else { return true }
