@@ -127,21 +127,27 @@ enum BandParser {
         // Reciprocal lattice vectors, if present, for crystal-coordinate metric.
         let reciprocal = parseReciprocal(text)
 
-        // The k-point LIST (with weights + coordinate system) is printed ONCE at the
-        // top of a QE bands output and applies to every iteration that follows, so its
-        // metadata is captured globally — not per iteration (which would lose it for
-        // the final selected iteration, since later iterations don't reprint it).
-        var globalWeights: [Float] = []
-        var globalKListCount = 0
-        var globalIsCrystal = false
+        // K-list metadata (weights, count, coord system) is captured per SECTION: when a
+        // new "number of k points" header appears (concatenated/restarted QE output), the
+        // previous section's metadata is snapshotted and a fresh section begins. This
+        // stops an earlier list from leaking into a later selected iteration.
+        struct KListMeta {
+            var weights: [Float] = []
+            var count: Int = 0
+            var isCrystal: Bool = false
+        }
+        var sections: [KListMeta] = []
+        var curMeta = KListMeta()
         func ingestKPointListHeader(_ headerLineIdx: Int) {
+            // A new k-point list opens a new section: snapshot any prior metadata and reset.
+            if curMeta.count > 0 { sections.append(curMeta); curMeta = KListMeta() }
             // Scan the few lines after "number of k points=" for the coord label.
             for off in 1...3 {
                 let idx = headerLineIdx + off
                 guard idx < lines.count else { break }
                 let low = lines[idx].lowercased()
-                if low.contains("cryst. coord") || low.contains("crystal") { globalIsCrystal = true; break }
-                if low.contains("cart. coord") { globalIsCrystal = false; break }
+                if low.contains("cryst. coord") || low.contains("crystal") { curMeta.isCrystal = true; break }
+                if low.contains("cart. coord") { curMeta.isCrystal = false; break }
             }
         }
 
@@ -152,6 +158,7 @@ enum BandParser {
         struct Iter {
             var records: [BandParserRecord] = []
             var fermi: Float? = nil
+            var meta: KListMeta = KListMeta()   // snapshot of the active k-list metadata
             // Counts EVERY recognized k = ... bands header, even ones whose eigenvalue
             // block is empty/malformed (and thus not appended to records). Deriving
             // position/spin from records.count would let a skipped block shift every
@@ -169,13 +176,17 @@ enum BandParser {
             }
             if isIterationBoundary(line) {
                 cur.fermi = parseFermiEnergy(line)
+                // Snapshot the active k-list metadata into this iteration: it is finalized
+                // here, and QE does not reprint the list for later iterations, so the
+                // metadata active at this boundary belongs to the blocks just parsed.
+                if cur.records.isEmpty == false { cur.meta = curMeta }
                 if !cur.records.isEmpty { iterations.append(cur) }
                 cur = Iter()
                 i += 1; continue
             }
             if isKPointListHeader(line) {
-                if let w = parseWeight(line) { globalWeights.append(w) }
-                globalKListCount += 1
+                if let w = parseWeight(line) { curMeta.weights.append(w) }
+                curMeta.count += 1
                 i += 1; continue
             }
             guard let k = parseKHeader(line) else { i += 1; continue }
@@ -186,10 +197,11 @@ enum BandParser {
             // fall back to a unique sequential position per record and a single spin.
             cur.blockCount += 1
             let idx = cur.blockCount - 1
-            let position = globalKListCount > 0 ? idx % globalKListCount : idx
-            let spin = globalKListCount > 0 ? idx / globalKListCount : 0
-            let widx = globalKListCount > 0 ? idx % globalKListCount : -1
-            let weight = widx >= 0 && widx < globalWeights.count ? globalWeights[widx] : 0
+            let kListCount = curMeta.count
+            let position = kListCount > 0 ? idx % kListCount : idx
+            let spin = kListCount > 0 ? idx / kListCount : 0
+            let widx = kListCount > 0 ? idx % kListCount : -1
+            let weight = widx >= 0 && widx < curMeta.weights.count ? curMeta.weights[widx] : 0
             i += 1
             if i < lines.count, lines[i].trimmingCharacters(in: .whitespaces).isEmpty { i += 1 }
             var energies: [Float] = []
@@ -212,30 +224,41 @@ enum BandParser {
             }
         }
         // Choose the final complete iteration; a file with no boundary lines is one
-        // iteration whose Fermi energy is unavailable (nil).
+        // iteration whose Fermi energy is unavailable (nil). Snapshot the currently
+        // active k-list metadata into whichever iteration is selected, so each iteration
+        // carries the metadata of its own k-list section (not the file-wide sum).
         var chosen = Iter()
         if iterations.isEmpty {
             chosen = cur
+            chosen.meta = curMeta
         } else {
             chosen = iterations.last!
         }
+        // A later section may have snapshotted meta before this iteration saw any blocks;
+        // if the chosen iteration captured no metadata, adopt the latest section's.
+        if chosen.meta.count == 0, let last = sections.last { chosen.meta = last }
         guard !chosen.records.isEmpty else { return nil }
 
-        // Spin channels: a complete layout has records.count = nSpin * kListCount. Integer
-        // division (5/3 = 1) would silently hide a truncated spin section, so REQUIRE clean
-        // divisibility; a malformed/truncated spin layout falls back to a single channel rather
-        // than connecting the end of one spin to the start of the next.
+        let meta = chosen.meta
+        let kListCount = meta.count
+
+        // Spin channels derived from blockCount (total headers incl. empty ones), not
+        // records.count: a missing spin-down block is then visible as a divisibility
+        // failure rather than being silently reinterpreted as spinless. Expect
+        // blockCount = nSpin * kListCount; if not cleanly divisible the layout is
+        // malformed/truncated and we fall back to a single channel.
         let nSpin: Int
-        if globalKListCount > 0, chosen.records.count % globalKListCount == 0 {
-            nSpin = chosen.records.count / globalKListCount
+        if kListCount > 0, chosen.blockCount % kListCount == 0 {
+            nSpin = chosen.blockCount / kListCount
         } else {
             nSpin = 1
         }
 
-        // A Monkhorst-Pack sampling mesh is identified by BOTH uniform integration
-        // weights AND coordinates lying on a regular grid (equal spacing per axis) —
-        // far more specific than weights alone, which a uniform band path can share.
-        let isMesh = detectUniformMesh(globalWeights, records: chosen.records)
+        // A Monkhorst-Pack sampling mesh is identified by uniform integration weights,
+        // regular-grid coordinate spacing, AND spanning ≥2 dimensions (non-collinear):
+        // the last condition is what separates a mesh from a straight band path such as
+        // a diagonal Γ-Χ, whose points are equally spaced on two axes yet lie on a line.
+        let isMesh = detectUniformMesh(meta.weights, records: chosen.records)
 
         // Filter to the modal band count, then DROP INCOMPLETE channel groups: keep
         // only k-point positions whose record survived in EVERY spin channel, so the
@@ -258,7 +281,7 @@ enum BandParser {
 
         let kPointsPerSpin = filtered.count / nSpin
         return BandStructure(kPoints: filtered, fermiEnergy: chosen.fermi, nSpin: nSpin,
-                             reciprocal: reciprocal, kPointsAreCrystal: globalIsCrystal,
+                             reciprocal: reciprocal, kPointsAreCrystal: meta.isCrystal,
                              kPointsPerSpin: kPointsPerSpin, isMesh: isMesh)
     }
 
@@ -276,10 +299,10 @@ enum BandParser {
 
     /// True if the k-point coordinates describe a regular sampling grid — the signature
     /// of a Monkhorst-Pack mesh. Requires (a) equal spacing along every non-degenerate
-    /// axis, AND (b) at least TWO non-degenerate axes. Condition (b) is what separates a
-    /// mesh (a 2D or 3D grid) from a straight band path such as Γ-X, whose points are
-    /// equally spaced along one axis but sit at constant coordinates on the others; that
-    /// path has a single non-degenerate axis and must NOT be classified as a mesh.
+    /// axis, (b) at least TWO non-degenerate axes, AND (c) the points are NOT collinear.
+    /// Condition (c) is the key fix: a diagonal band path such as (0,0,0)→(0.5,0.5,0)→
+    /// (1,1,0) is equally spaced on two axes yet lies on a single line, and must NOT be
+    /// classified as a mesh. A genuine mesh spans an area/volume (non-collinear).
     private static func formsRegularGrid(_ points: [SIMD3<Float>]) -> Bool {
         guard points.count > 1 else { return false }
         let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]
@@ -294,7 +317,28 @@ enum BandParser {
                 if abs((unique[i] - unique[i - 1]) - step) > 1e-3 { return false }
             }
         }
-        return nonDegenerateAxes >= 2
+        guard nonDegenerateAxes >= 2 else { return false }
+        return !areCollinear(points)
+    }
+
+    /// True if all points lie on a single line (within tolerance). Collinear points form
+    /// a band path, never a mesh, even if spaced equally on multiple axes.
+    private static func areCollinear(_ points: [SIMD3<Float>]) -> Bool {
+        guard points.count > 2 else { return true }
+        // Find two distinct points to define the line direction.
+        guard let p0 = points.first, let idx = points.firstIndex(where: { $0 != p0 }) else { return true }
+        let p1 = points[idx]
+        let dir = p1 - p0
+        let len = simd_length(dir)
+        guard len > 1e-6 else { return true }
+        let d = dir / len
+        for p in points {
+            let v = p - p0
+            let proj = simd_dot(v, d)
+            let closest = p0 + d * proj
+            if simd_length(p - closest) > 1e-3 { return false }
+        }
+        return true
     }
 
     /// True if `line` terminates a band-iteration block: the metallic Fermi-energy
