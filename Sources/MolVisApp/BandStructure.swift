@@ -81,6 +81,7 @@ struct BandStructure: Codable {
         var d: [Float] = .init(repeating: 0, count: kPoints.count)
         for s in 0..<nSpin {
             let base = s * n
+            d[base] = 0   // explicit per-spin restart at 0 (relies on base being untouched)
             for i in (base + 1)..<(base + n) {
                 let dk = kPoints[i].k - kPoints[i - 1].k
                 let step: Float
@@ -397,34 +398,6 @@ enum BandParser {
     /// ≥2 distinct values on both chosen axes; does NOT demand a strict full product, which
     /// real offset slab meshes fail. Returns the occupancy computed over the two axes with
     /// the most distinct coordinates (the grid's spanning directions).
-    static func cartesianOccupancy(_ points: [SIMD3<Float>]) -> CGFloat {
-        guard points.count >= 4 else { return 0 }
-        // Per-axis rounded integer coordinates; the two axes with the most distinct values
-        // span the grid region.
-        let byAxis: [(Int, [Int])] = [0, 1, 2].map { ax in
-            (ax, points.map { pt in
-                let raw = ax == 0 ? pt.x : (ax == 1 ? pt.y : pt.z)
-                return Int((raw * 1000).rounded())
-            })
-        }
-        let ordered = byAxis.sorted { Set($0.1).count > Set($1.1).count }
-        let (ax0, vals0) = ordered[0]
-        let (ax1, vals1) = ordered[1]
-        let n0 = Set(vals0).count
-        let n1 = Set(vals1).count
-        guard n0 >= 2 && n1 >= 2 else { return 0 }
-        // Distinct (ax0, ax1) coordinate tuples actually occupied.
-        var tuples = Set<Int>()
-        for pt in points {
-            let c0 = Int(((ax0 == 0 ? pt.x : (ax0 == 1 ? pt.y : pt.z)) * 1000).rounded())
-            let c1 = Int(((ax1 == 0 ? pt.x : (ax1 == 1 ? pt.y : pt.z)) * 1000).rounded())
-            tuples.insert(c0 << 20 ^ c1)
-        }
-        let fullGrid = n0 * n1
-        guard fullGrid > 0 else { return 0 }
-        return CGFloat(tuples.count) / CGFloat(fullGrid)
-    }
-
     /// True if the points factor into uniform rows: there is some axis on which every
     /// distinct coordinate value is visited the SAME number of times, and that count
     /// multiplies back to the total (nDistinct × perRow == nPoints, perRow ≥ 3, nDistinct ≥ 2).
@@ -493,25 +466,6 @@ enum BandParser {
         guard let wkRange = line.range(of: "wk =") else { return nil }
         let after = String(line[wkRange.upperBound...])
         return after.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.flatMap { Float($0) }
-    }
-
-    /// Detect whether the k-point list is in crystal (fractional) or cartesian
-    /// coordinates, from the header line QE prints above the `k( N) = ...` list.
-    /// "cryst. coord." -> crystal; "cart. coord." -> cartesian. If the label is
-    /// absent, assume cartesian (the common case) to avoid a double transform.
-    private static func detectKPointCoordSystem(_ text: String) -> Bool {
-        // Find the "number of k points=" header, then scan the few lines right
-        // after it for the coordinate-system label.
-        let lines = text.components(separatedBy: "\n")
-        guard let marker = lines.firstIndex(where: { $0.contains("number of k points") }) else { return false }
-        for off in 1...3 {
-            let idx = marker + off
-            guard idx < lines.count else { break }
-            let low = lines[idx].lowercased()
-            if low.contains("cryst. coord") || low.contains("crystal") { return true }
-            if low.contains("cart. coord") || low.contains("cartesian") { return false }
-        }
-        return false
     }
 
     /// Parse the reciprocal lattice vectors b1..b3 from the QE "reciprocal axes"

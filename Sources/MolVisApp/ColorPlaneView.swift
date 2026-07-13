@@ -103,6 +103,18 @@ final class ColorPlaneView: NSView {
 
         // Uniform scale so the whole parallelogram fits, then center it. A
         // uniform scale preserves the angle; independent x/y scaling would not.
+        // A degenerate span (vectors parallel or a zero-length span) would divide by
+        // zero -> infinite scale and an un-drawable parallelogram; fall back to an
+        // axis-aligned unit-square mapping so the overlay degrades gracefully.
+        let eps: CGFloat = 1e-6
+        guard spanW > eps && spanH > eps else {
+            let s: CGFloat = 1
+            let centerView = CGPoint(x: viewW / 2, y: viewH / 2)
+            func projectUnit(_ u: CGFloat, _ v: CGFloat) -> NSPoint {
+                return NSPoint(x: centerView.x + (u - 0.5) * s, y: centerView.y - (v - 0.5) * s)
+            }
+            return GridProjection(point: projectUnit, affine: CGAffineTransform.identity)
+        }
         let s = min(viewW / spanW, viewH / spanH)
         // 2D origin (u=0,v=0) maps here; center the bbox in the view.
         let centerView = CGPoint(x: viewW / 2, y: viewH / 2)
