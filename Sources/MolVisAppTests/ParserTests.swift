@@ -536,17 +536,24 @@ final class ParserTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(d[i], d[i - 1], "k-distances not monotonic at \(i)")
         }
         // The real Fermi energy of the final iteration, not a fabricated zero.
-        XCTAssertEqual(bands.fermiEnergy, 4.6341, accuracy: 0.01,
-                       "Fermi energy should be parsed from the file")
+        let ef = bands.fermiEnergy
+        XCTAssertNotNil(ef, "metallic output must report a Fermi energy")
+        XCTAssertEqual(ef!, 4.6341, accuracy: 0.01, "Fermi energy should be parsed from the file")
         // And it must fall within the final iteration's eigenvalue window, i.e.
         // the grapher's red Fermi line actually intersects the plotted bands.
         let allE = bands.kPoints.flatMap { $0.energies }
-        if let lo = allE.min(), let hi = allE.max() {
-            XCTAssertGreaterThanOrEqual(bands.fermiEnergy, lo)
-            XCTAssertLessThanOrEqual(bands.fermiEnergy, hi)
+        if let ef = bands.fermiEnergy, let lo = allE.min(), let hi = allE.max() {
+            XCTAssertGreaterThanOrEqual(ef, lo)
+            XCTAssertLessThanOrEqual(ef, hi)
         }
-        // Reciprocal vectors were parsed from the output, so kDistances are physical.
-        XCTAssertNotNil(bands.reciprocal, "reciprocal axes should be parsed")
+        // The fixture labels its k-points "cart. coord.", so the parser must NOT
+        // apply the reciprocal metric (which would double-transform them). kDistances
+        // are therefore plain Euclidean |dk| in 2π/a_0 units.
+        XCTAssertFalse(bands.kPointsAreCrystal,
+                       "cartesian k-points must not be flagged as crystal")
+        let dk = bands.kPoints[1].k - bands.kPoints[0].k
+        XCTAssertEqual(bands.kDistances[1], sqrt(dot(dk, dk)), accuracy: 1e-4,
+                       "cartesian k-distances must be plain |dk|, not metric-transformed")
     }
 
     // Negative Fermi energies must keep their sign. The old `[0-9]+\.[0-9]+` regex
@@ -562,6 +569,9 @@ final class ParserTests: XCTestCase {
         check("     the Fermi energy is    -4.25 ev", -4.25, 0.001)
         check("     the Fermi energy is     5 ev", 5, 0.001)
         check("     the Fermi energy is   1.5e-3 ev", 1.5e-3, 1e-5)
+        // Fortran "D" exponent notation must normalize to "e" before conversion.
+        check("     the Fermi energy is   1.5D-3 ev", 1.5e-3, 1e-5)
+        check("     the Fermi energy is  -2.5d+1 ev", -25, 1e-3)
         XCTAssertNil(BandParser.parseFermiEnergy("     some other Fermi mention -4.25 ev"))
     }
 
@@ -591,34 +601,66 @@ final class ParserTests: XCTestCase {
             return XCTFail("no bandStructure parsed from insulator text")
         }
         XCTAssertEqual(bands.nKPoints, 4, "insulator iterations must split; expected final 4, got \(bands.nKPoints)")
-        XCTAssertEqual(bands.fermiEnergy, 0, "insulator has no Fermi energy -> unavailable (0)")
+        XCTAssertNil(bands.fermiEnergy, "insulator has no Fermi energy -> unavailable (nil)")
         // k-distances must still be monotonic for the kept iteration.
         for i in 1..<bands.kDistances.count {
             XCTAssertGreaterThanOrEqual(bands.kDistances[i], bands.kDistances[i - 1])
         }
     }
 
-    // With reciprocal vectors present, kDistances use the metric G_ij = b_i·b_j, so
-    // a fractional step's physical length reflects the non-orthogonal/anisotropic
-    // cell. Verifies k-distances are positive, monotonic, and (for this
-    // non-orthogonal cell) differ from the naive fractional-Euclidean length.
-    func testBandsPhysicalKDistance() throws {
+    // The fixture's k-points are explicitly labelled "cart. coord.", so the parser
+    // must treat them as Cartesian and compute plain Euclidean |dk| (in 2π/a_0)
+    // — NOT apply the reciprocal metric, which would double-transform them.
+    func testBandsCartesianKDistance() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/CH3Rh111.out")
         guard let bands = BandParser.parse(try String(contentsOf: url, encoding: .utf8)) else {
             return XCTFail("parse failed")
         }
-        guard let b = bands.reciprocal else { return XCTFail("no reciprocal") }
-        // Physical distance of the first step: |B·dk| where dk = k2-k1.
+        XCTAssertFalse(bands.kPointsAreCrystal, "fixture k-points are cartesian")
+        // Cartesian k-distance is plain Euclidean |dk|.
         let dk = bands.kPoints[1].k - bands.kPoints[0].k
-        let cart = b[0] * dk.x + b[1] * dk.y + b[2] * dk.z
-        let physical = sqrt(dot(cart, cart))
-        XCTAssertEqual(bands.kDistances[1], physical, accuracy: 1e-4,
-                       "first k-distance must equal the physical |B·dk|, not fractional")
-        // Monotonic & strictly increasing (distinct k-points).
+        XCTAssertEqual(bands.kDistances[1], sqrt(dot(dk, dk)), accuracy: 1e-4,
+                       "cartesian k-distance must be plain |dk|")
         for i in 1..<bands.kDistances.count {
             XCTAssertGreaterThan(bands.kDistances[i], bands.kDistances[i - 1], "not monotonic at \(i)")
         }
+    }
+
+    // Crystal (fractional) k-points MUST have the reciprocal metric applied, so a
+    // fractional step's physical length reflects the cell. We synthesize a crystal
+    // QE-style output (header "cryst. coord.") with an anisotropic reciprocal cell
+    // and verify the distance equals |B·dk| and differs from plain |dk|.
+    func testBandsCrystalKDistance() throws {
+        // Reciprocal cell (rows b1..b3), strongly anisotropic.
+        let b1 = "               b(1) = (  2.0000   .0000   .0000 )"
+        let b2 = "               b(2) = (  .0000  1.0000   .0000 )"
+        let b3 = "               b(3) = (  .0000   .0000   .5000 )"
+        let recipBlock = """
+             reciprocal axes: (cart. coord. in units 2 pi/a_0)
+            \(b1)
+            \(b2)
+            \(b3)
+        """
+        // Two crystal k-points differing by (0.1, 0, 0): fractional dk = (0.1,0,0).
+        // Physical dk = 0.1*b1 = (0.2, 0, 0), |dk|_phys = 0.2; plain |dk| = 0.1.
+        let k1 = "  k =  .1000  .0000  .0000 ( 6180 PWs)   bands (ev):"
+        let k2 = "  k =  .2000  .0000  .0000 ( 6180 PWs)   bands (ev):"
+        let ev = "    -7.2477  -1.7434"
+        let kBlock = { (k: String) in [k, "", ev].joined(separator: "\n") }
+        let text = ([
+            recipBlock,
+            "     number of k points=    2",
+            "                       cryst. coord.",
+            kBlock(k1), kBlock(k2),
+        ] as [String]).joined(separator: "\n")
+        guard let bands = BandParser.parse(text) else { return XCTFail("parse failed") }
+        XCTAssertTrue(bands.kPointsAreCrystal, "synthetic crystal k-points must be detected")
+        XCTAssertNotNil(bands.reciprocal, "reciprocal axes should be parsed")
+        // Physical distance: |B·dk| where dk_frac = (0.1,0,0) -> (0.2,0,0) -> 0.2.
+        XCTAssertEqual(bands.kDistances[1], 0.2, accuracy: 1e-4,
+                       "crystal k-distance must be metric-transformed |B·dk| = 0.2")
+        XCTAssertNotEqual(bands.kDistances[1], 0.1, "crystal distance must differ from plain fractional")
     }
 
     // An XSF file carrying a `DATAGRID_2D` block must bridge to a `Grid2D` (not a

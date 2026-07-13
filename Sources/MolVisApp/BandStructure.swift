@@ -20,13 +20,21 @@ struct BandKPoint: Codable {
 /// Grapher.
 struct BandStructure: Codable {
     var kPoints: [BandKPoint]
-    var fermiEnergy: Float
+    /// Fermi energy in eV, when the calculation reports one (metallic). Insulating
+    /// outputs report highest-occupied/lowest-unoccupied levels instead, leaving
+    /// this nil -> the grapher omits the Fermi line rather than forging a 0 eV line.
+    var fermiEnergy: Float?
     var nSpin: Int
     /// Reciprocal lattice vectors b1,b2,b3 (rows, units of 2π/a_0) parsed from the
-    /// QE output. When present, `kDistances` are physical Cartesian lengths;
-    /// otherwise they fall back to fractional-Euclidean (an approximation that is
-    /// only correct for cubic cells).
+    /// QE output.
     var reciprocal: [SIMD3<Float>]?
+    /// Whether the k-points are crystal (fractional) coordinates. When false
+    /// (cartesian, in units of 2π/a_0, as the QE header labels them), `kDistances`
+    /// use plain Euclidean length; when true, the reciprocal metric converts each
+    /// fractional step to a physical length. Detected from the k-point list header.
+    /// Default false: a cartesian file mis-read as crystal would be double-
+    /// transformed, so err on the side of NOT applying the metric when uncertain.
+    var kPointsAreCrystal: Bool = false
 
     /// Number of bands (assume uniform across k-points).
     var nBands: Int { kPoints.first?.energies.count ?? 0 }
@@ -34,15 +42,17 @@ struct BandStructure: Codable {
 
     /// Cumulative path distance for each k-point (x-axis of the band plot).
     ///
-    /// With reciprocal vectors this is the PHYSICAL distance: each fractional step
-    /// `dk` is mapped to Cartesian via B = [b1 b2 b3] and |B·dk| is accumulated.
-    /// Without them (vectors not found in the output) it falls back to the naive
-    /// fractional Euclidean length, which mis-spaces non-orthogonal/anisotropic
-    /// cells.
+    /// For CRYSTAL k-points (fractional) with reciprocal vectors present, this is
+    /// the PHYSICAL distance: each fractional step `dk` is mapped to Cartesian via
+    /// B = [b1 b2 b3] and |B·dk| = sqrt(dk^T G dk) is accumulated. For CARTESIAN
+    /// k-points (the common case, as the QE header labels them) the steps are
+    /// already in physical units (2π/a_0), so plain Euclidean |dk| is correct and
+    /// applying the metric again would double-transform the coordinates. Without
+    /// reciprocal vectors, fall back to plain Euclidean length regardless.
     var kDistances: [Float] {
         // Reciprocal-metric tensor G_ij = b_i·b_j; |B·dk| = sqrt(dk^T G dk).
         var G: simd_float3x3?
-        if let b = reciprocal, b.count == 3 {
+        if kPointsAreCrystal, let b = reciprocal, b.count == 3 {
             let c0 = b[0], c1 = b[1], c2 = b[2]
             G = simd_float3x3(rows: [
                 SIMD3(dot(c0, c0), dot(c0, c1), dot(c0, c2)),
@@ -82,20 +92,24 @@ struct BandStructure: Codable {
 enum BandParser {
     static func parse(_ text: String) -> BandStructure? {
         let lines = text.components(separatedBy: "\n")
-        // Reciprocal lattice vectors, if present -> physical k-path distances.
+        // Reciprocal lattice vectors, if present, and the k-point coordinate system.
         let reciprocal = parseReciprocal(text)
+        let kPointsAreCrystal = detectKPointCoordSystem(text)
         // First pass: split the file into per-iteration blocks. An iteration ends at
         // a Fermi-energy line (metallic) OR an occupation-summary line such as
         // "highest occupied level" (insulating) — relying on the Fermi line alone
         // left insulating outputs undelimited, concatenating every SCF iteration.
-        var iterations: [(kPoints: [BandKPoint], fermi: Float)] = []
+        // fermi is Float?: a metallic boundary carries a Fermi energy; an insulating
+        // one does not, and we store nil rather than fabricating 0 eV.
+        var iterations: [(kPoints: [BandKPoint], fermi: Float?)] = []
         var current: [BandKPoint] = []
         var i = 0
         while i < lines.count {
             let line = lines[i]
             if isIterationBoundary(line) {
-                // Record the Fermi energy if the boundary carries one.
-                let fermi = parseFermiEnergy(line) ?? 0
+                // Record the Fermi energy if the boundary carries one (metallic);
+                // insulating boundaries leave it nil.
+                let fermi = parseFermiEnergy(line)
                 if !current.isEmpty { iterations.append((current, fermi)) }
                 current = []
                 i += 1; continue
@@ -124,10 +138,10 @@ enum BandParser {
             }
         }
         // Choose the final complete iteration; a file with no boundary lines is one
-        // iteration whose Fermi energy is unavailable.
-        var chosen: ([BandKPoint], Float)?
+        // iteration whose Fermi energy is unavailable (nil).
+        var chosen: ([BandKPoint], Float?)?
         if iterations.isEmpty {
-            chosen = (current, 0)
+            chosen = (current, nil)
         } else {
             chosen = iterations.last
         }
@@ -141,7 +155,7 @@ enum BandParser {
         let filtered = kPoints.filter { $0.energies.count == bandCount }
         guard !filtered.isEmpty else { return nil }
         return BandStructure(kPoints: filtered, fermiEnergy: fermi, nSpin: 1,
-                             reciprocal: reciprocal)
+                             reciprocal: reciprocal, kPointsAreCrystal: kPointsAreCrystal)
     }
 
     /// True if `line` terminates a band-iteration block: the metallic Fermi-energy
@@ -157,6 +171,25 @@ enum BandParser {
     /// eigenvalue blocks — skip them so they are not mistaken for k-headers.
     private static func isKPointListHeader(_ line: String) -> Bool {
         line.contains("k(") && line.contains("wk =")
+    }
+
+    /// Detect whether the k-point list is in crystal (fractional) or cartesian
+    /// coordinates, from the header line QE prints above the `k( N) = ...` list.
+    /// "cryst. coord." -> crystal; "cart. coord." -> cartesian. If the label is
+    /// absent, assume cartesian (the common case) to avoid a double transform.
+    private static func detectKPointCoordSystem(_ text: String) -> Bool {
+        // Find the "number of k points=" header, then scan the few lines right
+        // after it for the coordinate-system label.
+        let lines = text.components(separatedBy: "\n")
+        guard let marker = lines.firstIndex(where: { $0.contains("number of k points") }) else { return false }
+        for off in 1...3 {
+            let idx = marker + off
+            guard idx < lines.count else { break }
+            let low = lines[idx].lowercased()
+            if low.contains("cryst. coord") || low.contains("crystal") { return true }
+            if low.contains("cart. coord") || low.contains("cartesian") { return false }
+        }
+        return false
     }
 
     /// Parse the reciprocal lattice vectors b1..b3 from the QE "reciprocal axes"
@@ -210,11 +243,14 @@ enum BandParser {
         // Require the literal QE phrase so a casual "Fermi" mention elsewhere (e.g.
         // a methods paragraph) does not false-positive.
         guard let phrase = line.range(of: "the Fermi energy is") else { return nil }
-        // Match the FIRST signed decimal in the remainder of the line.
+        // Match the FIRST signed decimal in the remainder of the line. QE may emit
+        // Fortran "D" exponent notation (e.g. "1.5D-3"); normalize d/D to e/E before
+        // handing it to Float, which does not parse D-notation itself.
         let tail = String(line[phrase.upperBound...])
         let pattern = #"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?"#
         guard let r = tail.range(of: pattern, options: .regularExpression) else { return nil }
-        return Float(tail[r])
+        let token = String(tail[r]).replacingOccurrences(of: "D", with: "e").replacingOccurrences(of: "d", with: "e")
+        return Float(token)
     }
 
     /// Most common value in `xs`, or nil if empty. Used to pick the representative

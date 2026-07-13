@@ -209,6 +209,35 @@ final class ColorPlaneDiag: XCTestCase {
                        "left crossing must be at v=2/3 (near bl), not reflected to 1/3")
     }
 
+    // Saddle-cell pairing topology (asymptotic decider). The ambiguous case 5
+    // (tl,br high; tr,bl low) has four crossings; they must be paired by the
+    // bilinear centre value, NOT uniformly (which would connect the wrong edges).
+    // We verify the actual pairing for an asymmetric field where the two possible
+    // pairings place segments at clearly different positions — confirming the
+    // asymptotic decider chose the topologically correct one.
+    func testContourSaddlePairing() throws {
+        // Asymmetric saddle at level 0: tl=10, br=0.5 (high); tr=-10, bl=-10 (low).
+        // Centre value = (10 + 0.5 - 10 - 10)/4 = -2.375 < 0, so the decider picks
+        // the pairing [[top,left],[right,bottom]]. With that pairing the segment
+        // spanning the left edge also spans the top edge — so the topmost crossing
+        // (the top edge, near tl) is connected to the leftmost crossing (left edge).
+        let segs = ColorPlaneView.contourSegments(tl: 10, tr: -10, br: 0.5, bl: -10, level: 0)
+        XCTAssertEqual(segs.count, 2, "saddle cell must yield exactly two segments")
+        // Identify each crossing by its edge.
+        func edge(_ p: SIMD2<Float>) -> String {
+            if p.y < 1e-3 { return "top" }
+            if abs(p.x - 1) < 1e-3 { return "right" }
+            if abs(p.y - 1) < 1e-3 { return "bottom" }
+            if p.x < 1e-3 { return "left" }
+            return "?"
+        }
+        let labelled = segs.map { seg in seg.map(edge) }
+        XCTAssertTrue(labelled.contains { $0.sorted() == ["left", "top"] },
+                      "asymptotic decider must pair top-left (got \(labelled))")
+        XCTAssertTrue(labelled.contains { $0.sorted() == ["bottom", "right"] },
+                      "asymptotic decider must pair bottom-right (got \(labelled))")
+    }
+
     // Cell-offset bug: P() maps a cell LOCAL (u,v). Without adding the cell's (x,y),
     // every cell's contour is drawn at cell (0,0)'s position, so a multi-cell grid's
     // contour occupies only the left portion of the view. With the offset applied,

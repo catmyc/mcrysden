@@ -35,11 +35,15 @@ final class BandGrapherView: NSView {
         let xMin = distances.first!, xMax = distances.last!
         let allE = bs.kPoints.flatMap { $0.energies }
         var yMin = allE.min()!, yMax = allE.max()!
-        // pad range and include the Fermi level in the visible window
+        // pad range; include the Fermi level in the window ONLY when present
+        // (metallic). Insulating outputs have no Fermi energy and we must not
+        // forge a 0 eV line, so nil leaves the window to the eigenvalues.
         let yPad = max(0.5, (yMax - yMin) * 0.08)
         yMin -= yPad; yMax += yPad
-        if bs.fermiEnergy < yMin { yMin = bs.fermiEnergy - 0.5 }
-        if bs.fermiEnergy > yMax { yMax = bs.fermiEnergy + 0.5 }
+        if let ef = bs.fermiEnergy {
+            if ef < yMin { yMin = ef - 0.5 }
+            if ef > yMax { yMax = ef + 0.5 }
+        }
 
         func proj(_ ix: Int, _ energy: Float) -> NSPoint {
             let fx = xMin == xMax ? 0 : CGFloat((distances[ix] - xMin) / (xMax - xMin))
@@ -74,14 +78,19 @@ final class BandGrapherView: NSView {
         // "E (eV)" axis label
         drawLabel("E (eV)", at: NSPoint(x: 6, y: origin.y - plotH - 14), font: titleFont, color: axis, rightAligned: false)
 
-        // --- Fermi level ---
-        NSColor.red.withAlphaComponent(0.8).setStroke()
-        let fermiPath = NSBezierPath()
-        fermiStyle(fermiPath)
-        let f0 = proj(0, bs.fermiEnergy), f1 = proj(bs.nKPoints - 1, bs.fermiEnergy)
-        fermiPath.move(to: f0); fermiPath.line(to: f1)
-        fermiPath.stroke()
-        drawLabel("Ef", at: NSPoint(x: f1.x + 3, y: f1.y), font: axisFont, color: .red, rightAligned: false)
+        // --- Fermi level (metallic only) ---
+        // Insulating QE outputs report highest-occupied/lowest-unoccupied levels
+        // instead of a Fermi energy; bs.fermiEnergy is then nil and we skip the
+        // red line entirely rather than forging a value.
+        if let ef = bs.fermiEnergy {
+            NSColor.red.withAlphaComponent(0.8).setStroke()
+            let fermiPath = NSBezierPath()
+            fermiStyle(fermiPath)
+            let f0 = proj(0, ef), f1 = proj(bs.nKPoints - 1, ef)
+            fermiPath.move(to: f0); fermiPath.line(to: f1)
+            fermiPath.stroke()
+            drawLabel("Ef", at: NSPoint(x: f1.x + 3, y: f1.y), font: axisFont, color: .red, rightAligned: false)
+        }
 
         // --- high-symmetry k-point gridlines + labels ---
         // Markers are placed at the k-point's CUMULATIVE path distance, not its
@@ -115,9 +124,15 @@ final class BandGrapherView: NSView {
         // --- k-path label ---
         drawLabel("k-path", at: NSPoint(x: origin.x + plotW / 2, y: origin.y + 16), font: titleFont, color: axis, rightAligned: false)
 
-        // title
-        drawLabel(bs.fermiEnergy != 0 ? "Band Structure (E\u{2081} = \(String(format: "%.3f", bs.fermiEnergy)) eV)" : "Band Structure",
-                  at: NSPoint(x: origin.x + plotW / 2, y: 6), font: titleFont, color: axis, rightAligned: false)
+        // title — show the Fermi energy in the title only when the calculation
+        // reports one (metallic); insulators get the plain label.
+        let titleStr: String
+        if let ef = bs.fermiEnergy {
+            titleStr = "Band Structure (E\u{2081} = \(String(format: "%.3f", ef)) eV)"
+        } else {
+            titleStr = "Band Structure"
+        }
+        drawLabel(titleStr, at: NSPoint(x: origin.x + plotW / 2, y: 6), font: titleFont, color: axis, rightAligned: false)
     }
 
     private func drawEmpty(_ dirtyRect: NSRect) {
