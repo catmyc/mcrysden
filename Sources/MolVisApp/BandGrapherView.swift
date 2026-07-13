@@ -93,34 +93,48 @@ final class BandGrapherView: NSView {
         }
 
         // --- high-symmetry k-point gridlines + labels ---
-        // Markers are placed at the k-point's CUMULATIVE path distance, not its
-        // uniform index — with nonuniform k-spacing the two differ, and an index-
-        // based x would misalign the marker from its band.
-        NSColor.lightGray.withAlphaComponent(0.5).setStroke()
-        let grid = NSBezierPath()
-        grid.lineWidth = 0.5
-        for ix in highSymmetryIndices where ix >= 0 && ix < bs.nKPoints {
-            let fx = xMin == xMax ? 0 : CGFloat((distances[ix] - xMin) / (xMax - xMin))
-            let gx = origin.x + plotW * fx
-            grid.move(to: NSPoint(x: gx, y: origin.y))
-            grid.line(to: NSPoint(x: gx, y: origin.y - plotH))
+        // Only meaningful for a band path: markers are placed at the k-point's
+        // cumulative path distance. A mesh uses an index-based x coordinate, so the
+        // two projections disagree — skip markers entirely in mesh mode (they would
+        // otherwise be misprojected once highSymmetryIndices is populated).
+        if !bs.isMesh {
+            NSColor.lightGray.withAlphaComponent(0.5).setStroke()
+            let grid = NSBezierPath()
+            grid.lineWidth = 0.5
+            for ix in highSymmetryIndices where ix >= 0 && ix < bs.nKPoints {
+                let fx = xMin == xMax ? 0 : CGFloat((distances[ix] - xMin) / (xMax - xMin))
+                let gx = origin.x + plotW * fx
+                grid.move(to: NSPoint(x: gx, y: origin.y))
+                grid.line(to: NSPoint(x: gx, y: origin.y - plotH))
+            }
+            grid.stroke()
         }
-        grid.stroke()
 
         // --- band lines ---
         // A uniform-weight sampling mesh is NOT a band path, so its points must not
         // be connected; render it as disconnected dots instead. Plot EVERY band: a
-        // mesh holds spectra at all bands, not just the first.
+        // mesh holds spectra at all bands, not just the first. Its x-axis is the
+        // k-point INDEX (categorical), not a physical distance — cumulative path
+        // length through the mesh's arbitrary listing order would be meaningless.
+        // x-axis label depends on mode: a mesh is plotted against the k-point index
+        // (categorical), a band path against the physical k-path distance.
+        let xLabel: String
         if bs.isMesh {
+            let n = bs.kPoints.count
+            let fxOf: (Int) -> CGFloat = { n > 1 ? CGFloat($0) / CGFloat(n - 1) : 0 }
             NSColor.systemBlue.set()
-            for ik in 0..<bs.kPoints.count {
+            for ik in 0..<n {
+                let px = origin.x + fxOf(ik) * plotW
                 for ib in 0..<bs.nBands {
-                    let p = proj(ik, bs.kPoints[ik].energies[ib])
-                    let rect = NSRect(x: p.x - 1.5, y: p.y - 1.5, width: 3, height: 3)
+                    let fy = yMin == yMax ? 0.5 : CGFloat((bs.kPoints[ik].energies[ib] - yMin) / (yMax - yMin))
+                    let py = origin.y - fy * plotH
+                    let rect = NSRect(x: px - 1.5, y: py - 1.5, width: 3, height: 3)
                     NSBezierPath(ovalIn: rect).fill()
                 }
             }
+            xLabel = "k-point index"
         } else {
+            xLabel = "k-path"   // set here so the label below compiles for both branches
             // Each spin channel is an ordered sub-path; draw them separately so the
             // grapher never connects the end of one channel to the start of the next.
             // Distinct colours + a legend identify the channels.
@@ -152,8 +166,8 @@ final class BandGrapherView: NSView {
             }
         }
 
-        // --- k-path label ---
-        drawLabel("k-path", at: NSPoint(x: origin.x + plotW / 2, y: origin.y + 16), font: titleFont, color: axis, rightAligned: false)
+        // --- x-axis label ---
+        drawLabel(xLabel, at: NSPoint(x: origin.x + plotW / 2, y: origin.y + 16), font: titleFont, color: axis, rightAligned: false)
 
         // title — show the Fermi energy in the title only when the calculation
         // reports one (metallic); insulators get the plain label.

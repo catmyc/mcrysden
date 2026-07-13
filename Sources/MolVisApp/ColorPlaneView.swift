@@ -242,7 +242,11 @@ final class ColorPlaneView: NSView {
             let c = bl - tl
             let d = br - tr - bl + tl
             let useSaddle = abs(d) > 1e-6
-            let fSaddle = useSaddle ? (a - b * c / d) : (a + b + c + d) / 4  // fallback to centre
+            // Degenerate case (d ≈ 0): the bilinear collapses toward a plane and the
+            // saddle value is undefined; fall back to the true cell-centre value of the
+            // bilinear, f(0.5,0.5) = a + b/2 + c/2 + d/4 = (tl+tr+bl+br)/4. (The naive
+            // (a+b+c+d)/4 would give br/4, which is wrong.)
+            let fSaddle = useSaddle ? (a - b * c / d) : (tl + tr + bl + br) / 4
             if fSaddle >= level {
                 return [[pts[0], pts[1]], [pts[2], pts[3]]]   // (top,right),(bottom,left)
             } else {

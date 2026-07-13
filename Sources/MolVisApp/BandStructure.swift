@@ -110,6 +110,17 @@ struct BandStructure: Codable {
 /// Iterations are delimited by the "the Fermi energy is ..." line that QE prints
 /// at the end of each; the Fermi energy of the selected iteration is parsed from
 /// that line rather than fabricated.
+/// One parsed eigenvalue block: its k-point, the integration weight from the QE
+/// k-list, the per-band energies, and the block's k-point position + spin channel
+/// (used to keep only complete spin-channel groups after modal filtering).
+struct BandParserRecord {
+    var k: SIMD3<Float>
+    var weight: Float
+    var energies: [Float]
+    var position: Int      // k-point index in the list (0..kListCount-1)
+    var spin: Int          // spin channel (0 = up, 1 = down, ...)
+}
+
 enum BandParser {
     static func parse(_ text: String) -> BandStructure? {
         let lines = text.components(separatedBy: "\n")
@@ -134,11 +145,18 @@ enum BandParser {
             }
         }
 
-        // Per-iteration accumulator: just k-points, eig-block count, and Fermi energy.
+        // Per-iteration accumulator. Each record carries its k-point POSITION (index
+        // in the k-list, 0..kListCount-1) and SPIN CHANNEL (0,1,...) so that after
+        // modal-band filtering we can keep only positions that are COMPLETE across
+        // all spin channels — never mixing partial channels into one bogus path.
         struct Iter {
-            var kPoints: [BandKPoint] = []
-            var eigBlockCount = 0
+            var records: [BandParserRecord] = []
             var fermi: Float? = nil
+            // Counts EVERY recognized k = ... bands header, even ones whose eigenvalue
+            // block is empty/malformed (and thus not appended to records). Deriving
+            // position/spin from records.count would let a skipped block shift every
+            // later assignment; this counter guards against that.
+            var blockCount = 0
         }
         var iterations: [Iter] = []
         var cur = Iter()
@@ -151,7 +169,7 @@ enum BandParser {
             }
             if isIterationBoundary(line) {
                 cur.fermi = parseFermiEnergy(line)
-                if !cur.kPoints.isEmpty { iterations.append(cur) }
+                if !cur.records.isEmpty { iterations.append(cur) }
                 cur = Iter()
                 i += 1; continue
             }
@@ -161,11 +179,16 @@ enum BandParser {
                 i += 1; continue
             }
             guard let k = parseKHeader(line) else { i += 1; continue }
-            // Eigenvalue block. Its weight is the k-list weight for the corresponding
-            // unique k-point (modulo the k-list count, since spin-polarized output
-            // repeats each k-point's block once per spin channel).
-            cur.eigBlockCount += 1
-            let widx = globalKListCount > 0 ? (cur.eigBlockCount - 1) % globalKListCount : -1
+            // Eigenvalue block. QE orders bands as (k1_up,k2_up,...,kN_up, k1_down,...);
+            // position = index % kListCount, spin = index / kListCount. blockCount advances
+            // for EVERY recognized header, so an empty/malformed block (not appended) can't
+            // shift later assignments. When the file has no k-list header (kListCount == 0),
+            // fall back to a unique sequential position per record and a single spin.
+            cur.blockCount += 1
+            let idx = cur.blockCount - 1
+            let position = globalKListCount > 0 ? idx % globalKListCount : idx
+            let spin = globalKListCount > 0 ? idx / globalKListCount : 0
+            let widx = globalKListCount > 0 ? idx % globalKListCount : -1
             let weight = widx >= 0 && widx < globalWeights.count ? globalWeights[widx] : 0
             i += 1
             if i < lines.count, lines[i].trimmingCharacters(in: .whitespaces).isEmpty { i += 1 }
@@ -184,7 +207,8 @@ enum BandParser {
                 i += 1
             }
             if !energies.isEmpty {
-                cur.kPoints.append(BandKPoint(k: k, weight: weight, label: "", energies: energies))
+                cur.records.append(BandParserRecord(k: k, weight: weight, energies: energies,
+                                                    position: position, spin: spin))
             }
         }
         // Choose the final complete iteration; a file with no boundary lines is one
@@ -195,43 +219,82 @@ enum BandParser {
         } else {
             chosen = iterations.last!
         }
-        guard !chosen.kPoints.isEmpty else { return nil }
+        guard !chosen.records.isEmpty else { return nil }
 
-        // Uniform-weight k-points are a Monkhorst-Pack sampling mesh, not an ordered
-        // band path: connecting them is physically meaningless, so flag for scatter.
-        let isMesh = detectUniformMesh(globalWeights)
-
-        // Deduce the band count from the MODE (most common length), and drop any
-        // k-point whose record does NOT match it. Zero-padding short records would
-        // fabricate bands that were never computed and distort the Fermi region.
-        let counts = chosen.kPoints.map { $0.energies.count }
-        let bandCount = modalValue(counts) ?? counts.max() ?? 0
-        let filtered = chosen.kPoints.filter { $0.energies.count == bandCount }
-        guard !filtered.isEmpty else { return nil }
-
-        // Spin channels and per-spin count are recomputed from the FILTERED array:
-        // removing non-modal records changes the total, so deriving nSpin/kPointsPerSpin
-        // from the pre-filter counts would over-run the array in kDistances/grapher.
+        // Spin channels: a complete layout has records.count = nSpin * kListCount. Integer
+        // division (5/3 = 1) would silently hide a truncated spin section, so REQUIRE clean
+        // divisibility; a malformed/truncated spin layout falls back to a single channel rather
+        // than connecting the end of one spin to the start of the next.
         let nSpin: Int
-        let kPointsPerSpin: Int
-        if globalKListCount > 0 && filtered.count % globalKListCount == 0 {
-            nSpin = filtered.count / globalKListCount
-            kPointsPerSpin = globalKListCount
+        if globalKListCount > 0, chosen.records.count % globalKListCount == 0 {
+            nSpin = chosen.records.count / globalKListCount
         } else {
             nSpin = 1
-            kPointsPerSpin = filtered.count
         }
+
+        // A Monkhorst-Pack sampling mesh is identified by BOTH uniform integration
+        // weights AND coordinates lying on a regular grid (equal spacing per axis) —
+        // far more specific than weights alone, which a uniform band path can share.
+        let isMesh = detectUniformMesh(globalWeights, records: chosen.records)
+
+        // Filter to the modal band count, then DROP INCOMPLETE channel groups: keep
+        // only k-point positions whose record survived in EVERY spin channel, so the
+        // channels never get stitched together across a partial position.
+        let counts = chosen.records.map { $0.energies.count }
+        let bandCount = modalValue(counts) ?? counts.max() ?? 0
+        let bandOk = chosen.records.filter { $0.energies.count == bandCount }
+        // A position is complete if it has one surviving record per spin channel.
+        var perPosSpinCount: [Int: Int] = [:]
+        for r in bandOk { perPosSpinCount[r.position, default: 0] += 1 }
+        let completePositions = Set(perPosSpinCount.filter { $0.value == nSpin }.keys)
+        let filteredRecords = bandOk.filter { completePositions.contains($0.position) }
+        // Re-sort into channel-major order (all of spin 0, then spin 1, ...), each
+        // channel ordered by k-point position, so the grapher reads them correctly.
+        let filtered: [BandKPoint] = (0..<nSpin).flatMap { s in
+            filteredRecords.filter { $0.spin == s }.sorted { $0.position < $1.position }
+                .map { BandKPoint(k: $0.k, weight: $0.weight, label: "", energies: $0.energies) }
+        }
+        guard !filtered.isEmpty else { return nil }
+
+        let kPointsPerSpin = filtered.count / nSpin
         return BandStructure(kPoints: filtered, fermiEnergy: chosen.fermi, nSpin: nSpin,
                              reciprocal: reciprocal, kPointsAreCrystal: globalIsCrystal,
                              kPointsPerSpin: kPointsPerSpin, isMesh: isMesh)
     }
 
-    /// True if every weight is (within tolerance) the same value — the hallmark of
-    /// a uniform Monkhorst-Pack sampling mesh rather than a band path.
-    private static func detectUniformMesh(_ weights: [Float]) -> Bool {
-        guard weights.count > 1 else { return false }
+    /// A Monkhorst-Pack sampling mesh is identified by BOTH uniform integration
+    /// weights AND coordinates that lie on a regular grid (equal spacing along each
+    /// fractional axis). Weights alone are insufficient — a uniform band path can
+    /// share them — so the grid structure is the discriminating signature.
+    private static func detectUniformMesh(_ weights: [Float], records: [BandParserRecord]) -> Bool {
+        guard weights.count > 1, records.count > 1 else { return false }
         let first = weights[0]
-        return weights.allSatisfy { abs($0 - first) < 1e-4 }
+        let uniformWeights = weights.allSatisfy { abs($0 - first) < 1e-4 }
+        guard uniformWeights else { return false }
+        return formsRegularGrid(records.map { $0.k })
+    }
+
+    /// True if the k-point coordinates describe a regular sampling grid — the signature
+    /// of a Monkhorst-Pack mesh. Requires (a) equal spacing along every non-degenerate
+    /// axis, AND (b) at least TWO non-degenerate axes. Condition (b) is what separates a
+    /// mesh (a 2D or 3D grid) from a straight band path such as Γ-X, whose points are
+    /// equally spaced along one axis but sit at constant coordinates on the others; that
+    /// path has a single non-degenerate axis and must NOT be classified as a mesh.
+    private static func formsRegularGrid(_ points: [SIMD3<Float>]) -> Bool {
+        guard points.count > 1 else { return false }
+        let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]
+        var nonDegenerateAxes = 0
+        for axis in axes {
+            let unique = Array(Set(axis.map { ($0 * 1000).rounded() / 1000 })).sorted()
+            guard unique.count > 1 else { continue }   // degenerate axis (e.g. slab)
+            nonDegenerateAxes += 1
+            let step = unique[1] - unique[0]
+            if step < 1e-4 { return false }
+            for i in 1..<unique.count {
+                if abs((unique[i] - unique[i - 1]) - step) > 1e-3 { return false }
+            }
+        }
+        return nonDegenerateAxes >= 2
     }
 
     /// True if `line` terminates a band-iteration block: the metallic Fermi-energy
