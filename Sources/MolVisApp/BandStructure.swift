@@ -140,8 +140,11 @@ enum BandParser {
         var sections: [KListMeta] = []
         var curMeta = KListMeta()
         func ingestKPointListHeader(_ headerLineIdx: Int) {
-            // A new k-point list opens a new section: snapshot any prior metadata and reset.
-            if curMeta.count > 0 { sections.append(curMeta); curMeta = KListMeta() }
+            // A new k-point list opens a new section: snapshot any prior metadata and reset —
+            // triggered by ANY section start (headerCount>0 OR count>0), so a header-only
+            // section (a bare "number of k points= N" with no k(...) list) does not carry the
+            // previous section's coordinate convention into the next one.
+            if curMeta.count > 0 || curMeta.headerCount > 0 { sections.append(curMeta); curMeta = KListMeta() }
             // Parse the explicit count from "number of k points= N". This is the fallback
             // when the section prints a header but no subsequent k(...) ... wk= list (a
             // malformed/truncated or restart-style output): we know N but must NOT inherit
@@ -266,10 +269,12 @@ enum BandParser {
         // When NONE exists, records were assigned sequential positions (single-spin) during
         // parsing, so the post-loop MUST agree: nSpin = 1 with every record its own position.
         let hasKListMeta = meta.count > 0 || meta.headerCount > 0
-        // k-points per channel: the parsed k-list count, else the header's number, else (no
-        // metadata at all) the full record set treated as one single-spin channel.
-        let kListCount = meta.count > 0 ? meta.count
-            : (meta.headerCount > 0 ? meta.headerCount : chosen.blockCount)
+        // k-points per channel. Use the SAME effective count as position/spin assignment did
+        // during parsing (max of parsed list lines and the declared header number) so the
+        // channel layout the records were tagged with matches the one the post-loop infers.
+        // Treat the header count as authoritative: a partial explicit list that disagrees with
+        // it signals a malformed/truncated file, which the divisibility check below rejects.
+        let kListCount = hasKListMeta ? max(meta.count, meta.headerCount) : chosen.blockCount
 
         // Spin channels derived from blockCount (total headers incl. empty ones), not
         // records.count: a missing spin-down block is then visible as a divisibility
@@ -343,17 +348,26 @@ enum BandParser {
     }
 
     /// True if the k-point coordinates form the signature layout of a Monkhorst-Pack
-    /// sampling mesh. Combines three independent checks:
+    /// sampling mesh. Combines independent checks:
     ///   (a) EQUALLY SPACED per non-degenerate axis (no random scatter);
     ///   (b) AT LEAST TWO non-degenerate axes (a 1D line of points is not a mesh);
     ///   (c) the points are NOT COLLINEAR (a diagonal Γ-Χ is spaced on two axes yet lies
     ///       on a line and must be rejected);
     ///   (d) UNIFORM-ROW FACTORIZATION: the total point count factors as
-    ///       nRows × nCols (both ≥ 2) along some axis, i.e. every distinct coordinate on
-    ///       that axis is hit the same number of times. This is the key distinguisher over
-    ///       an L-shaped band path, whose total can't factor that way. The CH3Rh111 slab
-    ///       fixture factors 8 = 2 × 4 (mesh); an L-path of 5 points does not.
-    /// (a)–(d) together admit regular and slab-like meshes while rejecting band paths.
+    ///       nRows × nCols (both ≥ 2) along some axis — every distinct coordinate on that
+    ///       axis is hit the same number of times (rejects L/sparse band paths);
+    ///   (e) CARTESIAN-PRODUCT-LIKE DENSITY: the distinct (x,y) tuples cover a healthy
+    ///       fraction of the implied nX × nY grid (see cartesianOccupancy). A Monkhorst-Pack
+    ///       mesh fills its grid region; a band path scatters isolated points.
+    ///
+    /// Note: a strict Cartesian-product requirement ("every nX·nY tuple present") would
+    /// reject real irregular meshes such as the CH3Rh111 slab fixture (an offset 2-row
+    /// sampling with nX=2, 8 distinct y, 8 points ≠ 16 full product). With only the k-point
+    /// coordinates and weights to go on (no calculation-type metadata, which lives in a QE
+    /// input file the bands reader never sees), no coordinate-only test perfectly separates
+    /// every mesh from every path. The combination below is the strongest defensible
+    /// heuristic: it verifies grid structure and density while rejecting the path shapes
+    /// (straight, diagonal, L-shaped, sparse) that the grapher must not connect.
     static func formsMultipartGrid(_ points: [SIMD3<Float>]) -> Bool {
         guard points.count > 1 else { return false }
         let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]
@@ -369,7 +383,44 @@ enum BandParser {
             }
         }
         guard nonDegenerateAxes >= 2, !areCollinear(points) else { return false }
-        return hasUniformRowFactorization(points)
+        guard hasUniformRowFactorization(points) else { return false }
+        return cartesianOccupancy(points) >= 0.5
+    }
+
+    /// Fraction of the implied 2D grid (spanned by the two most-populated varying axes)
+    /// that is actually occupied by the k-point tuples. Returns 0 if fewer than two axes
+    /// vary. A Monhkorst-Pack mesh fills most of its grid region (≈1.0 for regular grids,
+    /// ≈0.5 for the irregular CH3Rh111 slab fixture whose 8 points occupy half of a 2×8
+    /// envelope). A band path scatters isolated points (fraction well below 0.5). Requires
+    /// ≥2 distinct values on both chosen axes; does NOT demand a strict full product, which
+    /// real offset slab meshes fail. Returns the occupancy computed over the two axes with
+    /// the most distinct coordinates (the grid's spanning directions).
+    static func cartesianOccupancy(_ points: [SIMD3<Float>]) -> CGFloat {
+        guard points.count >= 4 else { return 0 }
+        // Per-axis rounded integer coordinates; the two axes with the most distinct values
+        // span the grid region.
+        let byAxis: [(Int, [Int])] = [0, 1, 2].map { ax in
+            (ax, points.map { pt in
+                let raw = ax == 0 ? pt.x : (ax == 1 ? pt.y : pt.z)
+                return Int((raw * 1000).rounded())
+            })
+        }
+        let ordered = byAxis.sorted { Set($0.1).count > Set($1.1).count }
+        let (ax0, vals0) = ordered[0]
+        let (ax1, vals1) = ordered[1]
+        let n0 = Set(vals0).count
+        let n1 = Set(vals1).count
+        guard n0 >= 2 && n1 >= 2 else { return 0 }
+        // Distinct (ax0, ax1) coordinate tuples actually occupied.
+        var tuples = Set<Int>()
+        for pt in points {
+            let c0 = Int(((ax0 == 0 ? pt.x : (ax0 == 1 ? pt.y : pt.z)) * 1000).rounded())
+            let c1 = Int(((ax1 == 0 ? pt.x : (ax1 == 1 ? pt.y : pt.z)) * 1000).rounded())
+            tuples.insert(c0 << 20 ^ c1)
+        }
+        let fullGrid = n0 * n1
+        guard fullGrid > 0 else { return 0 }
+        return CGFloat(tuples.count) / CGFloat(fullGrid)
     }
 
     /// True if the points factor into uniform rows: there is some axis on which every
