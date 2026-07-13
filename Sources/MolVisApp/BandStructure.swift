@@ -299,7 +299,14 @@ enum BandParser {
         // regular-grid coordinate spacing, AND spanning ≥2 dimensions (non-collinear):
         // the last condition is what separates a mesh from a straight band path such as
         // a diagonal Γ-Χ, whose points are equally spaced on two axes yet lie on a line.
-        let isMesh = detectUniformMesh(meta.weights, records: chosen.records)
+        // Mesh detection operates on ONE spin channel: QE's k-point list prints each
+        // position once (one weight), but the eigenvalue blocks repeat per spin, so
+        // chosen.records has nSpin entries per position. Deduplicate to the per-spin set
+        // (ordered by position) before checking weight coverage and grid topology.
+        let perSpin: [BandParserRecord] = (0..<max(1, nSpin)).flatMap { s in
+            chosen.records.filter { $0.spin == s }.sorted { $0.position < $1.position }
+        }
+        let isMesh = detectUniformMesh(meta.weights, records: perSpin)
 
         // Band filtering. A cleanly divisible multi-channel layout drops incomplete groups
         // (positions missing a record in some spin); the single-channel case keeps all.
