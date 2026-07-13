@@ -133,7 +133,8 @@ enum BandParser {
         // stops an earlier list from leaking into a later selected iteration.
         struct KListMeta {
             var weights: [Float] = []
-            var count: Int = 0
+            var count: Int = 0          // populated by k-list lines OR the header number
+            var headerCount: Int = 0    // the "number of k points= N" number, if parseable
             var isCrystal: Bool = false
         }
         var sections: [KListMeta] = []
@@ -141,6 +142,15 @@ enum BandParser {
         func ingestKPointListHeader(_ headerLineIdx: Int) {
             // A new k-point list opens a new section: snapshot any prior metadata and reset.
             if curMeta.count > 0 { sections.append(curMeta); curMeta = KListMeta() }
+            // Parse the explicit count from "number of k points= N". This is the fallback
+            // when the section prints a header but no subsequent k(...) ... wk= list (a
+            // malformed/truncated or restart-style output): we know N but must NOT inherit
+            // the previous section's k-list weights or coordinate convention.
+            if let eq = lines[headerLineIdx].firstIndex(of: "=") {
+                let tail = lines[headerLineIdx].index(after: eq)
+                let numStr = String(lines[headerLineIdx][tail...]).trimmingCharacters(in: .whitespaces)
+                curMeta.headerCount = Int(numStr) ?? 0
+            }
             // Scan the few lines after "number of k points=" for the coord label.
             for off in 1...3 {
                 let idx = headerLineIdx + off
@@ -226,7 +236,7 @@ enum BandParser {
         // Choose the final complete iteration; a file with no boundary lines is one
         // iteration whose Fermi energy is unavailable (nil). Snapshot the currently
         // active k-list metadata into whichever iteration is selected, so each iteration
-        // carries the metadata of its own k-list section (not the file-wide sum).
+        // carries the metadata of its own k-list section.
         var chosen = Iter()
         if iterations.isEmpty {
             chosen = cur
@@ -234,47 +244,71 @@ enum BandParser {
         } else {
             chosen = iterations.last!
         }
-        // A later section may have snapshotted meta before this iteration saw any blocks;
-        // if the chosen iteration captured no metadata, adopt the latest section's.
+        // If the chosen iteration captured no k-list metadata but its section printed a
+        // "number of k points= N" header with no following k(...) list, fall back to a
+        // count derived from that header — NOT the previous section's list, whose weights
+        // and coordinate convention must not leak into this later calculation.
+        if chosen.meta.count == 0, chosen.meta.headerCount > 0 {
+            chosen.meta.count = chosen.meta.headerCount
+        }
+        // Otherwise (a later section with a header but no headerCount), adopt the most
+        // recent complete section only if the chosen one is entirely metadata-less.
         if chosen.meta.count == 0, let last = sections.last { chosen.meta = last }
         guard !chosen.records.isEmpty else { return nil }
 
         let meta = chosen.meta
-        let kListCount = meta.count
+        // Whether any k-list metadata exists at all (parsed list lines or the header count).
+        // When NONE exists, records were assigned sequential positions (single-spin) during
+        // parsing, so the post-loop MUST agree: nSpin = 1 with every record its own position.
+        let hasKListMeta = meta.count > 0 || meta.headerCount > 0
+        // k-points per channel: the parsed k-list count, else the header's number, else (no
+        // metadata at all) the full record set treated as one single-spin channel.
+        let kListCount = meta.count > 0 ? meta.count
+            : (meta.headerCount > 0 ? meta.headerCount : chosen.blockCount)
 
         // Spin channels derived from blockCount (total headers incl. empty ones), not
         // records.count: a missing spin-down block is then visible as a divisibility
         // failure rather than being silently reinterpreted as spinless. Expect
-        // blockCount = nSpin * kListCount; if not cleanly divisible the layout is
-        // malformed/truncated and we fall back to a single channel.
-        let nSpin: Int
-        if kListCount > 0, chosen.blockCount % kListCount == 0 {
-            nSpin = chosen.blockCount / kListCount
-        } else {
-            nSpin = 1
-        }
+        // blockCount = nSpin * kListCount, validated ONLY when real k-list metadata exists;
+        // without metadata the layout is treated as a single channel (nSpin = 1).
+        let divisible = hasKListMeta && kListCount > 0 && chosen.blockCount % kListCount == 0
+        let nSpin: Int = divisible ? chosen.blockCount / kListCount : 1
 
-        // A Monkhorst-Pack sampling mesh is identified by uniform integration weights,
+        // A Monhkorst-Pack sampling mesh is identified by uniform integration weights,
         // regular-grid coordinate spacing, AND spanning ≥2 dimensions (non-collinear):
         // the last condition is what separates a mesh from a straight band path such as
         // a diagonal Γ-Χ, whose points are equally spaced on two axes yet lie on a line.
         let isMesh = detectUniformMesh(meta.weights, records: chosen.records)
 
-        // Filter to the modal band count, then DROP INCOMPLETE channel groups: keep
-        // only k-point positions whose record survived in EVERY spin channel, so the
-        // channels never get stitched together across a partial position.
+        // Band filtering. For a CLEANLY divisible multi-channel layout we drop incomplete
+        // channel groups (positions missing a record in some spin). For a non-divisible
+        // (truncated/malformed) layout the position-wrapping filter would misleadingly
+        // pare the data down to a few "complete" points, so in that case we emit ALL
+        // records as a single flat channel in parse order — never faking a clean subset.
         let counts = chosen.records.map { $0.energies.count }
-        let bandCount = modalValue(counts) ?? counts.max() ?? 0
+        let bandCount = modalValue(counts) ?? counts.max() ?? 0   // most common eigenvalue count
         let bandOk = chosen.records.filter { $0.energies.count == bandCount }
-        // A position is complete if it has one surviving record per spin channel.
-        var perPosSpinCount: [Int: Int] = [:]
-        for r in bandOk { perPosSpinCount[r.position, default: 0] += 1 }
-        let completePositions = Set(perPosSpinCount.filter { $0.value == nSpin }.keys)
-        let filteredRecords = bandOk.filter { completePositions.contains($0.position) }
+        let filteredRecords: [BandParserRecord]
+        if divisible {
+            var perPosSpinCount: [Int: Int] = [:]
+            for r in bandOk { perPosSpinCount[r.position, default: 0] += 1 }
+            let completePositions = Set(perPosSpinCount.filter { $0.value == nSpin }.keys)
+            filteredRecords = bandOk.filter { completePositions.contains($0.position) }
+        } else {
+            filteredRecords = bandOk   // truncated: keep everything, single channel
+        }
         // Re-sort into channel-major order (all of spin 0, then spin 1, ...), each
-        // channel ordered by k-point position, so the grapher reads them correctly.
-        let filtered: [BandKPoint] = (0..<nSpin).flatMap { s in
-            filteredRecords.filter { $0.spin == s }.sorted { $0.position < $1.position }
+        // channel ordered by k-point position, so the grapher reads them correctly. For a
+        // non-divisible (truncated) layout nSpin == 1, so emit all records in parse order —
+        // filtering by spin == 0 would wrongly discard records that wrapped to spin 1.
+        let filtered: [BandKPoint]
+        if divisible {
+            filtered = (0..<nSpin).flatMap { s in
+                filteredRecords.filter { $0.spin == s }.sorted { $0.position < $1.position }
+                    .map { BandKPoint(k: $0.k, weight: $0.weight, label: "", energies: $0.energies) }
+            }
+        } else {
+            filtered = filteredRecords
                 .map { BandKPoint(k: $0.k, weight: $0.weight, label: "", energies: $0.energies) }
         }
         guard !filtered.isEmpty else { return nil }
