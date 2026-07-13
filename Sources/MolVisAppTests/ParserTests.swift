@@ -554,6 +554,12 @@ final class ParserTests: XCTestCase {
         let dk = bands.kPoints[1].k - bands.kPoints[0].k
         XCTAssertEqual(bands.kDistances[1], sqrt(dot(dk, dk)), accuracy: 1e-4,
                        "cartesian k-distances must be plain |dk|, not metric-transformed")
+        // Single spin channel; per-spin count matches total.
+        XCTAssertEqual(bands.nSpin, 1, "fixture is spinless")
+        XCTAssertEqual(bands.kPointsPerSpin, 8, "one channel holds all 8 k-points")
+        // The fixture is a uniform-weight (wk=0.25) Monkhorst-Pack mesh, not a band
+        // path: the parser must flag it so the grapher does not connect the points.
+        XCTAssertTrue(bands.isMesh, "uniform-weight mesh must be detected")
     }
 
     // Negative Fermi energies must keep their sign. The old `[0-9]+\.[0-9]+` regex
@@ -661,6 +667,45 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(bands.kDistances[1], 0.2, accuracy: 1e-4,
                        "crystal k-distance must be metric-transformed |B·dk| = 0.2")
         XCTAssertNotEqual(bands.kDistances[1], 0.1, "crystal distance must differ from plain fractional")
+        XCTAssertFalse(bands.isMesh, "a true band path with distinct points is not a mesh")
+    }
+
+    // Spin-polarized QE output repeats each k-point's eigenvalue block once per spin
+    // (nSpin=2). The parser must detect two channels (eigBlockCount/kListCount) and
+    // store kPointsPerSpin so the grapher renders them as separate sub-paths.
+    func testBandsSpinPolarized() throws {
+        // k-list: 3 unique k-points. Eigenvalue section: each appears twice (spin up,
+        // then spin down) => 6 blocks total => nSpin=2, kPointsPerSpin=3.
+        func eigBlock(_ k: String) -> String {
+            ([k, "", "    -7.2477  -1.7434"] as [String]).joined(separator: "\n")
+        }
+        let k1 = "  k =  .1000  .0000  .0000 ( 6180 PWs)   bands (ev):"
+        let k2 = "  k =  .2000  .0000  .0000 ( 6180 PWs)   bands (ev):"
+        let k3 = "  k =  .3000  .0000  .0000 ( 6180 PWs)   bands (ev):"
+        // QE prints the k-list once, then ALL eigenvalue blocks (spin-up then spin-
+        // down) before a single Fermi line: 3 k-list entries, 6 eig blocks.
+        let allBlocks = [eigBlock(k1), eigBlock(k2), eigBlock(k3),
+                         eigBlock(k1), eigBlock(k2), eigBlock(k3)].joined(separator: "\n")
+        // Distinct weights (a band path, not a uniform mesh).
+        let kList = [
+            "        k(   1) = (    .1000000    .0000000    .0000000), wk =    .25000",
+            "        k(   2) = (    .2000000    .0000000    .0000000), wk =    .50000",
+            "        k(   3) = (    .3000000    .0000000    .0000000), wk =    .25000",
+        ].joined(separator: "\n")
+        let text = ([
+            "     number of k points=    3",
+            "                       cart. coord.",
+            kList,
+            allBlocks,
+            "     the Fermi energy is     4.5000 ev",
+        ] as [String]).joined(separator: "\n")
+        guard let bands = BandParser.parse(text) else { return XCTFail("parse failed") }
+        XCTAssertEqual(bands.nSpin, 2, "spin-doubled blocks must yield nSpin=2")
+        XCTAssertEqual(bands.kPointsPerSpin, 3, "three unique k-points per channel")
+        XCTAssertEqual(bands.nKPoints, 6, "2 channels x 3 k-points = 6 total")
+        // kDistances restart at 0 for the second channel (no cross-channel step).
+        XCTAssertEqual(bands.kDistances[3], 0, "second channel must restart distance at 0")
+        XCTAssertFalse(bands.isMesh, "distinct weights must not read as a uniform mesh")
     }
 
     // An XSF file carrying a `DATAGRID_2D` block must bridge to a `Grid2D` (not a

@@ -108,17 +108,36 @@ final class BandGrapherView: NSView {
         grid.stroke()
 
         // --- band lines ---
-        NSColor.systemBlue.setStroke()
-        let line = NSBezierPath()
-        line.lineWidth = 1.0
-        for ib in 0..<bs.nBands {
-            line.removeAllPoints()
-            var first = true
-            for ik in 0..<bs.nKPoints {
-                let p = proj(ik, bs.kPoints[ik].energies[ib])
-                if first { line.move(to: p); first = false } else { line.line(to: p) }
+        // A uniform-weight sampling mesh is NOT a band path, so its points must not
+        // be connected; render it as disconnected dots instead.
+        if bs.isMesh {
+            NSColor.systemBlue.set()
+            let cell = NSSize(width: 3, height: 3)
+            for ik in 0..<bs.kPoints.count {
+                let p = proj(ik, bs.kPoints[ik].energies[0])
+                let rect = NSRect(x: p.x - 1.5, y: p.y - 1.5, width: cell.width, height: cell.height)
+                NSBezierPath(ovalIn: rect).fill()
             }
-            line.stroke()
+        } else {
+            // Each spin channel is an ordered sub-path; draw them separately so the
+            // grapher never connects the end of one channel to the start of the next.
+            let palette: [NSColor] = [.systemBlue, .systemRed]
+            for s in 0..<bs.nSpin {
+                let base = s * bs.kPointsPerSpin
+                NSColor.systemBlue.setStroke()
+                let line = NSBezierPath()
+                line.lineWidth = 1.0
+                for ib in 0..<bs.nBands {
+                    line.removeAllPoints()
+                    var first = true
+                    for ik in 0..<bs.kPointsPerSpin {
+                        let p = proj(base + ik, bs.kPoints[base + ik].energies[ib])
+                        if first { line.move(to: p); first = false } else { line.line(to: p) }
+                    }
+                    line.stroke()
+                }
+                _ = palette
+            }
         }
 
         // --- k-path label ---

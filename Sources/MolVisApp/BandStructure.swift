@@ -10,6 +10,9 @@ import simd
 /// label (e.g. "Γ","X","M"), and the per-band eigenvalues at this k in eV.
 struct BandKPoint: Codable {
     let k: SIMD3<Float>
+    /// Integration weight `wk` from the QE k-point list, when present. Used only to
+    /// detect uniform-weight sampling meshes (all equal -> likely a Monkhorst-Pack
+    /// grid, not a band path); the band energies do not depend on it.
     let weight: Float
     let label: String
     var energies: [Float]   // eV, per band index
@@ -31,10 +34,19 @@ struct BandStructure: Codable {
     /// Whether the k-points are crystal (fractional) coordinates. When false
     /// (cartesian, in units of 2π/a_0, as the QE header labels them), `kDistances`
     /// use plain Euclidean length; when true, the reciprocal metric converts each
-    /// fractional step to a physical length. Detected from the k-point list header.
-    /// Default false: a cartesian file mis-read as crystal would be double-
-    /// transformed, so err on the side of NOT applying the metric when uncertain.
+    /// fractional step to a physical length. Detected from the k-point list header
+    /// of the SELECTED iteration (not the whole file). Default false: a cartesian
+    /// file mis-read as crystal would be double-transformed, so err on the side of
+    /// NOT applying the metric when uncertain.
     var kPointsAreCrystal: Bool = false
+    /// Number of k-points per spin channel. For a spin-polarized (nSpin=2) QE
+    /// output, each channel's k-points are concatenated in `kPoints`; the grapher
+    /// renders them as separate, unconnected sub-paths. 1 for spinless output.
+    var kPointsPerSpin: Int
+    /// True when all k-points carry the same integration weight — the signature of
+    /// a uniform Monkhorst-Pack sampling mesh. The grapher renders such data as
+    /// disconnected points (a mesh is not a band path and must not be connected).
+    var isMesh: Bool = false
 
     /// Number of bands (assume uniform across k-points).
     var nBands: Int { kPoints.first?.energies.count ?? 0 }
@@ -60,16 +72,25 @@ struct BandStructure: Codable {
                 SIMD3(dot(c2, c0), dot(c2, c1), dot(c2, c2)),
             ])
         }
-        var d: [Float] = [0]
-        for i in 1..<kPoints.count {
-            let dk = kPoints[i].k - kPoints[i - 1].k
-            let step: Float
-            if let G {
-                step = sqrt(simd_dot(dk, G * dk))
-            } else {
-                step = sqrt(dot(dk, dk))
+        // Distances are computed PER SPIN CHANNEL: a spin-polarized output repeats
+        // each k-point for spin-up then spin-down, and we must not accumulate a
+        // spurious step across the boundary between channels.
+        let n = kPointsPerSpin
+        guard n > 0 else { return .init(repeating: 0, count: kPoints.count) }
+        // First channel starts at 0; each subsequent channel restarts at 0 too.
+        var d: [Float] = .init(repeating: 0, count: kPoints.count)
+        for s in 0..<nSpin {
+            let base = s * n
+            for i in (base + 1)..<(base + n) {
+                let dk = kPoints[i].k - kPoints[i - 1].k
+                let step: Float
+                if let G {
+                    step = sqrt(simd_dot(dk, G * dk))
+                } else {
+                    step = sqrt(dot(dk, dk))
+                }
+                d[i] = d[i - 1] + step
             }
-            d.append(d.last! + step)
         }
         return d
     }
@@ -92,39 +113,68 @@ struct BandStructure: Codable {
 enum BandParser {
     static func parse(_ text: String) -> BandStructure? {
         let lines = text.components(separatedBy: "\n")
-        // Reciprocal lattice vectors, if present, and the k-point coordinate system.
+        // Reciprocal lattice vectors, if present, for crystal-coordinate metric.
         let reciprocal = parseReciprocal(text)
-        let kPointsAreCrystal = detectKPointCoordSystem(text)
-        // First pass: split the file into per-iteration blocks. An iteration ends at
-        // a Fermi-energy line (metallic) OR an occupation-summary line such as
-        // "highest occupied level" (insulating) — relying on the Fermi line alone
-        // left insulating outputs undelimited, concatenating every SCF iteration.
-        // fermi is Float?: a metallic boundary carries a Fermi energy; an insulating
-        // one does not, and we store nil rather than fabricating 0 eV.
-        var iterations: [(kPoints: [BandKPoint], fermi: Float?)] = []
-        var current: [BandKPoint] = []
+
+        // The k-point LIST (with weights + coordinate system) is printed ONCE at the
+        // top of a QE bands output and applies to every iteration that follows, so its
+        // metadata is captured globally — not per iteration (which would lose it for
+        // the final selected iteration, since later iterations don't reprint it).
+        var globalWeights: [Float] = []
+        var globalKListCount = 0
+        var globalIsCrystal = false
+        func ingestKPointListHeader(_ headerLineIdx: Int) {
+            // Scan the few lines after "number of k points=" for the coord label.
+            for off in 1...3 {
+                let idx = headerLineIdx + off
+                guard idx < lines.count else { break }
+                let low = lines[idx].lowercased()
+                if low.contains("cryst. coord") || low.contains("crystal") { globalIsCrystal = true; break }
+                if low.contains("cart. coord") { globalIsCrystal = false; break }
+            }
+        }
+
+        // Per-iteration accumulator: just k-points, eig-block count, and Fermi energy.
+        struct Iter {
+            var kPoints: [BandKPoint] = []
+            var eigBlockCount = 0
+            var fermi: Float? = nil
+        }
+        var iterations: [Iter] = []
+        var cur = Iter()
         var i = 0
         while i < lines.count {
             let line = lines[i]
-            if isIterationBoundary(line) {
-                // Record the Fermi energy if the boundary carries one (metallic);
-                // insulating boundaries leave it nil.
-                let fermi = parseFermiEnergy(line)
-                if !current.isEmpty { iterations.append((current, fermi)) }
-                current = []
+            if line.contains("number of k points") {
+                ingestKPointListHeader(i)
                 i += 1; continue
             }
-            if isKPointListHeader(line) { i += 1; continue }   // k( N)= ... list line
+            if isIterationBoundary(line) {
+                cur.fermi = parseFermiEnergy(line)
+                if !cur.kPoints.isEmpty { iterations.append(cur) }
+                cur = Iter()
+                i += 1; continue
+            }
+            if isKPointListHeader(line) {
+                if let w = parseWeight(line) { globalWeights.append(w) }
+                globalKListCount += 1
+                i += 1; continue
+            }
             guard let k = parseKHeader(line) else { i += 1; continue }
-            // A k-point header: scan forward for its wrapped eigenvalue rows.
+            // Eigenvalue block. Its weight is the k-list weight for the corresponding
+            // unique k-point (modulo the k-list count, since spin-polarized output
+            // repeats each k-point's block once per spin channel).
+            cur.eigBlockCount += 1
+            let widx = globalKListCount > 0 ? (cur.eigBlockCount - 1) % globalKListCount : -1
+            let weight = widx >= 0 && widx < globalWeights.count ? globalWeights[widx] : 0
             i += 1
             if i < lines.count, lines[i].trimmingCharacters(in: .whitespaces).isEmpty { i += 1 }
             var energies: [Float] = []
             while i < lines.count {
                 let t = lines[i].trimmingCharacters(in: .whitespaces)
                 if t.isEmpty { break }
-                if isIterationBoundary(t) { break }   // next iteration reached
-                if parseKHeader(t) != nil { break }   // next k-point reached
+                if isIterationBoundary(t) { break }
+                if parseKHeader(t) != nil { break }
                 var row: [Float] = []
                 for s in t.split(whereSeparator: { $0 == " " || $0 == "\t" }) {
                     if let v = Float(s) { row.append(v) }
@@ -134,28 +184,54 @@ enum BandParser {
                 i += 1
             }
             if !energies.isEmpty {
-                current.append(BandKPoint(k: k, weight: 0, label: "", energies: energies))
+                cur.kPoints.append(BandKPoint(k: k, weight: weight, label: "", energies: energies))
             }
         }
         // Choose the final complete iteration; a file with no boundary lines is one
         // iteration whose Fermi energy is unavailable (nil).
-        var chosen: ([BandKPoint], Float?)?
+        var chosen = Iter()
         if iterations.isEmpty {
-            chosen = (current, nil)
+            chosen = cur
         } else {
-            chosen = iterations.last
+            chosen = iterations.last!
         }
-        guard let (kPoints, fermi) = chosen, !kPoints.isEmpty else { return nil }
+        guard !chosen.kPoints.isEmpty else { return nil }
+
+        // Spin channels: a spin-polarized run prints each unique k-point's eigenvalue
+        // block once per spin, so per-iteration eigBlockCount = nSpin * kListCount.
+        // When kListCount is 0 (no k-list parsed) assume a single channel.
+        let nSpin: Int
+        let kPointsPerSpin: Int
+        if globalKListCount > 0 && chosen.eigBlockCount % globalKListCount == 0 {
+            nSpin = chosen.eigBlockCount / globalKListCount
+            kPointsPerSpin = globalKListCount
+        } else {
+            nSpin = 1
+            kPointsPerSpin = chosen.kPoints.count
+        }
+
+        // Uniform-weight k-points are a Monkhorst-Pack sampling mesh, not an ordered
+        // band path: connecting them is physically meaningless, so flag for scatter.
+        let isMesh = detectUniformMesh(globalWeights)
 
         // Deduce the band count from the MODE (most common length), and drop any
         // k-point whose record does NOT match it. Zero-padding short records would
         // fabricate bands that were never computed and distort the Fermi region.
-        let counts = kPoints.map { $0.energies.count }
+        let counts = chosen.kPoints.map { $0.energies.count }
         let bandCount = modalValue(counts) ?? counts.max() ?? 0
-        let filtered = kPoints.filter { $0.energies.count == bandCount }
+        let filtered = chosen.kPoints.filter { $0.energies.count == bandCount }
         guard !filtered.isEmpty else { return nil }
-        return BandStructure(kPoints: filtered, fermiEnergy: fermi, nSpin: 1,
-                             reciprocal: reciprocal, kPointsAreCrystal: kPointsAreCrystal)
+        return BandStructure(kPoints: filtered, fermiEnergy: chosen.fermi, nSpin: nSpin,
+                             reciprocal: reciprocal, kPointsAreCrystal: globalIsCrystal,
+                             kPointsPerSpin: kPointsPerSpin, isMesh: isMesh)
+    }
+
+    /// True if every weight is (within tolerance) the same value — the hallmark of
+    /// a uniform Monkhorst-Pack sampling mesh rather than a band path.
+    private static func detectUniformMesh(_ weights: [Float]) -> Bool {
+        guard weights.count > 1 else { return false }
+        let first = weights[0]
+        return weights.allSatisfy { abs($0 - first) < 1e-4 }
     }
 
     /// True if `line` terminates a band-iteration block: the metallic Fermi-energy
@@ -171,6 +247,14 @@ enum BandParser {
     /// eigenvalue blocks — skip them so they are not mistaken for k-headers.
     private static func isKPointListHeader(_ line: String) -> Bool {
         line.contains("k(") && line.contains("wk =")
+    }
+
+    /// Parse the integration weight `wk` from a k-list line
+    /// `k( N) = ( ... ), wk = W`. Returns nil if absent/malformed.
+    private static func parseWeight(_ line: String) -> Float? {
+        guard let wkRange = line.range(of: "wk =") else { return nil }
+        let after = String(line[wkRange.upperBound...])
+        return after.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.flatMap { Float($0) }
     }
 
     /// Detect whether the k-point list is in crystal (fractional) or cartesian

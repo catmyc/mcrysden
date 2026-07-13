@@ -314,7 +314,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.7"
+    static let appVersion = "1.1.8"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

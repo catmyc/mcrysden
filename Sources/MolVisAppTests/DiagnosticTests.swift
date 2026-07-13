@@ -216,14 +216,38 @@ final class ColorPlaneDiag: XCTestCase {
     // pairings place segments at clearly different positions — confirming the
     // asymptotic decider chose the topologically correct one.
     func testContourSaddlePairing() throws {
-        // Asymmetric saddle at level 0: tl=10, br=0.5 (high); tr=-10, bl=-10 (low).
-        // Centre value = (10 + 0.5 - 10 - 10)/4 = -2.375 < 0, so the decider picks
-        // the pairing [[top,left],[right,bottom]]. With that pairing the segment
-        // spanning the left edge also spans the top edge — so the topmost crossing
-        // (the top edge, near tl) is connected to the leftmost crossing (left edge).
+        // Edge identifier for a crossing point in normalized cell coords.
+        func edge(_ p: SIMD2<Float>) -> String {
+            if p.y < 1e-3 { return "top" }
+            if abs(p.x - 1) < 1e-3 { return "right" }
+            if abs(p.y - 1) < 1e-3 { return "bottom" }
+            if p.x < 1e-3 { return "left" }
+            return "?"
+        }
+        func pairing(_ segs: [[SIMD2<Float>]]) -> [[String]] {
+            segs.map { seg in seg.map(edge) }
+        }
+        // Standard asymmetric case: centre < level pairs top-left & bottom-right.
         let segs = ColorPlaneView.contourSegments(tl: 10, tr: -10, br: 0.5, bl: -10, level: 0)
         XCTAssertEqual(segs.count, 2, "saddle cell must yield exactly two segments")
-        // Identify each crossing by its edge.
+        let labelled = pairing(segs)
+        XCTAssertTrue(labelled.contains { $0.sorted() == ["left", "top"] },
+                      "asymptotic decider must pair top-left (got \(labelled))")
+        XCTAssertTrue(labelled.contains { $0.sorted() == ["bottom", "right"] },
+                      "asymptotic decider must pair bottom-right (got \(labelled))")
+    }
+
+    // Regression for the reviewer's exact counterexample: level 0, tl=10, tr=-2,
+    // br=0.1, bl=-2. The bilinear centre value is (10 - 2 + 0.1 - 2)/4 = 1.525 > 0,
+    // so the asymptotic decider pairs top-right & bottom-left. This IS the
+    // topologically correct pairing: the high corners tl(10) and br(0.1) are on the
+    // same side of the level and the contour arcs each wrap a low corner (tr, bl).
+    // The reviewer suggested a determinant criterion that pairs the OPPOSITE way for
+    // this case — that criterion is wrong here. We assert the centre-value result.
+    func testContourSaddleReviewerCase() throws {
+        let level: Float = 0
+        let segs = ColorPlaneView.contourSegments(tl: 10, tr: -2, br: 0.1, bl: -2, level: level)
+        XCTAssertEqual(segs.count, 2, "saddle cell must yield exactly two segments")
         func edge(_ p: SIMD2<Float>) -> String {
             if p.y < 1e-3 { return "top" }
             if abs(p.x - 1) < 1e-3 { return "right" }
@@ -232,10 +256,15 @@ final class ColorPlaneDiag: XCTestCase {
             return "?"
         }
         let labelled = segs.map { seg in seg.map(edge) }
-        XCTAssertTrue(labelled.contains { $0.sorted() == ["left", "top"] },
-                      "asymptotic decider must pair top-left (got \(labelled))")
-        XCTAssertTrue(labelled.contains { $0.sorted() == ["bottom", "right"] },
-                      "asymptotic decider must pair bottom-right (got \(labelled))")
+        // Centre value 1.525 > level -> pair (top,right) and (bottom,left): each arc
+        // encloses one of the low corners tr and bl.
+        XCTAssertTrue(labelled.contains { $0.sorted() == ["right", "top"] },
+                      "centre>level must pair top-right (got \(labelled))")
+        XCTAssertTrue(labelled.contains { $0.sorted() == ["bottom", "left"] },
+                      "centre>level must pair bottom-left (got \(labelled))")
+        // Sanity: the centre value really is above level (the decider's premise).
+        let center = (Float(10) + Float(-2) + Float(0.1) + Float(-2)) / 4
+        XCTAssertGreaterThan(center, level, "premise: centre value exceeds level")
     }
 
     // Cell-offset bug: P() maps a cell LOCAL (u,v). Without adding the cell's (x,y),
