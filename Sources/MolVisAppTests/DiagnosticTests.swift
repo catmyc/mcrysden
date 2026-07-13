@@ -81,6 +81,7 @@ final class ColorPlaneDiag: XCTestCase {
         let view = ColorPlaneView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         view.grid = grid.values
         view.zLabel = grid.ident
+        view.physicalSpan = Array(grid.vec.prefix(2))   // use real plane geometry
         view.contourLevels = [grid.minValue + (grid.maxValue - grid.minValue) * 0.5]
 
         // Render the view into a bitmap context (same path the scaffold draw() uses).
@@ -117,6 +118,61 @@ final class ColorPlaneDiag: XCTestCase {
                              "colormap was nearly flat (\(distinctR.count) distinct red levels)")
     }
 
+    // Skew-plane geometry: a plane whose span vectors are NOT orthogonal must be
+    // drawn as a parallelogram, preserving the angle between them. We render a
+    // 1x1-cell grid with skew spans and check the four corners of the drawn
+    // parallelogram: with both spans' lengths + angle kept, corner(0,1) must be
+    // offset in BOTH x and y from corner(0,0) (a non-orthogonal v1). A naive
+    // |v0|/|v1| aspect-only projection would collapse that to pure y.
+    func testColorPlaneSkewProjection() throws {
+        // A skew plane's span vectors v0=(3,0) and v1=(2,4) are non-orthogonal. The
+        // Gram-Schmidt projection maps them to a parallelogram whose top edge is
+        // sheared RIGHT by the v1-along-v0 component (here 2 units). So the drawn
+        // region's TOP rows begin farther right than its BOTTOM rows. An aspect-only
+        // (length-ratio) projection would keep them aligned (no shear).
+        let ns = 200
+        let view = ColorPlaneView(frame: NSRect(x: 0, y: 0, width: ns, height: ns))
+        view.grid = [[0, 3, 0], [3, 0, 3]]   // range of values -> bitmap fully filled
+        view.physicalSpan = [SIMD3<Float>(3, 0, 0), SIMD3<Float>(2, 4, 0)]  // skew
+
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: ns, height: ns, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { throw Thrown.msg("no ctx") }
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: ns, height: ns))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+        view.draw(view.bounds)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let data = ctx.data else { throw Thrown.msg("no pixels") }
+        let px = data.bindMemory(to: UInt8.self, capacity: ns * ns * 4)
+        let thresh = 30
+        // Min and max colored x per row. For each row with colored pixels, record
+        // its minX. A sheared parallelogram has a systematic drift: row minX changes
+        // monotonically with row (the slanted side). A rectangle's left edge keeps a
+        // constant minX across rows.
+        var rowMinX: [(Int, Int)] = []
+        for y in 0..<ns {
+            var mn = ns, found = false
+            for x in 0..<ns {
+                let i = (y*ns+x)*4
+                if px[i]>thresh&&px[i+1]>thresh&&px[i+2]>thresh { mn = min(mn, x); found = true }
+            }
+            if found { rowMinX.append((y, mn)) }
+        }
+        XCTAssertFalse(rowMinX.isEmpty, "no colored pixels drawn")
+        // Drift of minX from the topmost to bottommost colored row.
+        let topMinX = rowMinX.first!.1
+        let bottomMinX = rowMinX.last!.1
+        let drift = abs(bottomMinX - topMinX)
+        print("[colorplane-skew] coloredRows=\(rowMinX.count) topMinX=\(topMinX) bottomMinX=\(bottomMinX) drift=\(drift)")
+        // Shear from the non-orthogonal span makes the left edge slant -> drift.
+        XCTAssertGreaterThan(drift, ns / 10,
+                             "skew plane drew a vertical edge with no slant (drift=\(drift)/\(ns)) — angle not preserved")
+    }
+
     // Pure marching-squares geometry: top edge sampled 0 (left) and 3 (right),
     // level 1. Linear interpolation puts the top crossing at u=1/3, NOT the
     // midpoint 1/2. Verifies the interpolated crossing position directly.
@@ -128,6 +184,77 @@ final class ColorPlaneDiag: XCTestCase {
         XCTAssertEqual(top.y, 0, "crossing should lie on the top edge (v=0)")
         XCTAssertEqual(Double(top.x), 1.0 / 3.0, accuracy: 1e-6,
                        "top crossing at interpolated u=1/3, not midpoint 1/2")
+    }
+
+    // Bottom-edge mirror bug: bottom edge bl(0,1)->br(1,1), bl=0 br=3 level=1.
+    // The crossing must sit at u=1/3 (near bl), NOT at u=2/3 (the reflected side).
+    // The old `1 - crossT(bl,br)` put it at 2/3 — wrong side of the edge.
+    func testContourBottomNotMirrored() throws {
+        let segs = ColorPlaneView.contourSegments(tl: 3, tr: 3, br: 3, bl: 0, level: 1)
+        XCTAssertEqual(segs.count, 1, "single crossed edge -> one segment")
+        // Bottom crossing: u = crossT(bl,br) = (1-0)/(3-0) = 1/3, v = 1.
+        let bottom = segs[0].first { abs($0.y - 1) < 1e-3 }!
+        XCTAssertEqual(Double(bottom.x), 1.0 / 3.0, accuracy: 1e-6,
+                       "bottom crossing must be at u=1/3 (near bl), not reflected to 2/3")
+    }
+
+    // Left-edge mirror bug: left edge tl(0,0)->bl(0,1), tl=3 bl=0 level=1.
+    // The crossing must sit at v=2/3 (near bl), NOT at v=1/3 (reflected).
+    func testContourLeftNotMirrored() throws {
+        let segs = ColorPlaneView.contourSegments(tl: 3, tr: 3, br: 0, bl: 0, level: 1)
+        XCTAssertEqual(segs.count, 1, "single crossed edge -> one segment")
+        // Left crossing: u = 0, v = crossT(tl,bl) = (1-3)/(0-3) = 2/3.
+        let left = segs[0].first { $0.x < 1e-3 }!
+        XCTAssertEqual(Double(left.y), 2.0 / 3.0, accuracy: 1e-6,
+                       "left crossing must be at v=2/3 (near bl), not reflected to 1/3")
+    }
+
+    // Cell-offset bug: P() maps a cell LOCAL (u,v). Without adding the cell's (x,y),
+    // every cell's contour is drawn at cell (0,0)'s position, so a multi-cell grid's
+    // contour occupies only the left portion of the view. With the offset applied,
+    // the contour spans the full width. We render a 2-cell horizontal grid whose
+    // level-set is a continuous horizontal line and measure the drawn x-extent.
+    func testContourCellOffset() throws {
+        // Three columns, one row of cells, each with a horizontal level-set at v=1/3
+        // that spans its own width. Together they form a line across the view. With
+        // >1 column, each cell is narrower than the view, so the offset is visible:
+        // the buggy version piles every cell into cell (0,0) and spans only 1/width.
+        let grid: [[Float]] = [[0, 0, 0], [3, 3, 3]]
+        let ns = 200
+        let view = ColorPlaneView(frame: NSRect(x: 0, y: 0, width: ns, height: ns))
+        view.grid = grid
+        view.physicalSpan = [SIMD3(1, 0, 0), SIMD3(0, 1, 0)]   // orthogonal unit spans
+        view.contourLevels = [1]
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: ns, height: ns, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { throw Thrown.msg("no ctx") }
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: ns, height: ns))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+        view.draw(view.bounds)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let data = ctx.data else { throw Thrown.msg("no pixels") }
+        let px = data.bindMemory(to: UInt8.self, capacity: ns * ns * 4)
+        // White is drawn at alpha 0.6 over black -> ~150; use a permissive threshold.
+        let thresh = 100
+        var minX = ns, maxX = -1, whiteCount = 0
+        for y in 0..<ns {
+            for x in 0..<ns {
+                let i = (y * ns + x) * 4
+                if px[i] > thresh && px[i + 1] > thresh && px[i + 2] > thresh {
+                    whiteCount += 1; minX = min(minX, x); maxX = max(maxX, x)
+                }
+            }
+        }
+        print("[contour-offset] white=\(whiteCount) xExtent=(\(minX)..\(maxX)) ns=\(ns)")
+        XCTAssertGreaterThan(whiteCount, 0, "no contour drawn at all")
+        // With the offset, the line spans most of the width; without it, only ~half
+        // (both cells piled into the left cell) -> xExtent ~ ns/2.
+        XCTAssertGreaterThan(Double(maxX - minX), Double(ns) * 0.7,
+                             "contour x-extent too narrow — cells not offset (got \(maxX-minX)/\(ns))")
     }
 
     // Saddle cell: four crossings -> exactly TWO segments. The original bug drew

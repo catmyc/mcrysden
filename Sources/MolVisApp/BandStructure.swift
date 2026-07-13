@@ -16,23 +16,50 @@ struct BandKPoint: Codable {
 }
 
 /// A parsed band structure. `bands[ib][ik]` = energy of band ib at k-point ik.
-/// `kDistances` is the cumulative path length in fractional-reciprocal units, used
-/// as the x-coordinate of the Grapher.
+/// `kDistances` is the cumulative path length, used as the x-coordinate of the
+/// Grapher.
 struct BandStructure: Codable {
     var kPoints: [BandKPoint]
     var fermiEnergy: Float
     var nSpin: Int
+    /// Reciprocal lattice vectors b1,b2,b3 (rows, units of 2π/a_0) parsed from the
+    /// QE output. When present, `kDistances` are physical Cartesian lengths;
+    /// otherwise they fall back to fractional-Euclidean (an approximation that is
+    /// only correct for cubic cells).
+    var reciprocal: [SIMD3<Float>]?
 
     /// Number of bands (assume uniform across k-points).
     var nBands: Int { kPoints.first?.energies.count ?? 0 }
     var nKPoints: Int { kPoints.count }
 
     /// Cumulative path distance for each k-point (x-axis of the band plot).
+    ///
+    /// With reciprocal vectors this is the PHYSICAL distance: each fractional step
+    /// `dk` is mapped to Cartesian via B = [b1 b2 b3] and |B·dk| is accumulated.
+    /// Without them (vectors not found in the output) it falls back to the naive
+    /// fractional Euclidean length, which mis-spaces non-orthogonal/anisotropic
+    /// cells.
     var kDistances: [Float] {
+        // Reciprocal-metric tensor G_ij = b_i·b_j; |B·dk| = sqrt(dk^T G dk).
+        var G: simd_float3x3?
+        if let b = reciprocal, b.count == 3 {
+            let c0 = b[0], c1 = b[1], c2 = b[2]
+            G = simd_float3x3(rows: [
+                SIMD3(dot(c0, c0), dot(c0, c1), dot(c0, c2)),
+                SIMD3(dot(c1, c0), dot(c1, c1), dot(c1, c2)),
+                SIMD3(dot(c2, c0), dot(c2, c1), dot(c2, c2)),
+            ])
+        }
         var d: [Float] = [0]
         for i in 1..<kPoints.count {
             let dk = kPoints[i].k - kPoints[i - 1].k
-            d.append(d.last! + sqrt(dot(dk, dk)))
+            let step: Float
+            if let G {
+                step = sqrt(simd_dot(dk, G * dk))
+            } else {
+                step = sqrt(dot(dk, dk))
+            }
+            d.append(d.last! + step)
         }
         return d
     }
@@ -55,19 +82,25 @@ struct BandStructure: Codable {
 enum BandParser {
     static func parse(_ text: String) -> BandStructure? {
         let lines = text.components(separatedBy: "\n")
-        // First pass: split the file into per-iteration blocks. Every "the Fermi
-        // energy is ..." line ends an iteration; the k-points preceding it (since
-        // the previous delimiter, or file start) belong to that iteration.
+        // Reciprocal lattice vectors, if present -> physical k-path distances.
+        let reciprocal = parseReciprocal(text)
+        // First pass: split the file into per-iteration blocks. An iteration ends at
+        // a Fermi-energy line (metallic) OR an occupation-summary line such as
+        // "highest occupied level" (insulating) — relying on the Fermi line alone
+        // left insulating outputs undelimited, concatenating every SCF iteration.
         var iterations: [(kPoints: [BandKPoint], fermi: Float)] = []
         var current: [BandKPoint] = []
         var i = 0
         while i < lines.count {
             let line = lines[i]
-            if let f = parseFermiEnergy(line) {
-                if !current.isEmpty { iterations.append((current, f)) }
+            if isIterationBoundary(line) {
+                // Record the Fermi energy if the boundary carries one.
+                let fermi = parseFermiEnergy(line) ?? 0
+                if !current.isEmpty { iterations.append((current, fermi)) }
                 current = []
                 i += 1; continue
             }
+            if isKPointListHeader(line) { i += 1; continue }   // k( N)= ... list line
             guard let k = parseKHeader(line) else { i += 1; continue }
             // A k-point header: scan forward for its wrapped eigenvalue rows.
             i += 1
@@ -76,8 +109,8 @@ enum BandParser {
             while i < lines.count {
                 let t = lines[i].trimmingCharacters(in: .whitespaces)
                 if t.isEmpty { break }
-                if parseFermiEnergy(t) != nil { break }   // next iteration reached
-                if parseKHeader(t) != nil { break }        // next k-point reached
+                if isIterationBoundary(t) { break }   // next iteration reached
+                if parseKHeader(t) != nil { break }   // next k-point reached
                 var row: [Float] = []
                 for s in t.split(whereSeparator: { $0 == " " || $0 == "\t" }) {
                     if let v = Float(s) { row.append(v) }
@@ -90,7 +123,7 @@ enum BandParser {
                 current.append(BandKPoint(k: k, weight: 0, label: "", energies: energies))
             }
         }
-        // Choose the final complete iteration; a file with no Fermi line is one
+        // Choose the final complete iteration; a file with no boundary lines is one
         // iteration whose Fermi energy is unavailable.
         var chosen: ([BandKPoint], Float)?
         if iterations.isEmpty {
@@ -107,7 +140,44 @@ enum BandParser {
         let bandCount = modalValue(counts) ?? counts.max() ?? 0
         let filtered = kPoints.filter { $0.energies.count == bandCount }
         guard !filtered.isEmpty else { return nil }
-        return BandStructure(kPoints: filtered, fermiEnergy: fermi, nSpin: 1)
+        return BandStructure(kPoints: filtered, fermiEnergy: fermi, nSpin: 1,
+                             reciprocal: reciprocal)
+    }
+
+    /// True if `line` terminates a band-iteration block: the metallic Fermi-energy
+    /// line, or an insulating occupation-summary line (highest occupied / lowest
+    /// unoccupied) that QE prints in its place.
+    private static func isIterationBoundary(_ line: String) -> Bool {
+        if parseFermiEnergy(line) != nil { return true }
+        let lower = line.lowercased()
+        return lower.contains("highest occupied") || lower.contains("lowest unoccupied")
+    }
+
+    /// The full-precision k-point LIST lines `k( N) = (...), wk = ...` are not
+    /// eigenvalue blocks — skip them so they are not mistaken for k-headers.
+    private static func isKPointListHeader(_ line: String) -> Bool {
+        line.contains("k(") && line.contains("wk =")
+    }
+
+    /// Parse the reciprocal lattice vectors b1..b3 from the QE "reciprocal axes"
+    /// block (in units of 2π/a_0). Returns nil if the block is absent/malformed.
+    private static func parseReciprocal(_ text: String) -> [SIMD3<Float>]? {
+        let lines = text.components(separatedBy: "\n")
+        guard let marker = lines.firstIndex(where: { $0.contains("reciprocal axes") }) else { return nil }
+        // The three vector rows follow the marker: "b(1) = ( x y z )".
+        var vecs: [SIMD3<Float>] = []
+        for offset in 1...3 {
+            let idx = marker + offset
+            guard idx < lines.count else { return nil }
+            // Isolate the parenthesised triple.
+            guard let lpar = lines[idx].firstIndex(of: "("),
+                  let rpar = lines[idx].lastIndex(of: ")"), rpar > lpar else { return nil }
+            let body = String(lines[idx][lines[idx].index(after: lpar)..<rpar])
+            let nums = body.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "," }).compactMap { Float($0) }
+            guard nums.count >= 3 else { return nil }
+            vecs.append(SIMD3<Float>(nums[0], nums[1], nums[2]))
+        }
+        return vecs.count == 3 ? vecs : nil
     }
 
     /// Parse "  k =  .1250  .2165 -.1852 ( 6180 PWs)   bands (ev):" ->
@@ -130,14 +200,21 @@ enum BandParser {
         return SIMD3<Float>(nums[0], nums[1], nums[2])
     }
 
-    /// Parse "     the Fermi energy is     4.6669 ev" -> 4.6669.
-    private static func parseFermiEnergy(_ line: String) -> Float? {
+    /// Parse "     the Fermi energy is     4.6669 ev" -> 4.6669, or
+    /// "     the Fermi energy is    -4.25 ev" -> -4.25.
+    ///
+    /// The unsigned `[0-9]+\.[0-9]+` silently dropped the sign for negative Fermi
+    /// energies (insulators, some dopings) and rejected integers/scientific form. A
+    /// signed, exponent-aware decimal is matched instead.
+    static func parseFermiEnergy(_ line: String) -> Float? {
         // Require the literal QE phrase so a casual "Fermi" mention elsewhere (e.g.
         // a methods paragraph) does not false-positive.
-        guard line.contains("the Fermi energy is") else { return nil }
-        let pattern = #"[0-9]+\.[0-9]+"#
-        guard let r = line.range(of: pattern, options: .regularExpression) else { return nil }
-        return Float(line[r])
+        guard let phrase = line.range(of: "the Fermi energy is") else { return nil }
+        // Match the FIRST signed decimal in the remainder of the line.
+        let tail = String(line[phrase.upperBound...])
+        let pattern = #"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?"#
+        guard let r = tail.range(of: pattern, options: .regularExpression) else { return nil }
+        return Float(tail[r])
     }
 
     /// Most common value in `xs`, or nil if empty. Used to pick the representative

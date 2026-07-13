@@ -1,4 +1,5 @@
 import XCTest
+import simd
 @testable import MolVisApp
 import MolEnvParse
 
@@ -543,6 +544,80 @@ final class ParserTests: XCTestCase {
         if let lo = allE.min(), let hi = allE.max() {
             XCTAssertGreaterThanOrEqual(bands.fermiEnergy, lo)
             XCTAssertLessThanOrEqual(bands.fermiEnergy, hi)
+        }
+        // Reciprocal vectors were parsed from the output, so kDistances are physical.
+        XCTAssertNotNil(bands.reciprocal, "reciprocal axes should be parsed")
+    }
+
+    // Negative Fermi energies must keep their sign. The old `[0-9]+\.[0-9]+` regex
+    // matched only the magnitude, silently flipping negative (insulating/doped)
+    // values to positive. Verifies sign, integer, and scientific forms.
+    func testFermiNegative() throws {
+        // parseFermiEnergy returns Float?; compare as Floats to avoid Double overload issues.
+        func check(_ line: String, _ expected: Float, _ eps: Float = 1e-4) {
+            let got = BandParser.parseFermiEnergy(line)
+            XCTAssertNotNil(got, "expected a Fermi value for: \(line)")
+            XCTAssertEqual(got!, expected, accuracy: eps)
+        }
+        check("     the Fermi energy is    -4.25 ev", -4.25, 0.001)
+        check("     the Fermi energy is     5 ev", 5, 0.001)
+        check("     the Fermi energy is   1.5e-3 ev", 1.5e-3, 1e-5)
+        XCTAssertNil(BandParser.parseFermiEnergy("     some other Fermi mention -4.25 ev"))
+    }
+
+    // Insulating QE outputs report "highest occupied level" (not a Fermi energy)
+    // after each iteration. The parser must treat those lines as iteration
+    // boundaries, so iterations split and only the last is kept — not all SCF
+    // cycles concatenated into one path.
+    func testBandsInsulatorSplit() throws {
+        // Two synthetic iterations of 4 k-points each, delimited by a
+        // highest-occupied line (no Fermi line at all). Expect 4 k-points (final
+        // iteration), NOT the concatenation (8). k-headers must differ so each is
+        // parsed as a distinct k-point (parseKHeader rejects exact duplicates only
+        // via the value, not the text, so distinct fractional coords are needed).
+        func kHeader(_ i: Int) -> String {
+            // Distinct fractional coords per k-point; leading-integer form so Float
+            // parses reliably (a bare leading dot, e.g. ".10001", would fail).
+            return "          k =  .\(i)5000  .\(i)2500 -.1852 ( 6180 PWs)   bands (ev):"
+        }
+        let eigenvalues = "    -7.2477  -1.7434   -.7444   -.7095"
+        func block(_ i: Int) -> String { ([kHeader(i), "", eigenvalues] as [String]).joined(separator: "\n") }
+        let gap = "     highest occupied level            ... ev"
+        // Iteration 1: k-points 1..4 ; iteration 2: k-points 5..8.
+        let iter1 = (1...4).map { block($0) }.joined(separator: "\n")
+        let iter2 = (5...8).map { block($0) }.joined(separator: "\n")
+        let text = ([iter1, gap, iter2, gap] as [String]).joined(separator: "\n")
+        guard let bands = BandParser.parse(text) else {
+            return XCTFail("no bandStructure parsed from insulator text")
+        }
+        XCTAssertEqual(bands.nKPoints, 4, "insulator iterations must split; expected final 4, got \(bands.nKPoints)")
+        XCTAssertEqual(bands.fermiEnergy, 0, "insulator has no Fermi energy -> unavailable (0)")
+        // k-distances must still be monotonic for the kept iteration.
+        for i in 1..<bands.kDistances.count {
+            XCTAssertGreaterThanOrEqual(bands.kDistances[i], bands.kDistances[i - 1])
+        }
+    }
+
+    // With reciprocal vectors present, kDistances use the metric G_ij = b_i·b_j, so
+    // a fractional step's physical length reflects the non-orthogonal/anisotropic
+    // cell. Verifies k-distances are positive, monotonic, and (for this
+    // non-orthogonal cell) differ from the naive fractional-Euclidean length.
+    func testBandsPhysicalKDistance() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/CH3Rh111.out")
+        guard let bands = BandParser.parse(try String(contentsOf: url, encoding: .utf8)) else {
+            return XCTFail("parse failed")
+        }
+        guard let b = bands.reciprocal else { return XCTFail("no reciprocal") }
+        // Physical distance of the first step: |B·dk| where dk = k2-k1.
+        let dk = bands.kPoints[1].k - bands.kPoints[0].k
+        let cart = b[0] * dk.x + b[1] * dk.y + b[2] * dk.z
+        let physical = sqrt(dot(cart, cart))
+        XCTAssertEqual(bands.kDistances[1], physical, accuracy: 1e-4,
+                       "first k-distance must equal the physical |B·dk|, not fractional")
+        // Monotonic & strictly increasing (distinct k-points).
+        for i in 1..<bands.kDistances.count {
+            XCTAssertGreaterThan(bands.kDistances[i], bands.kDistances[i - 1], "not monotonic at \(i)")
         }
     }
 

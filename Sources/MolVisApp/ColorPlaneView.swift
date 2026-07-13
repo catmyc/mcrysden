@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import simd
 
 // Color-plane / 2D-contour rendering for a 2D scalar field (XSF DATAGRID_2D). The grid
 // is drawn as a value→color bitmap (a perceptual viridis-like map) in an NSView, like
@@ -10,10 +11,12 @@ final class ColorPlaneView: NSView {
     var grid: [[Float]]? {
         didSet { needsDisplay = true }
     }
-    /// The grid's physical aspect ratio (width/height in world units), from its
-    /// span vectors. Drives aspect-preserving layout; if nil the bitmap fills the
-    /// view (legacy behaviour for slice grids without stored geometry).
-    var physicalAspect: CGFloat = 1
+    /// The grid's world-space span vectors (col-axis, row-axis). When BOTH are
+    /// present, the view projects the skew plane with an affine map that
+    /// preserves the vectors' lengths AND the angle between them — so a skew
+    /// DATAGRID plane renders as a parallelogram, not a stretched rectangle.
+    /// Empty -> the bitmap fills the view (slice grids without stored geometry).
+    var physicalSpan: [SIMD3<Float>] = []
     /// Optional iso-contour levels to trace over the colormap.
     var contourLevels: [Float] = []
     var zLabel: String = ""
@@ -30,36 +33,101 @@ final class ColorPlaneView: NSView {
         guard let cg = renderBitmap(grid, rows: rows, cols: cols) else {
             NSColor.white.setFill(); dirtyRect.fill(); return
         }
-        // Draw the bitmap preserving the grid's physical aspect ratio, centered
-        // with letterbox bars — stretching to an arbitrary window size would skew
-        // an anisotropic or skew plane.
-        ctx.draw(cg, in: aspectFitRect(nativeW: cols, nativeH: rows, aspect: physicalAspect))
 
-        // Contour lines on top, mapped into the same aspect-fit rect.
+        // Projection from normalized grid coords (u in [0,1] across cols, v in
+        // [0,1] down rows) to view pixels. With both span vectors we build a 2D
+        // basis (Gram-Schmidt on vec[0],vec[1]) that keeps their relative length
+        // AND angle; without them the unit square fills the view.
+        let project = makeProjection(rows: rows, cols: cols)
+
+        // Draw the bitmap into the projected unit square via an affine transform,
+        // so a skew plane maps to a parallelogram instead of a rectangle.
+        var t = project.affine   // maps (u,v) -> pixel
+        ctx.concatenate(t)
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        ctx.concatenate(t.inverted())
+
+        // Contour lines on top, traced in the same projected space.
         if !contourLevels.isEmpty {
             NSColor.white.withAlphaComponent(0.6).setStroke()
             for level in contourLevels {
-                traceContour(grid, rows: rows, cols: cols, level: level)
+                traceContour(grid, rows: rows, cols: cols, level: level, project: project.point)
             }
         }
         drawTitle()
     }
 
-    /// Rectangle (in view coordinates) that fits a native-aspect rectangle of the
-    /// given aspect ratio into the view bounds, centered.
-    private func aspectFitRect(nativeW: Int, nativeH: Int, aspect: CGFloat) -> CGRect {
+    /// Projection of normalized grid coords (u∈[0,1]×v∈[0,1]) to view pixels.
+    /// `point(u,v)` gives a pixel; `affine` is the matching CGAffineTransform.
+    private struct GridProjection {
+        let point: (CGFloat, CGFloat) -> NSPoint
+        let affine: CGAffineTransform
+    }
+
+    private func makeProjection(rows: Int, cols: Int) -> GridProjection {
         let viewW = bounds.width, viewH = bounds.height
-        guard viewW > 0, viewH > 0, nativeW > 0, nativeH > 0, aspect > 0
-        else { return bounds }
-        // Pixel spacing is uniform; the data has (cols) samples across and (rows)
-        // down, so the sample grid's physical aspect is `aspect` (world units).
-        let targetAspect = aspect
-        var w = viewW
-        var h = w / targetAspect
-        if h > viewH { h = viewH; w = h * targetAspect }
-        let x = (viewW - w) / 2
-        let y = (viewH - h) / 2
-        return CGRect(x: x, y: y, width: w, height: h)
+        guard viewW > 0, viewH > 0, cols > 1, rows > 1 else {
+            return GridProjection(point: { _,_ in .zero }, affine: .identity)
+        }
+
+        // 2D basis from the two span vectors (Gram-Schmidt). Because the basis is
+        // orthonormal, the grid keeps its true shape: length ratio AND angle.
+        let v0 = physicalSpan.count > 0 ? physicalSpan[0] : SIMD3<Float>(1, 0, 0)
+        let v1 = physicalSpan.count > 1 ? physicalSpan[1] : SIMD3<Float>(0, 1, 0)
+        let len0 = simd_length(v0)
+        let e1 = len0 > 1e-6 ? (v0 / len0) : SIMD3<Float>(1, 0, 0)
+        let v1perp = v1 - e1 * simd_dot(v1, e1)
+        let len1p = simd_length(v1perp)
+        let e2 = len1p > 1e-6 ? (v1perp / len1p) :perp(e1)
+        // 2D coordinates of a sample (u,v): dot(u*v0 + v*v1, e1/e2).
+        // Corner (u,v) in 2D: U=u*|v0|, and V along e2 from v1's perpendicular.
+        let bu = CGFloat(len0)                 // e1 extent per unit u
+        let bvx = CGFloat(simd_dot(v1, e1))    // e1 extent per unit v
+        let bvy = CGFloat(len1p)               // e2 extent per unit v
+
+        // Bounding box of the parallelogram (u,v)∈[0,1]² in 2D.
+        let corners: [(CGFloat, CGFloat)] = [(0,0),(1,0),(0,1),(1,1)].map { (su, sv) in
+            let e1c = su * bu + sv * bvx
+            let e2c = sv * bvy
+            return (e1c, e2c)
+        }
+        let xs = corners.map { $0.0 }, ys = corners.map { $0.1 }
+        let minX = xs.min()!, maxX = xs.max()!
+        let minY = ys.min()!, maxY = ys.max()!
+        let spanW = maxX - minX, spanH = maxY - minY
+
+        // Uniform scale so the whole parallelogram fits, then center it. A
+        // uniform scale preserves the angle; independent x/y scaling would not.
+        let s = min(viewW / spanW, viewH / spanH)
+        // 2D origin (u=0,v=0) maps here; center the bbox in the view.
+        let centerView = CGPoint(x: viewW / 2, y: viewH / 2)
+        let center2D = CGPoint(x: (minX + maxX) / 2, y: (minY + maxY) / 2)
+
+        func project(_ u: CGFloat, _ v: CGFloat) -> NSPoint {
+            let e1c = u * bu + v * bvx
+            let e2c = v * bvy
+            // isFlipped == true: v grows downward in AppKit; flip e2.
+            let px = centerView.x + s * (e1c - center2D.x)
+            let py = centerView.y - s * (e2c - center2D.y)
+            return NSPoint(x: px, y: py)
+        }
+
+        // Matching affine: columns are the pixel steps for +1 in u and +1 in v.
+        // du changes only the 2D x (e1) component -> a=bu*s, b=0.
+        let a: CGFloat = bu * s
+        let b: CGFloat = 0
+        let c: CGFloat = bvx * s
+        let d: CGFloat = -bvy * s   // minus for isFlipped (v downward)
+        // tx,ty from u=v=0 corner.
+        let p00 = project(0, 0)
+        let affine = CGAffineTransform(a: a, b: b, c: c, d: d, tx: p00.x, ty: p00.y)
+        return GridProjection(point: project, affine: affine)
+    }
+
+    /// A unit vector perpendicular to e1 (for the degenerate parallel-span case).
+    private func perp(_ e1: SIMD3<Float>) -> SIMD3<Float> {
+        let cand = abs(e1.x) < 0.9 ? SIMD3<Float>(1, 0, 0) : SIMD3<Float>(0, 1, 0)
+        return normalize(cand - e1 * simd_dot(cand, e1))
     }
 
     /// Render the grid as a colormap bitmap via a viridis-style transfer.
@@ -106,24 +174,21 @@ final class ColorPlaneView: NSView {
     /// cells produce TWO segments; pairing them by the center value resolves the
     /// saddle ambiguity instead of dropping one. Geometry is computed by the pure
     /// `contourSegments` helper (unit-tested directly) and mapped into view space.
-    private func traceContour(_ g: [[Float]], rows: Int, cols: Int, level: Float) {
-        // Map grid samples into the same aspect-fit rect the colormap is drawn in.
-        let rect = aspectFitRect(nativeW: cols, nativeH: rows, aspect: physicalAspect)
-        guard rect.width > 0, rect.height > 0, cols > 1, rows > 1 else { return }
-        let cellW = rect.width / CGFloat(cols - 1)
-        let cellH = rect.height / CGFloat(rows - 1)
-        // Normalized cell coordinate (u,v in 0..1 across the cell) to view point.
-        func P(_ u: CGFloat, _ v: CGFloat) -> NSPoint {
-            NSPoint(x: rect.origin.x + u * cellW, y: rect.origin.y + v * cellH)
-        }
+    private func traceContour(_ g: [[Float]], rows: Int, cols: Int, level: Float,
+                              project: (CGFloat, CGFloat) -> NSPoint) {
+        guard cols > 1, rows > 1 else { return }
         let path = NSBezierPath()
         path.lineWidth = 0.8
         for y in 0..<(rows - 1) {
             for x in 0..<(cols - 1) {
                 let tl = g[y][x], tr = g[y][x + 1], br = g[y + 1][ x + 1], bl = g[y + 1][x]
                 for seg in ColorPlaneView.contourSegments(tl: tl, tr: tr, br: br, bl: bl, level: level) {
-                    path.move(to: P(CGFloat(seg[0].x), CGFloat(seg[0].y)))
-                    path.line(to: P(CGFloat(seg[1].x), CGFloat(seg[1].y)))
+                    // seg points are in cell-local (u,v)∈[0,1]²; add cell offset and
+                    // project through the (skew-aware) grid map.
+                    let fu0 = CGFloat(x) + CGFloat(seg[0].x), fv0 = CGFloat(y) + CGFloat(seg[0].y)
+                    let fu1 = CGFloat(x) + CGFloat(seg[1].x), fv1 = CGFloat(y) + CGFloat(seg[1].y)
+                    path.move(to: project(fu0 / CGFloat(cols - 1), fv0 / CGFloat(rows - 1)))
+                    path.line(to: project(fu1 / CGFloat(cols - 1), fv1 / CGFloat(rows - 1)))
                 }
             }
         }
@@ -145,10 +210,17 @@ final class ColorPlaneView: NSView {
             let d = b - a
             return abs(d) < 1e-9 ? 0.5 : (level - a) / d
         }
-        let top = SIMD2<Float>(crossT(tl, tr), 0)          // u in 0..1 along top (v=0)
-        let right = SIMD2<Float>(1, crossT(tr, br))        // v in 0..1 along right (u=1)
-        let bottom = SIMD2<Float>(1 - crossT(bl, br), 1)    // u in 1..0 along bottom (v=1)
-        let left = SIMD2<Float>(0, 1 - crossT(tl, bl))      // v in 1..0 along left (u=0)
+        // Corners in normalized cell coords (u rightward, v downward): tl(0,0)
+        // tr(1,0) / bl(0,1) br(1,1). Each crossing is interpolated from the corner
+        // with the same name as the edge start. The bottom and left edges were the
+        // bug: wrapping them as `1 - crossT(...)` reflected the crossing to the wrong
+        // side of the edge. They read clockwise from bl and tl respectively:
+        //   bottom bl->br: u along the edge = crossT(bl,br), v = 1
+        //   left    tl->bl: v along the edge = crossT(tl,bl), u = 0
+        let top = SIMD2<Float>(crossT(tl, tr), 0)          // tl->tr
+        let right = SIMD2<Float>(1, crossT(tr, br))        // tr->br
+        let bottom = SIMD2<Float>(crossT(bl, br), 1)       // bl->br
+        let left = SIMD2<Float>(0, crossT(tl, bl))          // tl->bl
         var pts: [SIMD2<Float>] = []
         if (tl < level) != (tr < level) { pts.append(top) }
         if (tr < level) != (br < level) { pts.append(right) }

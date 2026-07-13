@@ -132,11 +132,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             colorPlane.grid = grid.values
             colorPlane.zLabel = grid.ident
             colorPlane.contourLevels = defaultContourLevels(for: grid)
-            // Preserve the plane's physical aspect ratio (world-space span) so an
-            // anisotropic or skew grid is not stretched to the window shape.
-            let w = simd_length(grid.vec[0])
-            let h = simd_length(grid.vec[1])
-            colorPlane.physicalAspect = (h > 0) ? CGFloat(w / h) : 1
+            // Project the skew plane with an affine that keeps BOTH span vectors'
+            // lengths and the angle between them (Gram-Schmidt basis). Passing only
+            // |v0|/|v1| would discard the angle and draw a skew plane rectangular.
+            colorPlane.physicalSpan = Array(grid.vec.prefix(2))
             if state.showColorPlane { colorPlane.isHidden = false; canvas.isHidden = true }
         } else {
             colorPlane.grid = nil
