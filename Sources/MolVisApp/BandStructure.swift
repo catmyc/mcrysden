@@ -96,8 +96,6 @@ struct BandStructure: Codable {
         return d
     }
 
-    /// energy(ib, ik) convenience accessor.
-    func energy(band ib: Int, k ik: Int) -> Float { kPoints[ik].energies[ib] }
 }
 
 /// Parse QE PWscf `bands (ev):` sections from a plain-text `.out` file into a
@@ -390,14 +388,6 @@ enum BandParser {
         return hasUniformRowFactorization(points)
     }
 
-    /// Fraction of the implied 2D grid (spanned by the two most-populated varying axes)
-    /// that is actually occupied by the k-point tuples. Returns 0 if fewer than two axes
-    /// vary. A Monhkorst-Pack mesh fills most of its grid region (≈1.0 for regular grids,
-    /// ≈0.5 for the irregular CH3Rh111 slab fixture whose 8 points occupy half of a 2×8
-    /// envelope). A band path scatters isolated points (fraction well below 0.5). Requires
-    /// ≥2 distinct values on both chosen axes; does NOT demand a strict full product, which
-    /// real offset slab meshes fail. Returns the occupancy computed over the two axes with
-    /// the most distinct coordinates (the grid's spanning directions).
     /// True if the points factor into uniform rows: there is some axis on which every
     /// distinct coordinate value is visited the SAME number of times, and that count
     /// multiplies back to the total (nDistinct × perRow == nPoints, perRow ≥ 3, nDistinct ≥ 2).
