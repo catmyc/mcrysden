@@ -259,9 +259,11 @@ enum BandParser {
         if chosen.meta.count == 0, chosen.meta.headerCount > 0 {
             chosen.meta.count = chosen.meta.headerCount
         }
-        // Otherwise (a later section with a header but no headerCount), adopt the most
-        // recent complete section only if the chosen one is entirely metadata-less.
-        if chosen.meta.count == 0, let last = sections.last { chosen.meta = last }
+        // Do NOT fall back to a prior section's metadata. A chosen iteration with empty
+        // meta belongs to a genuinely new/malformed section; inheriting an earlier
+        // section's weights or coordinate convention across section boundaries would
+        // corrupt spin grouping and mesh detection. Missing metadata stays unknown → the
+        // safe single-spin sequential path.
         guard !chosen.records.isEmpty else { return nil }
 
         let meta = chosen.meta
@@ -341,9 +343,15 @@ enum BandParser {
     /// Testable directly (see DiagnosticTests).
     static func detectUniformMesh(_ weights: [Float], records: [BandParserRecord]) -> Bool {
         guard weights.count > 1, records.count > 1 else { return false }
+        // Require COMPLETE weight coverage: every k-point must have a weight. A partial
+        // k-list (e.g. header says 3 k-points but only 2 k(...) ... wk= lines parsed) means
+        // we don't know the full grid, so we must not infer a mesh — otherwise a sparse
+        // path with a couple of surviving weights would be misclassified. The per-spin
+        // k-point count is records.count / nSpin (nSpin == 1 here, since multi-spin is
+        // handled by the caller); require weights to cover all of them.
+        guard weights.count == records.count else { return false }
         let first = weights[0]
-        let uniformWeights = weights.allSatisfy { abs($0 - first) < 1e-4 }
-        guard uniformWeights else { return false }
+        guard weights.allSatisfy({ abs($0 - first) < 1e-4 }) else { return false }
         return formsMultipartGrid(records.map { $0.k })
     }
 
@@ -383,8 +391,9 @@ enum BandParser {
             }
         }
         guard nonDegenerateAxes >= 2, !areCollinear(points) else { return false }
-        guard hasUniformRowFactorization(points) else { return false }
-        return cartesianOccupancy(points) >= 0.5
+        // hasUniformRowFactorization already requires perRow ≥ 3 and a complete row
+        // factorization — the strongest topology signal available without metadata.
+        return hasUniformRowFactorization(points)
     }
 
     /// Fraction of the implied 2D grid (spanned by the two most-populated varying axes)
@@ -425,11 +434,16 @@ enum BandParser {
 
     /// True if the points factor into uniform rows: there is some axis on which every
     /// distinct coordinate value is visited the SAME number of times, and that count
-    /// multiplies back to the total (nDistinct × perRow == nPoints, perRow ≥ 2, nDistinct ≥ 2).
-    /// A Monkhorst-Pack mesh (including the irregular 2×4 slab fixture) satisfies this; an
-    /// L-shaped or diagonal band path does not. Tolerance accounts for float rounding.
+    /// multiplies back to the total (nDistinct × perRow == nPoints, perRow ≥ 3, nDistinct ≥ 2).
+    ///
+    /// perRow ≥ 3 is the key gate, not a density threshold. The reviewer's sparse-path
+    /// counterexamples (e.g. 6 points, 3 x-values each hit twice) have perRow = 2 and are
+    /// rightly rejected as paths: a real 2D mesh samples several points along each row,
+    /// whereas a band path traverses essentially one point per step. The CH3Rh111 slab
+    /// fixture has perRow = 4 (2 rows × 4) and passes. A perfect 3×N Monkhorst grid also
+    /// passes (perRow = N ≥ 3). Tolerance accounts for float rounding.
     static func hasUniformRowFactorization(_ points: [SIMD3<Float>]) -> Bool {
-        guard points.count >= 4 else { return false }
+        guard points.count >= 6 else { return false }   // a real mesh needs ≥ 2 rows × 3
         let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]
         for axis in axes {
             var freq: [Int: Int] = [:]
@@ -437,7 +451,7 @@ enum BandParser {
             let distinct = freq.count
             guard distinct >= 2 else { continue }
             let perRow = freq.values.first!
-            let uniform = perRow >= 2 && distinct * perRow == points.count
+            let uniform = perRow >= 3 && distinct * perRow == points.count
                 && freq.values.allSatisfy { $0 == perRow }
             guard uniform else { continue }
             return true
