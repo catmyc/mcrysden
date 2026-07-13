@@ -137,14 +137,13 @@ enum BandParser {
             var headerCount: Int = 0    // the "number of k points= N" number, if parseable
             var isCrystal: Bool = false
         }
-        var sections: [KListMeta] = []
         var curMeta = KListMeta()
         func ingestKPointListHeader(_ headerLineIdx: Int) {
             // A new k-point list opens a new section: snapshot any prior metadata and reset —
             // triggered by ANY section start (headerCount>0 OR count>0), so a header-only
             // section (a bare "number of k points= N" with no k(...) list) does not carry the
             // previous section's coordinate convention into the next one.
-            if curMeta.count > 0 || curMeta.headerCount > 0 { sections.append(curMeta); curMeta = KListMeta() }
+            if curMeta.count > 0 || curMeta.headerCount > 0 { curMeta = KListMeta() }
             // Parse the explicit count from "number of k points= N". This is the fallback
             // when the section prints a header but no subsequent k(...) ... wk= list (a
             // malformed/truncated or restart-style output): we know N but must NOT inherit
@@ -301,11 +300,10 @@ enum BandParser {
         // a diagonal Γ-Χ, whose points are equally spaced on two axes yet lie on a line.
         // Mesh detection operates on ONE spin channel: QE's k-point list prints each
         // position once (one weight), but the eigenvalue blocks repeat per spin, so
-        // chosen.records has nSpin entries per position. Deduplicate to the per-spin set
-        // (ordered by position) before checking weight coverage and grid topology.
-        let perSpin: [BandParserRecord] = (0..<max(1, nSpin)).flatMap { s in
-            chosen.records.filter { $0.spin == s }.sorted { $0.position < $1.position }
-        }
+        // chosen.records has nSpin entries per position. Take a single representative
+        // channel (spin 0) — for a well-formed calculation it carries every position —
+        // ordered by position, so that weights.count == records.count becomes meaningful.
+        let perSpin = chosen.records.filter { $0.spin == 0 }.sorted { $0.position < $1.position }
         let isMesh = detectUniformMesh(meta.weights, records: perSpin)
 
         // Band filtering. A cleanly divisible multi-channel layout drops incomplete groups
@@ -371,18 +369,6 @@ enum BandParser {
     ///   (d) UNIFORM-ROW FACTORIZATION: the total point count factors as
     ///       nRows × nCols (both ≥ 2) along some axis — every distinct coordinate on that
     ///       axis is hit the same number of times (rejects L/sparse band paths);
-    ///   (e) CARTESIAN-PRODUCT-LIKE DENSITY: the distinct (x,y) tuples cover a healthy
-    ///       fraction of the implied nX × nY grid (see cartesianOccupancy). A Monkhorst-Pack
-    ///       mesh fills its grid region; a band path scatters isolated points.
-    ///
-    /// Note: a strict Cartesian-product requirement ("every nX·nY tuple present") would
-    /// reject real irregular meshes such as the CH3Rh111 slab fixture (an offset 2-row
-    /// sampling with nX=2, 8 distinct y, 8 points ≠ 16 full product). With only the k-point
-    /// coordinates and weights to go on (no calculation-type metadata, which lives in a QE
-    /// input file the bands reader never sees), no coordinate-only test perfectly separates
-    /// every mesh from every path. The combination below is the strongest defensible
-    /// heuristic: it verifies grid structure and density while rejecting the path shapes
-    /// (straight, diagonal, L-shaped, sparse) that the grapher must not connect.
     static func formsMultipartGrid(_ points: [SIMD3<Float>]) -> Bool {
         guard points.count > 1 else { return false }
         let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]

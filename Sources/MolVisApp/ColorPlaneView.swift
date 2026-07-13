@@ -30,6 +30,11 @@ final class ColorPlaneView: NSView {
 
         let rows = grid.count
         let cols = firstRow.count
+        // A jagged (non-rectangular) grid would over-run row buffers; treat it as empty
+        // rather than crash (project principle: never crash on malformed input).
+        guard grid.allSatisfy({ $0.count == cols }) else {
+            NSColor.white.setFill(); dirtyRect.fill(); return
+        }
         guard let cg = renderBitmap(grid, rows: rows, cols: cols) else {
             NSColor.white.setFill(); dirtyRect.fill(); return
         }
