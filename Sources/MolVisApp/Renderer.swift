@@ -58,8 +58,9 @@ final class Renderer: NSObject {
     var scene: Scene = Scene() {
         didSet {
             invalidateBrillouinZoneCache()
-            cachedIsoBuffer = nil
-            cachedIsoKey = nil
+            cachedIsoBuffers = [nil, nil]
+            cachedIsoKeys = [nil, nil]
+            cachedIsoTriangleCounts = [0, 0]
             cachedFermiBuffers = []
         }
     }
@@ -80,9 +81,6 @@ final class Renderer: NSObject {
     // Isosurface cache. Marching cubes over a large grid is comparable in cost to
     // the BZ build (cubic in the sample counts); the result depends only on the
     // scalar field + the iso level, so build once and replay the vertex buffer.
-    private var cachedIsoBuffer: MTLBuffer?
-    private var cachedIsoKey: IsoCacheKey?
-    private var cachedIsoColor: SIMD3<Float> = SIMD3<Float>(0.3, 0.6, 1.0)
     private struct IsoCacheKey: Equatable {
         var nx: Int, ny: Int, nz: Int
         var origin: SIMD3<Float>, vec0: SIMD3<Float>, vec1: SIMD3<Float>, vec2: SIMD3<Float>
@@ -423,6 +421,15 @@ final class Renderer: NSObject {
                 // Bonds (instanced cylinders)
                 drawBonds(enc, frameBuffer: frameBuffer)
             }
+            // Force arrows (instanced lines): drawn for any 3D mode that shows real
+            // atom positions in world space (ball-stick/space-fill/wireframe AND
+            // polyhedral), so the vectors map to the same coordinates as the atoms.
+            // 2D modes are excluded: they route through Renderer2D (a separate
+            // renderer with no arrow path) and project atoms to screen space, where
+            // a world-space arrow has no meaningful projection.
+            if !scene.displayMode.is2D {
+                drawForceArrows(enc, frameBuffer: frameBuffer)
+            }
         }
 
         // Cell frame + axes
@@ -560,6 +567,55 @@ final class Renderer: NSObject {
                                   indexBuffer: cylinderIB,
                                   indexBufferOffset: 0,
                                   instanceCount: inst.count)
+    }
+
+    // MARK: - Force arrows
+
+    /// Draw an arrow per atom along its parsed force vector (eV/Å), scaled by
+    /// `scene.forceScale` into an Å length. Shaft is a world-space line from the
+    /// atom to atom+force; the head is a short barbed fork at the tip, all drawn
+    /// through the existing line pipeline. Gated on `scene.forceSet` presence and
+    /// the `showForces` toggle, so files without forces draw nothing.
+    private func drawForceArrows(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
+        guard scene.forceSet != nil, scene.showForces else { return }
+        let atoms = scene.atoms
+        guard !atoms.isEmpty else { return }
+        var verts: [SIMD3<Float>] = []
+        verts.reserveCapacity(atoms.count * 8)
+        let scale = scene.forceScale
+        let headFrac: Float = 0.18      // head length as a fraction of shaft
+        let headSpread: Float = 0.5
+        for a in atoms {
+            // After supercell widening every replica carries its own `force`
+            // (copied from its base atom in widenSuperCell), so the arrow is
+            // drawn from each atom's own guard — NOT truncated to the base-cell
+            // count. (Each replica's force vector is identical to its base's,
+            // which is physically correct for a periodic structure.)
+            guard let f = a.force else { continue }
+            let flen = length(f)
+            guard flen > 1e-6 else { continue }    // no arrow for a ~zero force
+            let start = a.coord
+            let tip = start + f * scale
+            verts.append(start); verts.append(tip)
+            // Head: two short segments splaying back from the tip along a
+            // perpendicular to the shaft. Build a stable perpendicular.
+            let dir = f / flen
+            let perp = makePerpendicular(dir)
+            let side = simd_length(f) * scale * headFrac
+            let back = tip - dir * side
+            let left = back + perp * side * headSpread
+            let right = back - perp * side * headSpread
+            verts.append(tip); verts.append(left)
+            verts.append(tip); verts.append(right)
+        }
+        if verts.isEmpty { return }
+        drawLineBuffer(verts, color: SIMD3<Float>(1.0, 0.55, 0.1), enc: enc, frameBuffer: frameBuffer)
+    }
+
+    /// A unit vector perpendicular to `d` (assumed unit-length).
+    private func makePerpendicular(_ d: SIMD3<Float>) -> SIMD3<Float> {
+        let cand = abs(d.x) < 0.9 ? SIMD3<Float>(1, 0, 0) : SIMD3<Float>(0, 1, 0)
+        return normalize(cand - d * simd_dot(cand, d))
     }
 
     // MARK: - True 2D primitives (flat screen-space atoms + 1px bonds)
@@ -946,35 +1002,45 @@ final class Renderer: NSObject {
     // MARK: - Isosurface
 
     /// Draw the isosurface (marching-cubes mesh over the scene's scalar field) as
-    /// a depth-tested triangle surface. Two complementary shells are drawn when a
-    /// field is present: an "outside" shell (field > iso) and an "inside" shell
-    /// (field < iso), tinted differently, so a charge-density blob reads as a
-    /// solid surface. The mesh is cached per (field signature + iso level).
+    /// a depth-tested triangle surface. Two complementary shells are drawn at
+    /// +iso and -iso, tinted differently so positive and negative orbital lobes
+    /// remain distinguishable. Cached per (field signature + iso level + sign).
     private func drawIsosurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
         guard let field = scene.scalarField, scene.showIsoSurface else { return }
         let iso = scene.isoLevel
-        let key = IsoCacheKey(nx: field.nx, ny: field.ny, nz: field.nz,
-                              origin: field.origin,
-                              vec0: field.vec[0], vec1: field.vec[1], vec2: field.vec[2],
-                              isoLevel: iso, sign: 1)
-        let needsBuild = cachedIsoBuffer == nil || cachedIsoKey != key
-        if needsBuild {
-            let mesh = IsoMesh(field: field, isoLevel: iso, sign: 1, color: SIMD3<Float>(0.30, 0.62, 0.95))
-            cachedIsoBuffer = mesh.triangleCount > 0
-                ? device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: [])
-                : nil
-            cachedIsoKey = key
-            cachedIsoTriangleCount = mesh.triangleCount
+        // Draw the positive shell first, then the negative shell.
+        let shells: [(sign: Float, color: SIMD3<Float>)] = [
+            (1, SIMD3<Float>(0.30, 0.62, 0.95)),   // outside: cool blue
+            (-1, SIMD3<Float>(0.95, 0.45, 0.25)),   // inside:  warm orange
+        ]
+        for shell in shells {
+            let key = IsoCacheKey(nx: field.nx, ny: field.ny, nz: field.nz,
+                                  origin: field.origin,
+                                  vec0: field.vec[0], vec1: field.vec[1], vec2: field.vec[2],
+                                  isoLevel: iso, sign: shell.sign)
+            let cacheIndex = shell.sign > 0 ? 0 : 1
+            let needsBuild = cachedIsoBuffers[cacheIndex] == nil || cachedIsoKeys[cacheIndex] != key
+            if needsBuild {
+                let mesh = IsoMesh(field: field, isoLevel: iso, sign: shell.sign, color: shell.color)
+                cachedIsoBuffers[cacheIndex] = mesh.triangleCount > 0
+                    ? device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: [])
+                    : nil
+                cachedIsoKeys[cacheIndex] = key
+                cachedIsoTriangleCounts[cacheIndex] = mesh.triangleCount
+            }
+            guard let buf = cachedIsoBuffers[cacheIndex], cachedIsoTriangleCounts[cacheIndex] > 0 else { continue }
+            enc.setRenderPipelineState(polyPipeline)
+            enc.setVertexBuffer(buf, offset: 0, index: 0)
+            enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)   // FrameData (lighting)
+            enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cachedIsoTriangleCounts[cacheIndex] * 3)
         }
-        guard let buf = cachedIsoBuffer, cachedIsoTriangleCount > 0 else { return }
-        enc.setRenderPipelineState(polyPipeline)
-        enc.setVertexBuffer(buf, offset: 0, index: 0)
-        enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)   // FrameData (lighting)
-        enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cachedIsoTriangleCount * 3)
     }
 
-    private var cachedIsoTriangleCount: Int = 0
+    // Per-shell isosurface cache (index 0 = outside/sign>0, 1 = inside/sign<0).
+    private var cachedIsoBuffers: [MTLBuffer?] = [nil, nil]
+    private var cachedIsoKeys: [IsoCacheKey?] = [nil, nil]
+    private var cachedIsoTriangleCounts: [Int] = [0, 0]
 
     // MARK: - Fermi surface (multi-band isosurface at the Fermi level)
 

@@ -1,8 +1,8 @@
 &control
          calculation = 'scf'
-              outdir = '.
+              outdir = '.'
               prefix = 'BFO_s'
-          pseudo_dir = '.
+          pseudo_dir = '.'
            verbosity = 'high'
           wf_collect = .true.
 /

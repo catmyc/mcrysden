@@ -360,66 +360,239 @@ enum BandParser {
     }
 
     /// True if the k-point coordinates form the signature layout of a Monkhorst-Pack
-    /// sampling mesh. Combines independent checks:
-    ///   (a) EQUALLY SPACED per non-degenerate axis (no random scatter);
-    ///   (b) AT LEAST TWO non-degenerate axes (a 1D line of points is not a mesh);
-    ///   (c) the points are NOT COLLINEAR (a diagonal Γ-Χ is spaced on two axes yet lies
-    ///       on a line and must be rejected);
-    ///   (d) UNIFORM-ROW FACTORIZATION: the total point count factors as
-    ///       nRows × nCols (both ≥ 2) along some axis — every distinct coordinate on that
-    ///       axis is hit the same number of times (rejects L/sparse band paths);
+    /// sampling mesh. A genuine MP mesh is a COMPLETE multidimensional lattice: every
+    /// integer combination of its primitive basis vectors, filling a box whose sample
+    /// count equals its dimensions' product, with no gaps. This is orientation-independent
+    /// (works for sheared slabs AND bulk 3D grids) AND rejects sparse band paths whose
+    /// per-axis marginal frequencies look uniform but whose coordinate COMBINATIONS do not
+    /// fill a grid (e.g. (0,0),(0,1),(1,0),(1,2),(2,1),(2,2)).
+    ///
+    /// Two paths, both O(N): a fast AXIS-ALIGNED check (equal spacing on the raw x/y/z
+    /// axes with a completely filled Cartesian product — the common bulk 4×4×4 case), and
+    /// a general ORIENTATION-INDEPENDENT lattice test that searches a bounded set of the
+    /// shortest candidate basis directions (so work is linear, not cubic). Testable.
     static func formsMultipartGrid(_ points: [SIMD3<Float>]) -> Bool {
-        guard points.count > 1 else { return false }
-        let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]
-        var nonDegenerateAxes = 0
-        for axis in axes {
-            let unique = Array(Set(axis.map { ($0 * 1000).rounded() / 1000 })).sorted()
-            guard unique.count > 1 else { continue }   // degenerate axis (e.g. slab)
-            nonDegenerateAxes += 1
-            let step = unique[1] - unique[0]
-            if step < 1e-4 { return false }
-            for i in 1..<unique.count {
-                if abs((unique[i] - unique[i - 1]) - step) > 1e-3 { return false }
-            }
-        }
-        guard nonDegenerateAxes >= 2, !areCollinear(points) else { return false }
-        // hasUniformRowFactorization already requires perRow ≥ 3 and a complete row
-        // factorization — the strongest topology signal available without metadata.
-        return hasUniformRowFactorization(points)
+        guard points.count > 1, !areCollinear(points) else { return false }
+        // Fast path: axis-aligned MP grid on the raw axes (covers bulk 3D grids).
+        if formsAxisAlignedGrid(points) { return true }
+        // General path: orientation-independent complete-lattice test (sheared slabs etc.).
+        return formsLatticeGrid(points)
     }
 
-    /// True if the points factor into uniform rows: there is some axis on which every
-    /// distinct coordinate value is visited the SAME number of times, and that count
-    /// multiplies back to the total (nDistinct × perRow == nPoints, perRow ≥ 3, nDistinct ≥ 2).
-    ///
-    /// perRow ≥ 3 is the key gate, not a density threshold. The reviewer's sparse-path
-    /// counterexamples (e.g. 6 points, 3 x-values each hit twice) have perRow = 2 and are
-    /// rightly rejected as paths: a real 2D mesh samples several points along each row,
-    /// whereas a band path traverses essentially one point per step. The CH3Rh111 slab
-    /// fixture has perRow = 4 (2 rows × 4) and passes. A perfect 3×N Monkhorst grid also
-    /// passes (perRow = N ≥ 3). Tolerance accounts for float rounding.
-    static func hasUniformRowFactorization(_ points: [SIMD3<Float>]) -> Bool {
-        guard points.count >= 6 else { return false }   // a real mesh needs ≥ 2 rows × 3
+    /// Fast path: an axis-aligned MP grid has equal spacing on each non-degenerate raw
+    /// axis AND a completely filled Cartesian product (product of the per-axis sample
+    /// counts equals the point count, with every combination present). O(N).
+    private static func formsAxisAlignedGrid(_ points: [SIMD3<Float>]) -> Bool {
         let axes = [points.map { $0.x }, points.map { $0.y }, points.map { $0.z }]
-        for axis in axes {
-            var freq: [Int: Int] = [:]
-            for v in axis { let k = Int((v * 1000).rounded()); freq[k, default: 0] += 1 }
-            let distinct = freq.count
-            guard distinct >= 2 else { continue }
-            let perRow = freq.values.first!
-            let uniform = perRow >= 3 && distinct * perRow == points.count
-                && freq.values.allSatisfy { $0 == perRow }
-            guard uniform else { continue }
-            return true
+        var sizes: [Int] = []
+        for ax in axes {
+            let u = Array(Set(ax.map { ($0 * 1000).rounded() / 1000 })).sorted()
+            if u.count <= 1 { continue }            // degenerate axis (e.g. slab): allowed
+            let step = u[1] - u[0]
+            if step < 1e-4 { return false }
+            for i in 1..<u.count { if abs((u[i] - u[i - 1]) - step) > 1e-3 { return false } }
+            sizes.append(u.count)
+        }
+        guard sizes.count >= 2 else { return false }   // need ≥ 2 non-degenerate axes
+        let prod = sizes.reduce(1, *)
+        guard prod == points.count else { return false }
+        // Verify the product box is fully filled (reject same-size axes with gaps).
+        let axisUniq: [[Float]] = axes.map { Array(Set($0.map { ($0 * 1000).rounded() / 1000 })).sorted() }
+        var seen = Set<Int>()
+        for p in points {
+            // ignore degenerate axes in the key (their count is 1)
+            let comps = [p.x, p.y, p.z]
+            var key = 0, mul = 1
+            for (ai, u) in axisUniq.enumerated() {
+                if u.count <= 1 { continue }
+                guard let ix = u.firstIndex(where: { abs($0 - comps[ai]) < 1e-3 }) else { return false }
+                key += ix * mul
+                mul *= 100
+            }
+            if !seen.insert(key).inserted { return false }
+        }
+        return seen.count == prod
+    }
+
+    /// General path: does `points` equal a complete lattice {p0 + Σ ni·bi} for some set of
+    /// primitive basis vectors b1..bd (d = 2 or 3) and a filled n1×..×nd box? Uses incremental
+    /// Gram-Schmidt to compute the true affine dimension (O(N), order-independent), then
+    /// collects distinct directions from p0 until the direction set spans that dimension —
+    /// guaranteeing the out-of-plane axis is always captured even when in-plane multiples
+    /// dominate. The lattice check is O(K³·N) with K ≤ 16.
+    private static func formsLatticeGrid(_ points: [SIMD3<Float>]) -> Bool {
+        let p0 = points[0]
+        func len2(_ v: SIMD3<Float>) -> Float { simd_dot(v, v) }
+        func len(_ v: SIMD3<Float>) -> Float { sqrt(len2(v)) }
+        let sinEps: Float = 0.05
+        func independent2(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Bool {
+            simd_length(simd_cross(a, b)) > sinEps * len(a) * len(b)
+        }
+        // Dimension spanned by a set of direction vectors.
+        func span(_ vs: [SIMD3<Float>]) -> Int {
+            guard !vs.isEmpty else { return 0 }
+            for i in 0..<vs.count { for j in (i + 1)..<vs.count {
+                if independent2(vs[i], vs[j]) {
+                    for k in 0..<vs.count where k != i && k != j {
+                        let triple = simd_dot(vs[k], simd_cross(vs[i], vs[j]))
+                        if abs(triple) > sinEps * len(vs[i]) * len(vs[j]) * len(vs[k]) { return 3 }
+                    }
+                    return 2
+                }
+            } }
+            return 1
+        }
+
+        // 1. Compute true affine dimension via Gram-Schmidt — O(N), order-independent.
+        var gsBasis: [SIMD3<Float>] = []
+        var targetDim = 0
+        for p in points {
+            var residual = p - p0
+            for b in gsBasis {
+                let proj = simd_dot(residual, b) / simd_dot(b, b)
+                residual -= proj * b
+            }
+            if simd_dot(residual, residual) > 1e-8 {
+                gsBasis.append(residual)
+                targetDim += 1
+                if targetDim >= 3 { break }
+            }
+        }
+        guard targetDim >= 2 else { return false }
+
+        // 2. Collect distinct directions from p0. Keep collecting until the direction set
+        //    spans the GS-detected dimension — even when in-plane multiples dominate the
+        //    first N directions. This is what makes the detection order-independent.
+        var dirs: [SIMD3<Float>] = []
+        var spanBasis: [SIMD3<Float>] = []
+        var currentSpan = 0
+        for q in points.dropFirst() {
+            let d = q - p0
+            if len2(d) < 1e-10 { continue }
+            let nextSpan = span(spanBasis + [d])
+            let addsDimension = nextSpan > currentSpan
+            if addsDimension {
+                spanBasis.append(d)
+                currentSpan = nextSpan
+            }
+            let candidatePoolFull = dirs.count >= 200
+            if !candidatePoolFull,
+               !dirs.contains(where: { simd_length($0 - d) < 1e-4 * max(1, len($0)) }) {
+                dirs.append(d)
+            }
+            // Once the ordinary candidate pool is full, retain only vectors that add
+            // a missing dimension. This keeps work bounded without making point order
+            // determine whether an out-of-plane direction is ever considered.
+            if candidatePoolFull && addsDimension { dirs.append(d) }
+            if dirs.count >= 24 && currentSpan >= targetDim { break }
+        }
+        guard dirs.count >= 2 else { return false }
+
+        // 3. Rank-based candidate selection + short-direction fill.
+        var byRank: [SIMD3<Float>] = []
+        for d in dirs.sorted(by: { len2($0) < len2($1) }) {
+            if span(byRank + [d]) > span(byRank) { byRank.append(d) }
+            if span(byRank) >= targetDim { break }
+        }
+        var cand = byRank
+        for d in dirs where !cand.contains(where: { simd_length($0 - d) < 1e-4 }) {
+            if cand.count >= 16 { break }
+            cand.append(d)
+        }
+        guard cand.count >= 2 else { return false }
+
+        // 4. Lattice check — try 2D then 3D basis combinations.
+        for i in 0..<cand.count {
+            for j in (i + 1)..<cand.count {
+                if !independent2(cand[i], cand[j]) { continue }
+                if isLatticeBasis([cand[i], cand[j]], p0, points) { return true }
+                for k in (j + 1)..<cand.count {
+                    let triple = abs(simd_dot(cand[i], simd_cross(cand[j], cand[k])))
+                    let denom = len(cand[i]) * len(cand[j]) * len(cand[k])
+                    if triple < sinEps * denom { continue }
+                    if isLatticeBasis([cand[i], cand[j], cand[k]], p0, points) { return true }
+                }
+            }
         }
         return false
+    }
+
+    /// True when every point equals p0 + Σ ri·basis[i] for integer ri that exactly fill an
+    /// axis-aligned bounding box (product of per-axis counts == point count, no gaps/dupes).
+    private static func isLatticeBasis(_ basis: [SIMD3<Float>], _ p0: SIMD3<Float>,
+                                       _ points: [SIMD3<Float>]) -> Bool {
+        let d = basis.count
+        guard d == 2 || d == 3 else { return false }
+        // Normal equations: ri = G^{-1} · (basis · (point - p0)), G_ij = bi·bj.
+        var g = [[Float]](repeating: [Float](repeating: 0, count: d), count: d)
+        for a in 0..<d { for b in 0..<d { g[a][b] = simd_dot(basis[a], basis[b]) } }
+        let detG: Float = d == 2
+            ? (g[0][0] * g[1][1] - g[0][1] * g[1][0])
+            : (g[0][0] * (g[1][1] * g[2][2] - g[1][2] * g[2][1])
+             - g[0][1] * (g[1][0] * g[2][2] - g[1][2] * g[2][0])
+             + g[0][2] * (g[1][0] * g[2][1] - g[1][1] * g[2][0]))
+        // SINGULARITY: a dependent basis has detG = 0. Use a RELATIVE cutoff so tiny meshes
+        // (primitive spacing ~0.001, detG ~1e-12) aren't rejected as degenerate. detG equals
+        // squared cell volume; compare against the product of the squared basis lengths (the
+        // value for an orthogonal basis of those lengths), i.e. the squared-cosine of the cell.
+        let lenSqProd = g[0][0] * (d == 2 ? g[1][1] : (g[1][1]*g[2][2] - g[1][2]*g[2][1]))
+        if lenSqProd > 0, abs(detG) < 1e-6 * lenSqProd { return false }
+        var gi = [[Float]](repeating: [Float](repeating: 0, count: d), count: d)
+        if d == 2 {
+            gi[0][0] = g[1][1] / detG; gi[0][1] = -g[0][1] / detG
+            gi[1][0] = -g[1][0] / detG; gi[1][1] = g[0][0] / detG
+        } else {
+            gi[0][0] = (g[1][1]*g[2][2] - g[1][2]*g[2][1]) / detG
+            gi[0][1] = (g[0][2]*g[2][1] - g[0][1]*g[2][2]) / detG
+            gi[0][2] = (g[0][1]*g[1][2] - g[0][2]*g[1][1]) / detG
+            gi[1][0] = (g[1][2]*g[2][0] - g[1][0]*g[2][2]) / detG
+            gi[1][1] = (g[0][0]*g[2][2] - g[0][2]*g[2][0]) / detG
+            gi[1][2] = (g[0][2]*g[2][0] - g[0][0]*g[1][2]) / detG
+            gi[2][0] = (g[1][0]*g[2][1] - g[1][1]*g[2][0]) / detG
+            gi[2][1] = (g[0][1]*g[2][0] - g[0][0]*g[2][1]) / detG
+            gi[2][2] = (g[0][0]*g[1][1] - g[0][1]*g[1][0]) / detG
+        }
+        var coords: [[Int]] = []
+        for q in points {
+            let r = q - p0
+            var c = [Float](repeating: 0, count: d)
+            for i in 0..<d { c[i] = simd_dot(basis[i], r) }
+            var f = [Float](repeating: 0, count: d)
+            for i in 0..<d { for j in 0..<d { f[i] += gi[i][j] * c[j] } }
+            let ri = f.map { Int($0.rounded()) }
+            // reconstruct & verify integer lattice maps back onto the real point.
+            var recon = p0
+            for i in 0..<d { recon += basis[i] * Float(ri[i]) }
+            if simd_length(q - recon) > 2e-3 { return false }
+            coords.append(ri)
+        }
+        var lo = coords[0], hi = coords[0]
+        for cc in coords.dropFirst() { for i in 0..<d { lo[i] = min(lo[i], cc[i]); hi[i] = max(hi[i], cc[i]) } }
+        var sizes = [Int](repeating: 0, count: d)
+        var prod = 1
+        for i in 0..<d { sizes[i] = hi[i] - lo[i] + 1; prod *= sizes[i] }
+        guard prod == points.count else { return false }
+        var seen = Set<Int>()
+        for cc in coords {
+            var key = 0, mul = 1
+            for i in 0..<d { key += (cc[i] - lo[i]) * mul; mul *= 1000 }
+            if !seen.insert(key).inserted { return false }   // duplicate lattice coordinate
+        }
+        guard seen.count == prod else { return false }       // gap in the box
+        return true
     }
 
     /// True if all points lie on a single line (within tolerance). Collinear points form
     /// a band path, never a mesh, even if spaced equally on multiple axes. Testable.
     static func areCollinear(_ points: [SIMD3<Float>]) -> Bool {
         guard points.count > 2 else { return true }
-        // Find two distinct points to define the line direction.
+        // SINE-BASED collinearity (scale-independent, consistent with `independent2` in
+        // formsLatticeGrid). A point p lies on the line through p0 along d iff the sine of the
+        // angle between (p-p0) and d — |(p-p0)×d|/|p-p0| — is below sinEps. This is immune to
+        // aspect ratio: a high-aspect grid (0,0),(100,0),(0,0.5),(100,0.5) has sin≈0.05 for the
+        // 0.5-offset points, correctly flagged non-collinear, where an absolute or diagonal-scaled
+        // distance tolerance would wrongly accept them. Works regardless of point order.
+        let sinEps: Float = 0.05   // ~3° from parallel still treated as collinear
         guard let p0 = points.first, let idx = points.firstIndex(where: { $0 != p0 }) else { return true }
         let p1 = points[idx]
         let dir = p1 - p0
@@ -428,9 +601,10 @@ enum BandParser {
         let d = dir / len
         for p in points {
             let v = p - p0
-            let proj = simd_dot(v, d)
-            let closest = p0 + d * proj
-            if simd_length(p - closest) > 1e-3 { return false }
+            let dist = simd_length(v)
+            guard dist > 1e-6 else { continue }       // p coincides with p0 → on the line
+            let sinAngle = simd_length(simd_cross(v, d)) / dist
+            if sinAngle > sinEps { return false }
         }
         return true
     }

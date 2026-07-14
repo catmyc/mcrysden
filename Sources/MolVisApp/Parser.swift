@@ -14,6 +14,27 @@ enum ParseError: Error, CustomStringConvertible {
     }
 }
 
+/// Decompress a gzip file without loading a C parser with compressed bytes.
+/// Read stdout before waiting so large files cannot deadlock on a full pipe.
+internal func gunzipData(_ url: URL) throws -> Data {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
+    process.arguments = ["-c", url.path]
+    let output = Pipe()
+    process.standardOutput = output
+    do {
+        try process.run()
+    } catch {
+        throw ParseError.io(path: url.path, reason: "could not launch gunzip: \(error)")
+    }
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw ParseError.io(path: url.path, reason: "gunzip failed (exit \(process.terminationStatus))")
+    }
+    return data
+}
+
 struct LoadedScene {
     var atoms: [Atom] = []
     var bonds: [Bond] = []
@@ -24,7 +45,9 @@ struct LoadedScene {
     var scalarField: ScalarField?
     var fermiSurface: FermiSurface?
     var bandStructure: BandStructure?
+    var forceSet: ForceSet?
     var grid2D: Grid2D?
+    var multiOrbitalFields: [ScalarField] = []
 }
 
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
@@ -47,7 +70,7 @@ enum ParseFormat {
         case "pwo", "out": self = .pwo
         case "cif": self = .cif
         case "poscar", "contcar", "vasp": self = .poscar
-        case "cube": self = .cube
+        case "cube", "g98": self = .cube
         case "bxsf": self = .bxsf
         case "struct": self = .struct_
         case "r1": self = .crystal
@@ -62,6 +85,7 @@ enum ParseFormat {
     /// formats (`.bxsf.gz`) dispatch to their own parser. `pathExtension` alone would
     /// yield only `gz`; when it is, we look one layer deeper at the stem's extension.
     static func from(url: URL) -> ParseFormat? {
+        if url.lastPathComponent.lowercased() == "geometry.in" { return .fhi }
         let ext = url.pathExtension.lowercased()
         if let f = ParseFormat(ext: ext) {
             // `.out` is ambiguous: QE PWscf, ORCA and FHI-aims all use it. When the
@@ -141,6 +165,16 @@ enum Parser {
         guard let effective else {
             throw ParseError.io(path: url.path, reason: "unknown extension \(url.pathExtension)")
         }
+        // The C XSF parser uses fopen and cannot consume gzip bytes directly.
+        // Decompress to a short-lived file, then use the normal bridge so all
+        // structure and DATAGRID copying still follows one path.
+        if effective == .xsf, url.pathExtension.lowercased() == "gz" {
+            let temporary = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mcrysden-\(UUID().uuidString).xsf")
+            try gunzipData(url).write(to: temporary, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            return try load(temporary, as: .xsf)
+        }
         // Gaussian cube is a pure-text volumetric format parsed entirely in Swift
         // (it produces atoms + a scalarField but no C MolEnvScene).
         if effective == .cube {
@@ -177,6 +211,13 @@ enum Parser {
         // 2D Grapher (no atoms/cell -> no C MolEnvScene).
         if effective == .bands {
             return try loadBands(url)
+        }
+        // QE PWscf output (.pwo): structure (atoms/cell) via the C parser, plus
+        // forces/energy/stress parsed in Swift from the raw text and attached to
+        // the scene. Forces correspond to the final SCF iteration (the one the
+        // user sees). Without this the .pwo path would return forces nowhere.
+        if effective == .pwo {
+            return try loadPWO(url, frameIndex: 0)
         }
         let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
@@ -245,6 +286,11 @@ enum Parser {
         // the C parsers so frameIndex reaches loadOrca.
         if effective == .orca {
             return try loadOrca(url, frameIndex: frameIndex)
+        }
+        // QE .pwo: structure via C, forces/energy/stress in Swift. Routed here
+        // (before the C switch) so frameIndex reaches loadPWO for animated output.
+        if effective == .pwo {
+            return try loadPWO(url, frameIndex: frameIndex)
         }
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
@@ -707,32 +753,98 @@ enum Parser {
             let p = SIMD3<Float>(Float(t[2]) ?? 0, Float(t[3]) ?? 0, Float(t[4]) ?? 0) * scale
             atoms.append(Atom(coord: p, atomicNumber: Z, label: Table.id(Z)))
         }
-        // optional MO record if multiple orbitals: consume the MO-count/indices
-        // line so its integer tokens aren't mistaken for grid values.
+        // optional MO record if multiple orbitals: the next token line gives the
+        // number of orbitals followed by their 1-based indices, e.g. "2  1  2".
+        var nOrbitals = 1
         if multiOrb {
-            _ = nextTokenLine()
+            if let moLine = nextTokenLine(), let nOrb = Int(moLine.first ?? ""), nOrb >= 1 {
+                nOrbitals = nOrb
+            }
         }
 
-        // remaining tokens are the grid values, x-fastest, flattened across all
-        // sub-grids (orbitals). Take the first nx*ny*nz block as the field; any
-        // further orbitals are ignored (single isosurface per file for now).
-        let needed = nx * ny * nz
-        var values: [Float] = []
-        values.reserveCapacity(needed)
-        while values.count < needed, let tok = nextTokenLine() {
-            for s in tok { if values.count < needed, let v = Float(s) { values.append(v) } }
+        // Gaussian cube writes voxels with the third axis varying fastest. For an
+        // MO cube, values are additionally interleaved by orbital at every voxel.
+        // Read the complete stream, then transpose it into ScalarField's x-fastest
+        // layout and one independent value array per orbital.
+        let perOrb = nx * ny * nz
+        let totalNeeded = perOrb * nOrbitals
+        var allValues: [Float] = []
+        allValues.reserveCapacity(totalNeeded)
+        while allValues.count < totalNeeded, let tok = nextTokenLine() {
+            for s in tok { if allValues.count < totalNeeded, let v = Float(s) { allValues.append(v) } }
         }
-        guard values.count == needed else {
-            throw ParseError.parse(path: url.path, line: 0, reason: "cube grid short (\(values.count)/\(needed))")
+        guard allValues.count == totalNeeded else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "cube grid short (\(allValues.count)/\(totalNeeded))")
         }
-        var minV = values[0], maxV = values[0]
-        for v in values { if v < minV { minV = v }; if v > maxV { maxV = v } }
+
+        var valuesByOrbital = Array(repeating: [Float](repeating: 0, count: perOrb), count: nOrbitals)
+        var src = 0
+        for ix in 0..<nx {
+            for iy in 0..<ny {
+                for iz in 0..<nz {
+                    let dst = ix + nx * (iy + ny * iz)
+                    for orbital in 0..<nOrbitals {
+                        valuesByOrbital[orbital][dst] = allValues[src]
+                        src += 1
+                    }
+                }
+            }
+        }
+
+        var multiOrbitalFields: [ScalarField] = []
+        multiOrbitalFields.reserveCapacity(nOrbitals)
+        var scalarField: ScalarField?
+        for o in 0..<nOrbitals {
+            let orbValues = valuesByOrbital[o]
+            var minV = orbValues[0], maxV = orbValues[0]
+            for v in orbValues { if v < minV { minV = v }; if v > maxV { maxV = v } }
+            let field = ScalarField(nx: nx, ny: ny, nz: nz, origin: origin, vec: vec,
+                                    values: orbValues, minValue: minV, maxValue: maxV)
+            if o == 0 { scalarField = field }
+            multiOrbitalFields.append(field)
+        }
 
         var out = LoadedScene()
         out.atoms = atoms
-        out.scalarField = ScalarField(nx: nx, ny: ny, nz: nz, origin: origin, vec: vec,
-                                      values: values, minValue: minV, maxValue: maxV)
+        out.scalarField = scalarField
+        out.multiOrbitalFields = multiOrbitalFields
         out.title = url.lastPathComponent
+        return out
+    }
+
+    /// QE PWscf `.pwo` / `.out`: atoms + cell come from the C `parse_pwo`; forces,
+    /// total force, total energy and optional stress come from the Swift ForceParser
+    /// reading the SAME raw text. Per-atom forces are placed on the atoms by the
+    /// printed index (`atom N` -> atom N-1), so they stay aligned even if an earlier
+    /// block is malformed. The whole LoadedScene (structure + forceSet) bridges to
+    /// `Scene`, so a QE output can finally expose forces, energy and arrows.
+    private static func loadPWO(_ url: URL, frameIndex: Int) throws -> LoadedScene {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        let cPath = url.path.cString(using: .utf8)!
+        guard let scene = parse_pwo(cPath, Int32(frameIndex)) else {
+            let msg = String(cString: molenv_last_error())
+            var path = url.path, line = 0, reason = msg
+            if let match = msg.range(of: #"^(.+):(\d+):\s?(.*)$"#, options: .regularExpression) {
+                let body = String(msg[match]); let parts = body.components(separatedBy: ":")
+                if parts.count >= 3, let n = Int(parts[parts.count-2]) {
+                    path = parts[0..<parts.count-2].joined(separator: ":"); line = n
+                    reason = parts[parts.count-1].trimmingCharacters(in: .whitespaces)
+                }
+            }
+            throw ParseError.parse(path: path, line: line, reason: reason)
+        }
+        defer { molenv_scene_free(scene) }
+        var out = copyOut(scene.pointee)
+        out.title = out.title.isEmpty ? url.lastPathComponent : out.title
+        // Converged forces of the requested SCF frame (frameIndex selects it via the geometry
+        // block windows; see ForceParser.parse). Requires the block to match the parsed atom
+        // count so a truncated block is rejected.
+        if let fs = ForceParser.parse(raw, frameIndex: frameIndex, atomCount: out.atoms.count) {
+            for i in 0..<min(fs.forces.count, out.atoms.count) {
+                out.atoms[i].force = fs.forces[i]
+            }
+            out.forceSet = fs
+        }
         return out
     }
 }
@@ -824,16 +936,110 @@ internal func orcaCycleCount(_ url: URL) -> Int {
     OrcaParser.cycleCount(url)
 }
 
-// FHI-aims coord.out structure (ported from XCrySDen's F/fhi_coord2xcr.f):
-//   <a1> <a2> <a3>        (lattice vectors as 3 columns, Bohr -> Angstrom)
-//   <n_all_species>
-//   [per species:]
-//   <n_i_species>
-//   <name>                 (element name, e.g. "Gallium", "Arsenic", "hy_1.25")
-//   (<x> <y> <z> <T/F>)*n  (Cartesian coords, Bohr -> Angstrom; flag ignored)
+// FHI-aims structure parser. Detects one of two formats from the first
+// non-blank line and dispatches accordingly:
+//   (a) XCrySDen-style coord.out (ported from F/fhi_coord2xcr.f):
+//       <a1> <a2> <a3>        (lattice vectors as 3 columns, Bohr -> Angstrom)
+//       <n_all_species>
+//       [per species:]
+//       <n_i_species>
+//       <name>                 (element name, e.g. "Gallium", "hy_1.25")
+//       (<x> <y> <z> <T/F>)*n  (Cartesian coords, Bohr -> Angstrom; flag ignored)
+//   (b) Standard FHI-aims geometry.in / FHI98MD:
+//       lattice_vector  x y z   (×3, Angstrom)
+//       atom_frac       x y z Element   (fractional)
+//       atom            x y z Element   (Cartesian, Angstrom)
 internal func loadFHIaims(_ url: URL) throws -> LoadedScene {
     let raw = try String(contentsOf: url, encoding: .utf8)
     let lines = raw.components(separatedBy: "\n")
+    enum E: Error { case malformed(String) }
+    func tok(_ s: String) -> [String] { s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init) }
+
+    // Find first non-blank line to decide format.
+    let firstNonBlank = lines.first {
+        let line = $0.trimmingCharacters(in: .whitespaces)
+        return !line.isEmpty && !line.hasPrefix("#")
+    }
+    let isStandard = firstNonBlank?.lowercased().hasPrefix("lattice_vector") == true ||
+                     firstNonBlank?.lowercased().hasPrefix("atom_frac") == true ||
+                     firstNonBlank?.lowercased().hasPrefix("atom") == true
+
+    if isStandard {
+        return try loadFHIaimsGeometryIn(lines: lines)
+    }
+    return try loadFHIaimsCoordOut(lines: lines)
+}
+
+/// Parse a standard FHI-aims `geometry.in` / `FHI98MD` file. Keywords:
+///   `lattice_vector x y z`  — 3×, Angstrom
+///   `atom_frac x y z Elem`  — fractional coordinate
+///   `atom x y z Elem`       — Cartesian coordinate (Angstrom)
+///   `constrain_relaxation .true.` / `.false.` — ignored
+internal func loadFHIaimsGeometryIn(lines: [String]) throws -> LoadedScene {
+    enum E: Error { case malformed(String) }
+    func tok(_ s: String) -> [String] { s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init) }
+
+    // Orbit关键词不敏感的匹配。
+    var latticeVecs: [SIMD3<Float>] = []
+    var fracAtoms: [(SIMD3<Float>, String)] = []
+    var cartAtoms: [(SIMD3<Float>, String)] = []
+
+    for raw in lines {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.isEmpty || line.hasPrefix("#") { continue }
+        let t = tok(line)
+        guard let kw = t.first?.lowercased() else { continue }
+        switch kw {
+        case "lattice_vector":
+            guard t.count >= 4, let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else {
+                throw E.malformed("bad lattice_vector: \(line)")
+            }
+            latticeVecs.append(SIMD3<Float>(x, y, z))
+        case "atom_frac":
+            guard t.count >= 5, let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else {
+                throw E.malformed("bad atom_frac: \(line)")
+            }
+            fracAtoms.append((SIMD3<Float>(x, y, z), t[4]))
+        case "atom":
+            guard t.count >= 5, let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else {
+                throw E.malformed("bad atom: \(line)")
+            }
+            cartAtoms.append((SIMD3<Float>(x, y, z), t[4]))
+        default:
+            break   // ignore `constrain_relaxation`, `empty`, etc.
+        }
+    }
+
+    guard latticeVecs.count == 3 else {
+        throw E.malformed("geometry.in needs exactly 3 lattice_vector lines (found \(latticeVecs.count))")
+    }
+    let cell = Cell(a: latticeVecs[0], b: latticeVecs[1], c: latticeVecs[2])
+
+    // Convert fractional atoms to Cartesian using the lattice vectors.
+    func fracToCart(_ f: SIMD3<Float>) -> SIMD3<Float> {
+        f.x * latticeVecs[0] + f.y * latticeVecs[1] + f.z * latticeVecs[2]
+    }
+
+    var atoms: [Atom] = []
+    for (coord, sym) in fracAtoms {
+        let Z = ElementTable.atomicNumber(sym)
+        atoms.append(Atom(coord: fracToCart(coord), atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
+    }
+    for (coord, sym) in cartAtoms {
+        let Z = ElementTable.atomicNumber(sym)
+        atoms.append(Atom(coord: coord, atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
+    }
+
+    var out = LoadedScene()
+    out.atoms = atoms
+    out.cell = cell
+    out.isCrystal = true
+    out.title = "geometry.in"
+    return out
+}
+
+/// Parse an XCrySDen-style FHI-aims `coord.out`.
+internal func loadFHIaimsCoordOut(lines: [String]) throws -> LoadedScene {
     enum E: Error { case malformed(String) }
     func tok(_ s: String) -> [String] { s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init) }
     var idx = 0
@@ -878,7 +1084,7 @@ internal func loadFHIaims(_ url: URL) throws -> LoadedScene {
     out.atoms = atoms
     out.cell = cell
     out.isCrystal = true
-    out.title = url.lastPathComponent
+    out.title = "coord.out"
     return out
 }
 

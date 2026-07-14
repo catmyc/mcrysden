@@ -66,6 +66,10 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(field.nx, 19)
         XCTAssertEqual(field.ny, 19)
         XCTAssertEqual(field.nz, 31)
+        XCTAssertEqual(scene.multiOrbitalFields.count, 2)
+        XCTAssertEqual(scene.multiOrbitalFields[0].value(0, 0, 0), 1.41569e-4, accuracy: 1e-9)
+        XCTAssertEqual(scene.multiOrbitalFields[1].value(0, 0, 0), -3.88836e-4, accuracy: 1e-9)
+        XCTAssertEqual(scene.multiOrbitalFields[0].value(0, 0, 1), 2.31251e-4, accuracy: 1e-9)
         // grid is non-trivial: a spread of orbital values around 0.
         XCTAssertLessThan(field.minValue, 0.0)
         XCTAssertGreaterThan(field.maxValue, 0.0)
@@ -75,6 +79,168 @@ final class SceneTests: XCTestCase {
         // first orbital renders a surface at a mid iso level.
         let mesh = IsoMesh(field: field, isoLevel: 0.005, sign: 1)
         XCTAssertGreaterThan(mesh.triangleCount, 0)
+    }
+
+    // .g98 extension must dispatch to the same cube parser.
+    func testGaussianG98ExtensionDispatchesToCube() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("mol.g98")
+        try """
+        Gaussian mock
+        Test
+         1   0.000000   0.000000   0.000000   0.000000
+           2   1.000000   0.000000   0.000000
+           2   0.000000   1.000000   0.000000
+           2   0.000000   0.000000   1.000000
+         1   0.000000   0.500000   0.500000   0.500000
+           0.1   0.2   0.3   0.4   0.5   0.6   0.7   0.8
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let loaded = try Parser.load(tmp)
+        XCTAssertNotNil(loaded.scalarField, ".g98 must parse as a cube")
+        XCTAssertEqual(loaded.scalarField?.nx, 2)
+    }
+
+    // Multi-orbital cube files retain ALL orbitals so the user can switch between them.
+    func testMultiOrbitalCubeRetainsAllOrbitals() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("multi.cube")
+        // natoms = -1 → multi-orbital. MO record "2  1  2" → 2 orbitals.
+        // Cube values are voxel-major with z fastest, and orbital values are
+        // interleaved at each voxel: (orb1,orb2), (orb1,orb2), ...
+        let values = (1...8).flatMap { [Float($0), Float(100 + $0)] }
+            .map { String(format: "%.1f", $0) }.joined(separator: "   ")
+        try """
+        Multi-orbital test
+        mock
+        -1   0.000000   0.000000   0.000000
+           2   1.000000   0.000000   0.000000
+           2   0.000000   1.000000   0.000000
+           2   0.000000   0.000000   1.000000
+         1   0.000000   0.500000   0.500000   0.500000
+        2  1  2
+        \(values)
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let loaded = try Parser.load(tmp, as: .cube)
+        XCTAssertEqual(loaded.multiOrbitalFields.count, 2, "both orbitals retained")
+        // ScalarField stores x fastest, so transpose cube's z-fastest voxel order.
+        XCTAssertEqual(loaded.multiOrbitalFields[0].values, [1, 5, 3, 7, 2, 6, 4, 8])
+        XCTAssertEqual(loaded.multiOrbitalFields[1].values, [101, 105, 103, 107, 102, 106, 104, 108])
+        // scalarField defaults to the first orbital
+        XCTAssertEqual(loaded.scalarField?.values.first ?? -1, 1.0, accuracy: 0.01)
+    }
+
+    func testMultiOrbitalSelectionWiresThroughController() throws {
+        let fields = [
+            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
+                        vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
+                        values: Array(repeating: -1, count: 8), minValue: -1, maxValue: 1),
+            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
+                        vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
+                        values: Array(repeating: 4, count: 8), minValue: 2, maxValue: 6),
+        ]
+        var scene = Scene()
+        scene.scalarField = fields[0]
+        scene.multiOrbitalFields = fields
+        let wc = MainWindowController(scene: Scene())
+        defer { wc.window.close() }
+        wc.loadFile(scene)
+        XCTAssertEqual(wc.state.orbitalCount, 2)
+        wc.state.currentOrbital = 1
+        XCTAssertEqual(wc.scene.currentOrbital, 1)
+        XCTAssertEqual(wc.scene.scalarField?.values.first, 4)
+        XCTAssertEqual(wc.state.isoRange, 2...6)
+    }
+
+    // The isosurface renderer draws both positive (sign>0) and negative (sign<0)
+    // shells for an orbital field that spans both signs.
+    func testInsideIsosurfaceShellNonEmpty() throws {
+        let url = fixture("N2O.cube")
+        let scene = Scene(loaded: try Parser.load(url, as: .cube))
+        guard let field = scene.scalarField else { return XCTFail("expected a scalar field") }
+        // outside shell at iso=0.005
+        let outside = IsoMesh(field: field, isoLevel: 0.005, sign: 1)
+        XCTAssertGreaterThan(outside.triangleCount, 0, "outside shell must render")
+        // negative shell at field == -0.005.
+        let inside = IsoMesh(field: field, isoLevel: 0.005, sign: -1)
+        XCTAssertGreaterThan(inside.triangleCount, 0, "inside shell must render a surface too")
+    }
+
+    func testNegativeIsosurfaceInterpolatesAtNegativeThreshold() throws {
+        // v=-2 at x=0 and v=0 at x=1. A sign=-1 shell at iso=0.5 crosses
+        // v=-0.5 at x=0.75; interpolating at +0.5 would extrapolate to x=1.25.
+        var values: [Float] = []
+        for _ in 0..<4 { values += [-2, 0] }
+        let field = ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
+                                vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
+                                values: values, minValue: -2, maxValue: 0)
+        let mesh = IsoMesh(field: field, isoLevel: 0.5, sign: -1)
+        XCTAssertGreaterThan(mesh.triangleCount, 0)
+        for i in stride(from: 0, to: mesh.vertices.count, by: 9) {
+            XCTAssertEqual(mesh.vertices[i], 0.75, accuracy: 1e-5)
+            XCTAssertGreaterThan(mesh.vertices[i + 3], 0.99, "negative-lobe normal faces higher values")
+        }
+    }
+
+    func testWorldGradientTransformsSkewedAnisotropicGrid() throws {
+        let spans = [SIMD3<Float>(2, 0, 0), SIMD3<Float>(1, 3, 0), SIMD3<Float>(0.5, 0.25, 4)]
+        let expected = SIMD3<Float>(1, 2, -0.5)
+        var values: [Float] = []
+        for iz in 0..<3 { for iy in 0..<3 { for ix in 0..<3 {
+            let p = spans[0] * (Float(ix) / 2) + spans[1] * (Float(iy) / 2) + spans[2] * (Float(iz) / 2)
+            values.append(simd_dot(expected, p))
+        } } }
+        let field = ScalarField(nx: 3, ny: 3, nz: 3, origin: .zero, vec: spans,
+                                values: values, minValue: values.min()!, maxValue: values.max()!)
+        let gradient = field.worldGradient(0.5, 0.5, 0.5)
+        XCTAssertTrue(allComponentsEqual(gradient, expected, 1e-4), "got \(gradient)")
+    }
+
+    // Standard FHI-aims `geometry.in` (lattice_vector + atom_frac/atom) parses.
+    func testFHIGeometryInParses() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("geometry.in")
+        try """
+        lattice_vector   5.430000   0.000000   0.000000
+        lattice_vector   0.000000   5.430000   0.000000
+        lattice_vector   0.000000   0.000000   5.430000
+        atom_frac   0.000000   0.000000   0.000000   Si
+        atom_frac   0.250000   0.250000   0.250000   Si
+        atom            1.000000   2.000000   3.000000   H
+        constrain_relaxation .true.
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let loaded = try Parser.load(tmp)
+        XCTAssertEqual(loaded.atoms.count, 3, "2 fractional + 1 Cartesian atom")
+        XCTAssertEqual(loaded.atoms[0].atomicNumber, 14) // Si
+        XCTAssertEqual(loaded.atoms[2].atomicNumber, 1)  // H
+        XCTAssertNotNil(loaded.cell, "geometry.in has a cell")
+        // fractional Si at (0,0,0) → origin
+        XCTAssertEqual(loaded.atoms[0].coord.x, 0, accuracy: 1e-5)
+        // fractional Si at (0.25,0.25,0.25) → (0.25*5.43, ...)
+        XCTAssertEqual(loaded.atoms[1].coord.x, 0.25 * 5.43, accuracy: 0.01)
+        // Cartesian H at (1,2,3) → unchanged
+        XCTAssertEqual(loaded.atoms[2].coord.x, 1.0, accuracy: 1e-5)
+        XCTAssertEqual(loaded.atoms[2].coord.y, 2.0, accuracy: 1e-5)
+        XCTAssertEqual(loaded.atoms[2].coord.z, 3.0, accuracy: 1e-5)
+    }
+
+    func testCompressedXSFLoadsThroughNormalDispatch() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+        process.arguments = ["-c", fixture("si.grid.xsf").path]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("si.grid.xsf.gz")
+        try data.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let loaded = try Parser.load(url)
+        XCTAssertEqual(loaded.atoms.count, 2)
+        XCTAssertNotNil(loaded.scalarField)
+    }
+
+    func testOpenPanelIncludesTierAExtensions() throws {
+        XCTAssertTrue(App.openPanelExtensions.contains("g98"))
+        XCTAssertTrue(App.openPanelExtensions.contains("gz"))
     }
 
     // Regression for review P1#1: the isosurface must span the WHOLE grid, not

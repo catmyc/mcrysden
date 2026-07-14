@@ -34,7 +34,10 @@ enum StateStore {
         payload["showStructure"] = scene.showStructure
         payload["showIsoSurface"] = scene.showIsoSurface
         payload["isoLevel"] = scene.isoLevel
+        payload["currentOrbital"] = scene.currentOrbital
         payload["showFermiSurface"] = scene.showFermiSurface
+        payload["showForces"] = scene.showForces
+        payload["forceScale"] = scene.forceScale
         payload["atomScale"] = scene.atomScale
         payload["bondRadius"] = scene.bondRadius
         payload["lighting"] = [
@@ -126,8 +129,29 @@ enum StateStore {
         if let v = obj["showBrillouinZone"] as? Bool { scene.showBrillouinZone = v }
         if let v = obj["showStructure"] as? Bool { scene.showStructure = v }
         if let v = obj["showIsoSurface"] as? Bool { scene.showIsoSurface = v }
-        if let v = obj["isoLevel"] as? Double { scene.isoLevel = Float(v) }
+        if !scene.multiOrbitalFields.isEmpty {
+            let requested = obj["currentOrbital"] as? Int ?? scene.currentOrbital
+            let index = min(max(0, requested), scene.multiOrbitalFields.count - 1)
+            scene.currentOrbital = index
+            scene.scalarField = scene.multiOrbitalFields[index]
+        } else if let requested = obj["currentOrbital"] as? Int {
+            scene.currentOrbital = max(0, requested)
+        }
+        if let v = obj["isoLevel"] as? Double {
+            let requested = Float(v)
+            if let field = scene.scalarField {
+                scene.isoLevel = min(field.maxValue, max(field.minValue, requested))
+            } else {
+                scene.isoLevel = requested
+            }
+        }
         if let v = obj["showFermiSurface"] as? Bool { scene.showFermiSurface = v }
+        if let v = obj["showForces"] as? Bool { scene.showForces = v }
+        // Clamp to the sidebar's 5...200 range so a malformed state file can't feed
+        // a negative/zero/giant scale into Metal (reversed or infinite arrow verts).
+        if let v = obj["forceScale"] as? Double {
+            scene.forceScale = min(200, max(5, Float(v)))
+        }
         if let v = obj["atomScale"] as? Double { scene.atomScale = Float(v) }
         if let v = obj["bondRadius"] as? Double { scene.bondRadius = Float(v) }
         if let light = obj["lighting"] as? [String: Any] {

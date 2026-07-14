@@ -70,6 +70,11 @@ struct SideBar: View {
             if state.hasScalarField {
                 Section("Isosurface") {
                     Toggle("Show Surface", isOn: $state.showIsoSurface)
+                    if state.orbitalCount > 1 {
+                        Stepper("Orbital \(state.currentOrbital + 1) of \(state.orbitalCount)",
+                                value: $state.currentOrbital,
+                                in: 0...(state.orbitalCount - 1))
+                    }
                     Slider(value: $state.isoLevel, in: state.isoRange) {
                         Text("Iso level: \(state.isoLevel, specifier: "%.3f")")
                     }
@@ -91,6 +96,12 @@ struct SideBar: View {
                 Section("Color Plane") {
                     Toggle("Show Color Plane", isOn: $state.showColorPlane)
                 }
+            }
+            // --- Forces (QE output): per-atom force arrows + energy readout. ---
+            // Shown only when the loaded file carried a parsed `Forces acting on
+            // atoms` block. The arrows are force vectors drawn from each atom.
+            if state.hasForceSet {
+                ForcesSection(state: state)
             }
             // --- k-path (crystal only): Brillouin-zone overlay + band path. -----
             // The scene exposes cell + base atoms; the controller builds the
@@ -159,5 +170,23 @@ struct SideBar: View {
         .formStyle(.grouped)
         .padding()
         .frame(minWidth: 200)
+    }
+}
+
+/// Forces sidebar section: per-atom force arrows + energy readout. Arrows render in
+/// every 3D mode; in 2D modes atoms are screen-space (a separate Renderer2D) and
+/// world-space vectors have no meaningful projection, so the toggle is disabled there
+/// rather than promise invisible arrows.
+private struct ForcesSection: View {
+    @ObservedObject var state: SideBarState
+    var body: some View {
+        Section("Forces") {
+            Toggle("Show Force Arrows", isOn: $state.showForces)
+                .disabled(state.displayMode.is2D)
+            Slider(value: $state.forceScale, in: 5...200) { Text("Arrow Scale: \(Int(state.forceScale))") }
+            Text(state.forceSummary)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+        }
     }
 }

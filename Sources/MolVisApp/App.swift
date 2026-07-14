@@ -17,7 +17,7 @@ final class App: NSObject, NSApplicationDelegate {
         let format: ParseFormat
     }
     private static let formatTable: [FormatInfo] = [
-        FormatInfo(flag: "--xsf",     extensions: ["xsf"],                       format: .xsf),
+        FormatInfo(flag: "--xsf",     extensions: ["xsf", "xsf.gz"],             format: .xsf),
         FormatInfo(flag: "--axsf",    extensions: ["axsf"],                      format: .axsf),
         FormatInfo(flag: "--xyz",     extensions: ["xyz"],                       format: .xyz),
         FormatInfo(flag: "--pdb",     extensions: ["pdb"],                       format: .pdb),
@@ -25,7 +25,7 @@ final class App: NSObject, NSApplicationDelegate {
         FormatInfo(flag: "--pwo",     extensions: ["pwo", "out"],                format: .pwo),
         FormatInfo(flag: "--cif",     extensions: ["cif"],                       format: .cif),
         FormatInfo(flag: "--poscar",  extensions: ["poscar", "contcar", "vasp"], format: .poscar),
-        FormatInfo(flag: "--cube",    extensions: ["cube"],                      format: .cube),
+        FormatInfo(flag: "--cube",    extensions: ["cube", "g98"],               format: .cube),
         FormatInfo(flag: "--bxsf",    extensions: ["bxsf", "bxsf.gz"],           format: .bxsf),
         FormatInfo(flag: "--struct",  extensions: ["struct"],                    format: .struct_),
         FormatInfo(flag: "--crystal", extensions: ["r1"],                        format: .crystal),
@@ -44,7 +44,15 @@ final class App: NSObject, NSApplicationDelegate {
 
     /// All extensions the Open panel should offer, in display order (primary
     /// extension of each format first, then alternates).
-    private static let openPanelExtensions: [String] = formatTable.flatMap { $0.extensions }
+    static let openPanelExtensions: [String] = {
+        var seen = Set<String>()
+        return formatTable.flatMap { $0.extensions }.compactMap { advertised in
+            // NSOpenPanel matches the final extension, so `xsf.gz`/`bxsf.gz` must
+            // contribute `gz`; Parser.from validates the inner extension after open.
+            let ext = advertised.split(separator: ".").last.map(String.init) ?? advertised
+            return seen.insert(ext).inserted ? ext : nil
+        }
+    }()
 
     /// Find the input structure file: the first arg that is not a known flag and
     /// is not consumed by `--export <path>`. Allows the force-format flags to be
@@ -139,6 +147,11 @@ final class App: NSObject, NSApplicationDelegate {
             scene.showBrillouinZone = restored.showBrillouinZone
             scene.showIsoSurface = restored.showIsoSurface
             scene.isoLevel = restored.isoLevel
+            // Force-arrow settings: carry across the frame rebuild so restoring a saved
+            // animation frame (headless --frame or GUI saved currentFrame) keeps the
+            // visibility/scale the user set, matching the other appearance fields.
+            scene.showForces = restored.showForces
+            scene.forceScale = restored.forceScale
             scene.atomScale = restored.atomScale
             scene.bondRadius = restored.bondRadius
             scene.selectedAtoms = restored.selectedAtoms
@@ -314,12 +327,12 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.9"
+    static let appVersion = "1.1.11"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
         // units note can never drift out of sync with the parser.
-        let exts = formatTable.map { $0.extensions.first! }.joined(separator: " ")
+        let exts = formatTable.flatMap { $0.extensions }.joined(separator: " ")
         let flags = formatTable.map { $0.flag }.joined(separator: " ")
         print("""
         mcrysden v\(appVersion) — native macOS crystal/molecule viewer (Metal).

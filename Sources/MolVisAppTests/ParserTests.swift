@@ -78,6 +78,40 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(s.atoms[1].coord.x, 5.0 * 0.529177210903, accuracy: 0.01)
     }
 
+    // Parenthesized unit syntax "ATOMIC_POSITIONS (crystal)" and
+    // "CELL_PARAMETERS (bohr)" is valid QE input and appears in XCrySDen
+    // reference files. The C parser must strip the parentheses so the unit
+    // resolves correctly — otherwise "(crystal)" is not recognised and
+    // falls back to the alat default, zeroing atoms when celldm(1) is unset.
+    func testPWIParenthesizedUnits() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("paren.pwi")
+        try """
+        &system
+          ibrav = 0
+          nat = 1
+          ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Fe 55.845 Fe.upf
+        ATOMIC_POSITIONS (crystal)
+         Fe 0.5 0.5 0.5
+        CELL_PARAMETERS (bohr)
+         10.0 0.0 0.0
+         0.0 10.0 0.0
+         0.0 0.0 10.0
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let s = try Parser.load(tmp)
+        XCTAssertEqual(s.atoms.count, 1)
+        XCTAssertTrue(s.isCrystal)
+        // Fe at fractional (0.5,0.5,0.5) in a 10-Bohr cubic cell → (5,5,5) Bohr
+        // = 5*BOHR_TO_ANG ≈ 2.6459 Å. If "(crystal)" were read literally, the
+        // atom would be at (0,0,0) or a bogus alat scale.
+        let expected = Float(5.0 * 0.529177210903)
+        XCTAssertEqual(s.atoms[0].coord.x, expected, accuracy: 0.01)
+        XCTAssertEqual(s.atoms[0].coord.y, expected, accuracy: 0.01)
+        XCTAssertEqual(s.atoms[0].coord.z, expected, accuracy: 0.01)
+    }
+
     func testXYZHappyPathWater() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/h2o.xyz")
@@ -668,6 +702,602 @@ final class ParserTests: XCTestCase {
                        "crystal k-distance must be metric-transformed |B·dk| = 0.2")
         XCTAssertNotEqual(bands.kDistances[1], 0.1, "crystal distance must differ from plain fractional")
         XCTAssertFalse(bands.isMesh, "a true band path with distinct points is not a mesh")
+    }
+
+    // QE `Forces acting on atoms` blocks are parsed into a ForceSet (eV/Å, eV).
+    // parse() now auto-fills energy/stress and counts iterations, so the returned
+    // set is fully populated without a separate fillEnergyAndStress() call.
+    func testForceParse() throws {
+        let block = """
+             Forces acting on atoms (Ry/au):
+
+             atom   1 type  1   force =      .01178589     .00671649    -.00370617
+             atom   2 type  1   force =     -.01165606     .00670024    -.00383326
+             atom   3 type  2   force =      .00005964    -.01367884    -.00324235
+
+             Total force =      .267804     Total SCF correction =      .002682
+            """
+        // Energy in "Ry" (unit matched case-insensitively) — printed BEFORE forces in a real
+        // QE iteration, so it falls within the accepted block's window. Filled automatically.
+        let text = "!    total energy              =  -545.21374359 Ry\n" + block
+        // atomCount: the block must match the structure's 3 atoms.
+        guard let fs = ForceParser.parse(text, atomCount: 3) else { return XCTFail("no forceSet parsed") }
+        XCTAssertEqual(fs.forces.count, 3, "expected per-atom forces for 3 atoms")
+        // Forces placed by printed index: force[0] is atom 1's, force[1] atom 2's.
+        XCTAssertEqual(fs.forces[0].x, 0.01178589 * ForceParser.ryPerAu_to_eVPerAng, accuracy: 1e-6,
+                       "force[0] must be atom 1's force (index-aligned, not shifted)")
+        // Forces were converted Ry/au -> eV/Å: magnitude should be non-zero and finite.
+        XCTAssertFalse(fs.forces.contains { !$0.x.isFinite || !$0.y.isFinite || !$0.z.isFinite },
+                       "forces must be finite")
+        XCTAssertNotNil(fs.totalForce, "total force line must be parsed (non-nil)")
+        XCTAssertGreaterThan(fs.totalForce!, 0, "total force must be positive")
+        // Energy filled automatically by parse(): the real value, not a zero placeholder.
+        XCTAssertNotNil(fs.totalEnergy, "total energy line must be parsed (non-nil)")
+        XCTAssertEqual(fs.totalEnergy!, -545.21374359 * ForceParser.ry_to_eV, accuracy: 0.05,
+                       "total energy must be parsed and converted Ry -> eV")
+        XCTAssertEqual(fs.nIterations, 1, "one force block -> one iteration")
+    }
+
+    // A malformed atom line must NOT shift subsequent forces onto the wrong atoms,
+    // and a block with a gap in the printed indices must be rejected in favor of an
+    // earlier complete iteration.
+    func testForceIndexAlignment() throws {
+        // Two iterations: final one has a GAP (atom 2 malformed), so it is rejected
+        // and the earlier complete iteration is used instead. Forces stay aligned.
+        let iter1 = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             atom   2 type  1   force =      .20000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction =      .000010
+            """
+        // Final iteration: atom 2 line is malformed (no "force =") -> index 2 gap.
+        let iter2 = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .90000000     .00000000     .00000000
+             atom   2 type  1   force =     garbage
+             atom   3 type  1   force =      .90000000     .00000000     .00000000
+             Total force =      .90000000     Total SCF correction =      .000010
+            """
+        let text = iter1 + "\n" + iter2
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        // iter2 is incomplete (gap at index 2) -> rejected; iter1 (2 atoms) is used.
+        XCTAssertEqual(fs.forces.count, 2, "should fall back to the complete iteration")
+        XCTAssertEqual(fs.forces[0].x, 0.1 * ForceParser.ryPerAu_to_eVPerAng, accuracy: 1e-6,
+                       "force[0] must be atom 1's, not shifted onto it by the malformed line")
+        XCTAssertEqual(fs.forces[1].x, 0.2 * ForceParser.ryPerAu_to_eVPerAng, accuracy: 1e-6,
+                       "force[1] must be atom 2's, not the value from a later iteration")
+    }
+
+    // When the final force block is truncated and parse() falls back to an earlier
+    // complete block, the paired energy must come from THAT block's iteration, not
+    // the file's final "total energy" (which belongs to a different cycle).
+    func testForceEnergyPairedWithBlock() throws {
+        // Realistic QE order: each SCF cycle prints its total energy BEFORE its
+        // forces block. Iteration 1: energy -10, then a complete 2-atom force block.
+        // Iteration 2: energy -20, then an INCOMPLETE block (gap: atoms 1 and 3,
+        // atom 2 missing) -> rejected, forcing fallback to iter1. parse() must
+        // use iter1's forces AND iter1's energy (-10), NOT iter2's -20.
+        let iter1 = """
+             !    total energy              =     -10.00000000 Ry
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             atom   2 type  1   force =      .20000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction =      .000010
+            """
+        let iter2 = """
+             !    total energy              =     -20.00000000 Ry
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .90000000     .00000000     .00000000
+             atom   3 type  1   force =      .90000000     .00000000     .00000000
+             Total force =      .90000000     Total SCF correction =      .000010
+            """
+        let text = iter1 + "\n" + iter2
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        // iter2 rejected (gap at 2) -> iter1 used: 2 forces AND its own energy (-10),
+        // NOT iter2's (-20). Energy pairs with the ACCEPTED block.
+        XCTAssertEqual(fs.forces.count, 2, "should fall back to the complete iteration")
+        XCTAssertNotNil(fs.totalEnergy, "energy must be paired with the accepted block")
+        XCTAssertEqual(fs.totalEnergy!, -10.0 * ForceParser.ry_to_eV, accuracy: 0.05,
+                       "energy must pair with the accepted block, not the file's last energy")
+    }
+
+    // QE prints the stress tensor as three "s(i j)=" rows of three floats (the
+    // standard PWscf format), NOT six floats on the header line. Verify the full
+    // symmetric 3×3 is recovered.
+    func testForceStressThreeRows() throws {
+        let text = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction =      .000010
+                 Computing stress (Ry/bohr**3) components
+             s(1 1)=      -1.00000000     .50000000     .00000000
+             s(2 1)=       .50000000    -2.00000000     .00000000
+             s(3 1)=       .00000000     .00000000    -3.00000000
+            """
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        guard let s = fs.stress else { return XCTFail("stress should be parsed from three s(i j)= rows") }
+        XCTAssertEqual(s[0].x, -1, accuracy: 1e-5, "sxx")
+        XCTAssertEqual(s[0].y, 0.5, accuracy: 1e-5, "sxy")
+        XCTAssertEqual(s[1].y, -2, accuracy: 1e-5, "syy")
+        XCTAssertEqual(s[2].z, -3, accuracy: 1e-5, "szz")
+        XCTAssertEqual(s[1].x, s[0].y, accuracy: 1e-5, "tensor must be symmetric")
+    }
+
+    // A force block that repeats an atom index (atom 1; atom 2; atom 2) must be
+    // REJECTED (not silently overwrite), so an earlier complete block is used.
+    func testForceRejectsDuplicateIndex() throws {
+        let clean = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             atom   2 type  1   force =      .20000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction =      .000010
+            """
+        // Final block: atom 2 appears twice -> duplicate -> rejected -> clean used.
+        let dup = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .90000000     .00000000     .00000000
+             atom   2 type  1   force =      .80000000     .00000000     .00000000
+             atom   2 type  1   force =      .70000000     .00000000     .00000000
+             Total force =      .90000000     Total SCF correction =      .000010
+            """
+        let text = clean + "\n" + dup
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        XCTAssertEqual(fs.forces[1].x, 0.2 * ForceParser.ryPerAu_to_eVPerAng, accuracy: 1e-6,
+                       "duplicate block must be rejected, not overwrite atom 2's force")
+    }
+
+    // Frame binding: in a relaxation, `ATOMIC_POSITIONS` blocks index frames and the forces
+    // printed after each step belong to that step's geometry. parse(frameIndex:) must select
+    // the force block of the REQUESTED frame, not the file's final forces, so arrows map to
+    // the displayed coordinates.
+    // Frame→force mapping matches real QE PWscf relaxation output, where forces computed on
+    // geometry[k] are printed AFTER that step's SCF and BEFORE the next ATOMIC_POSITIONS block.
+    // So frame k's forces appear in the forward window [geomStarts[k], geomStarts[k+1]); the last
+    // frame's converged forces precede it, so it falls back to [geomStarts[k-1], geomStarts[k]).
+    // Physically, forces[k] are the forces on geometry[k] — verified against real QE output.
+    func testForceFrameBinding() throws {
+        // Real QE relaxation order: [geom0] forces0 [geom1] forces1 [geom2 (final)], where
+        // forces_k is the force computed on geometry_k. Distinct values per geometry.
+        let geom = """
+             ATOMIC_POSITIONS (angstrom)
+             Si        0.000000   0.000000   0.000000
+             Si        1.357500   1.357500   1.357500
+            """
+        // forces on geometry 0 (initial, large forces, not converged).
+        let forcesG0 = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .50000000     .00000000     .00000000
+             atom   2 type  1   force =      .50000000     .00000000     .00000000
+             Total force =      1.00000000     Total SCF correction =      .000010
+            """
+        // forces on geometry 1 (converged, small forces).
+        let forcesG1 = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .01000000     .00000000     .00000000
+             atom   2 type  1   force =      .01000000     .00000000     .00000000
+             Total force =      .02000000     Total SCF correction =      .000010
+            """
+        // forces on geometry 2 (final, printed after last geom — some QE versions do this).
+        let forcesG2 = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .00100000     .00000000     .00000000
+             atom   2 type  1   force =      .00100000     .00000000     .00000000
+             Total force =      .00200000     Total SCF correction =      .000010
+            """
+        // Order: geom0 forcesG0 geom1 forcesG1 geom2(final) forcesG2.
+        // forcesG0 in [geom0,geom1) → frame 0.  forcesG1 in [geom1,geom2) → frame 1.
+        // forcesG2 in [geom2, EOF) → frame 2.
+        // Last frame with NO following forces returns nil (no backward-window fallback).
+        let text = geom + "\n" + forcesG0 + "\n" + geom + "\n" + forcesG1 + "\n" + geom + "\n" + forcesG2
+        guard let f0 = ForceParser.parse(text, frameIndex: 0) else { return XCTFail("frame0 parse failed") }
+        XCTAssertEqual(f0.forces[0].x, 0.5 * ForceParser.ryPerAu_to_eVPerAng, accuracy: 1e-6,
+                       "frame 0 must get geometry 0's forces (0.5)")
+        guard let f1 = ForceParser.parse(text, frameIndex: 1) else { return XCTFail("frame1 parse failed") }
+        XCTAssertEqual(f1.forces[0].x, 0.01 * ForceParser.ryPerAu_to_eVPerAng, accuracy: 1e-6,
+                       "frame 1 must get geometry 1's converged forces (0.01)")
+        guard let f2 = ForceParser.parse(text, frameIndex: 2) else { return XCTFail("frame2 parse failed") }
+        XCTAssertEqual(f2.forces[0].x, 0.001 * ForceParser.ryPerAu_to_eVPerAng, accuracy: 1e-6,
+                       "final frame gets forces from its forward window")
+        XCTAssertEqual(f2.nIterations, 3, "nIterations reflects all force blocks in the file")
+
+        // Last frame with NO following forces: must return nil, not borrow from previous frame.
+        let noFinalForces = geom + "\n" + forcesG0 + "\n" + geom + "\n" + forcesG1 + "\n" + geom
+        XCTAssertNil(ForceParser.parse(noFinalForces, frameIndex: 2),
+                     "last frame with no forward forces must return nil, not borrow")
+    }
+
+    // Overflow-glued fields: QE prints forces in fixed columns and glues adjacent
+    // integer.decimal fields when a magnitude overflows its width. Two cases:
+    // (a) realistic overflow (trailing zeros): "90.000000120.000000" = 90.000000 + 120.000000.
+    // (b) nonzero fractional parts: "90.123456120.654321" = 90.123456 + 120.654321.
+    // An early greedy regex split after the first fractional digit (90.1 + ...); the
+    // fix snaps every field to the canonical width of the last (clean) field.
+    func testForceGluedOverflowFields() throws {
+        let conv = ForceParser.ryPerAu_to_eVPerAng
+
+        func check(_ label: String, _ atom1Forces: String, _ x: Float, _ y: Float) throws {
+            // Mirror real QE: the substring after "force =" begins with column padding
+            // whitespace, then three components. Components 1 and 2 are overflow-glued;
+            // component 3 is a clean field whose fractional width can differ from the
+            // glued pair — so the canonical width must be derived from the glued token.
+            let text = """
+                 Forces acting on atoms (Ry/au):
+                 atom   1 type  1   force =  \(atom1Forces)
+                 atom   2 type  1   force =      .10000000     .00000000     .00000000
+                 Total force =      .30000000     Total SCF correction =      .000010
+                """
+            guard let fs = ForceParser.parse(text) else { return XCTFail("\(label): no forceSet") }
+            XCTAssertEqual(fs.forces.count, 2, label)
+            // Forces are converted Ry/au -> eV/Å; the glued field must still split into two
+            // components (90 and 120 Ry/au), not merge into 90.000000120.
+            XCTAssertEqual(fs.forces[0].x, x * conv, accuracy: 0.05 * conv, "\(label): x corrupted")
+            XCTAssertEqual(fs.forces[0].y, y * conv, accuracy: 0.05 * conv, "\(label): y corrupted")
+        }
+        try check("zeros", "90.000000120.000000 -.00370617", 90.0, 120.0)
+        try check("nonzero-frac", "90.123456120.654321 -.00370617", 90.123456, 120.654321)
+    }
+
+    // Inline QE stress form "total stress (Ry/bohr**3) = xx yy zz xy xz yz": the
+    // "(Ry/bohr**3)" label carries a "3". Scanning the WHOLE line would read that "3"
+    // as xx; the fix parses only after '='. Input = 1 2 3 4 5 6, so xx must be 1 (not 3).
+    func testForceStressInlineForm() throws {
+        let text = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction =      .000010
+             total   stress  (Ry/bohr**3)                   = 1.00    2.00    3.00 4.00    5.00    6.00
+            """
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        guard let s = fs.stress else { return XCTFail("inline stress should be parsed") }
+        XCTAssertEqual(s[0].x, 1.0, accuracy: 0.01, "xx must be 1 (the '3' from bohr**3 must NOT be read)")
+        XCTAssertEqual(s[1].y, 2.0, accuracy: 0.01, "syy must be 2")
+        XCTAssertEqual(s[2].z, 3.0, accuracy: 0.01, "szz must be 3")
+    }
+
+    // Some QE builds print the stress as three UNLABELLED numeric rows after the
+    // "total stress (Ry/bohr**3)" header. The parser must recover the 3×3 too.
+    func testForceStressUnlabeledRows() throws {
+        let text = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction =      .000010
+                total   stress  (Ry/bohr**3) (kbar)
+             -1.00000000     .50000000     .00000000
+              .50000000    -2.00000000     .00000000
+              .00000000     .00000000    -3.00000000
+            """
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        guard let s = fs.stress else { return XCTFail("stress should be parsed from unlabeled rows") }
+        XCTAssertEqual(s[0].x, -1, accuracy: 1e-5, "sxx")
+        XCTAssertEqual(s[1].y, -2, accuracy: 1e-5, "syy")
+        XCTAssertEqual(s[2].z, -3, accuracy: 1e-5, "szz")
+    }
+
+    // When stress appears in multiple iterations and parse() falls back to an
+    // earlier complete force block, the selected stress tensor must be the one
+    // nearest that accepted block — not the file's first/dump stress.
+    func testStressPairedWithAcceptedBlock() throws {
+        // Iteration 1 (complete forces + its stress tensor = diag -1,-2,-3).
+        let iter1 = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             atom   2 type  1   force =      .20000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction = .000010
+             Computing stress (Ry/bohr**3) components
+             s(1 1)=      -1.00000000     .00000000     .00000000
+             s(2 1)=       .00000000    -2.00000000     .00000000
+             s(3 1)=       .00000000     .00000000    -3.00000000
+            """
+        // Iteration 2: a DIFFERENT stress (diag -9) but a TRUNCATED force block
+        // (gap at atom 2) -> rejected, so stress must pair with iter1, not iter2.
+        let iter2 = """
+             s(1 1)=      -9.00000000     .00000000     .00000000
+             s(2 1)=       .00000000    -9.00000000     .00000000
+             s(3 1)=       .00000000     .00000000    -9.00000000
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .90000000     .00000000     .00000000
+             atom   3 type  1   force =      .90000000     .00000000     .00000000
+             Total force =      .90000000     Total SCF correction = .000010
+            """
+        let text = iter1 + "\n" + iter2
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        XCTAssertEqual(fs.forces.count, 2, "should fall back to the complete iteration")
+        guard let s = fs.stress else { return XCTFail("stress should be parsed") }
+        XCTAssertEqual(s[0].x, -1, accuracy: 1e-5,
+                       "stress must pair with the accepted (iter1) block, not iter2's (-9)")
+        XCTAssertEqual(s[2].z, -3, accuracy: 1e-5, "stress paired with iter1")
+    }
+
+    // When the accepted force block has NO stress and the next (rejected) iteration
+    // prints stress before its own force header, that later tensor must NOT be
+    // borrowed. The contiguous scan in parseStress stops at the first structural
+    // boundary (non-blank, non-stress line) after the accepted block, so SCF output
+    // between iterations acts as a natural fence.
+    func testStressNotBorrowedFromRejectedIteration() throws {
+        // Accepted block (iter1): complete forces + Total force, NO stress.
+        let iter1 = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             atom   2 type  1   force =      .20000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction = .000010
+            """
+        // A single SCF line between iterations is enough for the contiguous scan
+        // to stop before reaching iter2's pre-header stress.
+        let iter2 = """
+             estimated scf accuracy    <   0.00000001
+             s(1 1)=      -9.00000000     .00000000     .00000000
+             s(2 1)=       .00000000    -9.00000000     .00000000
+             s(3 1)=       .00000000     .00000000    -9.00000000
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .90000000     .00000000     .00000000
+             atom   3 type  1   force =      .90000000     .00000000     .00000000
+             Total force =      .90000000     Total SCF correction = .000010
+            """
+        let text = iter1 + "\n" + iter2
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        // Iter1 (complete, accepted) has NO stress → must be nil.
+        XCTAssertNil(fs.stress, "stress from a rejected iteration must not be borrowed across SCF output")
+        XCTAssertEqual(fs.forces.count, 2, "uses iter1 forces")
+    }
+
+    // A truncated unlabelled stress header immediately before the next force block
+    // must not consume that block's numeric atom rows as a 3x3 tensor.
+    func testTruncatedUnlabelledStressStopsAtNextForceBlock() throws {
+        let text = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             atom   2 type  1   force =      .20000000     .00000000     .00000000
+             Total force =      .30000000     Total SCF correction = .000010
+             total stress (Ry/bohr**3) (kbar)
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .90000000     .00000000     .00000000
+             atom   3 type  1   force =      .90000000     .00000000     .00000000
+             atom   4 type  1   force =      .90000000     .00000000     .00000000
+            """
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        XCTAssertEqual(fs.forces.count, 2, "uses the earlier complete force block")
+        XCTAssertNil(fs.stress, "truncated stress must not borrow rows from the next force block")
+    }
+
+    // When a force block has no "Total force" line, parseBlock must still return an
+    // endLine that sits right after the force atom rows (forceEnd), not at blockEnd.
+    // Otherwise the stress search window [endLine, stressEnd) is empty and a valid
+    // stress tensor following the atom rows is silently discarded.
+    func testStressParsedWhenTotalForceAbsent() throws {
+        let text = """
+             Forces acting on atoms (Ry/au):
+             atom   1 type  1   force =      .10000000     .00000000     .00000000
+             atom   2 type  1   force =      .20000000     .00000000     .00000000
+             Computing stress (Ry/bohr**3) components
+             s(1 1)=      -1.00000000     .00000000     .00000000
+             s(2 1)=       .00000000    -2.00000000     .00000000
+             s(3 1)=       .00000000     .00000000    -3.00000000
+            """
+        guard let fs = ForceParser.parse(text) else { return XCTFail("no forceSet parsed") }
+        XCTAssertNil(fs.totalForce, "no Total force line → totalForce is nil")
+        guard let s = fs.stress else { return XCTFail("stress after forces must be parsed even without Total force line") }
+        XCTAssertEqual(s[0].x, -1, accuracy: 1e-5, "sxx parsed correctly")
+        XCTAssertEqual(s[2].z, -3, accuracy: 1e-5, "szz parsed correctly")
+    }
+
+    // Wiring test: loading a QE .pwo populates scene.forceSet and per-atom
+    // forces by index, instead of the forces being parsed but never attached.
+    // Uses a synthetic valid `.pwo` (the C parser accepts its atoms/cell) with a
+    // force block and energy appended — self-contained, no restart quirks.
+    func testPwoForceWiring() throws {
+        let pwo = """
+             Program PWSCF v.6.7
+                 Today is  1Jan2024 at  0:00:00
+             bravais-lattice index     =            1
+             lattice parameter (alat)  =      10.2000  a.u.
+             number of atoms/cell      =            2
+             number of atomic types    =            1
+             CELL_PARAMETERS (alat)
+              1.0000000  0.0000000  0.0000000
+              0.0000000  1.0000000  0.0000000
+              0.0000000  0.0000000  1.0000000
+             ATOMIC_POSITIONS (crystal)
+             Si        0.000000   0.000000   0.000000
+             Si        0.250000   0.250000   0.250000
+
+                 End of self-consistent calculation
+
+             !    total energy              =     -15.84123456 Ry
+
+             Forces acting on atoms (Ry/au):
+
+             atom   1 type  1   force =      .01178589     .00671649    -.00370617
+             atom   2 type  1   force =     -.01165606     .00670024    -.00383326
+
+             Total force =      .267804     Total SCF correction =      .002682
+            """
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("wiring.pwo")
+        try pwo.write(to: tmp, atomically: true, encoding: .utf8)
+        let loaded = try Parser.load(tmp, as: .pwo)
+        guard let fs = loaded.forceSet else { return XCTFail("no forceSet wired from .pwo") }
+        XCTAssertEqual(loaded.atoms.count, 2, "structure has 2 atoms")
+        XCTAssertEqual(fs.forces.count, 2, "2 atoms -> 2 forces")
+        // Per-atom forces aligned by index on the LoadedScene atoms.
+        for i in 0..<2 {
+            let a = loaded.atoms[i].force!
+            let b = fs.forces[i]
+            XCTAssertEqual(a.x, b.x, accuracy: 1e-8, "atom \(i) fx alignment")
+            XCTAssertEqual(a.y, b.y, accuracy: 1e-8, "atom \(i) fy alignment")
+            XCTAssertEqual(a.z, b.z, accuracy: 1e-8, "atom \(i) fz alignment")
+        }
+        // Energy parsed (auto-filled, non-nil) and positive total-force magnitude.
+        XCTAssertNotNil(fs.totalEnergy, "energy auto-filled by wiring path")
+        XCTAssertEqual(fs.totalEnergy!, -15.84123456 * ForceParser.ry_to_eV, accuracy: 0.01,
+                       "energy auto-filled by wiring path")
+        XCTAssertNotNil(fs.totalForce, "total force auto-filled by wiring path")
+        XCTAssertGreaterThan(fs.totalForce!, 0)
+        XCTAssertEqual(fs.nIterations, 1)
+    }
+
+    // A legitimate 2×2 Monkhorst-Pack mesh (the smallest physically meaningful
+    // MP grid) must be detected as a mesh, not a band path. After relaxing the
+    // size gate to count >= 4 / perRow >= 2 the 4-point grid passes the
+    // hasUniformRowFactorization() check (uniform weights + equal spacing +
+    // non-collinear also required).
+    func testBandsMesh2x2() throws {
+        // 2×2 grid in the xy-plane: (0,0),(0,.5),(.5,0),(.5,.5), all wk equal.
+        func kHeader(_ x: String, _ y: String) -> String {
+            return "  k =  \(x)  \(y)  .0000 ( 6180 PWs)   bands (ev):"
+        }
+        let ev = "    -7.2477  -1.7434"
+        let grid = [(0,0),(0,5),(5,0),(5,5)]
+        let blocks = grid.map { kHeader(String(format: ".%d",$0.0), String(format: ".%d",$0.1)) }
+            .map { [$0, "", ev].joined(separator: "\n") }.joined(separator: "\n")
+        let kList = [
+            "        k(   1) = (    .0000000    .0000000    .0000000), wk =    .2500",
+            "        k(   2) = (    .0000000    .5000000    .0000000), wk =    .2500",
+            "        k(   3) = (    .5000000    .0000000    .0000000), wk =    .2500",
+            "        k(   4) = (    .5000000    .5000000    .0000000), wk =    .2500",
+        ].joined(separator: "\n")
+        let text = ([
+            "     number of k points=    4",
+            "                       cart. coord.",
+            kList,
+            blocks,
+            "     the Fermi energy is     4.5000 ev",
+        ] as [String]).joined(separator: "\n")
+        guard let bands = BandParser.parse(text) else { return XCTFail("parse failed") }
+        XCTAssertTrue(bands.isMesh, "a 2×2 Monkhorst-Pack mesh must be detected as a mesh")
+        XCTAssertEqual(bands.nKPoints, 4)
+    }
+
+    // A sparse set whose per-axis marginal frequencies LOOK uniform — every x and every y
+    // value appears twice, equally spaced, non-collinear — but whose coordinate
+    // COMBINATIONS do not fill a complete grid: (0,0),(0,1),(1,0),(1,2),(2,1),(2,2).
+    // The lattice-completeness gate must reject it as a path so it still renders as bands.
+    // (Two distinct points per row is not enough; a real mesh fills every grid crossing.)
+    func testBandsRejectsSparsePath() throws {
+        func kHeader(_ x: String, _ y: String) -> String {
+            return "  k =  \(x)  \(y)  .0000 ( 6180 PWs)   bands (ev):"
+        }
+        let ev = "    -7.2477  -1.7434"
+        let pairs = [(0,0),(0,1),(1,0),(1,2),(2,1),(2,2)]
+        let blocks = pairs
+            .map { kHeader(String(format: ".%d",$0.0), String(format: ".%d",$0.1)) }
+            .map { [$0, "", ev].joined(separator: "\n") }.joined(separator: "\n")
+        let kList = pairs.enumerated().map { i, p in
+            "        k(   \(i+1)) = (    .\(p.0)0000000    .\(p.1)0000000    .0000000), wk =    .16667"
+        }.joined(separator: "\n")
+        let text = ([
+            "     number of k points=    6",
+            "                       cart. coord.",
+            kList,
+            blocks,
+            "     the Fermi energy is     4.5000 ev",
+        ] as [String]).joined(separator: "\n")
+        guard let bands = BandParser.parse(text) else { return XCTFail("parse failed") }
+        XCTAssertFalse(bands.isMesh, "a sparse non-lattice path must NOT be classified as a mesh")
+    }
+
+    // A genuine three-dimensional Monkhorst-Pack mesh (2×2×2 bulk grid) must be detected
+    // as a mesh — the lattice test handles all dimensions via its basis search, not just 2D.
+    // Also a sheared 2D slab whose primitive basis vectors are tiny (spacing ~0.01) must pass:
+    // the collinearity test is relative to vector length, so small-but-independent vectors are
+    // not falsely rejected.
+    func testBandsMesh3DAndSheared() throws {
+        // QE-style 7-decimal cartesian coords: ".ABCDEFG" parses to 0.ABCDEFG. We emit x,y,z
+        // independently so all three axes can vary (a previous version pinned z and silently
+        // collapsed to 2D). wk equal across points (uniform MP sampling).
+        func mkText(_ pts: [(Int, Int, Int)]) -> String {
+            let w = String(format: "%.5f", 1.0 / Float(pts.count))
+            let ev = "    -7.2477  -1.7434"
+            let blocks = pts.map { p in
+                "  k =  .\(p.0)0000  .\(p.1)0000  .\(p.2)0000 ( 6180 PWs)   bands (ev):\n\n\(ev)"
+            }.joined(separator: "\n")
+            let kList = pts.enumerated().map { i, p in
+                "        k(   \(i+1)) = (    .\(p.0)0000000    .\(p.1)0000000    .\(p.2)0000000), wk =    \(w)"
+            }.joined(separator: "\n")
+            return ([
+                "     number of k points=    \(pts.count)",
+                "                       cart. coord.",
+                kList,
+                blocks,
+                "     the Fermi energy is     4.5000 ev",
+            ] as [String]).joined(separator: "\n")
+        }
+        // 2×2×2 bulk MP mesh: x∈{5,15}, y∈{2,7}, z∈{1,6} (×1e-2), all 8 combos distinct.
+        let bulk: [(Int, Int, Int)] = (0..<2).flatMap { i in (0..<2).flatMap { j in (0..<2).map { k in
+            (5 + 10 * i, 2 + 5 * j, 1 + 5 * k)
+        } } }
+        guard let b3d = BandParser.parse(mkText(bulk)) else { return XCTFail("3D parse failed") }
+        XCTAssertTrue(b3d.isMesh, "a 2×2×2 bulk MP mesh must be detected as a mesh")
+
+        // Sheared 2D slab spanning a 3×3 grid. Primitive vectors b1=(1,0.5,0), b2=(0,1,0)
+        // (×1e-2); basis vectors are short (len ~0.011) so the RELATIVE collinearity gate is
+        // exercised — an absolute cross-product threshold would falsely reject them.
+        let sheared: [(Int, Int, Int)] = (0..<3).flatMap { i in (0..<3).map { j in
+            (1 * i + 0 * j, i + 3 * j, 0)
+        } }
+        guard let bSh = BandParser.parse(mkText(sheared)) else { return XCTFail("sheared parse failed") }
+        XCTAssertTrue(bSh.isMesh, "a sheared tiny-spacing MP mesh must be detected as a mesh")
+
+        // Reviewer's exact scenario: a valid sheared mesh at PRIMITIVE SPACING ~0.001 (smaller
+        // than the 1e-3 absolute cutoff the old code used), anisotropic so the short primitive
+        // has multiples spanning the box. Prefer integer grid indices × a fine step, expressed in
+        // the same 7-decimal QE format as the passing cases, then scaled to the reviewer's scale.
+        // Sheared 3×3 grid whose primitive spacing is ~0.001 (the reviewer's scenario): short
+        // primitive b1=(1,0.5,0)·0.001 against long b2=(0,3,0)·0.001, expressed in QE's 7-decimal
+        // cart. format. Fine spacing exercises the relative collinearity gate.
+        var aniso: [(Int, Int)] = []
+        for i in 0..<3 { for j in 0..<3 { aniso.append((i, j)) } }
+        // lattice coords (integer indices) × step → grid-aligned at fine scale.
+        let anisoText = ([
+            "     number of k points=    9",
+            "                       cart. coord.",
+        ] as [String]).joined(separator: "\n") + "\n" + aniso.enumerated().map { i, p in
+            "        k(   \(i+1)) = (    0.\(p.0)5000  0.\(p.0 + p.1*3)5000  .0000000), wk =    .11111"
+        }.joined(separator: "\n") + "\n" + aniso.enumerated().map { i, p in
+            String(format: "  k =  0.%d5000  0.%d5000  .0000 ( 6180 PWs)   bands (ev):\n\n    -7.2477  -1.7434",
+                   p.0, p.0 + p.1*3)
+        }.joined(separator: "\n") + "\n     the Fermi energy is     4.5000 ev"
+        guard let bAniso = BandParser.parse(anisoText) else { return XCTFail("anisotropic parse failed") }
+        XCTAssertTrue(bAniso.isMesh, "a fine-spacing sheared mesh must be detected as a mesh")
+    }
+
+    // An ANISOTROPIC 3D bulk mesh: short primitive a=(1,0,0) and long primitive b=(0,0,10), both at
+    // fine spacing, in a 3×3×12 grid. The many in-plane a-multiples are all coplanar, so a
+    // length-sorted candidate cap would exclude the long out-of-plane primitive; the rank-based
+    // selection must still capture it so a complete 3D Monkhorst-Pack mesh is detected (not a path).
+    func testBandsMeshAnisotropic3D() throws {
+        // Generate on-the-fly: a=(0.01,0,0), b=(0,0.01,0), c=(0,0,0.12), 2×3×4 grid.
+        var pts: [SIMD3<Float>] = []
+        for i in 0..<2 { for j in 0..<3 { for k in 0..<4 {
+            pts.append(SIMD3(0.01 * Float(i), 0.01 * Float(j), 0.12 * Float(k)))
+        } } }
+        let text = ([
+            "     number of k points=    \(pts.count)",
+            "                       cart. coord.",
+        ] as [String]).joined(separator: "\n") + "\n" + pts.enumerated().map { idx, p in
+            String(format: "        k(   %2d) = (    %.5f   %.5f   %.5f  ), wk =    .04167",
+                   idx + 1, p.x, p.y, p.z)
+        }.joined(separator: "\n") + "\n" + pts.map { p in
+            String(format: "  k =  %.5f  %.5f  %.5f ( 6180 PWs)   bands (ev):\n\n    -7.2477  -1.7434",
+                   p.x, p.y, p.z)
+        }.joined(separator: "\n") + "\n     the Fermi energy is     4.5000 ev"
+        guard let bands = BandParser.parse(text) else { return XCTFail("3D anisotropic parse failed") }
+        XCTAssertTrue(bands.isMesh, "an anisotropic 3D bulk MP mesh must be detected as a mesh")
+    }
+
+    // A sheared 3D mesh whose first plane has more than 200 distinct directions, so
+    // a capped direction collection fills with coplanar vectors before seeing the
+    // third (out-of-plane) basis direction.
+    func testBandsMeshLargeInPlaneSheared3D() throws {
+        // Sheared 15×15×2 mesh: k is outermost, so all 225 z=0 points (224 distinct
+        // coplanar directions from p0) precede the z=1 points.
+        var pts: [SIMD3<Float>] = []
+        for k in 0..<2 { for i in 0..<15 { for j in 0..<15 {
+            pts.append(SIMD3(0.01 * Float(i), 0.005 * Float(i) + 0.01 * Float(j), Float(k)))
+        } } }
+        let result = BandParser.detectUniformMesh(
+            Array(repeating: 1.0 / Float(pts.count), count: pts.count),
+            records: pts.map { BandParserRecord(k: $0, weight: 0, energies: [0], position: 0, spin: 0) }
+        )
+        XCTAssertTrue(result, "sheared 3D mesh with >200 coplanar directions must be detected")
     }
 
     // Spin-polarized QE output repeats each k-point's eigenvalue block once per spin

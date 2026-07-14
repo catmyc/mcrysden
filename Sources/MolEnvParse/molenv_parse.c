@@ -829,11 +829,26 @@ MolEnvScene* parse_pwi(const char *path) {
         }
 
         if (strncmp(p, "ATOMIC_POSITIONS", 16) == 0) {
-            /* optional {unit} */
+            /* optional {unit}, (unit), or bare keyword: "ATOMIC_POSITIONS crystal"
+               (PWscf accepts all three forms). */
             char *b = strchr(p, '{');
             if (b) {
                 char *be = strchr(b, '}');
                 if (be) { *be = '\0'; snprintf(pos_unit, sizeof(pos_unit), "%s", b + 1); trim_in_place(pos_unit); }
+            } else {
+                char *op = strchr(p, '(');
+                if (op) {
+                    char *cp = strchr(op, ')');
+                    if (cp) { *cp = '\0'; snprintf(pos_unit, sizeof(pos_unit), "%s", op + 1); trim_in_place(pos_unit); }
+                } else {
+                    /* bare form: the token after "ATOMIC_POSITIONS" is the unit */
+                    char *u = p + 16;
+                    while (*u == ' ' || *u == '\t') u++;
+                    char *e = u;
+                    while (*e && *e != ' ' && *e != '\t') e++;
+                    if (*e) *e = '\0';
+                    if (*u) { snprintf(pos_unit, sizeof(pos_unit), "%s", u); trim_in_place(pos_unit); }
+                }
             }
             /* Read exactly nat position lines. */
             while (natoms < nat && fgets(line, sizeof(line), fp)) {
@@ -870,13 +885,19 @@ MolEnvScene* parse_pwi(const char *path) {
                 char *be = strchr(b, '}');
                 if (be) { *be = '\0'; snprintf(cell_unit, sizeof(cell_unit), "%s", b + 1); trim_in_place(cell_unit); }
             } else {
-                /* bare form: CELL_PARAMETERS bohr / angstrom / alat */
-                char *u = p + 15;
-                while (*u == ' ' || *u == '\t') u++;
-                char *e = u;
-                while (*e && *e != ' ' && *e != '\t') e++;
-                *e = '\0';
-                if (*u) snprintf(cell_unit, sizeof(cell_unit), "%s", u);
+                char *op = strchr(p, '(');
+                if (op) {
+                    char *cp = strchr(op, ')');
+                    if (cp) { *cp = '\0'; snprintf(cell_unit, sizeof(cell_unit), "%s", op + 1); trim_in_place(cell_unit); }
+                } else {
+                    /* bare form: CELL_PARAMETERS bohr / angstrom / alat */
+                    char *u = p + 15;
+                    while (*u == ' ' || *u == '\t') u++;
+                    char *e = u;
+                    while (*e && *e != ' ' && *e != '\t') e++;
+                    *e = '\0';
+                    if (*u) snprintf(cell_unit, sizeof(cell_unit), "%s", u);
+                }
             }
             int r = 0;
             while (r < 3 && fgets(line, sizeof(line), fp)) {

@@ -1,13 +1,13 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-12 (v1.1.3 shipped)**.
+Last updated: **2026-07-14 (v1.1.11 shipped)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
 ## Implemented in v1.1.2
 
 ### File formats
-- [x] XSF (structure only — `DATAGRID` blocks are rejected), AXSF animation
+- [x] XSF (structure + `DATAGRID_3D`/`2D`, including `.xsf.gz`), AXSF animation
 - [x] XYZ, PDB, CIF, POSCAR / CONTCAR / VASP
 - [x] Quantum Espresso PWscf input `.pwi/.in/.inp` (all 17 `ibrav`)
 - [x] Quantum Espresso PWscf output `.pwo/.out` (final cell + positions; multi-step relax/MD → AXSF frames)
@@ -33,7 +33,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG + vector PDF/SVG/EPS/PS
 
 ### Tests
-- [x] 76 tests: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache tests (incl. BZ cache + BZ-visible-for-slab render tests). `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 140 tests: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache tests (incl. BZ cache + BZ-visible-for-slab render tests + force-arrow render test). `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## Half-done (mechanism exists, UI missing)
 - [~] **Save-state menu item** — `StateStore.save` writer is implemented and load is wired to the CLI and headless export, but there is **no menu item or button** to trigger a save from the GUI. A one-line UI hook onto the existing writer.
@@ -45,21 +45,25 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 
 | # | Feature | Test fixtures verified on |
 |---|---------|---------------------------|
-| 1 | **Volumetric isosurface engine** (un-reject `DATAGRID_3D`/`2D` in XSF; marching cubes; iso-value slider; gradient normals; two-shell outside/inside surface) | `Assets/volumetric_grid.xsf` (rendered, frame-spanning), `CO_homo.xsf.gz`, `oxirane_homo.xsf.gz`, `mol-urea.xsf.gz`, `Si datagrid` render test |
-| 2 | **Gaussian `.cube` / `.g98` reader** | `N2O_homo+lumo.cube` (19×19×31 grid, 3 atoms, Bohr→Å) reuses the field buffer |
+| 1 | **Volumetric isosurface engine** (`DATAGRID_3D`/`2D` in XSF and `.xsf.gz`; marching cubes; iso-value slider; inverse-transpose world-space gradient normals; positive/negative shells) | `Assets/volumetric_grid.xsf` (rendered, frame-spanning), compressed-XSF dispatch regression, `Si datagrid` render test |
+| 2 | **Gaussian `.cube` / `.g98` reader** (z-fastest cube layout; voxel-interleaved multi-orbital fields; GUI orbital selector + saved selection) | `N2O.cube` (19×19×31 grid, 3 atoms, Bohr→Å), exact synthetic multi-orbital ordering test |
 | 3 | **Fermi-surface reader** (BXSF, multi-band shell at the Fermi level; `.gz` peeling) | `MgB2.bxsf` (3 bands, Fermi 0.523), `RhBulkFcc.bxsf` (negative vectors); PNG + PDF/SVG/EPS/PS export |
 | 6 | **WIEN2k `.struct` reader** | 24 files (Bohr→Å, fractional atoms, multi-position sites + rotation matrices) |
 | 7 | **CRYSTAL `.r1` reader** | 16 files (all crystal systems via space group → lattice params + angles; trigonal/hexagonal/monoclinic) |
 | 8 | **Orca `.out` reader** | `pbe.accOpt.AsF2-C2C2.out` via header sniff (ORCA banner; checked AFTER PWSCF marker) |
-| 9 | **FHI-aims / FHI98MD reader** | `GaAsSurface_coord.out` (lattice + species blocks; Bohr→Å) via 3-numeric-lattice-line sniff |
+| 9 | **FHI-aims / FHI98MD reader** | `GaAsSurface_coord.out` (lattice + species blocks; Bohr→Å) plus standard `geometry.in` (`lattice_vector`, `atom`, `atom_frac`) with automatic filename dispatch |
 | 5 | **Band-structure extraction** (QE `bands (ev):` k-point + eigenvalue blocks → line graph) | `CH3Rh111.out` (56 k-points × 69 bands via `--bands`); 2D Grapher (Fermi line, k-path, energy axes) swaps in for the 3D canvas |
 | 4 | **Color-plane / 2D-contour rendering** (DATAGRID_2D → viridis colormap + marching-squares contours; anisotropic dims; GUI toggle swaps canvas) | `mol-urea2D.xsf` (41×42 charge-density-difference plane); rendered to 56994 non-white px / 176 distinct hues |
 
+### Done in v1.1.10
+
+| # | Feature | Test fixtures verified on |
+|---|---------|---------------------------|
+| 10 | **Force / stress / energy readouts + force arrows** | `CH3Rh111.out`, `si_relax.out`; `ForceParser` (per-atom forces, Total force, stress tensor, energy auto-fill); `Renderer.drawForceArrows` (shaft + barb overlay); SideBar toggle/scale + readout (`showForces`, `forceScale`, `buildForceSummary`); `StateStore` persistence. |
+
 ### Remaining Tier A (still TODO)
 
-| # | Feature | Test fixtures on disk | Blocker / notes |
-|---|---------|-----------------------|-----------------|
-| 10 | **Force / stress / energy readouts + force arrows** | `CH3Rh111.out` has per-atom forces, Total force, total energy | `Atom` stores no force vector — needs a struct change + readout + arrow rendering. |
+None — all 10 Tier A items complete.
 
 ### Tier B — needs another engine first
 

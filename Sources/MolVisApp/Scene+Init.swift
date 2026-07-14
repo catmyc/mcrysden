@@ -40,6 +40,13 @@ extension Scene {
         self.fermiSurface = loaded.fermiSurface
         self.bandStructure = loaded.bandStructure
         self.grid2D = loaded.grid2D
+        // Forces/energy/stress parsed from a QE output (final SCF iteration);
+        // nil for non-QE files. `loaded.atoms[i].force` already carries per-atom
+        // arrows aligned by the printed index below.
+        self.forceSet = loaded.forceSet
+        // Multi-orbital cube files: retain every orbital grid so the user can
+        // switch between them. `scalarField` above is already the first orbital.
+        self.multiOrbitalFields = loaded.multiOrbitalFields
         self.baseAtoms = loaded.atoms
         self.baseBonds = loaded.bonds
     }
@@ -126,7 +133,11 @@ extension Scene {
         newAtoms.reserveCapacity(src.count * total)
         for i in 0..<sc.n1 { for j in 0..<sc.n2 { for k in 0..<sc.n3 {
             let t = cell.a * Float(i) + cell.b * Float(j) + cell.c * Float(k)
-            for a in src { newAtoms.append(Atom(coord: a.coord + t, atomicNumber: a.atomicNumber, label: a.label))
+            for a in src {
+                // Each supercell replica carries the same force as its base atom
+                // (physically periodic), so arrows repeat correctly across the cell.
+                newAtoms.append(Atom(coord: a.coord + t, atomicNumber: a.atomicNumber,
+                                     label: a.label, force: a.force))
             }
         }}}
         var out = self

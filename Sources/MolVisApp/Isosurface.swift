@@ -63,20 +63,31 @@ struct ScalarField: Codable {
         return origin + vec[0] * fx + vec[1] * fy + vec[2] * fz
     }
 
-    /// Central-difference field gradient at a fractional grid position, in WORLD
-    /// units. This is what `gridNormals.c` computes; normalizing and negating it
-    /// gives the outward surface normal (gradient points toward higher field).
+    /// Finite-difference field gradient at a fractional grid position, transformed
+    /// into world space. If B has the three grid spans as columns, derivatives in
+    /// fractional coordinates obey grad_f = B^T grad_world, hence
+    /// grad_world = B^-T grad_f.
     func worldGradient(_ fx: Float, _ fy: Float, _ fz: Float) -> SIMD3<Float> {
-        func sample(_ i: Float, _ j: Float, _ k: Float) -> Float {
-            let ix = max(0, min(nx - 1, Int((i * Float(nx - 1)).rounded())))
-            let iy = max(0, min(ny - 1, Int((j * Float(ny - 1)).rounded())))
-            let iz = max(0, min(nz - 1, Int((k * Float(nz - 1)).rounded())))
-            return value(ix, iy, iz)
+        let ix = max(0, min(nx - 1, Int((fx * Float(nx - 1)).rounded())))
+        let iy = max(0, min(ny - 1, Int((fy * Float(ny - 1)).rounded())))
+        let iz = max(0, min(nz - 1, Int((fz * Float(nz - 1)).rounded())))
+        func derivative(_ axis: Int) -> Float {
+            let count = [nx, ny, nz][axis]
+            guard count > 1 else { return 0 }
+            let at = [ix, iy, iz][axis]
+            let lo = max(0, at - 1), hi = min(count - 1, at + 1)
+            var p0 = [ix, iy, iz], p1 = p0
+            p0[axis] = lo; p1[axis] = hi
+            let dv = value(p1[0], p1[1], p1[2]) - value(p0[0], p0[1], p0[2])
+            return dv * Float(count - 1) / Float(hi - lo)
         }
-        let gx = nx > 1 ? (sample(fx + 1.0/(Float(nx-1)), fy, fz) - sample(fx - 1.0/(Float(nx-1)), fy, fz)) : 0
-        let gy = ny > 1 ? (sample(fx, fy + 1.0/(Float(ny-1)), fz) - sample(fx, fy - 1.0/(Float(ny-1)), fz)) : 0
-        let gz = nz > 1 ? (sample(fx, fy, fz + 1.0/(Float(nz-1))) - sample(fx, fy, fz - 1.0/(Float(nz-1)))) : 0
-        return SIMD3<Float>(gx, gy, gz)
+        let gradF = SIMD3<Float>(derivative(0), derivative(1), derivative(2))
+        let a = vec[0], b = vec[1], c = vec[2]
+        let det = simd_dot(a, simd_cross(b, c))
+        guard abs(det) > 1e-12 else { return .zero }
+        return (gradF.x * simd_cross(b, c)
+              + gradF.y * simd_cross(c, a)
+              + gradF.z * simd_cross(a, b)) / det
     }
 }
 
@@ -167,7 +178,10 @@ struct IsoMesh {
                     // Interpolate (and cache) the vertices on the cut edges.
                     for e in 0..<12 {
                         if edges & (1 << UInt16(e)) != 0 {
-                            if vert[e] == nil { let (w, f) = edgePoint(e, isoLevel, ix, iy, iz); vert[e] = w; frac[e] = f }
+                            if vert[e] == nil {
+                                let (w, f) = edgePoint(e, sign * isoLevel, ix, iy, iz)
+                                vert[e] = w; frac[e] = f
+                            }
                         }
                     }
 
@@ -178,9 +192,9 @@ struct IsoMesh {
                         let i0 = Int(tri[ti]), i1 = Int(tri[ti+1]), i2 = Int(tri[ti+2])
                         let p0 = vert[i0]!, p1 = vert[i1]!, p2 = vert[i2]!
                         let f0 = frac[i0]!, f1 = frac[i1]!, f2 = frac[i2]!
-                        let n0 = normalFromGradient(field, f0)
-                        let n1 = normalFromGradient(field, f1)
-                        let n2 = normalFromGradient(field, f2)
+                        let n0 = normalFromGradient(field, f0, sign: sign)
+                        let n1 = normalFromGradient(field, f1, sign: sign)
+                        let n2 = normalFromGradient(field, f2, sign: sign)
                         for (p, n) in [(p0,n0),(p1,n1),(p2,n2)] {
                             out += [p.x, p.y, p.z, n.x, n.y, n.z, color.x, color.y, color.z]
                         }
@@ -196,12 +210,11 @@ struct IsoMesh {
 }
 
 /// Outward normal from the world-space field gradient at fractional coords `f`.
-private func normalFromGradient(_ field: ScalarField, _ f: SIMD3<Float>) -> SIMD3<Float> {
+private func normalFromGradient(_ field: ScalarField, _ f: SIMD3<Float>, sign: Float) -> SIMD3<Float> {
     let g = field.worldGradient(f.x, f.y, f.z)
     let len = simd_length(g)
-    // Negate: gradient points toward higher field; the surface's "outward" side
-    // (field > iso) faces lower field, so the visible normal opposes the gradient.
-    return len > 1e-9 ? -g / len : SIMD3<Float>(0, 0, 1)
+    // Positive lobes face lower values; negative lobes face higher values.
+    return len > 1e-9 ? -sign * g / len : SIMD3<Float>(0, 0, 1)
 }
 
 // Float literals can't be appended to `[Float]` without coercion in some
@@ -307,27 +320,17 @@ struct FermiSurface: Codable {
 /// `/usr/bin/gunzip`, matching XCrySDen's gunzipXSF) before parsing.
 enum BXSFLoader {
     static func load(from url: URL) throws -> FermiSurface {
-        enum E: Error { case decompress(String) }
         let needsGunzip = url.pathExtension.lowercased() == "gz"
         let text: String
         if needsGunzip {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
-            p.arguments = ["-c", url.path]
-            let pipe = Pipe()
-            p.standardOutput = pipe
-            try p.run()
-            // Read BEFORE waiting: a full pipe buffer would otherwise deadlock gunzip
-            // (it blocks on write while we block on waitUntilExit) — the Rh fixture is
-            // ~500KB, far past the pipe capacity.
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            guard p.terminationStatus == 0 else { throw E.decompress("gunzip exit \(p.terminationStatus)") }
-            text = String(data: data, encoding: .utf8) ?? ""
+            let data = try gunzipData(url)
+            guard let decoded = String(data: data, encoding: .utf8) else {
+                throw ParseError.io(path: url.path, reason: "decompressed BXSF is not UTF-8")
+            }
+            text = decoded
         } else {
             text = try String(contentsOf: url, encoding: .utf8)
         }
         return try FermiSurface.parse(text)
     }
 }
-

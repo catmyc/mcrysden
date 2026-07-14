@@ -2,7 +2,11 @@ import Foundation
 import simd
 import AppKit
 
-struct Atom: Codable { var coord: SIMD3<Float>; var atomicNumber: Int; var label: String }
+struct Atom: Codable { var coord: SIMD3<Float>; var atomicNumber: Int; var label: String
+    /// Optional force on this atom (eV/Å), parsed from a QE `Forces acting on atoms`
+    /// block when present. Drives the force-arrow overlay.
+    var force: SIMD3<Float>?
+}
 struct Bond:  Codable { var i: Int; var j: Int }
 struct Cell:  Codable { var a: SIMD3<Float>; var b: SIMD3<Float>; var c: SIMD3<Float> }
 
@@ -162,10 +166,26 @@ struct Scene: Codable {
     /// carried `bands (ev):` data (QE PWscf output). Gated in the UI on its
     /// presence; when set, the 2D Grapher replaces the 3D canvas.
     var bandStructure: BandStructure?
+    /// Multiple orbital grids from a multi-orbital Gaussian `.cube`/`.g98` file.
+    /// When present, `scalarField` is the currently-selected orbital and the
+    /// `currentOrbital` index picks which one. Empty for single-orbital files.
+    var multiOrbitalFields: [ScalarField] = []
+    /// Index of the currently displayed orbital into `multiOrbitalFields`.
+    /// Ignored when `multiOrbitalFields` is empty (single-orbital case).
+    var currentOrbital: Int = 0
     /// An optional 2D scalar grid (a `DATAGRID_2D` block), the color-plane source.
     /// Gated in the UI on its presence; when the color-plane is toggled on, the
     /// 2D ColorPlaneView replaces the 3D canvas with a value→color map + contours.
     var grid2D: Grid2D?
+    /// Parsed forces/stress/energy from a QE output (final SCF iteration). Gated in
+    /// the UI on its presence: a sidebar toggle draws force arrows and a readout.
+    var forceSet: ForceSet?
+    /// Draw force arrows (when `forceSet` is present). Gated in the UI on the
+    /// presence of a forceSet; the renderer scales each arrow by `forceScale`.
+    var showForces: Bool = false
+    /// Multiplier converting a force (eV/Å) to an arrow length (Å) so typical
+    /// forces (0.01–1 eV/Å) span a few Å and read clearly. Sidebar-adjustable.
+    var forceScale: Float = 50.0
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

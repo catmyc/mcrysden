@@ -151,6 +151,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onChange = saved
         stopPlayback()
         // The readout stays hidden until the user selects an atom.
+        // Populate the Forces sidebar readout (incl. the non-@Published summary) for THIS
+        // scene on load, so a force-bearing file shows its arrows/energy immediately without
+        // waiting for a later UI interaction to trigger setNeedsRender().
+        setNeedsRender()
     }
 
     private func layoutSplit() {
@@ -199,7 +203,36 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         updateLabels()
         let text = buildInfoText()
         if infoPanel.string != text { infoPanel.string = text }
+        // Keep the sidebar Forces readout in sync with the scene's forceSet.
+        if state.forceSummary != buildForceSummary() { state.forceSummary = buildForceSummary() }
         canvas.draw()
+    }
+
+    /// Build the Forces sidebar readout from scene.forceSet (total force, total
+    /// energy, number of iterations, optional stress). Returns a placeholder when
+    /// no forceSet is present (the sidebar section is hidden then, so unused).
+    private func buildForceSummary() -> String {
+        guard let fs = scene.forceSet else { return "" }
+        var lines: [String] = []
+        // totalForce/totalEnergy are optional: a parsed value (even ~0) shows the number; nil shows
+        // "—" so the readout never presents an absent measurement as a physical zero (P2 fix).
+        if let tf = fs.totalForce {
+            lines.append(String(format: "Total force: %.5f eV/Å", tf))
+        } else {
+            lines.append("Total force: —")
+        }
+        if let te = fs.totalEnergy {
+            lines.append(String(format: "Total energy: %.5f eV", te))
+        } else {
+            lines.append("Total energy: —")
+        }
+        lines.append("Iterations: \(fs.nIterations)")
+        if let s = fs.stress {
+            lines.append(String(format: "Stress (Ry/Bohr³): %.4f %.4f %.4f", s[0].x, s[0].y, s[0].z))
+            lines.append(String(format: "                  %.4f %.4f %.4f", s[1].x, s[1].y, s[1].z))
+            lines.append(String(format: "                  %.4f %.4f %.4f", s[2].x, s[2].y, s[2].z))
+        }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - NSWindowDelegate
@@ -445,6 +478,19 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         camera.perspective = !state.orthographic
         // Hide-structure toggle: suppress atoms/bonds/polyhedra, keep frame/axes/BZ.
         scene.showStructure = state.showStructure
+        // Multi-orbital cube: selecting an orbital swaps the renderer's scalarField
+        // and updates the slider range. Preserve the current iso value where possible,
+        // clamping it when the new orbital has a narrower value range.
+        if !scene.multiOrbitalFields.isEmpty {
+            let index = min(max(0, state.currentOrbital), scene.multiOrbitalFields.count - 1)
+            let field = scene.multiOrbitalFields[index]
+            scene.currentOrbital = index
+            scene.scalarField = field
+            state.currentOrbital = index
+            state.orbitalCount = scene.multiOrbitalFields.count
+            state.isoRange = field.minValue...field.maxValue
+            state.isoLevel = min(field.maxValue, max(field.minValue, state.isoLevel))
+        }
         // Isosurface: only the slider + toggle are meaningful when a field is
         // present, but writing the values unconditionally is harmless (the renderer
         // gates the draw on `scene.scalarField != nil`).
@@ -453,6 +499,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Fermi surface: written unconditionally; the renderer gates the draw on
         // `scene.fermiSurface != nil`.
         scene.showFermiSurface = state.showFermiSurface
+        // Force arrows: only meaningful when a forceSet is present; the renderer
+        // gates the draw on forceSet + showForces, so writing is unconditional.
+        scene.showForces = state.showForces
+        scene.forceScale = state.forceScale
         // Color-plane overlay: a 2D grid may coexist with the 3D structure. The
         // canvas shows EITHER the 3D scene or the color plane, never both — so the
         // plane wins only while the toggle is on AND a grid is present.
@@ -567,6 +617,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showIsoSurface = scene.showIsoSurface
         next.isoLevel = scene.isoLevel
         next.showFermiSurface = scene.showFermiSurface
+        // Force-arrow settings: carry them across the frame reload so scrubbing an
+        // animated .pwo doesn't silently drop the visibility / scale the user set.
+        next.showForces = scene.showForces
+        next.forceScale = scene.forceScale
         next.lighting = state.lighting
         next.backgroundType = state.backgroundType
         next.background = state.backgroundHex
@@ -587,6 +641,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.frameIndex = index     // keep the two in sync; guarded from re-entry
         isReloadingFrame = false
         self.scene = next
+        // The newly parsed frame may have gained or lost a forceSet (e.g. one ionic
+        // step truncated without forces). Refresh the sidebar Forces-section gate so the
+        // section hides when scrubbing onto a force-less frame or appears when forces exist.
+        state.hasForceSet = (next.forceSet != nil)
         setNeedsRender()
     }
 

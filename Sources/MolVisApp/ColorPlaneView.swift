@@ -104,16 +104,24 @@ final class ColorPlaneView: NSView {
         // Uniform scale so the whole parallelogram fits, then center it. A
         // uniform scale preserves the angle; independent x/y scaling would not.
         // A degenerate span (vectors parallel or a zero-length span) would divide by
-        // zero -> infinite scale and an un-drawable parallelogram; fall back to an
-        // axis-aligned unit-square mapping so the overlay degrades gracefully.
+        // zero -> infinite scale and an un-drawable parallelogram; fall back to a
+        // uniform scaled unit square CENTERED in the view so the bitmap occupies a
+        // sensible area instead of a single top-left pixel. The affine MUST match the
+        // point() mapping below exactly, or the bitmap (drawn via affine) and the
+        // contours (drawn via point) would land in different places.
         let eps: CGFloat = 1e-6
         guard spanW > eps && spanH > eps else {
-            let s: CGFloat = 1
+            let s = min(viewW, viewH) * 0.5
             let centerView = CGPoint(x: viewW / 2, y: viewH / 2)
             func projectUnit(_ u: CGFloat, _ v: CGFloat) -> NSPoint {
                 return NSPoint(x: centerView.x + (u - 0.5) * s, y: centerView.y - (v - 0.5) * s)
             }
-            return GridProjection(point: projectUnit, affine: CGAffineTransform.identity)
+            // Columns: +1 in u -> (+s, 0) px; +1 in v -> (0, -s) px (isFlipped).
+            // Origin (u=v=0) maps to centerView - (s*0.5, -s*0.5).
+            let affine = CGAffineTransform(a: s, b: 0, c: 0, d: -s,
+                                           tx: centerView.x - s * 0.5,
+                                           ty: centerView.y + s * 0.5)
+            return GridProjection(point: projectUnit, affine: affine)
         }
         let s = min(viewW / spanW, viewH / spanH)
         // 2D origin (u=0,v=0) maps here; center the bbox in the view.

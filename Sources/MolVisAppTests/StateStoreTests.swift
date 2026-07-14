@@ -89,6 +89,33 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(s2.currentFrame, 7)
     }
 
+    func testCurrentOrbitalRoundTripSelectsSavedField() throws {
+        let fields = [
+            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
+                        vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
+                        values: Array(repeating: -1, count: 8), minValue: -1, maxValue: 1),
+            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
+                        vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
+                        values: Array(repeating: 5, count: 8), minValue: 4, maxValue: 6),
+        ]
+        var scene = Scene()
+        scene.multiOrbitalFields = fields
+        scene.scalarField = fields[1]
+        scene.currentOrbital = 1
+        scene.isoLevel = 5
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("orbital.mvis-state")
+        try StateStore.save(scene, camera: nil, sourceURL: nil, to: tmp)
+
+        var restored = Scene()
+        restored.multiOrbitalFields = fields
+        restored.scalarField = fields[0]
+        var camera: Camera?
+        try StateStore.load(into: &restored, camera: &camera, from: tmp)
+        XCTAssertEqual(restored.currentOrbital, 1)
+        XCTAssertEqual(restored.scalarField?.values.first, 5)
+        XCTAssertEqual(restored.isoLevel, 5)
+    }
+
     func testStateRejectsFutureVersion() throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("t3.mvis-state")
         let payload: [String: Any] = ["version": 99, "scene": try JSONSerialization.jsonObject(with: JSONEncoder().encode(Scene()))]

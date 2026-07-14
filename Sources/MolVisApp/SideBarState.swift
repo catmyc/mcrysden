@@ -49,10 +49,13 @@ final class SideBarState: ObservableObject {
     /// sliderRange is set by the controller from the field's [minValue, maxValue].
     @Published var showIsoSurface: Bool = true { didSet { onChange?() } }
     @Published var isoLevel: Float = 0 { didSet { onChange?() } }
-    var isoRange: ClosedRange<Float> = 0...1
+    @Published var isoRange: ClosedRange<Float> = 0...1
     /// True when a volumetric field is present — the sidebar gates the
     /// Isosurface section on this so structure-only files show no empty controls.
     var hasScalarField: Bool = false
+    /// Multi-orbital cube selection. The picker is shown only when orbitalCount > 1.
+    @Published var currentOrbital: Int = 0 { didSet { onChange?() } }
+    @Published var orbitalCount: Int = 0
     /// True when a Fermi surface (BXSF) is present — the sidebar gates the
     /// Fermi Surface section on this so structure-only files show no empty controls.
     var hasFermiSurface: Bool = false
@@ -65,6 +68,18 @@ final class SideBarState: ObservableObject {
     /// Toggle the color-plane overlay. Synced in syncFromState(); when on, the
     /// 2D ColorPlaneView replaces the 3D canvas. Meaningful only when hasGrid2D.
     @Published var showColorPlane: Bool = true { didSet { onChange?() } }
+    /// True when a forceSet (parsed from a QE output) is present — the sidebar
+    /// gates the Forces section on this so force-less files show no empty controls.
+    var hasForceSet: Bool = false
+    /// Draw force arrows (when a forceSet is present). Synced to scene.showForces
+    /// in syncFromState(); meaningless without a forceSet.
+    @Published var showForces: Bool = true { didSet { onChange?() } }
+    /// Å-per-(eV/Å) arrow-length multiplier. Synced to scene.forceScale.
+    @Published var forceScale: Float = 50.0 { didSet { onChange?() } }
+    /// Human-readable force/energy/stress readout for the Forces sidebar section,
+    /// set by the controller from scene.forceSet on every render. Not @Published:
+    /// it changes only when the scene reloads, so a plain assignment suffices.
+    var forceSummary: String = ""
     /// AXSF animation playback state. frameCount is 1 for non-animated files
     /// (the playback UI is hidden in that case). isPlaying drives a timer in
     /// MainWindowController; frameIndex advances it and reloads the frame.
@@ -122,10 +137,18 @@ final class SideBarState: ObservableObject {
         } else {
             hasScalarField = false
         }
+        orbitalCount = scene.multiOrbitalFields.count
+        currentOrbital = orbitalCount > 0
+            ? min(max(0, scene.currentOrbital), orbitalCount - 1)
+            : 0
         hasFermiSurface = (scene.fermiSurface != nil)
         showFermiSurface = scene.showFermiSurface
         hasGrid2D = (scene.grid2D != nil)
         showColorPlane = scene.grid2D != nil   // default to shown when a grid is present
+        // Forces: gate the sidebar section on presence, reflect the toggle/scale.
+        hasForceSet = (scene.forceSet != nil)
+        showForces = scene.showForces
+        forceScale = scene.forceScale
         onChange = saved
     }
 }
