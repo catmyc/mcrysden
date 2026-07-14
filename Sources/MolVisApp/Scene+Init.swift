@@ -39,6 +39,7 @@ extension Scene {
         self.scalarField = loaded.scalarField
         self.fermiSurface = loaded.fermiSurface
         self.bandStructure = loaded.bandStructure
+        self.densityOfStates = loaded.densityOfStates
         self.grid2D = loaded.grid2D
         // Forces/energy/stress parsed from a QE output (final SCF iteration);
         // nil for non-QE files. `loaded.atoms[i].force` already carries per-atom

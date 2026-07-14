@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-14 (v1.1.11 shipped)**.
+Last updated: **2026-07-14 (v1.1.12 shipped)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -33,7 +33,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG + vector PDF/SVG/EPS/PS
 
 ### Tests
-- [x] 140 tests: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache tests (incl. BZ cache + BZ-visible-for-slab render tests + force-arrow render test). `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 153 tests: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache tests (incl. BZ cache + BZ-visible-for-slab render tests + force-arrow render test). `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## Half-done (mechanism exists, UI missing)
 - [~] **Save-state menu item** — `StateStore.save` writer is implemented and load is wired to the CLI and headless export, but there is **no menu item or button** to trigger a save from the GUI. A one-line UI hook onto the existing writer.
@@ -65,11 +65,11 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 
 None — all 10 Tier A items complete.
 
-### Tier B — needs another engine first
+### Tier B — done
 
-| # | Feature | Blocker |
+| # | Feature | Scope |
 |---|---------|---------|
-| 11 | **Density of states (DOS)** plot (total + projected) | Needs a DOS/projwfc reader (the 2D Grapher layer from #5 now exists). No local `projwfc`/`dos.x` output. |
+| 11 | **Density of states (DOS)** plot (total + projected) | QE `dos.x`/`projwfc.x` tables via `.dos`, `.pdos`, standard `.pdos_*` names, or `--dos`; total/projected series render in `DOSGrapherView` and export to PNG/PDF/SVG/EPS/PS. |
 
 ### Tier C — validated by interaction, not files
 

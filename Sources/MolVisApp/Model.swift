@@ -166,6 +166,9 @@ struct Scene: Codable {
     /// carried `bands (ev):` data (QE PWscf output). Gated in the UI on its
     /// presence; when set, the 2D Grapher replaces the 3D canvas.
     var bandStructure: BandStructure?
+    /// Total and projected density-of-states data. When present, the DOS graph
+    /// replaces the structure, band, and color-plane canvases.
+    var densityOfStates: DensityOfStates?
     /// Multiple orbital grids from a multi-orbital Gaussian `.cube`/`.g98` file.
     /// When present, `scalarField` is the currently-selected orbital and the
     /// `currentOrbital` index picks which one. Empty for single-orbital files.

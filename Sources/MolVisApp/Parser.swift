@@ -45,6 +45,7 @@ struct LoadedScene {
     var scalarField: ScalarField?
     var fermiSurface: FermiSurface?
     var bandStructure: BandStructure?
+    var densityOfStates: DensityOfStates?
     var forceSet: ForceSet?
     var grid2D: Grid2D?
     var multiOrbitalFields: [ScalarField] = []
@@ -53,7 +54,7 @@ struct LoadedScene {
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi, bands
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi, bands, dos
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext.lowercased() {
@@ -77,6 +78,7 @@ enum ParseFormat {
         case "orca": self = .orca
         case "fhi", "coord": self = .fhi
         case "bands": self = .bands
+        case "dos", "pdos", "pdos_tot": self = .dos
         default: return nil
         }
     }
@@ -86,6 +88,10 @@ enum ParseFormat {
     /// yield only `gz`; when it is, we look one layer deeper at the stem's extension.
     static func from(url: URL) -> ParseFormat? {
         if url.lastPathComponent.lowercased() == "geometry.in" { return .fhi }
+        // projwfc.x uses names such as `prefix.pdos_tot` and
+        // `prefix.pdos_atm#1(Fe)_wfc#2(p)`, whose full suffix is not a fixed
+        // extension. Route the whole standard filename family to DOSParser.
+        if url.lastPathComponent.lowercased().contains(".pdos_") { return .dos }
         let ext = url.pathExtension.lowercased()
         if let f = ParseFormat(ext: ext) {
             // `.out` is ambiguous: QE PWscf, ORCA and FHI-aims all use it. When the
@@ -212,6 +218,18 @@ enum Parser {
         if effective == .bands {
             return try loadBands(url)
         }
+        // Total/projected DOS text is parsed in Swift and displayed by the DOS
+        // grapher; it intentionally carries no atom or cell geometry.
+        if effective == .dos {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            guard let densityOfStates = DOSParser.parse(text) else {
+                throw ParseError.parse(path: url.path, line: 0, reason: "invalid DOS data")
+            }
+            var out = LoadedScene()
+            out.title = url.lastPathComponent
+            out.densityOfStates = densityOfStates
+            return out
+        }
         // QE PWscf output (.pwo): structure (atoms/cell) via the C parser, plus
         // forces/energy/stress parsed in Swift from the raw text and attached to
         // the scene. Forces correspond to the final SCF iteration (the one the
@@ -237,6 +255,7 @@ enum Parser {
         case .orca: scene = nil   // Orca .out is parsed in Swift (see loadOrca)
         case .fhi: scene = nil   // FHI-aims coord.out is parsed in Swift (see loadFHIaims)
         case .bands: scene = nil   // QE bands are parsed in Swift (see loadBands)
+        case .dos: scene = nil     // DOS is parsed in Swift above
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())

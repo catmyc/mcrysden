@@ -29,16 +29,22 @@ enum RasterExporter {
     // the export tests) across all formats — not just the written file's byte size.
     @discardableResult
     static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
-        let ext = url.pathExtension.lowercased()
         let w = Int(size.width.rounded()), h = Int(size.height.rounded())
         let cg = try render(scene: scene, camera: camera, w: w, h: h)
+        try write(cgImage: cg, to: url, size: CGSize(width: w, height: h))
+        return cg
+    }
+
+    /// Wrap an already-rendered AppKit graph in the requested vector container.
+    static func write(cgImage: CGImage, to url: URL, size: CGSize) throws {
+        let ext = url.pathExtension.lowercased()
+        let w = Int(size.width.rounded()), h = Int(size.height.rounded())
         switch ext {
-        case "pdf": try emitPDF(cgImage: cg, w: w, h: h, to: url)
-        case "svg": try emitSVG(cgImage: cg, w: w, h: h, to: url)
-        case "eps", "ps": try emitEPS(cgImage: cg, w: w, h: h, to: url)
+        case "pdf": try emitPDF(cgImage: cgImage, w: w, h: h, to: url)
+        case "svg": try emitSVG(cgImage: cgImage, w: w, h: h, to: url)
+        case "eps", "ps": try emitEPS(cgImage: cgImage, w: w, h: h, to: url)
         default: throw RasterExportError.unsupported
         }
-        return cg
     }
 
     // MARK: Metal → CGImage (mirrors PngExporter, reused for all formats)

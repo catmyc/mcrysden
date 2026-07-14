@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "longcat": {
+      "description": "Implements substantial code changes autonomously using LongCat 2.0.",
+      "mode": "all",
+      "model": "longcat/LongCat-2.0",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    }
+  }
+}

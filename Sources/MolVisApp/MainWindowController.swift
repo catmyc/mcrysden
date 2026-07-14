@@ -8,9 +8,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let window: NSWindow
     let split = NSSplitView()
     let sidebar: NSHostingView<SideBar>
+    let viewport = NSView()
     let canvas: MetalView
     let labelOverlay: LabelOverlayView
     let bandGrapher: BandGrapherView    // 2D band-structure diagram (shown when bandStructure != nil)
+    let dosGrapher: DOSGrapherView      // total/projected DOS graph (shown when densityOfStates != nil)
     let colorPlane: ColorPlaneView      // color-plane / 2D-contour overlay (shown when grid2D != nil and toggled)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
@@ -29,7 +31,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// recreate it on Play and invalidate on Pause/stop in `syncFromState`.
     private var playTimer: Timer?
 
-    init(scene: Scene) {
+    init(scene: Scene, showWindow: Bool = true) {
         self.scene = scene
         let device = MTLCreateSystemDefaultDevice()!
         renderer = try! Renderer(device: device)
@@ -38,17 +40,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         self.state = state
         sidebar = NSHostingView(rootView: SideBar(state: state))
         canvas = MetalView(frame: .zero, device: device)
+        canvas.autoresizingMask = [.width, .height]
+        viewport.addSubview(canvas)
         labelOverlay = LabelOverlayView(frame: .zero)
         canvas.addSubview(labelOverlay)
         labelOverlay.autoresizingMask = [.width, .height]
         bandGrapher = BandGrapherView(frame: .zero)
         bandGrapher.autoresizingMask = [.width, .height]
         bandGrapher.isHidden = true
-        canvas.addSubview(bandGrapher)
+        viewport.addSubview(bandGrapher)
+        dosGrapher = DOSGrapherView(frame: .zero)
+        dosGrapher.autoresizingMask = [.width, .height]
+        dosGrapher.isHidden = true
+        viewport.addSubview(dosGrapher)
         colorPlane = ColorPlaneView(frame: .zero)
         colorPlane.autoresizingMask = [.width, .height]
         colorPlane.isHidden = true
-        canvas.addSubview(colorPlane)
+        viewport.addSubview(colorPlane)
         let info = NSTextView(frame: .zero)
         info.isEditable = false
         info.isSelectable = true
@@ -100,7 +108,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         refreshDelegate()
         layoutSplit()
         window.center()
-        window.makeKeyAndOrderFront(nil)
+        if showWindow {
+            window.makeKeyAndOrderFront(nil)
+        }
         applyCameraForNewSceneIfNeeded()
         // The docked readout is shown lazily by toggleLabels the first time a
         // structure is loaded; it isn't needed on the empty opening frame.
@@ -117,14 +127,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         self.forcedFormat = format
         state.syncFromScene(scene)
         applyCameraForNewSceneIfNeeded()
-        // A band-structure file has no atoms: hide the 3D canvas and show the grapher.
+        // Graph data replaces the Metal canvas. DOS takes precedence if a loaded
+        // scene ever contains both DOS and band data.
         let hasBands = scene.bandStructure != nil
-        bandGrapher.isHidden = !hasBands
-        canvas.isHidden = hasBands
+        bandGrapher.bandStructure = scene.bandStructure
         if hasBands {
-            bandGrapher.bandStructure = scene.bandStructure
             bandGrapher.highSymmetryIndices = []   // parsed labels go here once k-labels are read
         }
+        dosGrapher.densityOfStates = scene.densityOfStates
         // A 2D scalar grid: the color-plane overlay is available. On load we push
         // the grid data and show the plane by default (the canvas is hidden so the
         // plane fills the viewport); the sidebar toggle drives showColorPlane.
@@ -136,11 +146,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             // lengths and the angle between them (Gram-Schmidt basis). Passing only
             // |v0|/|v1| would discard the angle and draw a skew plane rectangular.
             colorPlane.physicalSpan = Array(grid.vec.prefix(2))
-            if state.showColorPlane { colorPlane.isHidden = false; canvas.isHidden = true }
         } else {
             colorPlane.grid = nil
-            if state.showColorPlane { colorPlane.isHidden = true }
         }
+        updateContentVisibility()
         // Initialise the animation controls WITHOUT triggering onChange (which
         // would otherwise try to reload frame 0 on top of this fresh load).
         let saved = state.onChange
@@ -158,11 +167,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     }
 
     private func layoutSplit() {
-        // Horizontal split: sidebar | canvas.
+        // Horizontal split: sidebar | viewport. The viewport owns sibling canvas,
+        // band, DOS, and color-plane layers so hiding Metal never hides a graph.
         split.isVertical = true
         split.dividerStyle = .thin
         split.addArrangedSubview(sidebar)
-        split.addArrangedSubview(canvas)
+        split.addArrangedSubview(viewport)
         window.contentView = split
         // Set the 1:4 sidebar‑to‑canvas ratio after the split is in the window
         // so the position isn't ignored by an unplaced view.
@@ -437,6 +447,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     }
 
     func syncFromState() {
+        // reloadFrame mirrors its accepted index back into the published sidebar
+        // state. That assignment fires onChange synchronously, so this guard must
+        // run before the frame-dispatch branch or the same frame reloads recursively
+        // until the main-thread stack overflows.
+        guard !isReloadingFrame else { return }
         // AXSF animation: a new frame index means the user scrubbed or stepped —
         // decode that frame in full, re-applying the current view/UI state so the
         // camera, supercell, slab, etc. survive the reload. reloadFrame keeps
@@ -446,9 +461,6 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             reloadFrame(state.frameIndex)
             return
         }
-        // Guard the main path so that reloadFrame's own state.frameIndex
-        // assignment (which fires onChange) does not re-run the UI sync below.
-        guard !isReloadingFrame else { return }
         // Guard re-entrancy: below we mirror scene-derived values back into
         // `state` (isCrystal, kPathPoints), whose @Published didSet fires
         // onChange -> syncFromState again. Without this guard a sidebar change
@@ -506,10 +518,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Color-plane overlay: a 2D grid may coexist with the 3D structure. The
         // canvas shows EITHER the 3D scene or the color plane, never both — so the
         // plane wins only while the toggle is on AND a grid is present.
-        let showPlane = state.showColorPlane && scene.grid2D != nil
-        colorPlane.isHidden = !showPlane
-        canvas.isHidden = showPlane || scene.bandStructure != nil
-        if showPlane { colorPlane.needsDisplay = true }
+        updateContentVisibility()
         scene.measurementMode = state.measurementMode
         // Scene-derived mirrors flow state <- scene purely to keep the sidebar
         // indicators in sync; guarded above against re-entrant onChange.
@@ -667,6 +676,21 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private func stopPlayback() {
         playTimer?.invalidate()
         playTimer = nil
+    }
+
+    /// Select exactly one viewport layer. Keeping the graph views as siblings of
+    /// Metal avoids overlapping plots and avoids hiding a graph with its parent.
+    private func updateContentVisibility() {
+        let showDOS = scene.densityOfStates != nil
+        let showBands = !showDOS && scene.bandStructure != nil
+        let showPlane = !showDOS && !showBands && state.showColorPlane && scene.grid2D != nil
+        dosGrapher.isHidden = !showDOS
+        bandGrapher.isHidden = !showBands
+        colorPlane.isHidden = !showPlane
+        canvas.isHidden = showDOS || showBands || showPlane
+        if showDOS { dosGrapher.needsDisplay = true }
+        if showBands { bandGrapher.needsDisplay = true }
+        if showPlane { colorPlane.needsDisplay = true }
     }
 
     private func colorFromHex(_ hex: String) -> (r: Double, g: Double, b: Double)? {

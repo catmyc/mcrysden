@@ -37,10 +37,16 @@ enum PngExporter {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)!
         guard let cg = ctx.makeImage() else { throw PngExportError.noCGImage }
-        let rep = NSBitmapImageRep(cgImage: cg)
+        try write(cgImage: cg, to: url)
+        return cg
+    }
+
+    /// Write an already-rendered AppKit graph through the same PNG encoder used
+    /// by Metal scenes.
+    static func write(cgImage: CGImage, to url: URL) throws {
+        let rep = NSBitmapImageRep(cgImage: cgImage)
         guard let png = rep.representation(using: .png, properties: [:]) else { throw PngExportError.noPNG }
         try png.write(to: url)
-        return cg
     }
     static func clearColor(_ hex: String) -> MTLClearColor {
         var s = hex.trimmingCharacters(in: .whitespaces)

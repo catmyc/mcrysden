@@ -1,7 +1,7 @@
 import AppKit
 import Darwin
 
-final class App: NSObject, NSApplicationDelegate {
+final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     var mainWC: MainWindowController?
 
     /// Quit automatically when the user closes the last window (issue 1).
@@ -32,6 +32,7 @@ final class App: NSObject, NSApplicationDelegate {
         FormatInfo(flag: "--orca",    extensions: ["orca"],                      format: .orca),
         FormatInfo(flag: "--fhi",     extensions: ["fhi", "coord"],              format: .fhi),
         FormatInfo(flag: "--bands",   extensions: ["bands"],                     format: .bands),
+        FormatInfo(flag: "--dos",     extensions: ["dos", "pdos", "pdos_tot"], format: .dos),
     ]
     /// Force-format flags (take no value).
     private static let formatFlags: Set<String> = Set(formatTable.map { $0.flag })
@@ -184,12 +185,7 @@ final class App: NSObject, NSApplicationDelegate {
                     .map { URL(fileURLWithPath: args[$0]) }
                 let (scene, camera) = try Self.loadScene(from: inURL, format: format, cliFrame: frame, stateURL: stURL)
                 let exportSize = CGSize(width: 800, height: 800)
-                switch outURL.pathExtension.lowercased() {
-                case "pdf", "svg", "eps", "ps":
-                    try RasterExporter.export(scene: scene, camera: camera, to: outURL, size: exportSize)
-                default:
-                    try PngExporter.export(scene: scene, camera: camera, to: outURL, size: exportSize)
-                }
+                try Self.exportScene(scene, camera: camera, to: outURL, size: exportSize)
                 exportHasHappened = true
             } catch {
                 print("[mcrysden] export failed: \(error)")
@@ -272,7 +268,11 @@ final class App: NSObject, NSApplicationDelegate {
     @objc private func openDocument(_ sender: Any?) {
         guard let wc = mainWC else { return }
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = Self.openPanelExtensions.compactMap { .init(filenameExtension: $0) }
+        // Use a broad UTI and let ParseFormat perform the authoritative filename
+        // filtering. QE projected-DOS suffixes encode atom/wfc metadata and cannot
+        // be represented by a finite allowedContentTypes list.
+        panel.allowedContentTypes = [.data]
+        panel.delegate = self
         panel.beginSheetModal(for: wc.window) { result in
             guard result == .OK, let url = panel.url else { return }
             do {
@@ -281,6 +281,28 @@ final class App: NSObject, NSApplicationDelegate {
             } catch {
                 print("[mcrysden] open failed: \(error)")
             }
+        }
+    }
+
+    static func supportsOpenURL(_ url: URL) -> Bool {
+        url.hasDirectoryPath || ParseFormat.from(url: url) != nil
+    }
+
+    func panel(_ sender: Any, shouldEnable url: URL) -> Bool {
+        Self.supportsOpenURL(url)
+    }
+
+    @MainActor
+    @discardableResult
+    static func exportScene(_ scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
+        if let dos = scene.densityOfStates {
+            return try DOSExporter.export(dos, to: url, size: size)
+        }
+        switch url.pathExtension.lowercased() {
+        case "pdf", "svg", "eps", "ps":
+            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size)
+        default:
+            return try PngExporter.export(scene: scene, camera: camera, to: url, size: size)
         }
     }
 
@@ -327,7 +349,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.11"
+    static let appVersion = "1.1.12"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
