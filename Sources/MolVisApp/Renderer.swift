@@ -16,7 +16,7 @@ struct InstanceData { var model: float4x4; var color: SIMD4<Float>; var radius: 
 struct FrameData {
     var view: float4x4
     var proj: float4x4
-    var lightDir: SIMD3<Float>   // world-space light direction (computed from azimuth/elevation)
+    var lightDir: SIMD3<Float>   // world-space direction of the camera-relative light
     var ambient: Float           // material.ambient
     var diffuse: Float           // material.diffuse
     var specular: Float          // material.specular weight
@@ -95,15 +95,16 @@ final class Renderer: NSObject {
     private var currentLightDir: SIMD3<Float> = normalize(SIMD3<Float>(0.3, 0.8, 0.5))
 
     /// Fill a FrameData from the current scene's lighting + camera. Centralised so
-    /// the main-encode and gizmo-encode paths stay byte-for-byte in sync: the
-    /// light direction is derived from Lighting.azimuth/elevation (the same
-    /// spherical convention the sidebar sliders drive) and the material slots come
-    /// straight off scene.lighting.
+    /// the main-encode and gizmo-encode paths stay byte-for-byte in sync. The
+    /// sidebar's azimuth/elevation describe a camera-space light, which is
+    /// transformed into world space so orbiting the structure changes which
+    /// surfaces face the viewer-fixed light.
     static func makeFrame(view: float4x4, proj: float4x4, lighting: Lighting, eye: SIMD3<Float>) -> FrameData {
         let az = lighting.azimuth * .pi / 180.0
         let el = lighting.elevation * .pi / 180.0
         let cel = cos(el)
-        let lightDir = SIMD3<Float>(cel * cos(az), cel * sin(az), sin(el))
+        let viewLight = SIMD3<Float>(cel * cos(az), cel * sin(az), sin(el))
+        let lightDir = normalize((view.transpose * SIMD4<Float>(viewLight, 0)).xyz)
         return FrameData(view: view, proj: proj, lightDir: lightDir,
                          ambient: lighting.ambient, diffuse: lighting.diffuse,
                          specular: lighting.specular, shininess: lighting.shininess,
@@ -848,19 +849,23 @@ final class Renderer: NSObject {
         enc.setViewport(MTLViewport(originX: margin, originY: Double(h) - gSize - margin,
                                     width: gSize, height: gSize, znear: 0, zfar: 1))
 
-        // Mini-camera: rotation-only view + fixed orthographic projection. The
-        // gizmo is lit from the SAME scene.lighting as the main scene (via
-        // makeFrame) so its arrows' shading is consistent with what you see.
-        let R = float4x4(camera.rotation).transpose            // world -> view (no translation)
+        // Rotate the axis directions into camera space before instancing. The
+        // arrows can then use an identity view with a viewer-fixed light and eye,
+        // avoiding a second world/view conversion that made their shading appear
+        // attached to the gizmo while it rotated.
+        let worldToView = float4x4(camera.rotation).transpose
         let half: Float = 1.05
         let proj = float4x4(orthographicLeft: -half, right: half, bottom: -half, top: half,
                             near: -10, far: 10)
-        // Eye far down +Z in the gizmo's rotation-only space — purely to give
-        // the specular term a stable view vector; distance is irrelevant.
-        var frame = Renderer.makeFrame(view: R, proj: proj,
-                                       lighting: scene.lighting,
-                                       eye: SIMD3<Float>(0, 0, 100))
-        let fb = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: [])
+        var arrowFrame = Renderer.makeFrame(view: matrix_identity_float4x4, proj: proj,
+                                            lighting: scene.lighting,
+                                            eye: SIMD3<Float>(0, 0, 100))
+        let arrowFB = device.makeBuffer(bytes: &arrowFrame, length: MemoryLayout<FrameData>.stride, options: [])
+        // Labels remain in world-axis coordinates and need the rotation-only view.
+        var labelFrame = Renderer.makeFrame(view: worldToView, proj: proj,
+                                            lighting: scene.lighting,
+                                            eye: SIMD3<Float>(0, 0, 100))
+        let labelFB = device.makeBuffer(bytes: &labelFrame, length: MemoryLayout<FrameData>.stride, options: [])
         enc.setRenderPipelineState(atomPipeline)
         enc.setDepthStencilState(overlayDepthState)
 
@@ -877,9 +882,9 @@ final class Renderer: NSObject {
         }
         struct Axis { let dir: SIMD3<Float>; let color: SIMD3<Float> }
         let axes = [
-            Axis(dir: SIMD3<Float>(1, 0, 0), color: SIMD3<Float>(1, 0.2, 0.2)), // x red
-            Axis(dir: SIMD3<Float>(0, 1, 0), color: SIMD3<Float>(0.2, 1, 0.2)), // y green
-            Axis(dir: SIMD3<Float>(0, 0, 1), color: SIMD3<Float>(0.2, 0.2, 1)), // z blue
+            Axis(dir: (worldToView * SIMD4<Float>(1, 0, 0, 0)).xyz, color: SIMD3<Float>(1, 0.2, 0.2)), // x red
+            Axis(dir: (worldToView * SIMD4<Float>(0, 1, 0, 0)).xyz, color: SIMD3<Float>(0.2, 1, 0.2)), // y green
+            Axis(dir: (worldToView * SIMD4<Float>(0, 0, 1, 0)).xyz, color: SIMD3<Float>(0.2, 0.2, 1)), // z blue
         ]
 
         // Draw shafts (cylinders) and heads (cones) as two instanced passes.
@@ -893,8 +898,8 @@ final class Renderer: NSObject {
             let buf = device.makeBuffer(bytes: inst, length: inst.count * MemoryLayout<InstanceData>.stride, options: [])
             enc.setVertexBuffer(meshVB, offset: 0, index: 0)
             enc.setVertexBuffer(buf, offset: 0, index: 1)
-            enc.setVertexBuffer(fb, offset: 0, index: 2)
-            enc.setFragmentBuffer(fb, offset: 0, index: 2)
+            enc.setVertexBuffer(arrowFB, offset: 0, index: 2)
+            enc.setFragmentBuffer(arrowFB, offset: 0, index: 2)
             enc.drawIndexedPrimitives(type: .triangle,
                                       indexCount: meshIB.length / MemoryLayout<UInt16>.stride,
                                       indexType: .uint16, indexBuffer: meshIB, indexBufferOffset: 0,
@@ -922,7 +927,7 @@ final class Renderer: NSObject {
             let vb = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<SIMD3<Float>>.stride, options: [])
             enc.setVertexBuffer(vb, offset: 0, index: 0)
             enc.setVertexBuffer(cb, offset: 0, index: 3)
-            enc.setVertexBuffer(fb, offset: 0, index: 2)
+            enc.setVertexBuffer(labelFB, offset: 0, index: 2)
             enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: segs.count)
         }
     }

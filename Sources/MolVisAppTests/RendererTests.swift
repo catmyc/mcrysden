@@ -1,10 +1,44 @@
 import XCTest
 import Metal
+import simd
 @testable import MolVisApp
 
 private enum Thrown: Error { case noGPU, noTex }
 
 final class RendererTests: XCTestCase {
+    func testCylinderWallNormalsAreRadial() {
+        let segments = 12
+        let mesh = Geometry.unitCylinder(radialSegments: segments)
+        let wallNormals = mesh.normals.prefix(segments * 2)
+
+        XCTAssertEqual(wallNormals.count, segments * 2)
+        for normal in wallNormals {
+            XCTAssertEqual(normal.y, 0, accuracy: 1e-6)
+            XCTAssertEqual(simd_length(normal), 1, accuracy: 1e-6)
+        }
+    }
+
+    func testLightDirectionRemainsFixedRelativeToCamera() {
+        var lighting = Lighting()
+        lighting.azimuth = 0
+        lighting.elevation = 0
+        let projection = matrix_identity_float4x4
+        let identity = Renderer.makeFrame(view: matrix_identity_float4x4, proj: projection,
+                                          lighting: lighting, eye: .zero)
+
+        var camera = Camera()
+        camera.rotation = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(0, 1, 0))
+        let view = camera.viewMatrix()
+        let rotated = Renderer.makeFrame(view: view, proj: projection,
+                                         lighting: lighting, eye: camera.eyePosition())
+        let rotatedLightInView = (view * SIMD4<Float>(rotated.lightDir, 0)).xyz
+
+        XCTAssertEqual(rotatedLightInView.x, identity.lightDir.x, accuracy: 1e-5)
+        XCTAssertEqual(rotatedLightInView.y, identity.lightDir.y, accuracy: 1e-5)
+        XCTAssertEqual(rotatedLightInView.z, identity.lightDir.z, accuracy: 1e-5)
+        XCTAssertLessThan(simd_dot(rotated.lightDir, identity.lightDir), 0.01)
+    }
+
     func testRendererProducesDrawablePixels() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
         let r = try Renderer(device: device)
@@ -153,6 +187,23 @@ final class RendererTests: XCTestCase {
         XCTAssertEqual(ratio, 1.0, accuracy: 0.5, "gizmo size should not track zoom (near=\(near), far=\(far))")
     }
 
+    func testOrientationGizmoRespondsToCameraRotation() throws {
+        var scene = Scene()
+        scene.background = "#000000"
+        scene.showCellFrame = false
+        scene.showAxes = true
+        scene.lighting.ambient = 0.05
+        scene.lighting.diffuse = 0.95
+
+        let identity = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        let quarterTurn = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(0, 1, 0))
+        let before = try render(scene: scene, dist: 12, rotation: identity, w: 160, h: 160)
+        let after = try render(scene: scene, dist: 12, rotation: quarterTurn, w: 160, h: 160)
+
+        XCTAssertNotEqual(pixelHash(before), pixelHash(after),
+                          "rotating the gizmo must update its geometry and lighting")
+    }
+
     // The Renderer today clears with a single solid color and ignores
     // backgroundType — richer gradient rendering lives in the shader, owned by
     // another agent. What the state/sidebar layer CAN guarantee is that the
@@ -225,11 +276,14 @@ final class RendererTests: XCTestCase {
         return n
     }
 
-    private func render(scene: Scene, dist: Float, w: Int = 96, h: Int = 96) throws -> MTLTexture {
+    private func render(scene: Scene, dist: Float,
+                        rotation: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
+                        w: Int = 96, h: Int = 96) throws -> MTLTexture {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
         let r = try Renderer(device: device)
         r.scene = scene
         r.currentCamera.distance = dist
+        r.currentCamera.rotation = rotation
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm
         desc.width = w; desc.height = h
@@ -240,6 +294,16 @@ final class RendererTests: XCTestCase {
         r.encode(to: cb, target: tex, viewport: MTLViewport(originX:0,originY:0,width:Double(w),height:Double(h),znear:0,zfar:1), camera: r.currentCamera)
         cb.commit(); cb.waitUntilCompleted()
         return tex
+    }
+
+    private func pixelHash(_ tex: MTLTexture) -> UInt64 {
+        let w = tex.width, h = tex.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        tex.getBytes(&px, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        return px.reduce(into: UInt64(0xcbf29ce484222325)) { hash, byte in
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
     }
 
     private func nonzeroColumns(_ tex: MTLTexture) -> (minC: Int, maxC: Int) {

@@ -39,12 +39,11 @@ enum Geometry {
         let y0: Float = -0.5, y1: Float = 0.5
         for ring in 0...1 {
             let y = ring == 0 ? y0 : y1
-            let ny: Float = ring == 0 ? -1 : 1
             for s in 0..<radialSegments {
                 let phi = 2.0 * Float.pi * Float(s) / Float(radialSegments)
                 let cp = cos(phi); let sp = sin(phi)
                 positions.append(SIMD3<Float>(cp, y, sp))
-                normals.append(SIMD3<Float>(cp, ny, sp))                  // flat caps: normal = +-Y
+                normals.append(SIMD3<Float>(cp, 0, sp))
             }
         }
         var indices: [UInt16] = []
@@ -57,17 +56,31 @@ enum Geometry {
             indices.append(a); indices.append(c); indices.append(b)
             indices.append(b); indices.append(c); indices.append(d)
         }
-        // caps — triangulated ring
+        // Caps need their own ring vertices: sharing the wall vertices would
+        // blend axial cap normals into the radial wall and create a fixed
+        // dark/bright split along every bond.
         let topStart = UInt16(positions.count)
         positions.append(SIMD3<Float>(0, y1, 0)); normals.append(SIMD3<Float>(0, 1, 0))
         let botStart = UInt16(positions.count)
         positions.append(SIMD3<Float>(0, y0, 0)); normals.append(SIMD3<Float>(0, -1, 0))
+        let topRingStart = UInt16(positions.count)
+        for s in 0..<radialSegments {
+            let phi = 2.0 * Float.pi * Float(s) / Float(radialSegments)
+            positions.append(SIMD3<Float>(cos(phi), y1, sin(phi)))
+            normals.append(SIMD3<Float>(0, 1, 0))
+        }
+        let botRingStart = UInt16(positions.count)
+        for s in 0..<radialSegments {
+            let phi = 2.0 * Float.pi * Float(s) / Float(radialSegments)
+            positions.append(SIMD3<Float>(cos(phi), y0, sin(phi)))
+            normals.append(SIMD3<Float>(0, -1, 0))
+        }
         for s in 0..<radialSegments {
             let s1 = (s + 1) % radialSegments
             // top cap
-            indices.append(topStart); indices.append(UInt16(s + n)); indices.append(UInt16(s1 + n))
+            indices.append(topStart); indices.append(topRingStart + UInt16(s1)); indices.append(topRingStart + UInt16(s))
             // bottom cap (wound so normal points -Y)
-            indices.append(botStart); indices.append(UInt16(s1)); indices.append(UInt16(s))
+            indices.append(botStart); indices.append(botRingStart + UInt16(s)); indices.append(botRingStart + UInt16(s1))
         }
         return Mesh(positions: positions, normals: normals, indices: indices)
     }
