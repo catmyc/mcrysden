@@ -14,7 +14,8 @@ import simd
 ///   - SVG  : a minimal SVG wrapper around a base64-encoded PNG `<image>`.
 ///   - EPS  : a minimal EPSF-3.0 document with a hex-encoded `colorimage`.
 enum RasterExportError: Error {
-    case noGPU, noTex, noCGImage, noContext, noData, unsupported
+    case noGPU, noTex, noCGImage, noContext, noData, unsupported,
+         noQueue, noCommandBuffer, encodeFailed, commandBufferError(Error?)
 }
 
 /// PDF / EPS / PS / SVG export. The scene is rendered once to a high-res
@@ -29,6 +30,10 @@ enum RasterExporter {
     // the export tests) across all formats — not just the written file's byte size.
     @discardableResult
     static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
+              size.width <= 16_384, size.height <= 16_384 else {
+            throw RasterExportError.noTex
+        }
         let w = Int(size.width.rounded()), h = Int(size.height.rounded())
         let cg = try render(scene: scene, camera: camera, w: w, h: h)
         try write(cgImage: cg, to: url, size: CGSize(width: w, height: h))
@@ -60,7 +65,8 @@ enum RasterExporter {
         desc.usage = [.renderTarget, .shaderRead]
         desc.storageMode = .shared
         guard let tex = device.makeTexture(descriptor: desc) else { throw RasterExportError.noTex }
-        let cb = device.makeCommandQueue()!.makeCommandBuffer()!
+        guard let q = device.makeCommandQueue() else { throw RasterExportError.noQueue }
+        guard let cb = q.makeCommandBuffer() else { throw RasterExportError.noCommandBuffer }
         renderer.background = PngExporter.clearColor(scene.background)
         // No camera supplied (headless export)? Fall back to the scene's canonical
         // default framing, which matches what the GUI shows.
@@ -69,15 +75,22 @@ enum RasterExporter {
             cam.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         }
         let viewport = MTLViewport(originX: 0, originY: 0, width: Double(w), height: Double(h), znear: 0, zfar: 1)
-        renderer.encode(to: cb, target: tex, viewport: viewport, camera: cam)
+        guard renderer.encode(to: cb, target: tex, viewport: viewport, camera: cam) else {
+            cb.commit(); cb.waitUntilCompleted()
+            throw RasterExportError.encodeFailed
+        }
         cb.commit(); cb.waitUntilCompleted()
+        // Surface a GPU failure rather than wrapping a blank/partial raster.
+        if let error = cb.error { throw RasterExportError.commandBufferError(error) }
         let bytesPerRow = w * 4
         var bytes = [UInt8](repeating: 0, count: bytesPerRow * h)
         tex.getBytes(&bytes, bytesPerRow: bytesPerRow, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
         let cs = CGColorSpaceCreateDeviceRGB()
-        let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8,
-                            bytesPerRow: bytesPerRow, space: cs,
-                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)!
+        guard let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: bytesPerRow, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else {
+            throw RasterExportError.noCGImage
+        }
         guard let image = ctx.makeImage() else { throw RasterExportError.noCGImage }
         return image
     }

@@ -1362,3 +1362,411 @@ final class ParserTests: XCTestCase {
         XCTAssertFalse(grid.ident.isEmpty, "grid ident label should be populated")
     }
 }
+
+// MARK: - Adversarial regression coverage (findings 1-6)
+//
+// Each test verifies that a malformed / adversarial input is rejected cleanly
+// (traps never fire) and that the thread-local error buffer is left empty after
+// a failing parse so it cannot leak into a later parse. Structures that would
+// have an allocated size diverging from their declared size are rejected outright.
+
+final class AdversarialParserRegressionTests: XCTestCase {
+
+    private func tmp(_ name: String) -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent(name)
+    }
+    private func write(_ text: String, to url: URL) throws {
+        try text.write(to: url, atomically: true, encoding: .utf8)
+    }
+    private func mustThrow(_ url: URL, as format: ParseFormat? = nil,
+                           file: StaticString = #file, line: UInt = #line) {
+        XCTAssertThrowsError(try Parser.load(url, as: format),
+                             "expected a parse error for \(url.lastPathComponent)", file: file, line: line)
+    }
+    // After a FAILED parse the thread-local error buffer intentionally holds the
+    // message for the Swift side to read (loadPWO parses it out of molenv_last_error).
+    // The "buffer empty" contract applies only to a SUCCESSFUL parse, so these tests
+    // assert only that a ParseError was thrown — never that the buffer is empty.
+
+    // MARK: POSCAR (finding 1)
+
+    func testPOSCARRejectsFractionalCount() throws {
+        let url = tmp("frac.poscar")
+        try write("bad\n1.0\n 5 0 0\n 0 5 0\n 0 0 5\nSi\n2.5\nDirect\n 0 0 0\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+
+    func testPOSCARRejectsAlphanumericCount() throws {
+        let url = tmp("alpha.poscar")
+        try write("bad\n1.0\n 5 0 0\n 0 5 0\n 0 0 5\nSi\n2abc\nDirect\n 0 0 0\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+
+    func testPOSCARRejectsHugeCount() throws {
+        let url = tmp("huge.poscar")
+        try write("big\n1.0\n 5 0 0\n 0 5 0\n 0 0 5\nSi\n999999999\nDirect\n 0 0 0\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+
+    func testPOSCARRejectsZeroAtoms() throws {
+        let url = tmp("zero.poscar")
+        try write("none\n1.0\n 5 0 0\n 0 5 0\n 0 0 5\n0\nDirect\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+
+    func testPOSCARVASP5RejectsBadCount() throws {
+        let url = tmp("v5bad.poscar")
+        try write("bad\n1.0\n 5 0 0\n 0 5 0\n 0 0 5\nSi O\n1 garbage\nDirect\n 0 0 0\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+
+    func testPOSCARNegativeScaleStillParses() throws {
+        let url = tmp("vol.poscar")
+        try write("vol\n-27.0\n 2 0 0\n 0 2 0\n 0 0 2\nAl\n1\nDirect\n 0 0 0\n", to: url)
+        let s = try Parser.load(url, as: .poscar)
+        XCTAssertEqual(s.atoms.count, 1)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 13)
+        XCTAssertEqual(s.cell!.a.x, 3.0, accuracy: 0.001)
+    }
+
+    // MARK: PWI (finding 2 + declared-atom truncation)
+
+    func testPWIRejectsMoreThan32Species() throws {
+        var species = ""
+        for i in 0..<40 { species += "El\(i) 1.0 el.upf\n" }
+        let url = tmp("manyspec.pwi")
+        try write("&SYSTEM\n  ibrav = 2\n  celldm(1) = 10.26\n  nat = 0\n  ntyp = 40\n/\nATOMIC_SPECIES\n\(species)\n", to: url)
+        mustThrow(url, as: .pwi)
+    }
+
+    func testPWIRejectsTruncatedPositions() throws {
+        let url = tmp("trunc.pwi")
+        try write("&SYSTEM\n  ibrav = 2\n  celldm(1) = 10.26\n  nat = 3\n  ntyp = 1\n/\nATOMIC_SPECIES\n Si 28.0 Si.pbe.UPF\nATOMIC_POSITIONS {crystal}\n Si 0.0 0.0 0.0\n Si 0.25 0.25 0.25\n", to: url)
+        mustThrow(url, as: .pwi)
+    }
+
+    func testPWITruncationHappyPath() throws {
+        let url = tmp("ok.pwi")
+        try write("&SYSTEM\n  ibrav = 2\n  celldm(1) = 10.26\n  nat = 2\n  ntyp = 1\n/\nATOMIC_SPECIES\n Si 28.0 Si.pbe.UPF\nATOMIC_POSITIONS {crystal}\n Si 0.0 0.0 0.0\n Si 0.25 0.25 0.25\nK_POINTS automatic\n 1 1 1 0 0 0\n", to: url)
+        let s = try Parser.load(url, as: .pwi)
+        XCTAssertEqual(s.atoms.count, 2)
+    }
+
+    // MARK: PWO (declared-atom truncation)
+
+    func testPWORejectsTruncatedTargetFrame() throws {
+        let url = tmp("trunc.pwo")
+        try write(" number of atoms/cell      =    3\n lattice parameter (alat)  =   10.20 a.u.\nATOMIC_POSITIONS (crystal)\n Si  0.0000000000  0.0000000000  0.0000000000\n Si  0.2500000000  0.2500000000  0.2500000000\n", to: url)
+        mustThrow(url, as: .pwo)
+    }
+
+    // MARK: CIF (finding 3)
+
+    // A label far longer than the element buffer ("Cappadocian1") must resolve
+    // without writing past el[]. The old code truncated to "Cap" (NOT carbon);
+    // the point here is that it concludes safely with one atom, not a crash.
+    func testCIFForgivesLongLabel() throws {
+        let url = tmp("longlabel.cif")
+        try write("data_x\n_cell_length_a 5.0\n_cell_length_b 5.0\n_cell_length_c 5.0\n_cell_angle_alpha 90.0\n_cell_angle_beta 90.0\n_cell_angle_gamma 90.0\n\nloop_\n_atom_site_label\n_atom_site_fract_x\n_atom_site_fract_y\n_atom_site_fract_z\nCappadocian1 0.0 0.0 0.0\n", to: url)
+        let s = try Parser.load(url, as: .cif)
+        XCTAssertEqual(s.atoms.count, 1)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 0, "clamped 'Cap' is not a known element")
+    }
+
+    func testCIFDigitOnlyLabel() throws {
+        let url = tmp("diglabel.cif")
+        try write("data_x\n_cell_length_a 5.0\n_cell_length_b 5.0\n_cell_length_c 5.0\n_cell_angle_alpha 90.0\n_cell_angle_beta 90.0\n_cell_angle_gamma 90.0\n\nloop_\n_atom_site_label\n_atom_site_fract_x\n_atom_site_fract_y\n_atom_site_fract_z\n123 0.0 0.0 0.0\n", to: url)
+        let s = try Parser.load(url, as: .cif)
+        XCTAssertEqual(s.atoms.count, 1)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 0)
+    }
+
+    // MARK: Cube (finding 5)
+
+    func testCubeRejectsIntMinAtoms() throws {
+        let url = tmp("imin.cube")
+        try write("c1\nc2\n\(Int.min) 0 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n1 0 0 0 0\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    func testCubeRejectsZeroAxis() throws {
+        let url = tmp("zaxis.cube")
+        try write("c1\nc2\n1 0 0 0\n2 1 0 0\n0 0 1 0\n2 0 0 1\n1 0 0 0 0\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    func testCubeRejectsOverflowingGrid() throws {
+        let url = tmp("biggrid.cube")
+        try write("c1\nc2\n1 0 0 0\n100000 1 0 0\n100000 0 1 0\n100000 0 0 1\n1 0 0 0 0\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    func testCubeRejectsShortAtomLine() throws {
+        let url = tmp("shortatom.cube")
+        try write("c1\nc2\n1 0 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n1 0.0 0.0\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    func testCubeRejectsTruncatedGrid() throws {
+        let url = tmp("shortgrid.cube")
+        try write("c1\nc2\n1 0 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n1 0 0 0 0\n0.1 0.2 0.3\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    func testCubeMultiOrbitalHappyPath() throws {
+        let url = tmp("multi.cube")
+        let values = (1...8).flatMap { [Float($0), Float(100 + $0)] }.map { String(format: "%.1f", $0) }.joined(separator: " ")
+        // Atom record is Z, charge, x, y, z (5 fields).
+        try write("multi\nmock\n-1 0 0 0\n 2 1 0 0\n 2 0 1 0\n 2 0 0 1\n 1 0.0 0.5 0.5 0.5\n2 1 2\n\(values)\n", to: url)
+        let s = try Parser.load(url, as: .cube)
+        XCTAssertEqual(s.multiOrbitalFields.count, 2)
+    }
+
+    func testCubeRejectsHugeOrbitalCount() throws {
+        let url = tmp("hugeorb.cube")
+        try write("multi\nmock\n-1 0 0 0\n 2 1 0 0\n 2 0 1 0\n 2 0 0 1\n 1 0.5 0.5 0.5\n1099511627776 1 2\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    // MARK: BXSF (finding 6)
+
+    func testBXSFRejectsMissingFermiEnergy() throws {
+        let url = tmp("nofn.bxsf")
+        try write("BEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    func testBXSFRejectsNaNDimension() throws {
+        let url = tmp("nan.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 NaN\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    func testBXSFRejectsFractionalDimension() throws {
+        let url = tmp("frac.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2.5\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    func testBXSFRejectsOverflowingGrid() throws {
+        let url = tmp("ox.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n100000 100000 100000\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    func testBXSFRejectsTruncatedBand() throws {
+        let url = tmp("bandshort.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    func testBXSFZeroFermiEnergyParses() throws {
+        let url = tmp("fnz.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.000000\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        let fs = try BXSFLoader.load(from: url)
+        XCTAssertEqual(fs.fermiEnergy, 0.0, accuracy: 1e-6)
+        XCTAssertEqual(fs.bands.count, 1)
+    }
+
+    func testBXSFHappyPath() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let fs = try BXSFLoader.load(from: dir.appendingPathComponent("Fixtures/MgB2.bxsf"))
+        XCTAssertEqual(fs.fermiEnergy, 0.52304, accuracy: 1e-4)
+        XCTAssertEqual(fs.bands.count, 3)
+    }
+
+    // Canonical "Fermi Energy:" must be matched by the label, not a loose
+    // "fermi"+"energy" coincidence. A QE-style "the Fermi energy is ..." line is
+    // not a BXSF header and must NOT satisfy the requirement.
+    func testBXSFRejectsNonCanonicalFermiHeader() throws {
+        let url = tmp("qeheader.bxsf")
+        try write("BEGIN_INFO\n     the Fermi energy is     4.6341 ev\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    // A BANDGRID block that opens but never closes (no END marker) is malformed.
+    func testBXSFRejectsMissingEndBandgrid() throws {
+        let url = tmp("noend.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    // Band markers must be exactly 1..nband in sequence. Out-of-order (2, 1) fails.
+    func testBXSFRejectsOutOfOrderBandIndices() throws {
+        let url = tmp("ooo.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n2\n2 2 2\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 2\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    // A malformed numeric line (surplus non-numeric token) inside the body is rejected.
+    func testBXSFRejectsSurplusBandgridToken() throws {
+        let url = tmp("surplus.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2bad\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    // Non-finite band value (NaN) is rejected.
+    func testBXSFRejectsNanBandValue() throws {
+        let url = tmp("nanval.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 NaN 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    // Non-finite origin is rejected.
+    func testBXSFRejectsNanOrigin() throws {
+        let url = tmp("nanorig.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n1\n2 2 2\n NaN 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    // Aggregate band-cell cap: declare a grid big enough that perBand passes but
+    // perBand * nband exceeds the ceiling.
+    func testBXSFRejectsAggregateOverflow() throws {
+        let url = tmp("agg.bsxf")
+        // nx*ny*nz = 1000000000 (1e9, passes perBand<=4e9), nband=8, total=8e9 > 4e9 cap
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n8\n10000 10000 10\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    // A non-sequential band sequence (duplicate index 1) is rejected.
+    func testBXSFRejectsDuplicateBandIndex() throws {
+        let url = tmp("dupband.bxsf")
+        try write("BEGIN_INFO\n  Fermi Energy:    0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nband_energies\nBANDGRID_3D_BANDS\n2\n2 2 2\n 0 0 0\n 1 0 0\n 0 1 0\n 0 0 1\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nBAND: 1\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\nEND_BANDGRID3D\n", to: url)
+        mustThrow(url, as: .bxsf)
+    }
+
+    // MARK: Cube hardening (finite MO header + finite fields)
+
+    // A non-finite origin component in the cube header is rejected.
+    func testCubeRejectsNanOrigin() throws {
+        let url = tmp("norig.cube")
+        try write("c1\nc2\n1 NaN 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n1 0 0 0 0\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    // A non-finite axis step vector is rejected.
+    func testCubeRejectsNanAxisVector() throws {
+        let url = tmp("navec.cube")
+        try write("c1\nc2\n1 0 0 0\n2 NaN 0 0\n2 0 1 0\n2 0 0 1\n1 0 0 0 0\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    // A non-finite atom coordinate is rejected.
+    func testCubeRejectsNanAtomCoord() throws {
+        let url = tmp("natom.cube")
+        try write("c1\nc2\n1 0 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n1 0 NaN 0.0 0.5\n0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    // A MO header with a surplus token (declares 2 orbitals but gives 3 indices) is rejected.
+    func testCubeRejectsSurplusMOToken() throws {
+        let url = tmp("mooo.cube")
+        try write("multi\nmock\n-1 0 0 0\n 2 1 0 0\n 2 0 1 0\n 2 0 0 1\n 1 0.5 0.5 0.5\n2 1 2 3\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    // A MO header declaring more orbitals than indices provided is rejected.
+    func testCubeRejectsShortMOHeader() throws {
+        let url = tmp("moshort.cube")
+        try write("multi\nmock\n-1 0 0 0\n 2 1 0 0\n 2 0 1 0\n 2 0 0 1\n 1 0.5 0.5 0.5\n3 1 2\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    // A non-finite grid value is rejected.
+    func testCubeRejectsNanGridValue() throws {
+        let url = tmp("nangrid.cube")
+        try write("c1\nc2\n1 0 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n1 0 0 0 0\n0.1 NaN 0.3 0.4 0.5 0.6 0.7 0.8\n", to: url)
+        mustThrow(url, as: .cube)
+    }
+
+    // MARK: POSCAR hardening (32-token cap + VASP5 cardinality)
+
+    // A species line carrying more than 32 tokens is rejected outright.
+    func testPOSCARRejectsTooManySpeciesTokens() throws {
+        let syms = (0..<33).map { "El\($0)" }.joined(separator: " ")
+        let counts = (0..<33).map { _ in "1" }.joined(separator: " ")
+        let url = tmp("toomany.poscar")
+        try write("big\n1.0\n 5 0 0\n 0 5 0\n 0 0 5\n\(syms)\n\(counts)\nDirect\n 0 0 0\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+
+    // VASP5: species/count cardinality mismatch (3 species, 2 counts) is rejected.
+    func testPOSCARVASP5RejectsCardinalityMismatch() throws {
+        let url = tmp("card.poscar")
+        try write("v5\n1.0\n 5 0 0\n 0 5 0\n 0 0 5\nSi O Al\n2 3\nDirect\n 0 0 0\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+
+    // A POSCAR declaring an atom count exceeding the realistic cap is rejected
+    // before the allocation path is reached.
+    func testPOSCARRejectsExcessiveAtomCount() throws {
+        let url = tmp("hugeatoms.poscar")
+        try write("big\n1.0\n 5 0 0\n 0 5 0\n 0 0 5\nSi\n999999999\nDirect\n 0 0 0\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+
+    // MARK: PWI hardening (strict ntyp range)
+
+    // ntyp out of range (negative) is rejected.
+    func testPWIRejectsNegativeNtyp() throws {
+        let url = tmp("negntyp.pwi")
+        try write("&SYSTEM\n  ibrav = 2\n  celldm(1) = 10.26\n  nat = 1\n  ntyp = -1\n/\nATOMIC_SPECIES\n Si 28.0 Si.pbe.UPF\nATOMIC_POSITIONS {crystal}\n Si 0.0 0.0 0.0\n", to: url)
+        mustThrow(url, as: .pwi)
+    }
+
+    // ntyp out of range (>32) is rejected.
+    func testPWIRejectsLargeNtyp() throws {
+        let url = tmp("largentyp.pwi")
+        try write("&SYSTEM\n  ibrav = 2\n  celldm(1) = 10.26\n  nat = 1\n  ntyp = 99\n/\nATOMIC_SPECIES\n Si 28.0 Si.pbe.UPF\nATOMIC_POSITIONS {crystal}\n Si 0.0 0.0 0.0\n", to: url)
+        mustThrow(url, as: .pwi)
+    }
+
+    func testPWIAllowsNamelistCommentsAfterCounts() throws {
+        let url = tmp("commented.pwi")
+        try write("&SYSTEM\n  ibrav = 2\n  celldm(1) = 10.26\n  nat = 1, ! atoms\n  ntyp = 1, ! species\n/\nATOMIC_SPECIES\n Si 28.0 Si.upf\nATOMIC_POSITIONS {crystal}\n Si 0 0 0\n", to: url)
+        XCTAssertEqual(try Parser.load(url, as: .pwi).atoms.count, 1)
+    }
+
+    func testCubeAllowsBlankCommentsAndRejectsSurplusValues() throws {
+        let valid = tmp("blank-comments.cube")
+        try write("\n\n0 0 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n0 1 2 3 4 5 6 7\n", to: valid)
+        XCTAssertEqual(try Parser.load(valid, as: .cube).scalarField?.values.count, 8)
+
+        let surplus = tmp("surplus-values.cube")
+        try write("c1\nc2\n0 0 0 0\n2 1 0 0\n2 0 1 0\n2 0 0 1\n0 1 2 3 4 5 6 7 8\n", to: surplus)
+        mustThrow(surplus, as: .cube)
+    }
+
+    func testBXSFAcceptsIncreasingNoncontiguousBandIndices() throws {
+        let url = tmp("band-gap.bxsf")
+        try write("BEGIN_INFO\nFermi Energy: 0.5\nEND_INFO\nBEGIN_BLOCK_BANDGRID3D\nname\nBANDGRID_3D_BANDS\n2\n2 2 2\n0 0 0\n1 0 0\n0 1 0\n0 0 1\nBAND: 7\n0 0 0 0 1 1 1 1\nBAND: 9\n0 0 0 0 1 1 1 1\nEND_BANDGRID3D\n", to: url)
+        XCTAssertEqual(try BXSFLoader.load(from: url).bands.count, 2)
+    }
+
+    func testDATAGRIDRejectsBadDimensionsNonfiniteAndMissingEnd() throws {
+        func xsf(_ dims: String, _ values: String, end: Bool = true) -> String {
+            "CRYSTAL\nPRIMVEC\n1 0 0\n0 1 0\n0 0 1\nPRIMCOORD\n1 1\n1 0 0 0\nBEGIN_BLOCK_DATAGRID_3D\ngrid\nBEGIN_DATAGRID_3D_x\n\(dims)\n0 0 0\n1 0 0\n0 1 0\n0 0 1\n\(values)\n" + (end ? "END_DATAGRID_3D\nEND_BLOCK_DATAGRID_3D\n" : "")
+        }
+        let badDims = tmp("bad-dims.xsf")
+        try write(xsf("2 2", "0 1 2 3 4 5 6 7"), to: badDims)
+        mustThrow(badDims, as: .xsf)
+        let nonfinite = tmp("nan-grid.xsf")
+        try write(xsf("2 2 2", "0 1 2 NaN 4 5 6 7"), to: nonfinite)
+        mustThrow(nonfinite, as: .xsf)
+        let noEnd = tmp("no-end-grid.xsf")
+        try write(xsf("2 2 2", "0 1 2 3 4 5 6 7", end: false), to: noEnd)
+        mustThrow(noEnd, as: .xsf)
+    }
+
+    func testCIFRejectsFractionalSitesWithoutCell() throws {
+        let url = tmp("fractional-no-cell.cif")
+        try write("data_x\nloop_\n_atom_site_label\n_atom_site_fract_x\n_atom_site_fract_y\n_atom_site_fract_z\nC 0 0 0\n", to: url)
+        mustThrow(url, as: .cif)
+    }
+
+    func testPOSCARRejectsNonfiniteGeometry() throws {
+        let url = tmp("nan-coordinate.poscar")
+        try write("bad\n1.0\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\nNaN 0 0\n", to: url)
+        mustThrow(url, as: .poscar)
+    }
+}

@@ -194,6 +194,9 @@ extension Scene {
     }
 
     func applySlab(_ slab: Slab?) -> Scene {
+        // No-op: clearing a slab that isn't applied. Avoids an O(n) rebond every
+        // frame when the controller re-runs applySlab(nil) on an unslabbed scene.
+        if slab == nil && self.slab == nil { return self }
         guard let slab, let cell else {
             // Removing the slab — restore the full pre-slab atom set.
             var s = self
@@ -217,6 +220,7 @@ extension Scene {
             if projA >= dA && projB <= dB { kept.append(a) }
         }
         var out = self
+        if out.preslabAtoms.isEmpty { out.preslabAtoms = src }
         out.atoms = kept
         out.bonds = Self.rebond(kept, cell: cell)
         out.slab = slab

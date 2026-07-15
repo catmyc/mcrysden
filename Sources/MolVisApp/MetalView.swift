@@ -11,6 +11,9 @@ protocol World: AnyObject {
     func renderCamera() -> Camera
     /// Toggle selection of one atom index (measurement-cap aware).
     func toggleSelection(_ index: Int)
+    /// Adjust slab plane A distance by `delta` (right-drag): applies the new
+    /// slab so atoms are actually filtered, instead of mutating a bare field.
+    func adjustSlabPlaneA(by delta: Float)
 }
 
 final class MetalView: MTKView {
@@ -147,14 +150,18 @@ final class MetalView: MTKView {
     }
 
     override func rightMouseDragged(with e: NSEvent) {
-        // slab distance adjust if slab active
-        guard var slab = world?.scene.slab else { return }
+        // slab distance adjust if slab active: route through the controller so
+        // the slab is actually re-applied (atoms filtered), not just a bare field.
         let p = convert(e.locationInWindow, from: nil)
         let delta = Float(p.y - (lastMouse?.y ?? p.y)) * 0.05
         lastMouse = p
-        slab.planeA.distance += delta
-        world?.scene.slab = slab
-        world?.setNeedsRender()
+        world?.adjustSlabPlaneA(by: delta)
+    }
+    override func rightMouseDown(with e: NSEvent) {
+        lastMouse = convert(e.locationInWindow, from: nil)
+    }
+    override func rightMouseUp(with e: NSEvent) {
+        lastMouse = nil
     }
     override func scrollWheel(with e: NSEvent) {
         let factor = Float(1.0 + e.scrollingDeltaY * 0.001)

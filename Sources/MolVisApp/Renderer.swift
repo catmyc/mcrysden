@@ -56,13 +56,8 @@ final class Renderer: NSObject {
     private var depthTextureSize: (Int, Int) = (0, 0)
 
     var scene: Scene = Scene() {
-        didSet {
-            invalidateBrillouinZoneCache()
-            cachedIsoBuffers = [nil, nil]
-            cachedIsoKeys = [nil, nil]
-            cachedIsoTriangleCounts = [0, 0]
-            cachedFermiBuffers = []
-        }
+        /// Invalidate only caches whose inputs changed; see `invalidateCaches`.
+        didSet { invalidateCaches(old: oldValue) }
     }
     var currentCamera = Camera()
 
@@ -72,9 +67,14 @@ final class Renderer: NSObject {
     // frame; a large G-star (GaAsH, ~164 vectors) makes mouse-drag seconds-laggy.
     private var cachedBZ: BrillouinZone?
     private var cachedBZKey: BZCacheKey?
+    private(set) var bzRebuildCount = 0
+    private struct BaseAtomKey: Equatable {
+        var coord: SIMD3<Float>
+        var atomicNumber: Int
+    }
     private struct BZCacheKey: Equatable {
         var cellA: SIMD3<Float>; var cellB: SIMD3<Float>; var cellC: SIMD3<Float>
-        var nBase: Int; var firstBaseZ: Int
+        var baseAtoms: [BaseAtomKey]
     }
     private func invalidateBrillouinZoneCache() { cachedBZ = nil; cachedBZKey = nil }
 
@@ -86,6 +86,7 @@ final class Renderer: NSObject {
         var origin: SIMD3<Float>, vec0: SIMD3<Float>, vec1: SIMD3<Float>, vec2: SIMD3<Float>
         var isoLevel: Float
         var sign: Float
+        var values: [Float]
     }
     var background: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)
 
@@ -138,7 +139,7 @@ final class Renderer: NSObject {
     }
 
     /// Embedded Metal source (the executable does not reliably locate a bundled
-    /// metallib at runtime). Also saved verbatim as Shaders.metal.
+    /// metallib at runtime). This string is the runtime source of truth.
     static let shaderSource: String = """
     #include <metal_stdlib>
     using namespace metal;
@@ -176,6 +177,27 @@ final class Renderer: NSObject {
         return clamp(color, 0.0, 1.0);
     }
 
+    // Correct normal matrix (inverse-transpose of the linear 3x3) under nonuniform
+    // scale. Derived in-shader by hand (cofactor / determinant) because MSL's
+    // matrix intrinsics are unavailable to this toolchain, and InstanceData's
+    // layout can't carry a separate normal matrix. normalMatrix == cofactor(M)/det
+    // since cofactor^T/det = inverse(M) and we want transpose(inverse(M)).
+    float3x3 normalMatrix3x3(float3x3 m) {
+        // MSL indexes matrices as m[column][row]. Name these by mathematical row.
+        float a = m[0][0], b = m[1][0], c = m[2][0];
+        float d = m[0][1], e = m[1][1], f = m[2][1];
+        float g = m[0][2], h = m[1][2], k = m[2][2];
+        // cofactor matrix entries (sign pattern + - + / - + - / + - +).
+        float c00 =  (e*k - f*h), c01 = -(d*k - f*g), c02 =  (d*h - e*g);
+        float c10 = -(b*k - c*h), c11 =  (a*k - c*g), c12 = -(a*h - b*g);
+        float c20 =  (b*f - c*e), c21 = -(a*f - c*d), c22 =  (a*e - b*d);
+        float det = a*c00 + b*c01 + c*c02;
+        if (abs(det) < 1e-12) return float3x3(1.0);
+        return float3x3(float3(c00, c10, c20) / det,
+                        float3(c01, c11, c21) / det,
+                        float3(c02, c12, c22) / det);
+    }
+
     vertex VInOut v_main(VertexIn in [[stage_in]],
                          constant InstanceData *insts [[buffer(1)]],
                          constant FrameData &f [[buffer(2)]],
@@ -184,7 +206,15 @@ final class Renderer: NSObject {
         constant InstanceData &inst = insts[iid];
         float4 world = inst.model * float4(in.position * inst.radius, 1.0);
         o.worldPos = world.xyz;
-        o.normal = (inst.model * float4(in.normal, 0.0)).xyz;
+        // Normals transformed by the inverse-transpose of the model's linear 3x3
+        // so nonuniform scale (e.g. bond cylinders stretched along their length)
+        // keeps them orthogonal to the surface. InstanceData's layout can't carry
+        // a normal matrix, so derive it in-shader from the model. For rigid
+        // (rotation) + uniform scale this reduces to the linear part, matching the
+        // prior result. Computed by hand (cofactor/determinant) — see normalMatrix3x3.
+        float3x3 model3 = float3x3(inst.model[0].xyz, inst.model[1].xyz, inst.model[2].xyz);
+        float3x3 normalMatrix = normalMatrix3x3(model3);
+        o.normal = normalMatrix * in.normal;
         o.color = inst.color.rgb;
         o.position = f.proj * f.view * world;
         return o;
@@ -344,8 +374,13 @@ final class Renderer: NSObject {
 
     // MARK: - Lock-bearing encode API
 
+    /// Render the scene for one frame. Returns false if no render command encoder
+    /// could be created (e.g. the command buffer/texture is invalid) — callers
+    /// that write output must treat a false return as failure rather than a
+    /// successful blank frame.
+    @discardableResult
     func encode(to commandBuffer: MTLCommandBuffer, target: MTLTexture,
-                viewport: MTLViewport, camera: Camera) {
+                viewport: MTLViewport, camera: Camera) -> Bool {
         let w = target.width, h = target.height
         lastW = w; lastH = h
         let aspect = h > 0 ? Float(w) / Float(h) : 1.0
@@ -364,7 +399,7 @@ final class Renderer: NSObject {
                                        lighting: scene.lighting,
                                        eye: cam.eyePosition())
         let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: [])
-        ensureDepthTexture(width: w, height: h)
+        guard ensureDepthTexture(width: w, height: h) else { return false }
 
         // Clear color reflects the CURRENT background type + hex, recomputed every
         // frame so sidebar edits apply immediately (previously frozen at init).
@@ -380,15 +415,11 @@ final class Renderer: NSObject {
         if let depthTexture {
             desc.depthAttachment.texture = depthTexture
             desc.depthAttachment.loadAction = .clear
-            desc.depthAttachment.storeAction = .store
-            desc.depthAttachment.clearDepth = 1.0
-        } else {
-            // Depth texture unavailable (e.g. memoryless unsupported) — render without it.
-            desc.depthAttachment.loadAction = .dontCare
             desc.depthAttachment.storeAction = .dontCare
+            desc.depthAttachment.clearDepth = 1.0
         }
 
-        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return }
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return false }
         enc.setViewport(viewport)
         enc.setCullMode(.none)
         // Standard less-than depth test for the scene. The gradient pass (below)
@@ -463,6 +494,7 @@ final class Renderer: NSObject {
         drawMeasurements(enc, frameBuffer: frameBuffer)
 
         enc.endEncoding()
+        return true
     }
 
     /// Draw the vertical-gradient backdrop quad (called only when backgroundType
@@ -958,11 +990,13 @@ final class Renderer: NSObject {
         // don't change between frames — rebuilding the O(m^3) Wigner-Seitz cell
         // every frame is what made dragging laggy for large G-stars.
         let key = BZCacheKey(cellA: cell.a, cellB: cell.b, cellC: cell.c,
-                             nBase: scene.baseAtoms.count,
-                             firstBaseZ: scene.baseAtoms.first?.atomicNumber ?? 0)
-        if cachedBZ == nil || cachedBZKey != key {
+                             baseAtoms: scene.baseAtoms.map {
+                                 BaseAtomKey(coord: $0.coord, atomicNumber: $0.atomicNumber)
+                             })
+        if cachedBZKey != key {
             cachedBZ = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms)
             cachedBZKey = key
+            bzRebuildCount += 1
         }
         guard let bz = cachedBZ else { return }
         // The BZ lives in reciprocal space (units of 2pi/A). Scale it to a fixed
@@ -1022,10 +1056,11 @@ final class Renderer: NSObject {
             let key = IsoCacheKey(nx: field.nx, ny: field.ny, nz: field.nz,
                                   origin: field.origin,
                                   vec0: field.vec[0], vec1: field.vec[1], vec2: field.vec[2],
-                                  isoLevel: iso, sign: shell.sign)
+                                  isoLevel: iso, sign: shell.sign, values: field.values)
             let cacheIndex = shell.sign > 0 ? 0 : 1
-            let needsBuild = cachedIsoBuffers[cacheIndex] == nil || cachedIsoKeys[cacheIndex] != key
+            let needsBuild = cachedIsoKeys[cacheIndex] != key
             if needsBuild {
+                isoRebuildCount += 1
                 let mesh = IsoMesh(field: field, isoLevel: iso, sign: shell.sign, color: shell.color)
                 cachedIsoBuffers[cacheIndex] = mesh.triangleCount > 0
                     ? device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: [])
@@ -1046,13 +1081,20 @@ final class Renderer: NSObject {
     private var cachedIsoBuffers: [MTLBuffer?] = [nil, nil]
     private var cachedIsoKeys: [IsoCacheKey?] = [nil, nil]
     private var cachedIsoTriangleCounts: [Int] = [0, 0]
+    private(set) var isoRebuildCount = 0
 
     // MARK: - Fermi surface (multi-band isosurface at the Fermi level)
 
-    /// Per-band Fermi-surface mesh cache. Each band has identical geometry but
-    /// different values, so its surface shape differs; cache each band's vertex
-    /// buffer once (the Fermi level is fixed for a given file).
-    private var cachedFermiBuffers: [MTLBuffer] = []
+    /// Per-band Fermi-surface mesh cache. One slot per source band, INCLUDING a
+    /// nil/no-crossing band (`triangleCount == 0`). Keeping nil slots means the
+    /// slot count always equals `fs.bands.count`, so the rebuild guard fires only
+    /// when the band COUNT changes — a noncrossing band no longer forces a
+    /// rebuild every frame. The previous `[MTLBuffer]` dropped nils via
+    /// `compactMap`, shrinking the count and defeating the guard.
+    private var cachedFermiBuffers: [MTLBuffer?] = []
+
+    /// Instrumentation: rebuild count, reset with the cache, asserted by tests.
+    private(set) var fermiRebuildCount = 0
 
     /// A small per-band color palette so the overlapping bands read distinctly.
     private static let fermiPalette: [SIMD3<Float>] = [
@@ -1069,21 +1111,24 @@ final class Renderer: NSObject {
     /// correctly as the user orbits.
     private func drawFermiSurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
         guard let fs = scene.fermiSurface, scene.showFermiSurface else { return }
-        // rebuild the per-band buffers when the band count changes
+        // Rebuild only when the band COUNT changes. Because cachedFermiBuffers
+        // keeps one slot per band (nil for a no-crossing band), the slot count
+        // always equals fs.bands.count after the first build — a noncrossing
+        // band therefore never triggers a rebuild.
         if cachedFermiBuffers.count != fs.bands.count {
             var bufs: [MTLBuffer?] = []
             for (idx, band) in fs.bands.enumerated() {
                 let color = Renderer.fermiPalette[idx % Renderer.fermiPalette.count]
                 let mesh = IsoMesh(field: band, isoLevel: fs.fermiEnergy, sign: 1, color: color)
-                let buf = mesh.triangleCount > 0
+                bufs.append(mesh.triangleCount > 0
                     ? device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: [])
-                    : nil
-                bufs.append(buf)
+                    : nil)
             }
-            cachedFermiBuffers = bufs.compactMap { $0 }
+            cachedFermiBuffers = bufs
+            fermiRebuildCount += 1
         }
         enc.setRenderPipelineState(polyPipeline)
-        for buf in cachedFermiBuffers {
+        for case let buf? in cachedFermiBuffers {
             enc.setVertexBuffer(buf, offset: 0, index: 0)
             enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
             enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
@@ -1092,6 +1137,56 @@ final class Renderer: NSObject {
             let vertexCount = buf.length / (9 * MemoryLayout<Float>.stride)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
         }
+    }
+
+    /// Conditional cache invalidation. The renderer's `scene` is reassigned on
+    /// EVERY sidebar change (the controller writes appearance fields into its
+    /// Scene, which fires its own `scene.didSet → renderer.scene = scene`). Only
+    /// invalidate a cache when its inputs actually changed — otherwise an
+    /// appearance-only tweak (lighting, scales, background) rebuilds the BZ /
+    /// iso / fermi caches every frame.
+    private func invalidateCaches(old: Scene) {
+        // Inputs each cache depends on; recomputed cheaply from the scene.
+        let oldCell = old.cell
+        let newCell = scene.cell
+        let sameBase = old.baseAtoms.count == scene.baseAtoms.count
+            && zip(old.baseAtoms, scene.baseAtoms).allSatisfy {
+                $0.coord == $1.coord && $0.atomicNumber == $1.atomicNumber
+            }
+        if oldCell?.a != newCell?.a || oldCell?.b != newCell?.b
+            || oldCell?.c != newCell?.c || !sameBase {
+            invalidateBrillouinZoneCache()
+        }
+        if !isoInputsUnchanged(old: old) {
+            cachedIsoBuffers = [nil, nil]
+            cachedIsoKeys = [nil, nil]
+            cachedIsoTriangleCounts = [0, 0]
+        }
+        if !fermiInputsUnchanged(old: old) {
+            cachedFermiBuffers = []
+        }
+    }
+
+    private func isoInputsUnchanged(old: Scene) -> Bool {
+        let a = old.scalarField, b = scene.scalarField
+        guard let a, let b else { return a == nil && b == nil }
+        return a.nx == b.nx && a.ny == b.ny && a.nz == b.nz
+            && a.origin == b.origin && a.vec == b.vec
+            && a.values == b.values
+            && old.isoLevel == scene.isoLevel
+    }
+
+    private func fermiInputsUnchanged(old: Scene) -> Bool {
+        let a = old.fermiSurface, b = scene.fermiSurface
+        guard let a, let b else { return a == nil && b == nil }
+        guard a.bands.count == b.bands.count, a.fermiEnergy == b.fermiEnergy else { return false }
+        for (x, y) in zip(a.bands, b.bands) {
+            if (x.nx, x.ny, x.nz, x.origin, x.vec) != (y.nx, y.ny, y.nz, y.origin, y.vec)
+                || x.values != y.values {
+                return false
+            }
+        }
+        return true
     }
 
     /// Centroid of the (super)atom set, used to center overlays.
@@ -1107,15 +1202,39 @@ final class Renderer: NSObject {
 
     // MARK: - Depth
 
-    private func ensureDepthTexture(width: Int, height: Int) {
-        if depthTextureSize.0 == width, depthTextureSize.1 == height, depthTexture != nil { return }
+    /// Storage modes to try for the depth render target, best-first. macOS normally
+    /// uses GPU-private depth; shared is the compatibility fallback.
+    static let depthStorageFallbacks: [MTLStorageMode] = [.private, .shared]
+
+    /// Best storage mode the device accepts for a `.depth32Float` render target.
+    static func preferredDepthStorageMode(device: MTLDevice) -> MTLStorageMode? {
+        let probe = MTLTextureDescriptor()
+        probe.pixelFormat = MTLPixelFormat.depth32Float
+        probe.width = 1; probe.height = 1
+        probe.usage = .renderTarget
+        for mode in depthStorageFallbacks {
+            probe.storageMode = mode
+            if device.makeTexture(descriptor: probe) != nil { return mode }
+        }
+        return nil
+    }
+
+    private func ensureDepthTexture(width: Int, height: Int) -> Bool {
+        if depthTextureSize.0 == width, depthTextureSize.1 == height, depthTexture != nil { return true }
+        depthTexture = nil
         let d = MTLTextureDescriptor()
         d.pixelFormat = depthPixelFormat
         d.width = width; d.height = height
         d.usage = .renderTarget
-        d.storageMode = .memoryless
-        depthTexture = device.makeTexture(descriptor: d)
+        for mode in Renderer.depthStorageFallbacks {
+            d.storageMode = mode
+            if let texture = device.makeTexture(descriptor: d) {
+                depthTexture = texture
+                break
+            }
+        }
         depthTextureSize = (width, height)
+        return depthTexture != nil
     }
 
     private func makeDepthStencilState() -> MTLDepthStencilState? {
@@ -1249,8 +1368,8 @@ extension Renderer: MTKViewDelegate {
                              width: Double(view.drawableSize.width),
                              height: Double(view.drawableSize.height),
                              znear: 0, zfar: 1)
-        encode(to: cb, target: drawable.texture, viewport: vp, camera: currentCamera)
-        cb.present(drawable)
+        let ok = encode(to: cb, target: drawable.texture, viewport: vp, camera: currentCamera)
+        if ok { cb.present(drawable) }
         cb.commit()
     }
 }

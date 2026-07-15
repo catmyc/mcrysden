@@ -39,8 +39,9 @@ final class Renderer2D: NSObject, MTKViewDelegate {
                              width: Double(view.drawableSize.width),
                              height: Double(view.drawableSize.height),
                              znear: 0, zfar: 1)
-        renderer.encode(to: cb, target: drawable.texture, viewport: vp, camera: cam)
-        cb.present(drawable)
+        if renderer.encode(to: cb, target: drawable.texture, viewport: vp, camera: cam) {
+            cb.present(drawable)
+        }
         cb.commit()
     }
 }

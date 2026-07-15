@@ -4,6 +4,23 @@ import Darwin
 final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     var mainWC: MainWindowController?
 
+    struct LaunchOptions {
+        var inputURL: URL?
+        var stateURL: URL?
+        var exportURL: URL?
+        var format: ParseFormat?
+        var frame = -1
+        var help = false
+    }
+
+    enum CLIError: Error, CustomStringConvertible {
+        case invalid(String)
+        var description: String {
+            if case .invalid(let message) = self { return message }
+            return "invalid arguments"
+        }
+    }
+
     /// Quit automatically when the user closes the last window (issue 1).
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
 
@@ -37,12 +54,6 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     /// Force-format flags (take no value).
     private static let formatFlags: Set<String> = Set(formatTable.map { $0.flag })
 
-    /// Resolve a forced parser format from the CLI args, if any.
-    private static func forcedFormat(from args: [String]) -> ParseFormat? {
-        for info in formatTable where args.contains(info.flag) { return info.format }
-        return nil
-    }
-
     /// All extensions the Open panel should offer, in display order (primary
     /// extension of each format first, then alternates).
     static let openPanelExtensions: [String] = {
@@ -55,33 +66,70 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         }
     }()
 
-    /// Find the input structure file: the first arg that is not a known flag and
-    /// is not consumed by `--export <path>`. Allows the force-format flags to be
-    /// placed anywhere, e.g. `mcrysden --pwi file.in`.
-    private static func inputFile(from args: [String]) -> String? {
-        var skipNext = false
-        for a in args {
-            if skipNext { skipNext = false; continue }
-            if a == "--export" { skipNext = true; continue }
-            if a == "--frame" { skipNext = true; continue }   // its own value follows
-            if a == "--help" || a == "-h" { continue }
-            if Self.formatFlags.contains(a) { continue }
-            return a
+    static func parseArguments(_ args: [String]) throws -> LaunchOptions {
+        var options = LaunchOptions()
+        var positionals: [String] = []
+        var forced: ParseFormat?
+        var index = 0
+        var optionsEnded = false
+        while index < args.count {
+            let argument = args[index]
+            if !optionsEnded && argument == "--" {
+                optionsEnded = true
+            } else if !optionsEnded && (argument == "--help" || argument == "-h") {
+                options.help = true
+            } else if !optionsEnded && argument == "--export" {
+                guard options.exportURL == nil, index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--export requires exactly one output path")
+                }
+                index += 1
+                options.exportURL = URL(fileURLWithPath: args[index])
+            } else if !optionsEnded && argument == "--frame" {
+                guard options.frame == -1, index + 1 < args.count,
+                      let frame = Int(args[index + 1]), frame >= 0, frame <= Int(Int32.max) else {
+                    throw CLIError.invalid("--frame requires one non-negative 32-bit integer")
+                }
+                index += 1
+                options.frame = frame
+            } else if !optionsEnded, let info = formatTable.first(where: { $0.flag == argument }) {
+                guard forced == nil else { throw CLIError.invalid("multiple force-format flags are not allowed") }
+                forced = info.format
+            } else if !optionsEnded && argument.hasPrefix("-") {
+                throw CLIError.invalid("unknown option: \(argument)")
+            } else {
+                positionals.append(argument)
+            }
+            index += 1
         }
-        return nil
+        guard positionals.count <= 2 else { throw CLIError.invalid("too many positional arguments") }
+        if let first = positionals.first { options.inputURL = URL(fileURLWithPath: first) }
+        if options.frame != -1 {
+            guard options.inputURL != nil else { throw CLIError.invalid("--frame requires an input file") }
+        }
+        if forced != nil, options.inputURL == nil {
+            throw CLIError.invalid("force-format flags require an input file")
+        }
+        if positionals.count == 1, positionals[0].lowercased().hasSuffix(".mvis-state") {
+            throw CLIError.invalid("a state file requires an input file")
+        }
+        if positionals.count == 2 {
+            guard positionals[1].lowercased().hasSuffix(".mvis-state") else {
+                throw CLIError.invalid("second positional argument must be a .mvis-state file")
+            }
+            options.stateURL = URL(fileURLWithPath: positionals[1])
+        }
+        options.format = forced
+        if let output = options.exportURL {
+            guard options.inputURL != nil else { throw CLIError.invalid("--export requires an input file") }
+            guard supportedExportExtensions.contains(output.pathExtension.lowercased()) else {
+                throw CLIError.invalid("unsupported export extension: \(output.pathExtension)")
+            }
+        }
+        return options
     }
 
-    /// Parse `--frame N`: the animation frame to open at launch. Returns the
-    /// requested index (>= 0) when --frame is present, or -1 (sentinel) when it is
-    /// absent, so the loader can distinguish "default open" (cycle 0) from an
-    /// explicit --frame 0 (also cycle 0) -- both now route correctly. The per-format
-    /// frame loader clamps the value to the file's actual count downstream.
-    private static func frameIndex(from args: [String]) -> Int {
-        if let idx = args.firstIndex(of: "--frame"), idx + 1 < args.count, let n = Int(args[idx + 1]) {
-            return max(0, n)
-        }
-        return -1   // no --frame specified: default-open sentinel
-    }
+    private static let supportedExportExtensions: Set<String> = ["png", "pdf", "svg", "eps", "ps"]
+    private static let maxExportDimension: CGFloat = 16_384
 
     /// Parse a structure at the CLI frame, apply a companion state (which widens
     /// the supercell, applies the slab, and may encode a saved animation frame),
@@ -90,6 +138,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     /// would be metadata-only and the saved frame's geometry would never show.
     private static func loadScene(from url: URL, format: ParseFormat?, cliFrame: Int,
                                   stateURL: URL?) throws -> (scene: Scene, camera: Camera?) {
+        if let stateURL, sameFile(url, stateURL) {
+            throw CLIError.invalid("input and state alias the same file: \(url.path)")
+        }
+        let fc = Parser.frameCount(url, as: format)
+        if cliFrame >= 0, fc == 0 || cliFrame >= fc {
+            throw CLIError.invalid("--frame \(cliFrame) is out of range for \(url.lastPathComponent)")
+        }
         // The frame the initial load actually shows: cliFrame is -1 (default open) or an
         // explicit --frame N (>= 0). Record it on the scene so the GUI scrubber and the
         // displayed geometry agree -- without this the scene always reports frame 0 no
@@ -103,7 +158,6 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         }
         // Resolve the displayed frame (clamp a saved frame + reparse it) via the shared
         // helper so the GUI path and the frame-state tests run IDENTICAL logic.
-        let fc = Parser.frameCount(url, as: format)
         try resolveAnimationFrame(scene: &scene, from: url, format: format,
                                   loadedFrame: loadedFrame, fc: fc)
         return (scene, camera)
@@ -169,39 +223,38 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         NSApp.activate(ignoringOtherApps: true)         // bring to front so menu bar changes
         updateAnalysisCheckmarks()
         let args = Array(CommandLine.arguments.dropFirst())
-        if args.contains("--help") || args.contains("-h") {
+        let options: LaunchOptions
+        do {
+            options = try Self.parseArguments(args)
+        } catch {
+            print("[mcrysden] \(error)")
+            exit(EXIT_FAILURE)
+        }
+        if options.help {
             Self.printHelp(); NSApp.terminate(nil); return
         }
-        let format = Self.forcedFormat(from: args)
-        let frame = Self.frameIndex(from: args)
         // headless export path
-        var exportHasHappened = false
-        if let idx = args.firstIndex(of: "--export"), idx + 1 < args.count,
-           let input = Self.inputFile(from: args) {
-            let outURL = URL(fileURLWithPath: args[idx + 1])
-            let inURL = URL(fileURLWithPath: input)
+        if let outURL = options.exportURL, let inURL = options.inputURL {
             do {
-                let stURL = args.firstIndex(where: { $0.hasSuffix(".mvis-state") })
-                    .map { URL(fileURLWithPath: args[$0]) }
-                let (scene, camera) = try Self.loadScene(from: inURL, format: format, cliFrame: frame, stateURL: stURL)
+                try Self.validateExportDestination(outURL, input: inURL, state: options.stateURL)
+                let (scene, camera) = try Self.loadScene(from: inURL, format: options.format,
+                                                         cliFrame: options.frame, stateURL: options.stateURL)
                 let exportSize = CGSize(width: 800, height: 800)
                 try Self.exportScene(scene, camera: camera, to: outURL, size: exportSize)
-                exportHasHappened = true
             } catch {
                 print("[mcrysden] export failed: \(error)")
                 exit(EXIT_FAILURE)
             }
+            NSApp.terminate(nil)
+            return
         }
-        if exportHasHappened { NSApp.terminate(nil); return }
         // GUI path
-        if let input = Self.inputFile(from: args) {
-            let inURL = URL(fileURLWithPath: input)
+        if let inURL = options.inputURL {
             do {
-                let stURL = args.firstIndex(where: { $0.hasSuffix(".mvis-state") })
-                    .map { URL(fileURLWithPath: args[$0]) }
                 // loadScene honors a saved animation frame by re-parsing it (the
                 // saved frame becomes geometry, not just metadata).
-                let (scene, camera) = try Self.loadScene(from: inURL, format: format, cliFrame: frame, stateURL: stURL)
+                let (scene, camera) = try Self.loadScene(from: inURL, format: options.format,
+                                                         cliFrame: options.frame, stateURL: options.stateURL)
                 let wc = MainWindowController(scene: Scene())
                 mainWC = wc
                 // Pass the RESOLVED frame (clFrame, or the restored frame if the
@@ -209,7 +262,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
                 // The scene's currentFrame is now accurate (>= 0) whether it came from
                 // the CLI --frame, a saved state, or the default-open frame 0 -- so the
                 // scrubber initializes in sync with what's actually displayed.
-                wc.loadFile(scene, from: inURL, format: format, frameIndex: scene.currentFrame)
+                wc.loadFile(scene, from: inURL, format: options.format, frameIndex: scene.currentFrame)
                 if let camera {
                     wc.camera = camera
                     // Sync the orthographic toggle from the RESTORED camera (not the
@@ -219,7 +272,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
                     wc.setNeedsRender()
                 }
             } catch {
-                print("[mcrysden] failed to open \(input): \(error)")
+                print("[mcrysden] failed to open \(inURL.path): \(error)")
             }
         } else {
             mainWC = MainWindowController(scene: Scene())
@@ -292,18 +345,97 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         Self.supportsOpenURL(url)
     }
 
+    static func validateExportDestination(_ output: URL, input: URL, state: URL?) throws {
+        // Pairwise: no two of {input, state, output} may alias one another
+        // (canonical path, symlink target, or hardlink inode) — exporting onto
+        // an input/state would corrupt the source, and an input that is the same
+        // file as its state is a malformed invocation.
+        if let state, sameFile(input, state) {
+            throw CLIError.invalid("input and state alias the same file: \(input.path)")
+        }
+        for protected in [input, state].compactMap({ $0 }) where sameFile(output, protected) {
+            throw CLIError.invalid("export output aliases protected input: \(protected.path)")
+        }
+    }
+
+    private static func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
+        let left = lhs.standardizedFileURL.resolvingSymlinksInPath()
+        let right = rhs.standardizedFileURL.resolvingSymlinksInPath()
+        if left.path == right.path { return true }
+        let fm = FileManager.default
+        guard let la = try? fm.attributesOfItem(atPath: left.path),
+              let ra = try? fm.attributesOfItem(atPath: right.path),
+              let lfs = la[.systemNumber] as? NSNumber,
+              let rfs = ra[.systemNumber] as? NSNumber,
+              let lfile = la[.systemFileNumber] as? NSNumber,
+              let rfile = ra[.systemFileNumber] as? NSNumber else { return false }
+        return lfs == rfs && lfile == rfile
+    }
+
     @MainActor
     @discardableResult
     static func exportScene(_ scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
+        guard supportedExportExtensions.contains(url.pathExtension.lowercased()) else {
+            throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
+        }
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
+              size.width <= maxExportDimension, size.height <= maxExportDimension else {
+            throw CLIError.invalid("export size must be finite and positive")
+        }
         if let dos = scene.densityOfStates {
             return try DOSExporter.export(dos, to: url, size: size)
+        }
+        if let bands = scene.bandStructure {
+            return try exportGraph(BandGrapherView(frame: NSRect(origin: .zero, size: size)),
+                                   configure: { $0.bandStructure = bands }, to: url, size: size)
+        }
+        if let grid = scene.grid2D {
+            return try exportGraph(ColorPlaneView(frame: NSRect(origin: .zero, size: size)), configure: {
+                $0.grid = grid.values
+                $0.physicalSpan = Array(grid.vec.prefix(2))
+                $0.zLabel = grid.ident
+                if grid.maxValue > grid.minValue {
+                    $0.contourLevels = (1..<6).map {
+                        grid.minValue + (grid.maxValue - grid.minValue) * Float($0) / 6
+                    }
+                }
+            }, to: url, size: size)
         }
         switch url.pathExtension.lowercased() {
         case "pdf", "svg", "eps", "ps":
             return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size)
-        default:
+        case "png":
             return try PngExporter.export(scene: scene, camera: camera, to: url, size: size)
+        default:
+            throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
+    }
+
+    @MainActor
+    private static func exportGraph<View: NSView>(_ view: View, configure: (View) -> Void,
+                                                   to url: URL, size: CGSize) throws -> CGImage {
+        let width = Int(size.width.rounded()), height = Int(size.height.rounded())
+        guard width > 0, height > 0,
+              let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                            isPlanar: false, colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0, bitsPerPixel: 0),
+              let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            throw DOSExportError.noBitmap
+        }
+        configure(view)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        view.draw(view.bounds)
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let image = bitmap.cgImage else { throw DOSExportError.noImage }
+        if ["pdf", "svg", "eps", "ps"].contains(url.pathExtension.lowercased()) {
+            try RasterExporter.write(cgImage: image, to: url, size: size)
+        } else {
+            try PngExporter.write(cgImage: image, to: url)
+        }
+        return image
     }
 
     /// View > Toggle Element Labels
@@ -349,7 +481,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.12"
+    static let appVersion = "1.1.13"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

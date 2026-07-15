@@ -66,9 +66,9 @@ struct MeasurementResult: Codable {
     let summary: String
 }
 
-struct Plane: Codable { var h: Int = 0; var k: Int = 1; var l: Int = 0; var distance: Float = 0 }
+struct Plane: Codable, Equatable { var h: Int = 0; var k: Int = 1; var l: Int = 0; var distance: Float = 0 }
 
-struct Slab: Codable { var planeA: Plane = Plane(); var planeB: Plane = Plane() }
+struct Slab: Codable, Equatable { var planeA: Plane = Plane(); var planeB: Plane = Plane() }
 
 struct Camera: Codable {
     var center: SIMD3<Float> = SIMD3(0,0,0)

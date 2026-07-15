@@ -332,6 +332,22 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         setNeedsRender()
     }
 
+    /// Right-drag slab distance adjust on plane A. Mirrors the new distance into
+    /// `state` (single source of truth) and re-runs the slab filter on the scene
+    /// so atoms are actually culled. Guarded against onChange recursion: we set
+    /// the state field under `isSyncingState` so the synchronous onChange ->
+    /// syncFromState does not re-enter, then apply the slab directly.
+    func adjustSlabPlaneA(by delta: Float) {
+        guard scene.slab != nil else { return }
+        isSyncingState = true
+        state.slabA_dist += delta
+        isSyncingState = false
+        let slab = Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
+                        planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
+        scene = scene.applySlab(slab)
+        setNeedsRender()
+    }
+
     /// Project each atom to screen coordinates and overlay its element symbol.
     func updateLabels() {
         guard scene.showLabels, !scene.atoms.isEmpty else {
@@ -537,8 +553,16 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // supercell — compare the (n1,n2,n3) tuple, not just total, so changing
         // replication DIRECTION (e.g. 2×1×1 → 1×2×1, same total) re-widen happens.
         let sc = SuperCell(n1: state.n1, n2: state.n2, n3: state.n3)
+        var superCellChanged = false
         if sc != scene.superCell {
+            let previous = scene.superCell
             scene = scene.widenSuperCell(sc)
+            superCellChanged = scene.superCell != previous
+            if scene.superCell != sc {
+                state.n1 = scene.superCell.n1
+                state.n2 = scene.superCell.n2
+                state.n3 = scene.superCell.n3
+            }
         }
         // slab — build the Slab then run the scene through applySlab so the
         // atom set is actually filtered (Important #2 of the final review:
@@ -547,7 +571,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             ? Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
                    planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
             : nil
-        scene = scene.applySlab(slab)
+        if superCellChanged || scene.slab != slab {
+            scene = scene.applySlab(slab)
+        }
         // background clear color (solid top color today; gradient rendering is
         // pending on the shader work).
         if let c = colorFromHex(state.backgroundHex) {
@@ -604,9 +630,27 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// background, supercell, slab, show flags). Each frame is parsed fresh
     /// from sourceURL via Parser.load(frameIndex:).
     private func reloadFrame(_ index: Int) {
-        guard let url = sourceURL, index >= 0, index < state.frameCount else { return }
+        guard let url = sourceURL else { return }
+        guard index >= 0, index < state.frameCount else {
+            isReloadingFrame = true
+            state.isPlaying = false
+            state.frameIndex = scene.currentFrame
+            isReloadingFrame = false
+            stopPlayback()
+            return
+        }
         guard let loaded = try? Parser.load(url, frameIndex: index, as: forcedFormat) else {
-            print("[mcrysden] failed to load frame \(index)"); return
+            print("[mcrysden] failed to load frame \(index)")
+            // Roll back the requested index and STOP playback so a corrupt tail
+            // frame doesn't spin the timer retrying a frame that never loads.
+            // Raise isReloadingFrame BEFORE mutating state so the synchronous
+            // onChange -> syncFromState early-returns instead of reloading again.
+            isReloadingFrame = true
+            state.isPlaying = false
+            state.frameIndex = scene.currentFrame
+            isReloadingFrame = false
+            stopPlayback()
+            return
         }
         // Start from the freshly parsed frame but carry the LIVE UI state over
         // (not state.*, which lags by one onChange) so scrolling frames never

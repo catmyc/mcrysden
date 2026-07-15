@@ -43,6 +43,7 @@ final class RendererTests: XCTestCase {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
         let r = try Renderer(device: device)
         var s = Scene()
+        s.background = "#000000"   // black clear so nonzero pixels are foreground only
         s.atoms = [Atom(coord: SIMD3(0,0,0), atomicNumber: 6, label: "C")]
         r.scene = s
         r.currentCamera.distance = 6
@@ -69,6 +70,7 @@ final class RendererTests: XCTestCase {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
         let r = try Renderer(device: device)
         var s = Scene()
+        s.background = "#000000"   // black clear so nonzero pixels are foreground only
         s.displayMode = .spaceFill
         s.atoms = [Atom(coord: SIMD3(0,0,0), atomicNumber: 6, label: "C"),
                    Atom(coord: SIMD3(1.5,0,0), atomicNumber: 6, label: "C")]
@@ -99,13 +101,28 @@ final class RendererTests: XCTestCase {
         XCTAssertEqual(ElementTable.covalentRadius(1), 0.31, accuracy: 0.01)
     }
 
+    // Decode a CGImage to RGBA and count foreground (non-black) pixels.
+    private func foregroundPixels(_ cg: CGImage) -> Int {
+        let w = cg.width, h = cg.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                           space: CGColorSpaceCreateDeviceRGB(),
+                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var n = 0
+        for i in stride(from: 0, to: px.count, by: 4) where px[i] != 0 || px[i+1] != 0 || px[i+2] != 0 { n += 1 }
+        return n
+    }
+
     func testHeadlessPngExport() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
         let scene = Scene(loaded: try Parser.load(url))
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.png")
-        try PngExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
+        let cg = try PngExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
+        // A blank-success frame would be all black — prove the render drew geometry.
+        XCTAssertGreaterThan(foregroundPixels(cg), 0, "exported PNG must contain foreground pixels")
     }
 
     func testVectorExportPDF() throws {
@@ -113,10 +130,11 @@ final class RendererTests: XCTestCase {
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
         let scene = Scene(loaded: try Parser.load(url))
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.pdf")
-        try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
+        let cg = try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
         let header = try Data(contentsOf: out, options: .mappedIfSafe).prefix(5)
         XCTAssertEqual(String(data: header, encoding: .ascii), "%PDF-")
+        XCTAssertGreaterThan(foregroundPixels(cg), 0, "PDF raster must contain foreground pixels")
     }
 
     func testVectorExportSVG() throws {
@@ -124,12 +142,13 @@ final class RendererTests: XCTestCase {
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
         let scene = Scene(loaded: try Parser.load(url))
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.svg")
-        try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
+        let cg = try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
         let data = try Data(contentsOf: out)
         let str = String(data: data, encoding: .utf8) ?? ""
         XCTAssertTrue(str.hasPrefix("<?xml"), "SVG should start with xml declaration, got: \(str.prefix(40))")
         XCTAssertTrue(str.contains("<svg"), "SVG should contain <svg element")
+        XCTAssertGreaterThan(foregroundPixels(cg), 0, "SVG raster must contain foreground pixels")
     }
 
     func testVectorExportEPS() throws {
@@ -137,10 +156,11 @@ final class RendererTests: XCTestCase {
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
         let scene = Scene(loaded: try Parser.load(url))
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.eps")
-        try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
+        let cg = try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
         let header = try Data(contentsOf: out, options: .mappedIfSafe).prefix(4)
         XCTAssertEqual(String(data: header, encoding: .ascii), "%!PS")
+        XCTAssertGreaterThan(foregroundPixels(cg), 0, "EPS raster must contain foreground pixels")
     }
     // Axes must draw independently of the cell frame. A cell-only scene (no
     // atoms/bonds) isolates the axes: with Cell Frame OFF and Axes ON the axes

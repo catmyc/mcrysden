@@ -55,22 +55,43 @@ enum StateStore {
 
     /// Apply a saved view-state onto an already-parsed `scene` (atoms/bonds/cell
     /// come from re-parsing `source`; this only restores the appearance/controls)
-    /// and decode the optional `camera`. Never throws on a malformed file — it
-    /// warns and either falls back to defaults or aborts the load, leaving the
-    /// current scene intact (spec §9).
+    /// and decode the optional `camera`. Malformed state throws a path-bearing
+    /// ParseError and leaves both scene and camera unchanged.
     static func load(into scene: inout Scene, camera: inout Camera?, from url: URL) throws {
-        let data = try Data(contentsOf: url)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ParseError.io(path: url.path, reason: "bad state file")
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw ParseError.io(path: url.path, reason: error.localizedDescription)
+        }
+        let obj: [String: Any]
+        do {
+            guard let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw ParseError.io(path: url.path, reason: "bad state file")
+            }
+            obj = decoded
+        } catch let error as ParseError {
+            throw error
+        } catch {
+            throw ParseError.io(path: url.path, reason: "bad state file: \(error)")
         }
         if let v = obj["version"] as? Int, v > 1 {
             throw ParseError.parse(path: url.path, line: 0, reason: "state version \(v) too new")
         }
         let dec = JSONDecoder()
-
+        var candidate = scene
+        var candidateCamera: Camera?
+        func finiteFloat(_ value: Any?, field: String) throws -> Float? {
+            guard let value = value as? Double else { return nil }
+            let converted = Float(value)
+            guard value.isFinite, converted.isFinite else {
+                throw ParseError.parse(path: url.path, line: 0, reason: "non-finite state value: \(field)")
+            }
+            return converted
+        }
         // displayMode (unknown -> .ballStick fallback, forward-compatible).
         if let mode = obj["displayMode"] as? String {
-            scene.displayMode = DisplayMode(rawValue: mode) ?? .ballStick
+            candidate.displayMode = DisplayMode(rawValue: mode) ?? .ballStick
         }
         // supercell [n1,n2,n3]. Widen into atoms (not a bare field) so a saved
         // supercell is actually rendered — otherwise the restored view would show
@@ -92,16 +113,15 @@ enum StateStore {
             let d01 = dims[0].multipliedReportingOverflow(by: dims[1])
             let d012 = d01.partialValue.multipliedReportingOverflow(by: dims[2])
             guard !d01.overflow, !d012.overflow else {
-                print("[mcrysden] warning: saved supercell (\(dims)) refused (overflow)")
-                return
+                throw ParseError.parse(path: url.path, line: 0, reason: "saved supercell overflow")
             }
             let total = d012.partialValue
-            guard !total.multipliedReportingOverflow(by: scene.atoms.count).overflow,
-                  total * scene.atoms.count <= Scene.superCellAtomCap else {
-                print("[mcrysden] warning: saved supercell (\(dims)) refused (would exceed atom cap)")
-                return
+            let atomTotal = total.multipliedReportingOverflow(by: candidate.atoms.count)
+            guard !atomTotal.overflow, atomTotal.partialValue <= Scene.superCellAtomCap else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "saved supercell would exceed atom cap")
             }
-            scene = scene.widenSuperCell(SuperCell(n1: dims[0], n2: dims[1], n3: dims[2]))
+            candidate = candidate.widenSuperCell(SuperCell(n1: dims[0], n2: dims[1], n3: dims[2]))
         }
         // slab (optional). Assign the plane AND actually filter the atoms so a
         // saved slab is rendered — in headless export the scene is drawn
@@ -110,66 +130,77 @@ enum StateStore {
         // widened set that the slab should filter.
         if let slab = obj["slab"] as? [String: Any],
            let a = slab["planeA"] as? [String: Any], let b = slab["planeB"] as? [String: Any] {
+            let distanceA = try finiteFloat(a["distance"], field: "slab.planeA.distance") ?? 0
+            let distanceB = try finiteFloat(b["distance"], field: "slab.planeB.distance") ?? 0
             let sl = Slab(
                 planeA: Plane(h: a["h"] as? Int ?? 0, k: a["k"] as? Int ?? 1, l: a["l"] as? Int ?? 0,
-                              distance: (a["distance"] as? Double).map(Float.init) ?? 0),
+                              distance: distanceA),
                 planeB: Plane(h: b["h"] as? Int ?? 0, k: b["k"] as? Int ?? -1, l: b["l"] as? Int ?? 0,
-                              distance: (b["distance"] as? Double).map(Float.init) ?? 0))
-            scene = scene.applySlab(sl)
+                              distance: distanceB))
+            candidate = candidate.applySlab(sl)
         } else {
-            scene = scene.applySlab(nil)
+            candidate = candidate.applySlab(nil)
         }
         // appearance.
-        if let bg = obj["background"] as? String { scene.background = bg }
-        if let bb = obj["backgroundBottom"] as? String { scene.backgroundBottom = bb }
-        if let bt = obj["backgroundType"] as? String { scene.backgroundType = BackgroundType(rawValue: bt) ?? .solid }
-        if let v = obj["showCellFrame"] as? Bool { scene.showCellFrame = v }
-        if let v = obj["showAxes"] as? Bool { scene.showAxes = v }
-        if let v = obj["showLabels"] as? Bool { scene.showLabels = v }
-        if let v = obj["showBrillouinZone"] as? Bool { scene.showBrillouinZone = v }
-        if let v = obj["showStructure"] as? Bool { scene.showStructure = v }
-        if let v = obj["showIsoSurface"] as? Bool { scene.showIsoSurface = v }
-        if !scene.multiOrbitalFields.isEmpty {
-            let requested = obj["currentOrbital"] as? Int ?? scene.currentOrbital
-            let index = min(max(0, requested), scene.multiOrbitalFields.count - 1)
-            scene.currentOrbital = index
-            scene.scalarField = scene.multiOrbitalFields[index]
+        if let bg = obj["background"] as? String { candidate.background = bg }
+        if let bb = obj["backgroundBottom"] as? String { candidate.backgroundBottom = bb }
+        if let bt = obj["backgroundType"] as? String { candidate.backgroundType = BackgroundType(rawValue: bt) ?? .solid }
+        if let v = obj["showCellFrame"] as? Bool { candidate.showCellFrame = v }
+        if let v = obj["showAxes"] as? Bool { candidate.showAxes = v }
+        if let v = obj["showLabels"] as? Bool { candidate.showLabels = v }
+        if let v = obj["showBrillouinZone"] as? Bool { candidate.showBrillouinZone = v }
+        if let v = obj["showStructure"] as? Bool { candidate.showStructure = v }
+        if let v = obj["showIsoSurface"] as? Bool { candidate.showIsoSurface = v }
+        if !candidate.multiOrbitalFields.isEmpty {
+            let requested = obj["currentOrbital"] as? Int ?? candidate.currentOrbital
+            let index = min(max(0, requested), candidate.multiOrbitalFields.count - 1)
+            candidate.currentOrbital = index
+            candidate.scalarField = candidate.multiOrbitalFields[index]
         } else if let requested = obj["currentOrbital"] as? Int {
-            scene.currentOrbital = max(0, requested)
+            candidate.currentOrbital = max(0, requested)
         }
-        if let v = obj["isoLevel"] as? Double {
-            let requested = Float(v)
-            if let field = scene.scalarField {
-                scene.isoLevel = min(field.maxValue, max(field.minValue, requested))
+        if let requested = try finiteFloat(obj["isoLevel"], field: "isoLevel") {
+            if let field = candidate.scalarField {
+                candidate.isoLevel = min(field.maxValue, max(field.minValue, requested))
             } else {
-                scene.isoLevel = requested
+                candidate.isoLevel = requested
             }
         }
-        if let v = obj["showFermiSurface"] as? Bool { scene.showFermiSurface = v }
-        if let v = obj["showForces"] as? Bool { scene.showForces = v }
+        if let v = obj["showFermiSurface"] as? Bool { candidate.showFermiSurface = v }
+        if let v = obj["showForces"] as? Bool { candidate.showForces = v }
         // Clamp to the sidebar's 5...200 range so a malformed state file can't feed
         // a negative/zero/giant scale into Metal (reversed or infinite arrow verts).
-        if let v = obj["forceScale"] as? Double {
-            scene.forceScale = min(200, max(5, Float(v)))
+        if let v = try finiteFloat(obj["forceScale"], field: "forceScale") {
+            candidate.forceScale = min(200, max(5, v))
         }
-        if let v = obj["atomScale"] as? Double { scene.atomScale = Float(v) }
-        if let v = obj["bondRadius"] as? Double { scene.bondRadius = Float(v) }
+        if let v = try finiteFloat(obj["atomScale"], field: "atomScale") { candidate.atomScale = v }
+        if let v = try finiteFloat(obj["bondRadius"], field: "bondRadius") {
+            candidate.bondRadius = min(1, max(0.001, v))
+        }
         if let light = obj["lighting"] as? [String: Any] {
             var l = Lighting()
-            l.ambient = (light["ambient"] as? Double).map(Float.init) ?? l.ambient
-            l.diffuse = (light["diffuse"] as? Double).map(Float.init) ?? l.diffuse
-            l.specular = (light["specular"] as? Double).map(Float.init) ?? l.specular
-            l.shininess = (light["shininess"] as? Double).map(Float.init) ?? l.shininess
-            l.azimuth = (light["azimuth"] as? Double).map(Float.init) ?? l.azimuth
-            l.elevation = (light["elevation"] as? Double).map(Float.init) ?? l.elevation
-            scene.lighting = l
+            l.ambient = try finiteFloat(light["ambient"], field: "lighting.ambient") ?? l.ambient
+            l.diffuse = try finiteFloat(light["diffuse"], field: "lighting.diffuse") ?? l.diffuse
+            l.specular = try finiteFloat(light["specular"], field: "lighting.specular") ?? l.specular
+            l.shininess = try finiteFloat(light["shininess"], field: "lighting.shininess") ?? l.shininess
+            l.azimuth = try finiteFloat(light["azimuth"], field: "lighting.azimuth") ?? l.azimuth
+            l.elevation = try finiteFloat(light["elevation"], field: "lighting.elevation") ?? l.elevation
+            candidate.lighting = l
         }
-        if let v = obj["currentFrame"] as? Int { scene.currentFrame = v }
-        // camera (optional).
+        if let v = obj["currentFrame"] as? Int { candidate.currentFrame = v }
+        // camera (optional). Wrap a malformed subtree as a path-bearing
+        // ParseError (transactional rollback is preserved: scene/camera are only
+        // committed at the end, so a throw here leaves the caller's state intact).
         if let c = obj["camera"] {
-            camera = try dec.decode(Camera.self, from: try JSONSerialization.data(withJSONObject: c))
+            do {
+                candidateCamera = try dec.decode(Camera.self, from: try JSONSerialization.data(withJSONObject: c))
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0, reason: "malformed camera: \(error)")
+            }
         } else {
-            camera = nil
+            candidateCamera = nil
         }
+        scene = candidate
+        camera = candidateCamera
     }
 }

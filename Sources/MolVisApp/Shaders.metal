@@ -10,6 +10,20 @@ struct FrameData    { float4x4 view; float4x4 proj; float3 lightDir; };
 struct VInOut  { float4 position [[position]]; float3 worldPos; float3 normal; float3 color; };
 struct LineVOut { float4 position [[position]]; float3 color; };
 
+float3x3 normalMatrix3x3(float3x3 m) {
+    float a = m[0][0], b = m[1][0], c = m[2][0];
+    float d = m[0][1], e = m[1][1], f = m[2][1];
+    float g = m[0][2], h = m[1][2], k = m[2][2];
+    float c00 = e*k - f*h, c01 = -(d*k - f*g), c02 = d*h - e*g;
+    float c10 = -(b*k - c*h), c11 = a*k - c*g, c12 = -(a*h - b*g);
+    float c20 = b*f - c*e, c21 = -(a*f - c*d), c22 = a*e - b*d;
+    float det = a*c00 + b*c01 + c*c02;
+    if (abs(det) < 1e-12) return float3x3(1.0);
+    return float3x3(float3(c00, c10, c20) / det,
+                    float3(c01, c11, c21) / det,
+                    float3(c02, c12, c22) / det);
+}
+
 vertex VInOut v_main(VertexIn in [[stage_in]],
                      constant InstanceData *insts [[buffer(1)]],
                      constant FrameData &f [[buffer(2)]],
@@ -18,7 +32,8 @@ vertex VInOut v_main(VertexIn in [[stage_in]],
     constant InstanceData &inst = insts[iid];
     float4 world = inst.model * float4(in.position * inst.radius, 1.0);
     o.worldPos = world.xyz;
-    o.normal = (inst.model * float4(in.normal, 0.0)).xyz;
+    float3x3 model3 = float3x3(inst.model[0].xyz, inst.model[1].xyz, inst.model[2].xyz);
+    o.normal = normalMatrix3x3(model3) * in.normal;
     o.color = inst.color.rgb;
     o.position = f.proj * f.view * world;
     return o;

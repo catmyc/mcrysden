@@ -715,8 +715,12 @@ enum Parser {
     private static func loadCube(_ url: URL) throws -> LoadedScene {
         let raw = try String(contentsOf: url, encoding: .utf8)
         var lines = raw.components(separatedBy: "\n")
-        // tolerate files that lack a trailing newline by trimming empties between
-        // records but KEEP blank comment lines (lines 0-1) — index by reading.
+        guard lines.count >= 2 else {
+            throw ParseError.parse(path: url.path, line: 1, reason: "missing cube comments")
+        }
+        // Cube always has two physical comment records; consume them directly so
+        // an empty comment does not shift the numeric header.
+        lines.removeFirst(2)
         func nextTokenLine() -> [String]? {
             while !lines.isEmpty {
                 let line = lines.removeFirst()
@@ -727,18 +731,32 @@ enum Parser {
             }
             return nil
         }
-        // two comment lines (discard)
-        _ = nextTokenLine(); _ = nextTokenLine()
-
         // natoms, origin (Bohr). If natoms < 0 there are multiple orbitals.
-        guard let h = nextTokenLine(), let nAtomsT = Int(h[0]) else {
+        // Reject Int.min outright: abs(Int.min) traps on overflow in Swift, and an
+        // out-of-range header count must never reach the allocation path.
+        guard let h = nextTokenLine(), h.count >= 4, let nAtomsT = Int(h[0]) else {
             throw ParseError.parse(path: url.path, line: 3, reason: "bad cube header")
+        }
+        guard nAtomsT != Int.min else {
+            throw ParseError.parse(path: url.path, line: 3, reason: "cube atom count out of range")
         }
         let multiOrb = nAtomsT < 0
         let natoms = abs(nAtomsT)
+        // Cap declared atoms to a sane upper bound: the atom loop below reads this
+        // many records, so an absurd count must be rejected before it is honored.
+        guard natoms <= Scene.superCellAtomCap else {
+            throw ParseError.parse(path: url.path, line: 3, reason: "cube atom count out of range")
+        }
         // origin is in the same units as the axes; the per-axis unit flag (above)
         // decides the conversion. Use Bohr default when there are no axes to read.
-        let originRaw = SIMD3<Float>(Float(h[1]) ?? 0, Float(h[2]) ?? 0, Float(h[3]) ?? 0)
+        // Reject non-finite origin components: a NaN/Inf origin would silently
+        // corrupt every atom and grid position built from it.
+        guard let ox0 = Float(h[1]), ox0.isFinite,
+              let oy0 = Float(h[2]), oy0.isFinite,
+              let oz0 = Float(h[3]), oz0.isFinite else {
+            throw ParseError.parse(path: url.path, line: 3, reason: "bad cube origin")
+        }
+        let originRaw = SIMD3<Float>(ox0, oy0, oz0)
 
         // axis counts + step vectors. Gaussian cube writes a SIGNED voxel count per
         // axis: the magnitude is the sample count and the sign is the unit flag
@@ -748,36 +766,80 @@ enum Parser {
         var nAxis = [0, 0, 0]
         var dx = [SIMD3<Float>(0,0,0), SIMD3<Float>(0,0,0), SIMD3<Float>(0,0,0)]
         var bohrUnits: Bool? = nil
+        // Per-axis upper bound (samples along one axis). A single axis beyond this
+        // is unrealistic and keeps the triple-product within Int64 range so the
+        // overflow-checked multiply below cannot wrap.
+        let axisCap = 25_000_000
         for i in 0..<3 {
-            guard let t = nextTokenLine(), let ni = Int(t[0]) else { throw ParseError.parse(path: url.path, line: 4+i, reason: "bad cube axis") }
+            guard let t = nextTokenLine(), t.count >= 4, let ni = Int(t[0]) else { throw ParseError.parse(path: url.path, line: 4+i, reason: "bad cube axis") }
+            guard ni != Int.min else { throw ParseError.parse(path: url.path, line: 4+i, reason: "cube axis count out of range") }
             let axisBohr = ni >= 0
             if let prev = bohrUnits, prev != axisBohr {
                 throw ParseError.parse(path: url.path, line: 4+i, reason: "mixed-sign cube axes (units must agree)")
             }
             bohrUnits = axisBohr
-            nAxis[i] = abs(ni)
-            dx[i] = SIMD3<Float>(Float(t[1]) ?? 0, Float(t[2]) ?? 0, Float(t[3]) ?? 0)
+            let n = abs(ni)
+            guard n <= axisCap else { throw ParseError.parse(path: url.path, line: 4+i, reason: "cube axis count out of range") }
+            nAxis[i] = n
+            // Reject non-finite axis step vectors — a NaN step would silently
+            // zero out the corresponding grid span and mis-surface the volume.
+            guard let ax0 = Float(t[1]), ax0.isFinite,
+                  let ay0 = Float(t[2]), ay0.isFinite,
+                  let az0 = Float(t[3]), az0.isFinite else {
+                throw ParseError.parse(path: url.path, line: 4+i, reason: "bad cube axis vector")
+            }
+            dx[i] = SIMD3<Float>(ax0, ay0, az0)
         }
         let scale = (bohrUnits ?? true) ? b2a : 1.0
         dx = dx.map { $0 * scale }
         let nx = nAxis[0], ny = nAxis[1], nz = nAxis[2]
+        guard nx > 0, ny > 0, nz > 0 else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "zero cube grid dimension")
+        }
+        // Overflow-checked product before allocating. A raw Int64*Int64*Int64 can
+        // silently wrap to a positive value that passes a naive bound check.
+        guard let perOrb64 = mulOrOverflow(Int64(nx), Int64(ny), Int64(nz)),
+              perOrb64 > 0, perOrb64 <= 25_000_000 else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "cube grid dimensions overflow")
+        }
+        let perOrb = Int(perOrb64)
+        let nxUI = nx, nyUI = ny, nzUI = nz
         // spanning vectors v(i) = (n(i)-1)*dx(i)
-        let vec = [dx[0]*Float(max(1,nx)-1), dx[1]*Float(max(1,ny)-1), dx[2]*Float(max(1,nz)-1)]
+        let vec = [dx[0]*Float(max(1,nxUI)-1), dx[1]*Float(max(1,nyUI)-1), dx[2]*Float(max(1,nzUI)-1)]
 
-        // atom records: Z, charge, x, y, z (in the same units as the axes)
+        // atom records: Z, charge, x, y, z (in the same units as the axes).
+        // Reject non-finite coordinates (a NaN atom position is meaningless).
         let origin = originRaw * scale
         var atoms: [Atom] = []
         for _ in 0..<natoms {
-            guard let t = nextTokenLine(), let Z = Int(t[0]) else { throw ParseError.parse(path: url.path, line: 0, reason: "short cube atoms") }
-            let p = SIMD3<Float>(Float(t[2]) ?? 0, Float(t[3]) ?? 0, Float(t[4]) ?? 0) * scale
+            guard let t = nextTokenLine(), t.count >= 5, let Z = Int(t[0]) else { throw ParseError.parse(path: url.path, line: 0, reason: "short cube atoms") }
+            guard let ax0 = Float(t[2]), ax0.isFinite,
+                  let ay0 = Float(t[3]), ay0.isFinite,
+                  let az0 = Float(t[4]), az0.isFinite else {
+                throw ParseError.parse(path: url.path, line: 0, reason: "bad cube atom coordinate")
+            }
+            let p = SIMD3<Float>(ax0, ay0, az0) * scale
             atoms.append(Atom(coord: p, atomicNumber: Z, label: Table.id(Z)))
         }
         // optional MO record if multiple orbitals: the next token line gives the
         // number of orbitals followed by their 1-based indices, e.g. "2  1  2".
+        // The record is the count PLUS exactly that many indices; any surplus
+        // token on the line is a malformed header. The declared count also cannot
+        // exceed the realistic orbital cap.
         var nOrbitals = 1
         if multiOrb {
-            if let moLine = nextTokenLine(), let nOrb = Int(moLine.first ?? ""), nOrb >= 1 {
+            if let moLine = nextTokenLine(), let nOrb = Int(moLine.first ?? ""), nOrb >= 1, nOrb <= 4096 {
+                // moLine = [nOrb, idx_1, ..., idx_nOrb]; reject surplus tokens.
+                guard moLine.count == nOrb + 1 else {
+                    throw ParseError.parse(path: url.path, line: 0, reason: "cube MO header token count mismatch")
+                }
+                let ids = moLine.dropFirst().compactMap(Int.init)
+                guard ids.count == nOrb, ids.allSatisfy({ $0 > 0 }), Set(ids).count == nOrb else {
+                    throw ParseError.parse(path: url.path, line: 0, reason: "bad cube MO orbital indices")
+                }
                 nOrbitals = nOrb
+            } else {
+                throw ParseError.parse(path: url.path, line: 0, reason: "bad cube MO header")
             }
         }
 
@@ -785,15 +847,31 @@ enum Parser {
         // MO cube, values are additionally interleaved by orbital at every voxel.
         // Read the complete stream, then transpose it into ScalarField's x-fastest
         // layout and one independent value array per orbital.
-        let perOrb = nx * ny * nz
-        let totalNeeded = perOrb * nOrbitals
+        // The MO record's orbital count can be arbitrarily large, so this product is
+        // also overflow-checked (perOrb * nOrbitals) and capped against memory.
+        guard let totalNeeded64 = mulOrOverflow(Int64(perOrb), Int64(nOrbitals)),
+              totalNeeded64 > 0, totalNeeded64 <= 25_000_000 else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "cube value count overflow")
+        }
+        let totalNeeded = Int(totalNeeded64)
         var allValues: [Float] = []
         allValues.reserveCapacity(totalNeeded)
         while allValues.count < totalNeeded, let tok = nextTokenLine() {
-            for s in tok { if allValues.count < totalNeeded, let v = Float(s) { allValues.append(v) } }
+            for s in tok {
+                guard allValues.count < totalNeeded else {
+                    throw ParseError.parse(path: url.path, line: 0, reason: "surplus cube values")
+                }
+                guard let v = Float(s), v.isFinite else {
+                    throw ParseError.parse(path: url.path, line: 0, reason: "non-finite cube value")
+                }
+                allValues.append(v)
+            }
         }
         guard allValues.count == totalNeeded else {
             throw ParseError.parse(path: url.path, line: 0, reason: "cube grid short (\(allValues.count)/\(totalNeeded))")
+        }
+        if nextTokenLine() != nil {
+            throw ParseError.parse(path: url.path, line: 0, reason: "surplus cube values")
         }
 
         var valuesByOrbital = Array(repeating: [Float](repeating: 0, count: perOrb), count: nOrbitals)
@@ -829,6 +907,19 @@ enum Parser {
         out.multiOrbitalFields = multiOrbitalFields
         out.title = url.lastPathComponent
         return out
+    }
+
+    /// Overflow-checked product. Returns the product of the given non-negative
+    /// Int64 factors, or nil if it overflows the Int64 range. Used to size cube /
+    /// BXSF allocations where a wrapped (negative or spuriously small) product
+    /// must not pass a magnitude bound check.
+    private static func mulOrOverflow(_ a: Int64, _ b: Int64) -> Int64? {
+        let (p, o) = a.multipliedReportingOverflow(by: b)
+        return o ? nil : p
+    }
+    private static func mulOrOverflow(_ a: Int64, _ b: Int64, _ c: Int64) -> Int64? {
+        guard let p = mulOrOverflow(a, b) else { return nil }
+        return mulOrOverflow(p, c)
     }
 
     /// QE PWscf `.pwo` / `.out`: atoms + cell come from the C `parse_pwo`; forces,

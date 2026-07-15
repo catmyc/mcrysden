@@ -102,6 +102,9 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
         for (int i = 0; i < 119; i++) cov[i] = (i < n) ? 1.05f * rcovdef[i] : 0.0f;
         ready = 1;
     }
+    /* Cap natoms before the bond-pass: a huge atom count would overflow the
+       signed cap below (natoms*4) and is never realistic for a structure file. */
+    if (s->natoms > 500000) { set_error(path,0,"too many atoms for bond heuristic"); *out_nbonds=0; return NULL; }
     int cap = s->natoms * 4, nb = 0;
     if (cap < 4) cap = 4;
     MolEnvBond *b = calloc(cap, sizeof(MolEnvBond));
@@ -224,9 +227,13 @@ static int read_datagrid_block(FILE *fp, MolEnvGrid *g, const char *path, int *l
     (*ln)++;
     {
         int nx=0, ny=0, nz=0;
-        if (sscanf(line,"%d %d %d",&nx,&ny,&nz)<1) { set_error(path,*ln,"malformed DATAGRID dims"); return -1; }
-        if (g->dim==2) { g->n[0]=nx>0?nx:1; g->n[1]=ny>0?ny:1; g->n[2]=1; }
-        else           { g->n[0]=nx>0?nx:1; g->n[1]=ny>0?ny:1; g->n[2]=nz>0?nz:1; }
+        int parsed = sscanf(line,"%d %d %d",&nx,&ny,&nz);
+        if ((g->dim == 2 && parsed != 2) || (g->dim == 3 && parsed != 3) ||
+            nx <= 0 || ny <= 0 || (g->dim == 3 && nz <= 0)) {
+            set_error(path,*ln,"malformed DATAGRID dims"); return -1;
+        }
+        if (g->dim==2) { g->n[0]=nx; g->n[1]=ny; g->n[2]=1; }
+        else           { g->n[0]=nx; g->n[1]=ny; g->n[2]=nz; }
     }
 
     /* origin */
@@ -234,6 +241,9 @@ static int read_datagrid_block(FILE *fp, MolEnvGrid *g, const char *path, int *l
     (*ln)++;
     if (sscanf(line,"%f %f %f",&g->orig[0],&g->orig[1],&g->orig[2])<3) {
         set_error(path,*ln,"malformed DATAGRID origin"); return -1;
+    }
+    if (!isfinite(g->orig[0]) || !isfinite(g->orig[1]) || !isfinite(g->orig[2])) {
+        set_error(path,*ln,"non-finite DATAGRID origin"); return -1;
     }
 
     /* span vectors: two for a 2D grid (it spans a plane), three for 3D. Reading
@@ -245,27 +255,52 @@ static int read_datagrid_block(FILE *fp, MolEnvGrid *g, const char *path, int *l
         if (sscanf(line,"%f %f %f",&g->vec[ax][0],&g->vec[ax][1],&g->vec[ax][2])<3) {
             set_error(path,*ln,"malformed DATAGRID vector"); return -1;
         }
+        if (!isfinite(g->vec[ax][0]) || !isfinite(g->vec[ax][1]) || !isfinite(g->vec[ax][2])) {
+            set_error(path,*ln,"non-finite DATAGRID vector"); return -1;
+        }
     }
 
     /* values — x-fastest, any whitespace run. Read with fscanf so line breaks
-       don't matter (grid may be a single long line or many). */
-    long count = (long)g->n[0]*g->n[1]*g->n[2];
-    g->values = malloc(count * sizeof(float));
+       don't matter (grid may be a single long line or many). Cap the aggregate
+       allocation: a malicious file can declare a grid whose product overflows size_t
+       or requests an absurd amount of memory before any value is read. */
+    const long grid_cap = 25000000L;
+    if (g->n[0] <= 0 || g->n[1] <= 0 || g->n[2] <= 0 ||
+        g->n[0] > grid_cap / g->n[1] ||
+        (long)g->n[0] * g->n[1] > grid_cap / g->n[2]) {
+        set_error(path,*ln,"DATAGRID dimensions overflow"); return -1;
+    }
+    long count = (long)g->n[0] * g->n[1] * g->n[2];
+    g->values = malloc((size_t)count * sizeof(float));
     if (!g->values) { set_error(path,*ln,"out of memory for DATAGRID values"); return -1; }
     g->minval = FLT_MAX; g->maxval = -FLT_MAX;
     for (long i=0; i<count; i++) {
         float v;
-        if (fscanf(fp, "%f", &v)!=1) { set_error(path,*ln,"short DATAGRID values"); return -1; }
+        if (fscanf(fp, "%f", &v)!=1) {
+            free(g->values); g->values = NULL;
+            set_error(path,*ln,"short DATAGRID values"); return -1;
+        }
+        if (!isfinite(v)) {
+            free(g->values); g->values = NULL;
+            set_error(path,*ln,"non-finite DATAGRID value"); return -1;
+        }
         g->values[i] = v;
         if (v < g->minval) g->minval = v;
         if (v > g->maxval) g->maxval = v;
     }
 
     /* advance to END_DATAGRID_3D line */
+    int saw_end = 0;
     while (fgets(line, sizeof(line), fp)) {
         (*ln)++;
         first_tok(line, tok, sizeof(tok));
-        if (strcmp(tok,"END_DATAGRID_3D")==0 || strcmp(tok,"END_DATAGRID_2D")==0) break;
+        if (strcmp(tok,"END_DATAGRID_3D")==0 || strcmp(tok,"END_DATAGRID_2D")==0) {
+            saw_end = 1; break;
+        }
+    }
+    if (!saw_end) {
+        free(g->values); g->values = NULL;
+        set_error(path,*ln,"missing END_DATAGRID marker"); return -1;
     }
     return 0;
 }
@@ -372,7 +407,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             if (have_held && is_datagrid_opener(held, tok) && gridOut && *gridOut == NULL) {
                 MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
                 if (!g) { set_error(path,*ln,"out of memory for DATAGRID"); return -1; }
-                if (read_datagrid_block(fp, g, path, ln) < 0) { free(g); return -1; }
+                if (read_datagrid_block(fp, g, path, ln) < 0) { molenv_grid_free(g); free(g); return -1; }
                 *gridOut = g;
             }
             break;
@@ -387,7 +422,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             if (gridOut && *gridOut == NULL) {
                 MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
                 if (!g) { set_error(path,*ln,"out of memory for DATAGRID"); return -1; }
-                if (read_datagrid_block(fp, g, path, ln) < 0) { free(g); return -1; }
+                if (read_datagrid_block(fp, g, path, ln) < 0) { molenv_grid_free(g); free(g); return -1; }
                 *gridOut = g;
             } else {
                 /* skip the block body so the structure scan can continue */
@@ -446,7 +481,7 @@ MolEnvScene* parse_xsf(const char *path) {
                 MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
                 if (!g) { fclose(fp); set_error(path,ln,"out of memory for DATAGRID");
                            molenv_scene_free(s); return NULL; }
-                if (read_datagrid_block(fp, g, path, &ln) < 0) { free(g);
+                if (read_datagrid_block(fp, g, path, &ln) < 0) { molenv_grid_free(g); free(g);
                     fclose(fp); molenv_scene_free(s); return NULL; }
                 s->grid = g;
                 break;
@@ -736,6 +771,30 @@ static int celldm_index(const char *key) {
     return atoi(key + 7);
 }
 
+/* Grow the four parallel atom buffers to ``ncap`` slots each. On success the
+   originals are freed and replaced through the pointers, returning 1. On any
+   allocation failure, ownership-safe cleanup frees exactly the live allocation
+   per axis (the new buffer if that realloc succeeded, else the original) and
+   returns 0 with *ax..*asym untouched apart from the freed ones — the caller
+   then abandons the buffers and returns NULL. No double-free whether all,
+   none, or a subset succeed. */
+static int grow4(double **ax, double **ay, double **az, char (**asym)[8], int ncap)
+{
+    double *tx = realloc(*ax, ncap * sizeof(double));
+    double *ty = realloc(*ay, ncap * sizeof(double));
+    double *tz = realloc(*az, ncap * sizeof(double));
+    char (*ts)[8] = realloc(*asym, ncap * sizeof(*ts));
+    if (!tx || !ty || !tz || !ts) {
+        if (tx) free(tx); else free(*ax); *ax = NULL;
+        if (ty) free(ty); else free(*ay); *ay = NULL;
+        if (tz) free(tz); else free(*az); *az = NULL;
+        if (ts) free(ts); else free(*asym); *asym = NULL;
+        return 0;
+    }
+    *ax = tx; *ay = ty; *az = tz; *asym = ts;
+    return 1;
+}
+
 MolEnvScene* parse_pwi(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
@@ -802,9 +861,29 @@ MolEnvScene* parse_pwi(const char *path) {
             } else if (strcmp(key, "ibrav") == 0) {
                 ibrav = atoi(vp);
             } else if (strcmp(key, "nat") == 0) {
-                nat = atoi(vp);
+                char *endp = NULL;
+                long v = strtol(vp, &endp, 10);
+                while (endp && (*endp == ' ' || *endp == '\t')) endp++;
+                if (endp && *endp == ',') endp++;
+                while (endp && (*endp == ' ' || *endp == '\t')) endp++;
+                if (endp == vp || !endp || (*endp != '\0' && *endp != '!') || v < 1 || v > 500000) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "nat out of range (1..500000)"); return NULL;
+                }
+                nat = (int)v;
             } else if (strcmp(key, "ntyp") == 0) {
-                ntyp = atoi(vp);
+                /* Strict ntyp range (1..32). An out-of-range or non-integer ntyp
+                   must not silently default to 0/bogus. */
+                char *endp = NULL;
+                long v = strtol(vp, &endp, 10);
+                while (endp && (*endp == ' ' || *endp == '\t')) endp++;
+                if (endp && *endp == ',') endp++;
+                while (endp && (*endp == ' ' || *endp == '\t')) endp++;
+                if (endp == vp || !endp || (*endp != '\0' && *endp != '!') || v < 1 || v > 32) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "ntyp out of range (1..32)"); return NULL;
+                }
+                ntyp = (int)v;
             }
             continue;
         }
@@ -820,6 +899,10 @@ MolEnvScene* parse_pwi(const char *path) {
                 if (*q == '\0' || *q == '#' || *q == '/') continue;
                 char sym[16], pp[256]; double mass;
                 if (sscanf(q, "%15s %lf %255s", sym, &mass, pp) < 2) continue;
+                if (nspecies >= 32) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "too many species (max 32)"); return NULL;
+                }
                 snprintf(species_sym[nspecies], sizeof(species_sym[0]), "%s", sym);
                 char el[4]; qe_element(sym, el);
                 species_z[nspecies] = molenv_symbol_to_z(el[0] ? el : sym);
@@ -859,22 +942,28 @@ MolEnvScene* parse_pwi(const char *path) {
                 char sym[16]; double x, y, z;
                 if (sscanf(q, "%15s %lf %lf %lf", sym, &x, &y, &z) < 4) break;
                 if (natoms >= cap) {
-                    cap *= 2;
-                    double *tx = realloc(ax, cap * sizeof(double));
-                    double *ty = realloc(ay, cap * sizeof(double));
-                    double *tz = realloc(az, cap * sizeof(double));
-                    char (*ts)[8] = realloc(asym, cap * sizeof(*asym));
-                    if (!tx || !ty || !tz || !ts) {
-                        free(tx ? tx : ax); free(ty ? ty : ay);
-                        free(tz ? tz : az); free(ts ? ts : asym);
-                        free(ax); free(ay); free(az); free(asym);
+                    if (cap > 1 << 29) {     /* never need more than this many slots */
+                        if (ax) { free(ax); } if (ay) { free(ay); }
+                        if (az) { free(az); } if (asym) { free(asym); }
                         fclose(fp); set_error(path, 0, "out of memory"); return NULL;
                     }
-                    ax = tx; ay = ty; az = tz; asym = ts;
+                    int ncap = cap * 2;
+                    if (ncap < cap) ncap = cap + (1 << 28); /* overflow-safe growth */
+                    if (!grow4(&ax, &ay, &az, &asym, ncap)) {
+                        fclose(fp); set_error(path, 0, "out of memory"); return NULL;
+                    }
+                    cap = ncap;
                 }
                 snprintf(asym[natoms], sizeof(asym[0]), "%s", sym);
                 ax[natoms] = x; ay[natoms] = y; az[natoms] = z;
                 natoms++;
+            }
+            /* A QE input declares nat atoms and prints exactly nat position
+               lines; exiting early means a truncated / malformed block. Refuse
+               the partial structure rather than silently returning it. */
+            if (nat > 0 && natoms != nat) {
+                free(ax); free(ay); free(az); free(asym);
+                fclose(fp); set_error(path, 0, "truncated ATOMIC_POSITIONS block"); return NULL;
             }
             continue;
         }
@@ -1148,17 +1237,17 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
                 if (sscanf(q, "%15s %lf %lf %lf", sym, &px, &py, &pz) < 4) break;
                 if (!is_target) { got++; continue; }   /* skip non-target frames */
                 if (got >= cap) {
-                    cap *= 2;
-                    double *tx = realloc(ax, cap * sizeof(double));
-                    double *ty = realloc(ay, cap * sizeof(double));
-                    double *tz = realloc(az, cap * sizeof(double));
-                    char (*ts)[8] = realloc(asym, cap * sizeof(*asym));
-                    if (!tx || !ty || !tz || !ts) {
-                        free(tx?tx:ax); free(ty?ty:ay); free(tz?tz:az); free(ts?ts:asym);
-                        free(ax); free(ay); free(az); free(asym);
+                    if (cap > 1 << 29) {
+                        if (ax) { free(ax); } if (ay) { free(ay); }
+                        if (az) { free(az); } if (asym) { free(asym); }
                         fclose(fp); set_error(path, 0, "out of memory"); return NULL;
                     }
-                    ax = tx; ay = ty; az = tz; asym = ts;
+                    int ncap = cap * 2;
+                    if (ncap < cap) ncap = cap + (1 << 28); /* overflow-safe growth */
+                    if (!grow4(&ax, &ay, &az, &asym, ncap)) {
+                        fclose(fp); set_error(path, 0, "out of memory"); return NULL;
+                    }
+                    cap = ncap;
                 }
                 snprintf(asym[got], sizeof(asym[0]), "%s", sym);
                 if (frac) {
@@ -1172,7 +1261,15 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
                 }
                 got++;
             }
-            if (is_target) { natoms = got; target_done = 1; break; }
+            if (is_target) {
+                /* The block declares nat atoms; an early EOF / malformed line
+                   would otherwise yield a truncated frame. Reject it. */
+                if (nat > 0 && got != nat) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, 0, "truncated ATOMIC_POSITIONS in target frame"); return NULL;
+                }
+                natoms = got; target_done = 1; break;
+            }
             step++;
             continue;
         }
@@ -1249,8 +1346,9 @@ static double cif_float(const char *s) {
 }
 
 /* Resolve an element symbol for a CIF atom label (e.g. "Fe1" -> "Fe",
-   "CA" -> "Ca"). Writes the canonical symbol into el (cap 4) and returns
-   its atomic number via molenv_symbol_to_z. Unknown -> el empty, Z 0. */
+   "CA" -> "Ca"). Writes the canonical symbol into el (at most 3 chars + NUL,
+   so the buffer needs >= 4 bytes) and returns its atomic number via
+   molenv_symbol_to_z. Unknown -> el empty, Z 0. */
 static int cif_resolve_z(const char *label, char *el) {
     char t[8] = {0};
     int i = 0;
@@ -1258,6 +1356,7 @@ static int cif_resolve_z(const char *label, char *el) {
     t[i] = '\0';
     while (i > 0 && t[i - 1] >= '0' && t[i - 1] <= '9') t[--i] = '\0';
     if (i == 0) { el[0] = '\0'; return 0; }
+    if (i > 3) i = 3; /* canonical symbols are <= 2 letters; cap defensively */
     el[0] = (char)toupper((unsigned char)t[0]);
     for (int k = 1; k < i; k++) el[k] = (char)tolower((unsigned char)t[k]);
     el[i] = '\0';
@@ -1402,10 +1501,13 @@ MolEnvScene* parse_cif(const char *path) {
                     double fz = cif_float(toks[ci + 2]);
                     const char *lbl = NULL;
                     if (col_label >= 0 && col_label < nt) lbl = toks[col_label];
-                    char el[4] = {0};
+                    char el[8] = {0};
                     int z = lbl ? cif_resolve_z(lbl, el) : 0;
                     if (z == 0 && col_type >= 0 && col_type < nt)
                         z = cif_resolve_z(toks[col_type], el);
+                    if (natoms >= 500000) {
+                        free(at); fclose(fp); set_error(path, ln, "too many CIF atoms"); return NULL;
+                    }
                     if (natoms >= acap) {
                         acap = acap ? acap * 2 : 16;
                         Catom *t = realloc(at, acap * sizeof(Catom));
@@ -1433,6 +1535,13 @@ MolEnvScene* parse_cif(const char *path) {
     }
 
     int saw_cell = (len_a > 0 && len_b > 0 && len_c > 0);
+    if (!saw_cell) {
+        for (int i = 0; i < natoms; i++) {
+            if (at[i].frac) {
+                free(at); set_error(path, 0, "fractional CIF coordinates require a cell"); return NULL;
+            }
+        }
+    }
 
     /* Convert any fractional coordinates to Cartesian now that the cell is
        known (cell tags may have come before or after the atom loop). */
@@ -1478,6 +1587,28 @@ MolEnvScene* parse_cif(const char *path) {
 
 /* ----- POSCAR / CONTCAR / VASP ----- */
 
+/* Strictly parse a non-negative decimal integer token. Returns 1 on success
+   (value written to *out), 0 on any malformed / non-integer / negative /
+   out-of-range input. A token like "1abc" or "1.5" is rejected (must be
+   fully consumed). */
+static int parse_nonneg_int(const char *tok, int *out) {
+    char *endp = NULL;
+    long v = strtol(tok, &endp, 10);
+    if (endp == tok || *endp != '\0') return 0;       /* not a pure integer */
+    if (v < 0) return 0;                               /* negative count */
+    if (v > 500000L) return 0;                          /* per-species cap */
+    *out = (int)v;
+    return 1;
+}
+
+static int parse_finite_double(const char *tok, double *out) {
+    char *endp = NULL;
+    double v = strtod(tok, &endp);
+    if (endp == tok || *endp != '\0' || !isfinite(v)) return 0;
+    *out = v;
+    return 1;
+}
+
 MolEnvScene* parse_poscar(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
@@ -1501,7 +1632,11 @@ MolEnvScene* parse_poscar(const char *path) {
     }
     ln++;
     double scale = 1.0;
-    sscanf(line, "%lf", &scale);
+    char *scale_tok[2];
+    int scale_nt = split_tokens(line, scale_tok, 2);
+    if (scale_nt < 1 || !parse_finite_double(scale_tok[0], &scale) || scale == 0.0) {
+        fclose(fp); set_error(path, ln, "malformed scaling factor"); return NULL;
+    }
 
     /* lines 3-5: lattice vectors, read RAW (unscaled) so we can apply the VASP
        volume convention uniformly. */
@@ -1512,7 +1647,8 @@ MolEnvScene* parse_poscar(const char *path) {
         }
         ln++;
         double u, v, w;
-        if (sscanf(line, "%lf %lf %lf", &u, &v, &w) < 3) {
+        if (sscanf(line, "%lf %lf %lf", &u, &v, &w) < 3 ||
+            !isfinite(u) || !isfinite(v) || !isfinite(w)) {
             fclose(fp); set_error(path, ln, "malformed lattice vector"); return NULL;
         }
         cellv[r][0] = u; cellv[r][1] = v; cellv[r][2] = w;
@@ -1535,13 +1671,18 @@ MolEnvScene* parse_poscar(const char *path) {
         for (int c = 0; c < 3; c++)
             cellv[r][c] *= latScale;
 
-    /* line 6: element symbols (VASP 5+) or counts (VASP 4) */
+    /* line 6: element symbols (VASP 5+) or counts (VASP 4). Strict 32-token
+       cap: the species/counts arrays are fixed at 32, so a surplus-token line is
+       malformed input, not silently truncated data. */
     if (!fgets(line, sizeof(line), fp)) {
         fclose(fp); set_error(path, ln, "unexpected end at species"); return NULL;
     }
     ln++;
     char *stoks[64];
     int snt = split_tokens(line, stoks, 64);
+    if (snt > 32) {
+        fclose(fp); set_error(path, ln, "too many species tokens in POSCAR (max 32)"); return NULL;
+    }
     int vasp5 = 0;
     char species[32][8];
     int nspecies = 0;
@@ -1574,15 +1715,31 @@ MolEnvScene* parse_poscar(const char *path) {
         }
         ln++;
         int nt = split_tokens(line, stoks, 64);
-        for (int i = 0; i < nt && i < 32; i++) { counts[i] = atoi(stoks[i]); ncounts++; }
+        /* VASP5 cardinality: counts must match the number of declared species. */
+        if (nt != nspecies) {
+            fclose(fp); set_error(path, ln, "POSCAR species/count mismatch"); return NULL;
+        }
+        for (int i = 0; i < nt && i < 32; i++) {
+            int c;
+            if (!parse_nonneg_int(stoks[i], &c)) {
+                fclose(fp); set_error(path, ln, "malformed POSCAR species count"); return NULL;
+            }
+            counts[i] = c; ncounts++;
+        }
     } else {
-        for (int i = 0; i < snt && i < 32; i++) { counts[i] = atoi(stoks[i]); ncounts++; };
+        for (int i = 0; i < snt && i < 32; i++) {
+            int c;
+            if (!parse_nonneg_int(stoks[i], &c)) {
+                fclose(fp); set_error(path, ln, "malformed POSCAR species count"); return NULL;
+            }
+            counts[i] = c; ncounts++;
+        };
     }
 
-    int total = 0;
+    long long total = 0;
     for (int i = 0; i < ncounts; i++) total += counts[i];
-    if (total <= 0) {
-        fclose(fp); set_error(path, ln, "no atoms in POSCAR"); return NULL;
+    if (total <= 0 || total > 500000LL) {
+        fclose(fp); set_error(path, ln, "unreasonable atom count in POSCAR"); return NULL;
     }
 
     /* Optional "Selective dynamics" line, then the coordinate mode line. */
@@ -1631,7 +1788,13 @@ MolEnvScene* parse_poscar(const char *path) {
                 fclose(fp); set_error(path, ln, "malformed coordinate");
                 molenv_scene_free(s); return NULL;
             }
-            double px = atof(ctoks[0]), py = atof(ctoks[1]), pz = atof(ctoks[2]);
+            double px, py, pz;
+            if (!parse_finite_double(ctoks[0], &px) ||
+                !parse_finite_double(ctoks[1], &py) ||
+                !parse_finite_double(ctoks[2], &pz)) {
+                fclose(fp); set_error(path, ln, "malformed coordinate");
+                molenv_scene_free(s); return NULL;
+            }
             double cx, cy, cz;
             if (is_frac) {
                 cx = px*cellv[0][0] + py*cellv[1][0] + pz*cellv[2][0];

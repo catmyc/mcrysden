@@ -233,6 +233,28 @@ struct FermiSurface: Codable {
     var fermiEnergy: Float
     var bands: [ScalarField]       // index == band number (parallel to orig file)
 
+    /// Parse the "<index>" token of a "BAND:" <index> marker. The token may carry
+    /// surrounding non-digits (e.g. a trailing ":"); only a pure non-empty digit
+    /// sequence is accepted as a structural marker.
+    private static func parseBANDIndex(_ s: String) -> Int? {
+        let token = s.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+        guard !token.isEmpty, token.allSatisfy({ $0.isNumber }) else { return nil }
+        return Int(token)
+    }
+
+    /// Overflow-checked product of two non-negative Int64 factors; nil on overflow.
+    private static func mulOrOverflow(_ a: Int64, _ b: Int64) -> Int64? {
+        let (p, o) = a.multipliedReportingOverflow(by: b)
+        return o ? nil : p
+    }
+    /// Overflow-checked triple product of three non-negative Int64 factors; nil on
+    /// overflow. A raw Int64*Int64*Int64 can silently wrap to a positive value that
+    /// would pass a magnitude bound, so grid-sizing calls go through this.
+    private static func mulOrOverflow(_ a: Int64, _ b: Int64, _ c: Int64) -> Int64? {
+        guard let p = mulOrOverflow(a, b) else { return nil }
+        return mulOrOverflow(p, c)
+    }
+
     /// Parse a text-format `.bxsf` file (NOT gzipped — decompress first; use
     /// `BXSFLoader.load(from:)` which shells out to `/usr/bin/gunzip` for `.gz`).
     /// The Fermi energy is read from the `Fermi Energy:` header line. The block
@@ -245,66 +267,131 @@ struct FermiSurface: Codable {
             s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
         }
 
-        // 1) Fermi energy from the header line.
-        var fermi: Float = 0
+        // 1) Fermi energy from the canonical "Fermi Energy:" header line. A BXSF
+        // must declare one; a missing or non-finite value is malformed. Match the
+        // canonical label (case-insensitive) rather than any incidental mention of
+        // "fermi" + "energy" elsewhere in the file.
+        var fermi: Float? = nil
         for line in lines {
-            guard line.lowercased().contains("fermi") && line.lowercased().contains("energy") else { continue }
+            let lower = line.lowercased().trimmingCharacters(in: .whitespaces)
+            guard lower.hasPrefix("fermi energy:") else { continue }
             let toks = tokens(line)
-            // the value is the last numeric token on the line
             for t in toks.reversed() {
                 let clean = t.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-                if let v = Float(clean) { fermi = v; break }
+                if let v = Float(clean), v.isFinite { fermi = v; break }
             }
             break
         }
+        guard let fermi = fermi else { throw E.malformed("BXSF missing Fermi energy") }
 
-        // 2) Open the BANDGRID block and read the common header.
+        // 2) Open the BANDGRID block and read the common header. Require both the
+        // BEGIN marker and a matching END marker — a block that opens but never
+        // closes is malformed, not an empty grid.
         guard let beginIdx = lines.firstIndex(where: {
             $0.contains("BEGIN_BLOCK_BANDGRID3D") || $0.contains("BEGIN_BLOCK_BANDGRID_3D")
         }) else { throw E.malformed("no BEGIN_BLOCK_BANDGRID_3D block") }
+        guard beginIdx + 1 < lines.count, let endIdx = lines[(beginIdx+1)...].firstIndex(where: {
+            $0.contains("END_BANDGRID_3D") || $0.contains("END_BANDGRID3D")
+        }) else { throw E.malformed("no END_BANDGRID_3D block") }
+        guard let identIdx = lines[(beginIdx+1)..<endIdx].firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "BANDGRID_3D_BANDS"
+        }) else { throw E.malformed("no BANDGRID_3D_BANDS marker") }
 
         // Build a stream of numeric tokens (and "BAND" markers) from the body,
-        // skipping the comment line and the BANDGRID_3D_BANDS ident line.
+        // skipping the comment line and the BANDGRID_3D_BANDS ident line. A line
+        // that is neither a BAND marker nor fully numeric is malformed (reject
+        // surplus tokens rather than silently dropping them).
         enum Tok { case num(Float); case band(Int) }
         var stream: [Tok] = []
-        for line in lines[(beginIdx+1)...] {
-            if line.contains("END_BANDGRID") { break }   // END_BANDGRID_3D / END_BANDGRID3D
+        let cellCap = 5_000_000
+        for line in lines[(identIdx+1)..<endIdx] {
             let toks = tokens(line)
             guard !toks.isEmpty else { continue }
-            if toks[0].hasPrefix("BAND") {
-                // "BAND:" <index>
-                if toks.count >= 2, let bi = Int(toks[1]) { stream.append(.band(bi)) }
+            if toks[0].uppercased() == "BAND:" {
+                // "BAND:" <index> — require a usable integer band index.
+                guard toks.count == 2, let bi = parseBANDIndex(toks[1]) else {
+                    throw E.malformed("bad BAND marker")
+                }
+                stream.append(.band(bi))
+                guard stream.count <= cellCap + 2048 else {
+                    throw E.malformed("BXSF data exceeds memory cap")
+                }
                 continue
             }
-            // skip non-numeric lines (comment / ident)
-            if toks.compactMap({ Float($0) }).count != toks.count { continue }
-            for t in toks { if let v = Float(t) { stream.append(.num(v)) } }
+            // Every other non-empty line in the body must be fully numeric.
+            let nums = toks.compactMap { Float($0) }
+            guard nums.count == toks.count else {
+                throw E.malformed("malformed numeric line in BANDGRID block")
+            }
+            guard stream.count + nums.count <= cellCap + 2048 else {
+                throw E.malformed("BXSF data exceeds memory cap")
+            }
+            for v in nums { stream.append(.num(v)) }
         }
 
         var p = 0
         func nextNum() -> Float? { guard p < stream.count else { return nil }; defer { p += 1 };
             if case .num(let v) = stream[p] { return v } else { return nil } }
+        // Integral Int from the stream without ever trapping: rejects NaN/Inf,
+        // non-finite magnitudes, values with a fractional part, and anything
+        // outside the Int range (Int(Float) would trap on the last case and
+        // silently truncate on the fractional case).
+        func nextInt(maximum: Int) -> Int? {
+            guard let f = nextNum() else { return nil }
+            guard f.isFinite, f == f.rounded(), f >= 0, f <= Float(maximum) else { return nil }
+            return Int(f)
+        }
+        let dimCap = cellCap
 
-        guard let nband = nextNum().map(Int.init), nband > 0 else { throw E.malformed("bad nband") }
-        guard let nx = nextNum().map(Int.init), let ny = nextNum().map(Int.init),
-              let nz = nextNum().map(Int.init) else { throw E.malformed("bad dims") }
-        guard let ox = nextNum(), let oy = nextNum(), let oz = nextNum() else { throw E.malformed("bad origin") }
+        guard let nband = nextInt(maximum: 1024), nband > 0 else { throw E.malformed("bad nband") }
+        guard let nx = nextInt(maximum: dimCap), let ny = nextInt(maximum: dimCap),
+              let nz = nextInt(maximum: dimCap),
+              nx > 0, ny > 0, nz > 0 else { throw E.malformed("bad dims") }
+        // Overflow-checked product: a raw Int64*Int64*Int64 can wrap to a positive
+        // value that would pass the magnitude check.
+        guard let perBand = mulOrOverflow(Int64(nx), Int64(ny), Int64(nz)),
+              perBand > 0, perBand <= Int64(cellCap) else { throw E.malformed("BXSF grid dimensions overflow") }
+        // Practical aggregate memory cap: nband * perBand floats must not exceed
+        // a sane ceiling (a malicious file could declare nband * perBand huge while
+        // each factor individually passes its own bound).
+        guard let totalBandCells = mulOrOverflow(perBand, Int64(nband)),
+              totalBandCells > 0, totalBandCells <= Int64(cellCap) else {
+            throw E.malformed("BXSF aggregate band-cell count overflow")
+        }
+        // Origin and span vectors must be finite — non-finite geometry would
+        // silently corrupt every band's world positions.
+        guard let ox = nextNum(), ox.isFinite,
+              let oy = nextNum(), oy.isFinite,
+              let oz = nextNum(), oz.isFinite else { throw E.malformed("bad origin") }
         var vec = [SIMD3<Float>](repeating: .zero, count: 3)
         for a in 0..<3 {
-            guard let vx = nextNum(), let vy = nextNum(), let vz = nextNum() else { throw E.malformed("bad vec") }
+            guard let vx = nextNum(), vx.isFinite,
+                  let vy = nextNum(), vy.isFinite,
+                  let vz = nextNum(), vz.isFinite else { throw E.malformed("bad vec") }
             vec[a] = SIMD3<Float>(vx, vy, vz)
         }
 
-        // 3) Per-band grids. The stream now reads: [BAND i, <nx*ny*nz floats>]*.
+        // 3) Per-band grids. The stream reads: [BAND i, <nx*ny*nz floats>]*.
+        // Each declared band must be introduced by a BAND marker (structural marker)
+        // and carry a complete grid; a file with zero usable bands, or whose usable
+        // bands fall short of the declared count, fails rather than rendering at the
+        // wrong Fermi level. Physical band indices may start above one, but must
+        // be positive, unique, and contiguous.
         var bands: [ScalarField] = []
-        let needed = nx * ny * nz
-        while p < stream.count {
-            // expect a BAND marker (and ignore any stray floats before it)
-            if case .band(_) = stream[p] { p += 1 }
+        let needed = Int(perBand)
+        var previousBandIndex: Int?
+        for _ in 0..<nband {
+            // require an explicit BAND marker to start each band block
+            guard p < stream.count, case .band(let bi) = stream[p], bi > 0,
+                  previousBandIndex.map({ bi > $0 }) ?? true else { break }
+            previousBandIndex = bi
+            p += 1
             var vals: [Float] = []
             while vals.count < needed, p < stream.count {
-                if case .num(let v) = stream[p] { vals.append(v); p += 1 }
-                else { break }
+                if case .num(let v) = stream[p] {
+                    guard v.isFinite else { throw E.malformed("non-finite BXSF band value") }
+                    vals.append(v); p += 1
+                } else { break }
             }
             guard vals.count == needed else { break }
             var mn = vals[0], mx = vals[0]
@@ -312,6 +399,9 @@ struct FermiSurface: Codable {
             bands.append(ScalarField(nx: nx, ny: ny, nz: nz, origin: SIMD3<Float>(ox, oy, oz),
                                      vec: vec, values: vals, minValue: mn, maxValue: mx))
         }
+        if bands.isEmpty { throw E.malformed("no usable bands in BXSF") }
+        guard bands.count == nband else { throw E.malformed("BXSF truncated (\(bands.count)/\(nband) bands)") }
+        guard p == stream.count else { throw E.malformed("surplus BXSF band data") }
         return FermiSurface(fermiEnergy: fermi, bands: bands)
     }
 }

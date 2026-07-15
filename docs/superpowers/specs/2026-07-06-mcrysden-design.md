@@ -270,7 +270,7 @@ Two principles: **never crash on malformed input; never swallow an error silentl
 
 - **Parser errors.** `parse_*` returns `nil` on failure, writes reason to thread-local `molenv_last_error`. Swift wraps as `ParseError { path, line, reason }` with `localizedDescription == "file.xsf:142: unexpected token <FOOBAR>"`. I/O errors caught on Swift side before calling C. GUI shows non-fatal alert; headless prints to stderr and `exit(1)`.
 - **Renderer errors.** Shader compile/link failures caught at Renderer construction (once at launch), surfaced as fatal alert. OOM during supercell expansion bounded by the 500k-atom cap — non-fatal refusal.
-- **State load errors.** Missing keys → defaults. Unknown `displayMode` → `.ballStick` + console log. `version > 1` → non-fatal alert, abort load. Invalid numbers → clamped + console warning.
+- **State load errors.** Missing keys → defaults. Unknown `displayMode` → `.ballStick` + console log. `version > 1` → non-fatal alert, abort load. Invalid numbers → clamped + console warning. Malformed camera subtree or a saved supercell exceeding the atom cap throw a path-bearing `ParseError` and abort the WHOLE load with transactional rollback (neither `scene` nor `camera` is mutated), leaving the current view intact.
 
 In all cases: no crash, no on-disk corruption, no scene deletion. Worst case: user dismisses an alert and proceeds with reasonable defaults.
 

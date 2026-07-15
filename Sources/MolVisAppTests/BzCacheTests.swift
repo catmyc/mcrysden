@@ -103,12 +103,14 @@ final class BzCacheTests: XCTestCase {
         print("[isocache] volumetric_grid iso on vs off: \(d) changed pixels")
         XCTAssertGreaterThan(d, 50, "isosurface must visibly change the render")
 
-        // Gating: a structure-only file must NOT draw a surface.
+        // Gating: a structure-only file must NOT draw a surface regardless of
+        // the toggle (no scalarField present).
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         var plain = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf")))
-        plain.showIsoSurface = true
         XCTAssertNil(plain.scalarField, "si110 has no field")
+        plain.showIsoSurface = false
         let pOff = try render(plain)
+        plain.showIsoSurface = true
         let pOn = try render(plain)
         XCTAssertEqual(diff(pOff, pOn), 0, "no field => no surface regardless of toggle")
     }

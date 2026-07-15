@@ -3,13 +3,17 @@ import Metal
 import MetalKit
 import simd
 
-enum PngExportError: Error { case noGPU, noTex, noCGImage, noPNG }
+enum PngExportError: Error { case noGPU, noTex, noCGImage, noPNG, noQueue, noCommandBuffer, encodeFailed, commandBufferError(Error?) }
 
 enum PngExporter {
     /// Render the scene to PNG at `size`. Returns the rendered CGImage so a caller can
     /// validate pixel content (used by the export tests) in addition to the written file.
     @discardableResult
     static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
+              size.width <= 16_384, size.height <= 16_384 else {
+            throw PngExportError.noTex
+        }
         guard let device = MTLCreateSystemDefaultDevice() else { throw PngExportError.noGPU }
         let renderer = try Renderer(device: device)
         renderer.scene = scene
@@ -20,22 +24,30 @@ enum PngExporter {
         desc.usage = [.renderTarget, .shaderRead]
         desc.storageMode = .shared
         guard let tex = device.makeTexture(descriptor: desc) else { throw PngExportError.noTex }
-        let q = device.makeCommandQueue()!
-        let cb = q.makeCommandBuffer()!
+        guard let q = device.makeCommandQueue() else { throw PngExportError.noQueue }
+        guard let cb = q.makeCommandBuffer() else { throw PngExportError.noCommandBuffer }
         renderer.background = PngExporter.clearColor(scene.background)
         // No camera supplied (headless export)? Fall back to the scene's canonical
         // default framing, which matches what the GUI shows.
         var cam = camera ?? scene.defaultCamera()
         if cam.rotation == simd_quatf(ix:0,iy:0,iz:0,r:0) { cam.rotation = simd_quatf(ix:0,iy:0,iz:0,r:1) }
         let viewport = MTLViewport(originX: 0, originY: 0, width: Double(size.width), height: Double(size.height), znear: 0, zfar: 1)
-        renderer.encode(to: cb, target: tex, viewport: viewport, camera: cam)
+        guard renderer.encode(to: cb, target: tex, viewport: viewport, camera: cam) else {
+            cb.commit(); cb.waitUntilCompleted()
+            throw PngExportError.encodeFailed
+        }
         cb.commit(); cb.waitUntilCompleted()
+        // The GPU can fail without trapping — surface status/error rather than
+        // silently writing a blank/partial frame.
+        if let error = cb.error { throw PngExportError.commandBufferError(error) }
         // tex → CGImage → PNG
         let bytesPerRow = w * 4
         var bytes = [UInt8](repeating: 0, count: bytesPerRow * h)
         tex.getBytes(&bytes, bytesPerRow: bytesPerRow, from: MTLRegionMake2D(0,0,w,h), mipmapLevel: 0)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)!
+        guard let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else {
+            throw PngExportError.noCGImage
+        }
         guard let cg = ctx.makeImage() else { throw PngExportError.noCGImage }
         try write(cgImage: cg, to: url)
         return cg
