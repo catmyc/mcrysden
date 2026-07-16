@@ -2,6 +2,18 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.14] — 2026-07-16
+
+### Fixed
+- Hardened XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL parsing against malformed, truncated, non-finite, and ambiguous input while preserving useful `ParseError` diagnostics.
+- Corrected Quantum Espresso `ibrav` lattice orientations, case-insensitive `celldm` handling, direct DATAGRID forms, CIF loop boundaries, and symbol-based XSF atom rows.
+- Added overflow-safe limits for bond generation, supercell expansion, cell rendering, isosurface generation, and offscreen export allocation.
+- Made renderer and export failures graceful, including unsupported graph formats, invalid dimensions, Metal allocation failures, and EPS overwrite failures.
+- Preserved scene/state behavior across supercell, slab, camera, pan, magnification, frame reload, and renderer-unavailable paths.
+
+### Tests
+- Expanded the macOS test suite to 312 tests, including parser, renderer, export, state, and adversarial regression coverage.
+
 ## [1.1.2] — 2026-07-11
 
 ### Fixed

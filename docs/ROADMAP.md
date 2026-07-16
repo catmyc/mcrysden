@@ -33,7 +33,13 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG + vector PDF/SVG/EPS/PS
 
 ### Tests
-- [x] 153 tests: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache tests (incl. BZ cache + BZ-visible-for-slab render tests + force-arrow render test). `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 312 tests: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache, parser-hardening, renderer-safety, export, and state regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+
+## v1.1.14 hardening
+- [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
+- [x] Resource safety: bond generation, supercell expansion, cell drawing, isosurface generation, and offscreen export enforce overflow-safe practical limits.
+- [x] Export safety: invalid dimensions, unsupported graph formats, Metal allocation failures, and EPS replacement failures are reported without partial or misleading output.
+- [x] UI/state safety: camera, pan, magnification, slab, frame reload, and renderer initialization failure paths are covered by regressions.
 
 ## Half-done (mechanism exists, UI missing)
 - [~] **Save-state menu item** — `StateStore.save` writer is implemented and load is wired to the CLI and headless export, but there is **no menu item or button** to trigger a save from the GUI. A one-line UI hook onto the existing writer.
