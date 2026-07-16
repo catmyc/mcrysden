@@ -41,11 +41,13 @@ final class CellEnclosureTests: XCTestCase {
     }
 
     func testDisplayedCellEnclosesAtoms() throws {
-        let files: [(String, String)] = [
-            ("si110", "/Users/mao/dev/mcrysden/Sources/MolVisAppTests/Fixtures/si110.xsf"),
-            ("ZnS",   "/Users/mao/dev/mcrysden/Sources/MolVisAppTests/Fixtures/zns_like.xsf"),
+        let fixtures = URL(fileURLWithPath: #file).deletingLastPathComponent().appendingPathComponent("Fixtures")
+        let files: [(String, URL)] = [
+            ("si110", fixtures.appendingPathComponent("si110.xsf")),
+            ("ZnS",   fixtures.appendingPathComponent("zns_like.xsf")),
         ]
-        for (tag, path) in files {
+        for (tag, url) in files {
+            let path = url.path
             let s = try load(path)
             guard let cell = s.cell else { print("[cell3d] " + tag + ": no cell"); continue }
             guard let corners = displayedCorners(s) else { continue }
@@ -68,7 +70,8 @@ final class CellEnclosureTests: XCTestCase {
     // Tests the ACTUAL edges the renderer draws (Renderer.cellEdges), and
     // verifies each is parallel to one of the three lattice vectors.
     func testRendererCellEdgesAreLatticeVectors() throws {
-        let s = try load("/Users/mao/dev/mcrysden/Sources/MolVisAppTests/Fixtures/si110.xsf")
+        let fixtures = URL(fileURLWithPath: #file).deletingLastPathComponent().appendingPathComponent("Fixtures")
+        let s = try load(fixtures.appendingPathComponent("si110.xsf").path)
         guard let corners = displayedCorners(s) else { throw Thrown.msg("no cell") }
         let a = corners[1] - corners[0]
         let b = corners[3] - corners[0]

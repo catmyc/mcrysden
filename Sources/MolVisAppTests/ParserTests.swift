@@ -148,6 +148,57 @@ final class ParserTests: XCTestCase {
         XCTAssertFalse(sc.isCrystal)
     }
 
+    // A hybrid XSF with a malformed PRIMCOORD followed by a valid DATAGRID must be
+    // REJECTED with the original parser error — the grid-only fallback must not mask
+    // it. Before the fix, read_chunk's failure silently fell through to
+    // parse_xsf_gridonly, returning a grid-only scene and losing the structure error.
+    func testXSFMalformedHybridRejects() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("hybrid_bad.xsf")
+        try """
+        CRYSTAL
+        PRIMVEC
+         5.0 0.0 0.0
+         0.0 5.0 0.0
+         0.0 0.0 5.0
+        PRIMCOORD
+         2 1
+         6 0 0 0
+        this line is garbage, not a valid atom
+        DATAGRID_3D_density
+         2 2 2
+         0.0 0.0 0.0
+         5.0 0.0 0.0
+         0.0 5.0 0.0
+         0.0 0.0 5.0
+         1 2 3 4 5 6 7 8
+        END_DATAGRID
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(tmp)) { err in
+            guard case ParseError.parse = err else { return XCTFail("expected parse error, got \(err)") }
+        }
+        XCTAssertFalse(String(cString: molenv_last_error()).isEmpty, "error must explain the malformed structure")
+    }
+
+    // A structure-free DATAGRID XSF (no atoms at all) must still parse via the
+    // grid-only fallback — the fallback must remain for genuinely grid-only files.
+    func testXSFGridOnlyAccepts() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("gridonly.xsf")
+        try """
+        DATAGRID_3D_density
+         2 2 2
+         0.0 0.0 0.0
+         1.0 0.0 0.0
+         0.0 1.0 0.0
+         0.0 0.0 1.0
+         1 2 3 4 5 6 7 8
+        END_DATAGRID_3D
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let sc = try Parser.load(tmp)
+        XCTAssertTrue(sc.atoms.isEmpty)
+        XCTAssertNotNil(sc.scalarField)
+        XCTAssertFalse(sc.isCrystal)
+    }
+
     // Bond heuristic must never crash on an out-of-range atomic number: such an
     // atom is simply skipped (no bond), per spec §9 "never crash on malformed input".
     func testBondSkipsOutOfRangeAtomicNumber() throws {
@@ -166,6 +217,20 @@ final class ParserTests: XCTestCase {
         let sc = try Parser.load(tmp)
         XCTAssertEqual(sc.atoms.count, 2)
         XCTAssertEqual(sc.bonds.count, 0)
+    }
+
+    // Bond heuristic must refuse O(n^2) work above its documented cap without
+    // dereferencing the (here NULL) atom buffer — the guard reads natoms first, so
+    // no massive array needs to be allocated to verify the policy.
+    func testBondGuardSkipsAboveCap() throws {
+        var scene = MolEnvScene()
+        scene.natoms = 8001   // one above MOLENV_BOND_MAX_ATOMS (8000)
+        scene.atoms = nil
+        var nb: Int32 = -1
+        let bonds = molenv_make_bonds(&scene, 1.0, &nb)
+        XCTAssertNil(bonds, "bond heuristic must refuse above the atom cap")
+        XCTAssertEqual(nb, 0)
+        XCTAssertFalse(String(cString: molenv_last_error()).isEmpty, "guard sets an error")
     }
 
     // ----- Quantum Espresso (.pwi) -----
@@ -1361,6 +1426,55 @@ final class ParserTests: XCTestCase {
         XCTAssertGreaterThan(grid.maxValue, grid.minValue, "flat field is not a useful colormap")
         XCTAssertFalse(grid.ident.isEmpty, "grid ident label should be populated")
     }
+
+    // Structure-free grid: an XSF carrying ONLY a DATAGRID_3D block (no atoms) must
+    // still parse — the scene has natoms==0 but a populated scalarField/grid. A bare
+    // (standalone, no BEGIN_BLOCK) opener must behave the same way.
+    private func gridTmp(_ name: String) -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent(name)
+    }
+
+    func testDATAGRIDStructureFree() throws {
+        let url = gridTmp("gridonly.xsf")
+        try """
+        DATAGRID_3D_density
+        2 2 2
+        0 0 0
+        1 0 0
+        0 1 0
+        0 0 1
+        0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8
+        END_DATAGRID_3D
+        """.write(to: url, atomically: true, encoding: .utf8)
+        let loaded = try Parser.load(url)
+        XCTAssertEqual(loaded.atoms.count, 0, "grid-only file has no atoms")
+        XCTAssertFalse(loaded.isCrystal)
+        XCTAssertNil(loaded.cell)
+        XCTAssertNotNil(loaded.scalarField, "3D grid must bridge to a scalarField")
+        XCTAssertNil(loaded.grid2D)
+        XCTAssertEqual(loaded.scalarField?.values.count, 8)
+    }
+
+    func testDATAGRIDStructureFreeWrapped() throws {
+        let url = gridTmp("gridonly-wrapped.xsf")
+        try """
+        BEGIN_BLOCK_DATAGRID_3D
+        3D Total Charge Density
+        BEGIN_DATAGRID_3D_density
+        2 2 2
+        0 0 0
+        1 0 0
+        0 1 0
+        0 0 1
+        0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8
+        END_DATAGRID_3D
+        END_BLOCK_DATAGRID_3D
+        """.write(to: url, atomically: true, encoding: .utf8)
+        let loaded = try Parser.load(url)
+        XCTAssertEqual(loaded.atoms.count, 0)
+        XCTAssertNotNil(loaded.scalarField)
+        XCTAssertEqual(loaded.scalarField?.values.count, 8)
+    }
 }
 
 // MARK: - Adversarial regression coverage (findings 1-6)
@@ -1768,5 +1882,843 @@ final class AdversarialParserRegressionTests: XCTestCase {
         let url = tmp("nan-coordinate.poscar")
         try write("bad\n1.0\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\nNaN 0 0\n", to: url)
         mustThrow(url, as: .poscar)
+    }
+
+    // MARK: Regression tests — review findings
+
+    // ibrav=5 (trigonal R): verify correct cell lengths and angle.
+    // For cosbc = cos(60°) = 0.5, |vi| = a, all pairwise angles = 60°.
+    func testQEibrav5CellVectors() throws {
+        let url = tmp("ibrav5.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = 5, celldm(1) = 8.0, celldm(4) = 0.5, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertNotNil(s.cell)
+        let a = s.cell!.a, b = s.cell!.b, c = s.cell!.c
+        let lenA = simd_length(a), lenB = simd_length(b), lenC = simd_length(c)
+        let expectedLen = Float(8.0 * 0.529177210903)
+        XCTAssertEqual(lenA, expectedLen, accuracy: 0.001, "ibrav=5 |v1| must be a")
+        XCTAssertEqual(lenB, expectedLen, accuracy: 0.001, "ibrav=5 |v2| must be a")
+        XCTAssertEqual(lenC, expectedLen, accuracy: 0.001, "ibrav=5 |v3| must be a")
+        let dotAB = simd_dot(a, b) / (lenA * lenB)
+        XCTAssertEqual(dotAB, 0.5, accuracy: 0.001, "ibrav=5 pairwise cos must be celldm(4)")
+        let dotAC = simd_dot(a, c) / (lenA * lenC)
+        let dotBC = simd_dot(b, c) / (lenB * lenC)
+        XCTAssertEqual(dotAC, 0.5, accuracy: 0.001, "ibrav=5 all pairs must share cos")
+        XCTAssertEqual(dotBC, 0.5, accuracy: 0.001, "ibrav=5 all pairs must share cos")
+    }
+
+    // ibrav=91 (A-centered orthorhombic): v2/v3 must have zero x-component.
+    func testQEibrav91CellVectors() throws {
+        let url = tmp("ibrav91.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = 91, celldm(1) = 6.0, celldm(2) = 1.5, celldm(3) = 2.0, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertNotNil(s.cell)
+        // v1 = (a, 0, 0)
+        XCTAssertEqual(s.cell!.a.y, 0, accuracy: 0.001)
+        XCTAssertEqual(s.cell!.a.z, 0, accuracy: 0.001)
+        // v2 = (0, b/2, -c/2), v3 = (0, b/2, c/2) — zero x-component
+        XCTAssertEqual(s.cell!.b.x, 0, accuracy: 0.001, "ibrav=91 v2.x must be 0")
+        XCTAssertEqual(s.cell!.c.x, 0, accuracy: 0.001, "ibrav=91 v3.x must be 0")
+        let bVal = Float(6.0 * 1.5 * 0.529177210903 / 2.0)
+        let cVal = Float(6.0 * 2.0 * 0.529177210903 / 2.0)
+        XCTAssertEqual(s.cell!.b.y, bVal, accuracy: 0.001)
+        XCTAssertEqual(s.cell!.b.z, -cVal, accuracy: 0.001)
+        XCTAssertEqual(s.cell!.c.y, bVal, accuracy: 0.001)
+        XCTAssertEqual(s.cell!.c.z, cVal, accuracy: 0.001)
+    }
+
+    // ibrav=13 (monoclinic base-centered): v1 != v2, v3 non-zero
+    func testQEibrav13CellVectors() throws {
+        let url = tmp("ibrav13.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = 13, celldm(1) = 8.0, celldm(2) = 1.2, celldm(3) = 1.5, celldm(4) = 0.2, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertNotNil(s.cell)
+        let a = s.cell!.a, b = s.cell!.b, c = s.cell!.c
+        // QE ibrav=13: a1=(a/2,0,-c/2), a2=(b*cos4,b*sin4,0), a3=(a/2,0,c/2)
+        let a0 = Float(8.0 * 0.529177210903)
+        let b0 = Float(8.0 * 1.2 * 0.529177210903)
+        let c0 = Float(8.0 * 1.5 * 0.529177210903)
+        XCTAssertEqual(a.x, a0 / 2, accuracy: 0.001, "a1.x = a/2")
+        XCTAssertEqual(a.y, 0, accuracy: 0.001, "a1.y = 0")
+        XCTAssertEqual(a.z, -c0 / 2, accuracy: 0.001, "a1.z = -c/2")
+        XCTAssertEqual(b.x, b0 * 0.2, accuracy: 0.001, "a2.x = b*cos")
+        XCTAssertEqual(b.y, b0 * Float(sqrt(1.0 - 0.2 * 0.2)), accuracy: 0.001, "a2.y = b*sin")
+        XCTAssertEqual(b.z, 0, accuracy: 0.001, "a2.z = 0")
+        XCTAssertEqual(c.x, a0 / 2, accuracy: 0.001, "a3.x = a/2")
+        XCTAssertEqual(c.y, 0, accuracy: 0.001, "a3.y = 0")
+        XCTAssertEqual(c.z, c0 / 2, accuracy: 0.001, "a3.z = c/2")
+    }
+
+    // QE namelist: case-insensitive keys, comma-separated, trailing comment
+    func testQEInamelistFlexible() throws {
+        let url = tmp("flex.pwi")
+        try write("""
+        &system
+          IBRav = 2, CELldm(1) = 10.26, Nat = 2, ntyp = 1  ! comment
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+         Si 0.25 0.25 0.25
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertEqual(s.atoms.count, 2)
+        XCTAssertTrue(s.isCrystal)
+    }
+
+    // WIEN2k non-numeric Z must not trap; element from symbol fallback.
+    func testWIEN2kNonNumericZ() throws {
+        let url = tmp("wien2k_badZ.struct")
+        try write("""
+        TITLE
+        RELA  2
+          5.0 0.0 0.0
+          0.0 5.0 0.0
+          0.0 0.0 5.0
+        ATOM= 1: X=0.0 Y=0.0 Z=0.0
+        MULT= 1 ISPLIT= 1
+        Si  NPT=  781  R0=0.00001000 RMT=    2.00000   Z: bad
+        ATOM= 2: X=2.5 Y=2.5 Z=2.5
+        MULT= 1 ISPLIT= 1
+        O   NPT=  781  R0=0.00001000 RMT=    2.00000   Z: 8.0
+        """, to: url)
+        let s = try Parser.load(url, as: .struct_)
+        XCTAssertEqual(s.atoms.count, 2)
+        // First atom: Z was "bad" -> parsed as 0, then symbol "Si" fallback -> Z=14
+        XCTAssertEqual(s.atoms[0].atomicNumber, 14)
+        XCTAssertEqual(s.atoms[1].atomicNumber, 8)
+    }
+
+    // CRYSCAL negative natoms must not trap
+    func testCRYSCALNegativeNatoms() throws {
+        let url = tmp("cryscal_neg.r1")
+        try write("""
+        test title
+        CRYSCAL
+        1 2 3
+        225
+        5.0
+        -1
+        """, to: url)
+        // Must throw, not trap
+        mustThrow(url, as: .crystal)
+    }
+
+    // FHI coord.out negative nSpecies must not trap
+    func testFHICoordOutNegativeSpecies() throws {
+        let url = tmp("fhi_neg.fhi")
+        try write("""
+        1.0 0.0 0.0
+        0.0 1.0 0.0
+        0.0 0.0 1.0
+        -1
+        """, to: url)
+        mustThrow(url, as: .fhi)
+    }
+
+    // FHI geometry.in without lattice_vector (nonperiodic molecule)
+    func testFHIGeometryInNonperiodic() throws {
+        let url = tmp("mol_geometry.in")
+        try write("""
+        atom    0.0    0.0    0.0  H
+        atom    0.757  0.586  0.0  O
+        """, to: url)
+        let s = try Parser.load(url, as: .fhi)
+        XCTAssertEqual(s.atoms.count, 2)
+        XCTAssertFalse(s.isCrystal)
+        XCTAssertNil(s.cell)
+    }
+
+    // ORCA out-of-range frame must reject
+    func testORCAOutOfRangeFrame() throws {
+        let url = tmp("orca_frame.orca")
+        try write("""
+        # ORCA
+        CARTESIAN COORDINATES (ANGSTROEM)
+        -----------------------------------------
+        C    0.0    0.0    0.0
+        H    1.0    0.0    0.0
+        -----------------------------------------
+        """, to: url)
+        XCTAssertThrowsError(try Parser.load(url, as: .orca, frameIndex: 5))
+        // frameIndex -1 and 0 should work
+        let s0 = try Parser.load(url, as: .orca, frameIndex: 0)
+        XCTAssertEqual(s0.atoms.count, 2)
+        let sLast = try Parser.load(url, as: .orca, frameIndex: -1)
+        XCTAssertEqual(sLast.atoms.count, 2)
+    }
+
+    // XSF PRIMCOORD with element symbol (not number)
+    func testXSFElementSymbolPRIMCOORD() throws {
+        let url = tmp("prim_symbol.xsf")
+        try write("""
+        CRYSTAL
+        PRIMVEC
+          2 0 0
+          0 2 0
+          0 0 2
+        PRIMCOORD
+          2 1
+          Si 0 0 0
+          O 1 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertEqual(s.atoms.count, 2)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 14) // Si
+        XCTAssertEqual(s.atoms[1].atomicNumber, 8)  // O
+    }
+
+    // PDB: element symbol from cols 77-78, fallback to atom name
+    func testPDBElementColumns() throws {
+        let url = tmp("element77.pdb")
+        // PDB fixed columns: x=31-38, y=39-46, z=47-54, element=77-78 (1-based == idx 76-77).
+        // Build the record so the element symbol lands exactly at cols 77-78.
+        func pdbLine(element: String) -> String {
+            let fixed = "ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00"
+            let prefix = fixed.padding(toLength: 76, withPad: " ", startingAt: 0)
+            return (prefix + element).padding(toLength: 80, withPad: " ", startingAt: 0)
+        }
+        XCTAssertEqual(pdbLine(element: "FE").count, 80, "line must be 80 chars for fixed-column PDB")
+        let line = pdbLine(element: "FE")
+        // Verify the element is exactly at cols 77-78 (0-based indices 76-77).
+        XCTAssertEqual(line[line.index(line.startIndex, offsetBy: 76)], "F")
+        XCTAssertEqual(line[line.index(line.startIndex, offsetBy: 77)], "E")
+        let multi = line + "\n" + pdbLine(element: "C ")
+        try write(multi, to: url)
+        let s = try Parser.load(url, as: .pdb)
+        XCTAssertEqual(s.atoms.count, 2)
+        // First atom: cols 77-78 = "FE" -> Fe (Z=26)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 26, "PDB cols 77-78 must be authoritative")
+        // Second atom: cols 77-78 = "C " -> C (Z=6)
+        XCTAssertEqual(s.atoms[1].atomicNumber, 6, "two-letter slot right-justified single letter")
+    }
+
+    // CIF with nonadjacent/reordered coordinate columns
+    func testCIFNonadjacentColumns() throws {
+        let url = tmp("cif_reorder.cif")
+        try write("""
+        data_test
+        _cell_length_a 5.0
+        _cell_length_b 5.0
+        _cell_length_c 5.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_z
+        _atom_site_fract_x
+        _atom_site_fract_y
+        Fe1 0.25 0.5 0.75
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertEqual(s.atoms.count, 1)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 26)
+        // _fract_z is 2nd column, _fract_x is 3rd, _fract_y is 4th
+        // values: label=Fe1, z=0.25, x=0.5, y=0.75
+        // So cartesian should be (0.5*5, 0.75*5, 0.25*5) = (2.5, 3.75, 1.25)
+        XCTAssertEqual(s.atoms[0].coord.x, 2.5, accuracy: 0.001)
+        XCTAssertEqual(s.atoms[0].coord.y, 3.75, accuracy: 0.001)
+        XCTAssertEqual(s.atoms[0].coord.z, 1.25, accuracy: 0.001)
+    }
+
+    // CIF: cell tags after atom loop must be parsed
+    func testCIFCellAfterAtoms() throws {
+        let url = tmp("cif_cell_after.cif")
+        try write("""
+        data_test
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 0.25 0.25 0.25
+        _cell_length_a 5.0
+        _cell_length_b 5.0
+        _cell_length_c 5.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertEqual(s.atoms.count, 1)
+        XCTAssertTrue(s.isCrystal)
+        XCTAssertNotNil(s.cell)
+        XCTAssertEqual(s.cell!.a.x, 5.0, accuracy: 0.001)
+    }
+
+    // QE output CELL_PARAMETERS (alat=value) form
+    func testPWOCellParametersAlatEquals() throws {
+        let url = tmp("cell_alat_equals.pwo")
+        try write("""
+         bravais-lattice index     =            0
+         lattice parameter (alat)  =      10.2000  a.u.
+         number of atoms/cell      =                 1
+         crystal axes: (cart. coord. in units of alat)
+              1.000000   0.000000   0.000000
+              0.000000   1.000000   0.000000
+              0.000000   0.000000   1.000000
+         CELL_PARAMETERS (alat= 10.2)
+          1.000000   0.000000   0.000000
+          0.000000   1.000000   0.000000
+          0.000000   0.000000   1.000000
+         ATOMIC_POSITIONS (crystal)
+         Si     0.000000   0.000000   0.000000
+        """, to: url)
+        let s = try Parser.load(url, as: .pwo)
+        XCTAssertEqual(s.atoms.count, 1)
+        XCTAssertEqual(s.atoms[0].atomicNumber, 14)
+        let a0 = Float(10.2 * 0.529177210903)
+        XCTAssertEqual(s.cell!.a.x, a0, accuracy: 0.001)
+    }
+
+
+}
+
+// MARK: - Round-2 parser regression tests (independent-review findings 1-8)
+//
+// Each test below locks a mandated parser fix. They live in their own class so the
+// test names do not collide with the round-1 coverage kept in
+// AdversarialParserRegressionTests above.
+
+final class Round2ParserTests: XCTestCase {
+    private func tmp(_ name: String) -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent(name)
+    }
+    private func write(_ text: String, to url: URL) throws {
+        try text.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    // Finding 1: QE ibrav 5 (3-fold along c) must match QE latgen_lib exactly.
+    func testQEibrav5Orientation() throws {
+        let url = tmp("r2_ibrav5o.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = 5, celldm(1) = 8.0, celldm(4) = 0.5, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        let a = s.cell!.a, b = s.cell!.b, c = s.cell!.c
+        XCTAssertEqual(a.z, b.z, accuracy: 0.001, "ibrav=5: a.z must equal b.z")
+        XCTAssertEqual(b.z, c.z, accuracy: 0.001, "ibrav=5: b.z must equal c.z")
+        XCTAssertEqual(a.x, -c.x, accuracy: 0.001)
+        XCTAssertEqual(a.y, c.y, accuracy: 0.001)
+        XCTAssertEqual(b.x, 0, accuracy: 0.001)
+        let expectedLen = Float(8.0 * 0.529177210903)
+        XCTAssertEqual(simd_length(a), expectedLen, accuracy: 0.001)
+    }
+
+    // Finding 1: QE ibrav=-5 (3-fold along 111) => cyclic permutation vectors.
+    func testQEibravMinus5Orientation() throws {
+        let url = tmp("r2_ibravm5o.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = -5, celldm(1) = 8.0, celldm(4) = 0.5, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        let a = s.cell!.a, b = s.cell!.b, c = s.cell!.c
+        XCTAssertEqual(a.x, 0, accuracy: 0.001, "ibrav=-5: a.x must be 0 at cos=0.5")
+        XCTAssertEqual(a.y, a.z, accuracy: 0.001, "ibrav=-5: a.y must equal a.z")
+        XCTAssertEqual(b.y, 0, accuracy: 0.001, "ibrav=-5: b.y must be 0 at cos=0.5")
+        XCTAssertEqual(b.x, b.z, accuracy: 0.001, "ibrav=-5: b.x must equal b.z")
+        XCTAssertEqual(c.z, 0, accuracy: 0.001, "ibrav=-5: c.z must be 0 at cos=0.5")
+        XCTAssertEqual(c.x, c.y, accuracy: 0.001, "ibrav=-5: c.x must equal c.y")
+        // latgen returns Bohr; the scene converts to Angstrom (*BOHR_TO_ANG).
+        let f2Bohr = Float(8.0 * (sqrt(2.0) + sqrt(0.5)) / 3.0)
+        let f2Ang = f2Bohr * Float(0.529177210903)
+        XCTAssertEqual(a.y, f2Ang, accuracy: 0.001)
+        let expectedLen = Float(8.0 * 0.529177210903)
+        XCTAssertEqual(simd_length(a), expectedLen, accuracy: 0.001)
+    }
+
+    // Finding 1: QE ibrav=13 (unique axis c) exact vectors.
+    func testQEibrav13Exact() throws {
+        let url = tmp("r2_ibrav13e.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = 13, celldm(1) = 8.0, celldm(2) = 1.2, celldm(3) = 1.5, celldm(4) = 0.2, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        let a = s.cell!.a, b = s.cell!.b, c = s.cell!.c
+        let a0 = Float(8.0 * 0.529177210903)
+        let b0 = Float(8.0 * 1.2 * 0.529177210903)
+        let c0 = Float(8.0 * 1.5 * 0.529177210903)
+        XCTAssertEqual(a.x, a0 / 2, accuracy: 0.001)
+        XCTAssertEqual(a.y, 0, accuracy: 0.001)
+        XCTAssertEqual(a.z, -c0 / 2, accuracy: 0.001)
+        XCTAssertEqual(b.x, b0 * 0.2, accuracy: 0.001)
+        XCTAssertEqual(b.y, b0 * Float(sqrt(1.0 - 0.2 * 0.2)), accuracy: 0.001)
+        XCTAssertEqual(b.z, 0, accuracy: 0.001)
+        XCTAssertEqual(c.x, a0 / 2, accuracy: 0.001)
+        XCTAssertEqual(c.y, 0, accuracy: 0.001)
+        XCTAssertEqual(c.z, c0 / 2, accuracy: 0.001)
+    }
+
+    // Finding 1: QE ibrav=-13 (unique axis b, cos=celldm5).
+    func testQEibravMinus13Exact() throws {
+        let url = tmp("r2_ibravm13e.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = -13, celldm(1) = 8.0, celldm(2) = 1.2, celldm(3) = 1.5, celldm(5) = 0.2, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        let a = s.cell!.a, b = s.cell!.b, c = s.cell!.c
+        let a0 = Float(8.0 * 0.529177210903)
+        let b0 = Float(8.0 * 1.2 * 0.529177210903)
+        let c0 = Float(8.0 * 1.5 * 0.529177210903)
+        XCTAssertEqual(a.x, a0 / 2, accuracy: 0.001)
+        XCTAssertEqual(a.y, b0 / 2, accuracy: 0.001)
+        XCTAssertEqual(a.z, 0, accuracy: 0.001)
+        XCTAssertEqual(b.x, -a0 / 2, accuracy: 0.001)
+        XCTAssertEqual(b.y, b0 / 2, accuracy: 0.001)
+        XCTAssertEqual(b.z, 0, accuracy: 0.001)
+        XCTAssertEqual(c.x, c0 * 0.2, accuracy: 0.001)
+        XCTAssertEqual(c.y, 0, accuracy: 0.001)
+        XCTAssertEqual(c.z, c0 * Float(sqrt(1.0 - 0.2 * 0.2)), accuracy: 0.001)
+    }
+
+    // QE ibrav=12 (monoclinic P, unique axis c): v1=(a,0,0), v2=(b*cosγ,b*sinγ,0),
+    // v3=(0,0,c), cosγ = celldm(4) = cos(ab).
+    func testQEibrav12Exact() throws {
+        let url = tmp("r3_ibrav12e.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = 12, celldm(1) = 8.0, celldm(2) = 1.2, celldm(3) = 1.5, celldm(4) = 0.2, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        let a = s.cell!.a, b = s.cell!.b, c = s.cell!.c
+        let a0 = Float(8.0 * 0.529177210903)
+        let b0 = Float(8.0 * 1.2 * 0.529177210903)
+        let c0 = Float(8.0 * 1.5 * 0.529177210903)
+        XCTAssertEqual(a.x, a0, accuracy: 0.001)
+        XCTAssertEqual(a.y, 0, accuracy: 0.001)
+        XCTAssertEqual(a.z, 0, accuracy: 0.001)
+        XCTAssertEqual(b.x, b0 * 0.2, accuracy: 0.001)
+        XCTAssertEqual(b.y, b0 * Float(sqrt(1.0 - 0.2 * 0.2)), accuracy: 0.001)
+        XCTAssertEqual(b.z, 0, accuracy: 0.001)
+        XCTAssertEqual(c.x, 0, accuracy: 0.001)
+        XCTAssertEqual(c.y, 0, accuracy: 0.001)
+        XCTAssertEqual(c.z, c0, accuracy: 0.001)
+    }
+
+    // QE ibrav=-12 (monoclinic P, unique axis b): v1=(a,0,0), v2=(0,b,0),
+    // v3=(c*cosβ,0,c*sinβ), cosβ = celldm(5) = cos(ac).
+    func testQEibravMinus12Exact() throws {
+        let url = tmp("r3_ibravm12e.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = -12, celldm(1) = 8.0, celldm(2) = 1.2, celldm(3) = 1.5, celldm(5) = 0.2, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        let a = s.cell!.a, b = s.cell!.b, c = s.cell!.c
+        let a0 = Float(8.0 * 0.529177210903)
+        let b0 = Float(8.0 * 1.2 * 0.529177210903)
+        let c0 = Float(8.0 * 1.5 * 0.529177210903)
+        XCTAssertEqual(a.x, a0, accuracy: 0.001)
+        XCTAssertEqual(a.y, 0, accuracy: 0.001)
+        XCTAssertEqual(a.z, 0, accuracy: 0.001)
+        XCTAssertEqual(b.x, 0, accuracy: 0.001)
+        XCTAssertEqual(b.y, b0, accuracy: 0.001)
+        XCTAssertEqual(b.z, 0, accuracy: 0.001)
+        XCTAssertEqual(c.x, c0 * 0.2, accuracy: 0.001)
+        XCTAssertEqual(c.y, 0, accuracy: 0.001)
+        XCTAssertEqual(c.z, c0 * Float(sqrt(1.0 - 0.2 * 0.2)), accuracy: 0.001)
+    }
+
+    func testQEibravMinus5FractionalOrientation() throws {
+        let url = tmp("r2_ibravm5frac.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = -5, celldm(1) = 8.0, celldm(4) = 0.5, nat = 1, ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 1 0 0
+        """, to: url)
+        let s = try Parser.load(url)
+        let coord = s.atoms[0].coord
+        XCTAssertEqual(coord.x, 0, accuracy: 0.001, "a1.x=0 at cos=0.5")
+        XCTAssertEqual(coord.y, coord.z, accuracy: 0.001, "a1: y==z")
+        XCTAssertNotEqual(coord.x, coord.y, accuracy: 0.001, "orientation must differ from (0,1,0)")
+    }
+
+    // Finding 2: celldm keys are case-insensitive.
+    func testQECellDmCaseInsensitive() throws {
+        let url = tmp("r2_celldm_case.pwi")
+        try write("""
+        &SYSTEM
+          ibrav = 2
+          CELldm(1) = 10.26
+          Nat = 2
+          ntyp = 1
+        /
+        ATOMIC_SPECIES
+         Si 28.0855 Si.upf
+        ATOMIC_POSITIONS crystal
+         Si 0 0 0
+         Si 0.25 0.25 0.25
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertTrue(s.isCrystal)
+        XCTAssertEqual(s.cell!.a.x, Float(-5.13 * 0.529177210903), accuracy: 0.001)
+    }
+
+    // Finding 3: bond heuristic refuses above the (now lowered) cap, reading natoms only.
+    func testBondGuardRefusesHugeNatomsPromptly() throws {
+        var scene = MolEnvScene()
+        scene.natoms = Int32.max
+        scene.atoms = nil
+        var nb: Int32 = -1
+        let bonds = molenv_make_bonds(&scene, 1.0, &nb)
+        XCTAssertNil(bonds, "must refuse above atom cap regardless of magnitude")
+        XCTAssertEqual(nb, 0)
+        XCTAssertFalse(String(cString: molenv_last_error()).isEmpty)
+    }
+
+    func testBondGuardAtNewCap() throws {
+        var scene = MolEnvScene()
+        scene.natoms = 8001
+        scene.atoms = nil
+        var nb: Int32 = -1
+        let bonds = molenv_make_bonds(&scene, 1.0, &nb)
+        XCTAssertNil(bonds, "8001 atoms must be refused under the lowered cap")
+        XCTAssertEqual(nb, 0)
+    }
+
+    // Finding 4: direct BEGIN_DATAGRID_3D (no block wrapper, no comment) must parse.
+    func testXSFDirectBeginDATAGRID3D() throws {
+        let url = tmp("r2_direct_begin.xsf")
+        try write("""
+        BEGIN_DATAGRID_3D_density
+        2 2 2
+        0 0 0
+        1 0 0
+        0 1 0
+        0 0 1
+        0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8
+        END_DATAGRID_3D
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertNotNil(s.scalarField, "direct BEGIN_DATAGRID_3D must parse")
+        XCTAssertEqual(s.scalarField?.values.count, 8)
+    }
+
+    func testXSFDirectBeginDATAGRID2D() throws {
+        let url = tmp("r2_direct_begin2d.xsf")
+        try write("""
+        BEGIN_DATAGRID_2D_planecut
+        2 3
+        0 0 0
+        1 0 0
+        0 1 0
+        0 0 1
+        0.1 0.2 0.3 0.4 0.5 0.6
+        END_DATAGRID_2D
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertNotNil(s.grid2D, "direct BEGIN_DATAGRID_2D must parse")
+        XCTAssertEqual(s.grid2D?.cols, 2)
+        XCTAssertEqual(s.grid2D?.rows, 3)
+    }
+
+    // Finding 5: CIF atom-loop must terminate at a new tag boundary even when the
+    // new tag line has the same token count as the loop columns.
+    func testCIFLoopTerminatesAtNewTag() throws {
+        let url = tmp("r2_cif_tag_boundary.cif")
+        try write("""
+        data_test
+        _cell_length_a 5.0
+        _cell_length_b 5.0
+        _cell_length_c 5.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 0.25 0.25 0.25
+         O1 0.50 0.50 0.50
+        _symmetry_equiv_pos_site_id 1 2
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertEqual(s.atoms.count, 2, "loop must terminate at the new _symmetry_ tag")
+        XCTAssertEqual(s.atoms[0].atomicNumber, 26)
+        XCTAssertEqual(s.atoms[1].atomicNumber, 8)
+    }
+
+    func testCIFLoopTerminatesAtLoopKeyword() throws {
+        let url = tmp("r2_cif_loop_boundary.cif")
+        try write("""
+        data_test
+        _cell_length_a 5.0
+        _cell_length_b 5.0
+        _cell_length_c 5.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 0.25 0.25 0.25
+        loop_
+        _symmetry_equiv_pos_site_id
+        1
+        2
+        """, to: url)
+        let s = try Parser.load(url)
+        XCTAssertEqual(s.atoms.count, 1, "loop must terminate at the new loop_ keyword")
+        XCTAssertEqual(s.atoms[0].atomicNumber, 26)
+    }
+
+    // Finding 6: FHI atom_frac without a lattice must throw a useful ParseError.
+    func testFHIAtomFracWithoutLatticeThrows() throws {
+        let url = tmp("r2_fhi_frac_nolattice.fhi")
+        try write("""
+        atom_frac 0.0 0.0 0.0 Si
+        atom_frac 0.5 0.5 0.5 O
+        """, to: url)
+        XCTAssertThrowsError(try Parser.load(url, as: .fhi)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.contains("lattice"), "error should mention the missing lattice, got: \(reason)")
+        }
+    }
+
+    // Finding 7: PDB must reject NaN/Inf coordinates (skip the record).
+    func testPDBRejectsNaNCoordinates() throws {
+        let url = tmp("r2_pdb_nan.pdb")
+        let base = "ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00"
+        let line = (base as NSString).replacingCharacters(in: NSRange(location: 30, length: 8), with: "   NaN  ")
+        try (line.padding(toLength: 80, withPad: " ", startingAt: 0) + "\nEND").write(to: url, atomically: true, encoding: .utf8)
+        let s = try Parser.load(url, as: .pdb)
+        XCTAssertEqual(s.atoms.count, 0, "PDB record with NaN x must be skipped")
+    }
+
+    // Finding 8: XSF PRIMCOORD with a malformed (partial) row must throw, not leak.
+    func testXSFPRIMCOORDPartialRowThrows() throws {
+        let url = tmp("r2_primcoord_bad.xsf")
+        try write("""
+        CRYSTAL
+        PRIMVEC
+         1 0 0
+         0 1 0
+         0 0 1
+        PRIMCOORD
+         2 1
+         6 0 0 0
+         O 1 0
+        """, to: url)
+        XCTAssertThrowsError(try Parser.load(url), "partial PRIMCOORD row must throw")
+    }
+
+    // Finding 9: WIEN2k short-line bounds safety — a truncated atom line must never
+    // trap (no OOB read). The lenient ATOM= parser skips the incomplete site and zeros
+    // the site count; assert the call returns without crashing. (Audit finding: the
+    // fixed-index atom/symmol reads are all guarded by strlen/count checks.)
+    func testWIEN2kTruncatedAtomLineNoTrap() throws {
+        let url = tmp("r2_wien_trunc.struct")
+        try """
+        TITLE
+        F   1
+        RELA
+          5.0 0.0 0.0
+          0.0 5.0 0.0
+          0.0 0.0 5.0
+        ATOM= 1: X=0.0
+        """.write(to: url, atomically: true, encoding: .utf8)
+        // Must not crash; the incomplete ATOM= line is skipped safely.
+        let s = try Parser.load(url, as: .struct_)
+        XCTAssertEqual(s.atoms.count, 0, "incomplete WIEN2k atom line is skipped, not trapped")
+    }
+
+    func testCRYSCALTruncatedAtomLineThrows() throws {
+        let url = tmp("r2_cryscal_trunc.r1")
+        try """
+        test title
+        CRYSCAL
+        1 2 3
+        225
+        5.0
+        1
+        6 0.0 0.0
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url, as: .crystal), "truncated CRYSCAL atom line must throw")
+    }
+}
+
+// MARK: - Round-3 parser regression tests (XSF structure-intent + symbol rows)
+//
+// Locks the two mandated XSF corrections: ATOMS/ATOMS_FRAC must accept
+// element-symbol atom rows, and structure intent (CRYSTAL/PRIMVEC) must keep a
+// truncated structure file on the structure path instead of masking it behind
+// the grid-only fallback.
+
+final class Round3ParserTests: XCTestCase {
+    private func tmp(_ name: String) -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent(name)
+    }
+    private func write(_ text: String, to url: URL) throws {
+        try text.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    // ATOMS block given with element symbols (and a numeric Z mixed in) must
+    // parse under production dispatch — before the fix, atom_line_p rejected the
+    // leading symbol and silently stopped at the first row.
+    func testXSFAtomsSymbolRows() throws {
+        let url = tmp("atoms_symbol.xsf")
+        try write("""
+        ATOMS
+         Si 0.0 0.0 0.0
+         O  1.5 0.0 0.0
+         1  0.0 1.5 0.0
+        """, to: url)
+        let sc = try Parser.load(url)
+        XCTAssertEqual(sc.atoms.count, 3)
+        XCTAssertEqual(sc.atoms[0].atomicNumber, 14) // Si
+        XCTAssertEqual(sc.atoms[1].atomicNumber, 8)  // O
+        XCTAssertEqual(sc.atoms[2].atomicNumber, 1)  // H
+        XCTAssertFalse(sc.isCrystal)
+    }
+
+    // ATOMS_FRAC with element symbols: fractional coords (0.1,0.2,0.3) and
+    // (0.5,0.5,0.5) on a 5 A cubic cell must convert to Cartesian (0.5,1.0,1.5)
+    // and (2.5,2.5,2.5).
+    func testXSFAtomsFracSymbolRows() throws {
+        let url = tmp("atomsfrac_symbol.xsf")
+        try write("""
+        CRYSTAL
+        PRIMVEC
+         5.0 0.0 0.0
+         0.0 5.0 0.0
+         0.0 0.0 5.0
+        ATOMS_FRAC
+         Si 0.1 0.2 0.3
+         O  0.5 0.5 0.5
+        """, to: url)
+        let sc = try Parser.load(url)
+        XCTAssertEqual(sc.atoms.count, 2)
+        XCTAssertEqual(sc.atoms[0].atomicNumber, 14) // Si
+        XCTAssertEqual(sc.atoms[1].atomicNumber, 8)  // O
+        XCTAssertTrue(sc.isCrystal)
+        // frac (0.1,0.2,0.3) -> (0.5, 1.0, 1.5)
+        XCTAssertEqual(sc.atoms[0].coord.x, 0.5, accuracy: 0.001)
+        XCTAssertEqual(sc.atoms[0].coord.y, 1.0, accuracy: 0.001)
+        XCTAssertEqual(sc.atoms[0].coord.z, 1.5, accuracy: 0.001)
+        // frac (0.5,0.5,0.5) -> (2.5, 2.5, 2.5)
+        XCTAssertEqual(sc.atoms[1].coord.x, 2.5, accuracy: 0.001)
+        XCTAssertEqual(sc.atoms[1].coord.y, 2.5, accuracy: 0.001)
+        XCTAssertEqual(sc.atoms[1].coord.z, 2.5, accuracy: 0.001)
+    }
+
+    // A truncated CRYSTAL+PRIMVEC file (no atoms, no grid) must be REJECTED with
+    // a structure error — the grid-only fallback must not mask it with a
+    // generic "no DATAGRID block found" before the fix.
+    func testXSFTruncatedCrystalPreservesStructureError() throws {
+        let url = tmp("crystal_trunc.xsf")
+        try write("""
+        CRYSTAL
+        PRIMVEC
+         5.0 0.0 0.0
+         0.0 5.0 0.0
+         0.0 0.0 5.0
+        """, to: url)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, let line, let reason) = err else {
+                return XCTFail("expected parse error, got \(err)")
+            }
+            XCTAssertTrue(reason.contains("PRIMCOORD"),
+                          "error must explain the missing structure, got: \(reason)")
+            XCTAssertEqual(line, 0)
+        }
+        // The thread-local buffer must carry the useful structure reason.
+        XCTAssertTrue(String(cString: molenv_last_error()).contains("PRIMCOORD"),
+                      "last error must mention PRIMCOORD, not DATAGRID")
+    }
+
+    // Genuinely structure-free DATAGRID file must STILL parse via the fallback —
+    // the fallback must remain for real grid-only files. A bare
+    // BEGIN_BLOCK_DATAGRID_3D form exercises the wrapped path.
+    func testXSFGridOnlyStillPasses() throws {
+        let url = tmp("gridonly_round3.xsf")
+        try write("""
+        BEGIN_BLOCK_DATAGRID_3D
+        3D density
+        BEGIN_DATAGRID_3D_density
+        2 2 2
+        0 0 0
+        1 0 0
+        0 1 0
+        0 0 1
+        0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8
+        END_DATAGRID_3D
+        END_BLOCK_DATAGRID_3D
+        """, to: url)
+        let sc = try Parser.load(url)
+        XCTAssertTrue(sc.atoms.isEmpty)
+        XCTAssertNotNil(sc.scalarField)
+        XCTAssertFalse(sc.isCrystal)
     }
 }

@@ -465,4 +465,46 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(s.atoms.count, before)
         XCTAssertNotNil(s.slab)
     }
+
+    // supercell product overflow must be refused (returned unchanged), not wrap past
+    // the cap. Int.max/2 cubed overflows Int; the safe product rejects it.
+    func testSupercellOverflowIsRefused() throws {
+        var s = Scene(loaded: try Parser.load(fixture("si110.xsf")))
+        let before = s.atoms.count
+        let huge = SuperCell(n1: Int.max / 2, n2: Int.max / 2, n3: Int.max / 2)
+        let out = s.widenSuperCell(huge)
+        // Refusal leaves the scene untouched: same atom count and a default supercell.
+        XCTAssertEqual(out.atoms.count, before)
+        XCTAssertEqual(out.superCell, SuperCell())
+    }
+
+    // A zero/negative supercell factor is nonsensical and must be refused rather
+    // than produce a degenerate (zero-atom) expansion.
+    func testSupercellNonPositiveFactorIsRefused() throws {
+        var s = Scene(loaded: try Parser.load(fixture("si110.xsf")))
+        let before = s.atoms.count
+        let out = s.widenSuperCell(SuperCell(n1: 0, n2: 2, n3: 2))
+        XCTAssertEqual(out.atoms.count, before)
+    }
+
+    // fractionalCoord must return nil for a singular (zero-volume) cell so callers
+    // (applySlab) can refuse instead of fabricating an origin at (0,0,0).
+    func testFractionalCoordNilForSingularCell() {
+        var s = Scene()
+        // Two collinear vectors => det == 0.
+        s.cell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 1))
+        XCTAssertNil(s.fractionalCoord(SIMD3(0.5, 0, 0.5)))
+    }
+
+    // applySlab against a singular cell must leave the scene unchanged (refuse),
+    // not filter atoms against a fabricated origin.
+    func testApplySlabRefusesSingularCell() throws {
+        var s = Scene(loaded: try Parser.load(fixture("si110.xsf")))
+        s.cell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 1))
+        let before = s.atoms.count
+        let out = s.applySlab(Slab(planeA: Plane(h: 0, k: 1, l: 0, distance: 0),
+                                    planeB: Plane(h: 0, k: -1, l: 0, distance: 1)))
+        XCTAssertEqual(out.atoms.count, before)
+        XCTAssertNil(out.slab)
+    }
 }

@@ -44,6 +44,7 @@ final class RendererTests: XCTestCase {
         let r = try Renderer(device: device)
         var s = Scene()
         s.background = "#000000"   // black clear so nonzero pixels are foreground only
+        s.showAxes = false; s.showCellFrame = false   // isolate geometry from the gizmo/frame
         s.atoms = [Atom(coord: SIMD3(0,0,0), atomicNumber: 6, label: "C")]
         r.scene = s
         r.currentCamera.distance = 6
@@ -71,6 +72,7 @@ final class RendererTests: XCTestCase {
         let r = try Renderer(device: device)
         var s = Scene()
         s.background = "#000000"   // black clear so nonzero pixels are foreground only
+        s.showAxes = false; s.showCellFrame = false   // isolate geometry from the gizmo/frame
         s.displayMode = .spaceFill
         s.atoms = [Atom(coord: SIMD3(0,0,0), atomicNumber: 6, label: "C"),
                    Atom(coord: SIMD3(1.5,0,0), atomicNumber: 6, label: "C")]
@@ -117,7 +119,9 @@ final class RendererTests: XCTestCase {
     func testHeadlessPngExport() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
-        let scene = Scene(loaded: try Parser.load(url))
+        var scene = Scene(loaded: try Parser.load(url))
+        scene.background = "#000000"
+        scene.showAxes = false; scene.showCellFrame = false
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.png")
         let cg = try PngExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
@@ -128,7 +132,9 @@ final class RendererTests: XCTestCase {
     func testVectorExportPDF() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
-        let scene = Scene(loaded: try Parser.load(url))
+        var scene = Scene(loaded: try Parser.load(url))
+        scene.background = "#000000"
+        scene.showAxes = false; scene.showCellFrame = false
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.pdf")
         let cg = try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
@@ -140,7 +146,9 @@ final class RendererTests: XCTestCase {
     func testVectorExportSVG() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
-        let scene = Scene(loaded: try Parser.load(url))
+        var scene = Scene(loaded: try Parser.load(url))
+        scene.background = "#000000"
+        scene.showAxes = false; scene.showCellFrame = false
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.svg")
         let cg = try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
@@ -154,7 +162,9 @@ final class RendererTests: XCTestCase {
     func testVectorExportEPS() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let url = dir.appendingPathComponent("Fixtures/si110.xsf")
-        let scene = Scene(loaded: try Parser.load(url))
+        var scene = Scene(loaded: try Parser.load(url))
+        scene.background = "#000000"
+        scene.showAxes = false; scene.showCellFrame = false
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("out.eps")
         let cg = try RasterExporter.export(scene: scene, camera: nil, to: out, size: CGSize(width: 400, height: 400))
         XCTAssertGreaterThan(try out.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
@@ -261,6 +271,51 @@ final class RendererTests: XCTestCase {
                        "gradient top and bottom colors must differ")
     }
 
+    // MARK: - Gradient pixel coverage
+
+    func testGradientBackgroundInterpolation() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let r = try Renderer(device: device)
+        let w = 48, h = 48
+        let desc = MTLTextureDescriptor()
+        desc.pixelFormat = .rgba8Unorm; desc.width = w; desc.height = h
+        desc.usage = [.renderTarget, .shaderRead]; desc.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: desc) else { return }
+        // Same red→blue background for both frames so the ONLY difference between
+        // them is the presence of geometry — isolating the geometry contribution
+        // rather than the background color.
+        func makeScene(showGeometry: Bool) -> Scene {
+            var s = Scene()
+            s.backgroundType = .gradient_top
+            s.background = "#ff0000"
+            s.backgroundBottom = "#0000ff"
+            s.showStructure = showGeometry; s.showAxes = false; s.showCellFrame = false
+            if showGeometry {
+                s.atoms = [Atom(coord: .zero, atomicNumber: 6, label: "C")]
+                s.cell = Cell(a: SIMD3(5,0,0), b: SIMD3(0,5,0), c: SIMD3(0,0,5))
+            }
+            return s
+        }
+        func renderHash(scene: Scene, dist: Float) -> UInt64 {
+            r.scene = scene; r.currentCamera.distance = dist
+            let cb = device.makeCommandQueue()!.makeCommandBuffer()!
+            // encode must succeed, and the command buffer must surface no GPU error —
+            // a blank-success frame would be all background and pass pixel assertions.
+            let ok = r.encode(to: cb, target: tex,
+                              viewport: MTLViewport(originX:0,originY:0,width:Double(w),height:Double(h),znear:0,zfar:1),
+                              camera: r.currentCamera)
+            XCTAssertTrue(ok, "encode failed — gradient frame would be blank")
+            cb.commit(); cb.waitUntilCompleted()
+            XCTAssertNil(cb.error, "command buffer errored during gradient render")
+            var px = [UInt8](repeating: 0, count: w*h*4)
+            tex.getBytes(&px, bytesPerRow: w*4, from: MTLRegionMake2D(0,0,w,h), mipmapLevel: 0)
+            return px.reduce(into: UInt64(0xcbf29ce484222325)) { $0 ^= UInt64($1); $0 &*= 0x100000001b3 }
+        }
+        let onlyBg = renderHash(scene: makeScene(showGeometry: false), dist: 8)
+        let withGeo = renderHash(scene: makeScene(showGeometry: true), dist: 8)
+        XCTAssertNotEqual(onlyBg, withGeo, "geometry must change the frame over an identical background")
+    }
+
     // 2D display modes force an orthographic projection looking down +Z with no
     // rotation (Renderer.encode swaps to ortho for .is2D). Render the SAME atom
     // pair in 3D ballStick and 2D line2D: the images must differ (perspective vs
@@ -347,6 +402,60 @@ final class RendererTests: XCTestCase {
         let tex = try render(scene: s, dist: 10)
         let (minC, maxC) = nonzeroColumns(tex)
         XCTAssertGreaterThan(maxC - minC, 30, "two atoms should render as two distinct instances (spread was \(maxC-minC))")
+    }
+
+    // The allocation-failure seam must make encode drop the frame (false) rather than
+    // submit a partial render, and the exporters must surface it as an error — a
+    // makeBuffer failure otherwise never happens on CI to exercise this path.
+    func testEncodeSurfacesAllocationFailure() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let r = try Renderer(device: device)
+        var s = Scene()
+        s.showAxes = false; s.showCellFrame = false
+        s.atoms = [Atom(coord: SIMD3(0,0,0), atomicNumber: 6, label: "C")]
+        r.scene = s
+        Renderer.forceNextBufferAllocationSuccess = false
+        defer { Renderer.forceNextBufferAllocationSuccess = true }
+        let w = 32, h = 32
+        let desc = MTLTextureDescriptor()
+        desc.pixelFormat = .rgba8Unorm; desc.width = w; desc.height = h
+        desc.usage = [.renderTarget, .shaderRead]; desc.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: desc) else { throw Thrown.noTex }
+        let cb = device.makeCommandQueue()!.makeCommandBuffer()!
+        XCTAssertFalse(r.encode(to: cb, target: tex,
+                                viewport: MTLViewport(originX:0,originY:0,width:Double(w),height:Double(h),znear:0,zfar:1),
+                                camera: r.currentCamera),
+                       "encode must return false when a required allocation fails")
+    }
+
+    func testExportSurfacesAllocationFailureAsError() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        var scene = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf")))
+        scene.background = "#000000"
+        Renderer.forceNextBufferAllocationSuccess = false
+        defer { Renderer.forceNextBufferAllocationSuccess = true }
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("failalloc.png")
+        XCTAssertThrowsError(try PngExporter.export(scene: scene, camera: nil, to: out,
+                                                    size: CGSize(width: 200, height: 200))) { err in
+            guard case PngExportError.encodeFailed = err else {
+                return XCTFail("exporter must surface allocation failure as encodeFailed, got \(err)")
+            }
+        }
+    }
+
+    // An unrepresentable export size (greatestFiniteMagnitude) must throw rather
+    // than trap on the Int cast — the exporter validates representability BEFORE
+    // converting, so the App-layer guard is not the only thing protecting this path.
+    func testExporterRejectsUnrepresentableSizeWithoutTrapping() throws {
+        var scene = Scene()
+        scene.background = "#000000"
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("huge.png")
+        XCTAssertThrowsError(try PngExporter.export(scene: scene, camera: nil, to: out,
+                                                    size: CGSize(width: CGFloat.greatestFiniteMagnitude,
+                                                                 height: CGFloat.greatestFiniteMagnitude)))
+        XCTAssertThrowsError(try RasterExporter.export(scene: scene, camera: nil, to: out.appendingPathExtension("pdf"),
+                                                       size: CGSize(width: CGFloat.greatestFiniteMagnitude,
+                                                                    height: CGFloat.greatestFiniteMagnitude)))
     }
 
 }

@@ -25,16 +25,27 @@ enum RasterExportError: Error {
 /// This is raster-in-a-vector-wrapper, not true primitive (GL2PS-style)
 /// vector output — the name reflects that honestly.
 enum RasterExporter {
+    /// Maximum per-axis render dimension. Matches the Metal maximum 2D texture
+    /// size on macOS (16384); exports are refused above this rather than silently
+    /// producing a texture the device cannot allocate.
+    static let maxAxisDimension: CGFloat = 16_384
+
     /// Render the scene to a vector container (PDF/SVG/EPS/PS) at `size`. Returns the
     /// CGImage raster that was wrapped, so a caller can validate pixel content (used by
     // the export tests) across all formats — not just the written file's byte size.
     @discardableResult
     static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
-        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
-              size.width <= 16_384, size.height <= 16_384 else {
+        // Validate representability before Int conversion (mirrors PngExporter) so an
+        // absurd size throws instead of trapping on the Int cast.
+        let rw = size.width.rounded(), rh = size.height.rounded()
+        guard rw.isFinite, rh.isFinite, rw >= 1, rh >= 1,
+              rw <= CGFloat(RasterExporter.maxAxisDimension), rh <= CGFloat(RasterExporter.maxAxisDimension),
+              rw <= CGFloat(Int.max), rh <= CGFloat(Int.max) else {
             throw RasterExportError.noTex
         }
-        let w = Int(size.width.rounded()), h = Int(size.height.rounded())
+        let w = Int(rw), h = Int(rh)
+        let total = w.multipliedReportingOverflow(by: h)
+        guard !total.overflow, total.partialValue <= 16_000_000 else { throw RasterExportError.noTex }
         let cg = try render(scene: scene, camera: camera, w: w, h: h)
         try write(cgImage: cg, to: url, size: CGSize(width: w, height: h))
         return cg
@@ -134,42 +145,58 @@ enum RasterExporter {
     // MARK: EPS / PostScript (hex-encoded colorimage)
 
     private static func emitEPS(cgImage: CGImage, w: Int, h: Int, to url: URL) throws {
-        let data = cgImage.dataProvider?.data
-        guard let ptr = data.flatMap({ CFDataGetBytePtr($0) }) else {
+        guard let providerData = cgImage.dataProvider?.data,
+              let ptr = CFDataGetBytePtr(providerData) else {
             throw RasterExportError.noCGImage
         }
+        // Validate the source dimensions before raster allocation: a mismatch between
+        // the declared size and the actual image would read past the pixel buffer.
         let bpr = cgImage.bytesPerRow
-        var hex: [UInt8] = []
-        hex.reserveCapacity(w * h * 3 * 2)
-        for y in 0..<h {
-            let base = y * bpr
-            for x in 0..<w {
-                let i = base + x * 4
-                hex.append(contentsOf: byteToHex(ptr[i]))
-                hex.append(contentsOf: byteToHex(ptr[i + 1]))
-                hex.append(contentsOf: byteToHex(ptr[i + 2]))
-            }
+        guard w > 0, h > 0, w == cgImage.width, h == cgImage.height, bpr >= w * 4 else {
+            throw RasterExportError.noCGImage
         }
-        let hexStr = String(decoding: hex, as: UTF8.self)
+        // Stream into a TEMPORARY file next to the destination, then replace the
+        // destination atomically. `replaceItem` restores the original destination if
+        // placing the new item ever fails, so a valid existing file is never deleted
+        // before the replacement is guaranteed. On any write error the temp file is
+        // removed, so the output path never holds a truncated document.
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(ProcessInfo.processInfo.globallyUniqueString + ".eps.tmp")
+        try? FileManager.default.removeItem(at: tmp)
+        FileManager.default.createFile(atPath: tmp.path, contents: nil)
+        var moved = false
+        defer {
+            if !moved { try? FileManager.default.removeItem(at: tmp) }
+        }
+        let fh = try FileHandle(forWritingTo: tmp)
         let header = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 \(w) \(h)\n%%EndComments\n"
-        let setup = "/picstr \(w * 3) string def\n\(w) \(h) 8 [\(w) 0 0 \(-h) 0 \(h)]\n{ currentfile picstr readhexstring pop } false 3 colorimage\n"
-        var out = header + setup
-        // Wrap hex at 72 cols (readhexstring ignores whitespace, but keep lines short).
-        var idx = hexStr.startIndex
-        while idx < hexStr.endIndex {
-            let end = hexStr.index(idx, offsetBy: 72, limitedBy: hexStr.endIndex) ?? hexStr.endIndex
-            out += hexStr[idx..<end] + "\n"
-            idx = end
-        }
-        out += "%%EOF\n"
-        try out.write(to: url, atomically: true, encoding: .utf8)
-    }
-
-    /// Two lowercase hex digits for a byte (`0xAB` → `[0x61, 0x62]`... wait, digits).
-    private static func byteToHex(_ v: UInt8) -> [UInt8] {
-        let hi = v >> 4, lo = v & 0xF
+            + "/picstr \(w * 3) string def\n\(w) \(h) 8 [\(w) 0 0 \(-h) 0 \(h)]\n{ currentfile picstr readhexstring pop } false 3 colorimage\n"
+        try fh.write(contentsOf: header.data(using: .utf8)!)
         let tbl: [UInt8] = [0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
                             0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66]
-        return [tbl[Int(hi)], tbl[Int(lo)]]
+        var rowBuf = [UInt8]()
+        rowBuf.reserveCapacity(w * 6 + 1)
+        for y in 0..<h {
+            let base = y * bpr
+            rowBuf.removeAll(keepingCapacity: true)
+            for x in 0..<w {
+                let i = base + x * 4
+                rowBuf.append(tbl[Int(ptr[i] >> 4)])
+                rowBuf.append(tbl[Int(ptr[i] & 0xF)])
+                rowBuf.append(tbl[Int(ptr[i+1] >> 4)])
+                rowBuf.append(tbl[Int(ptr[i+1] & 0xF)])
+                rowBuf.append(tbl[Int(ptr[i+2] >> 4)])
+                rowBuf.append(tbl[Int(ptr[i+2] & 0xF)])
+            }
+            rowBuf.append(0x0A)
+            try fh.write(contentsOf: rowBuf)
+        }
+        try fh.write(contentsOf: "%%EOF\n".data(using: .utf8)!)
+        try fh.close()
+        // Atomic replacement: the original destination survives if placing tmp fails.
+        try FileManager.default.replaceItem(at: url, withItemAt: tmp, backupItemName: nil, options: [], resultingItemURL: nil)
+        moved = true
     }
+
+
 }

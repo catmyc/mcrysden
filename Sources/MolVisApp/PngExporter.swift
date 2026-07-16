@@ -10,14 +10,21 @@ enum PngExporter {
     /// validate pixel content (used by the export tests) in addition to the written file.
     @discardableResult
     static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
-        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
-              size.width <= 16_384, size.height <= 16_384 else {
+        // Validate the rounded dimensions are representable as Int BEFORE converting
+        // (greatestFiniteMagnitude.rounded() still overflows Int → trap), then enforce
+        // the per-axis Metal texture cap and an overflow-checked total-pixel cap.
+        let rw = size.width.rounded(), rh = size.height.rounded()
+        guard rw.isFinite, rh.isFinite, rw >= 1, rh >= 1,
+              rw <= CGFloat(RasterExporter.maxAxisDimension), rh <= CGFloat(RasterExporter.maxAxisDimension),
+              rw <= CGFloat(Int.max), rh <= CGFloat(Int.max) else {
             throw PngExportError.noTex
         }
+        let w = Int(rw), h = Int(rh)
+        let total = w.multipliedReportingOverflow(by: h)
+        guard !total.overflow, total.partialValue <= 16_000_000 else { throw PngExportError.noTex }
         guard let device = MTLCreateSystemDefaultDevice() else { throw PngExportError.noGPU }
         let renderer = try Renderer(device: device)
         renderer.scene = scene
-        let w = Int(size.width), h = Int(size.height)
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm
         desc.width = w; desc.height = h
@@ -31,7 +38,7 @@ enum PngExporter {
         // default framing, which matches what the GUI shows.
         var cam = camera ?? scene.defaultCamera()
         if cam.rotation == simd_quatf(ix:0,iy:0,iz:0,r:0) { cam.rotation = simd_quatf(ix:0,iy:0,iz:0,r:1) }
-        let viewport = MTLViewport(originX: 0, originY: 0, width: Double(size.width), height: Double(size.height), znear: 0, zfar: 1)
+        let viewport = MTLViewport(originX: 0, originY: 0, width: Double(w), height: Double(h), znear: 0, zfar: 1)
         guard renderer.encode(to: cb, target: tex, viewport: viewport, camera: cam) else {
             cb.commit(); cb.waitUntilCompleted()
             throw PngExportError.encodeFailed

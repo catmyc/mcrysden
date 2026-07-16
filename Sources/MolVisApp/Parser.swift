@@ -27,9 +27,28 @@ internal func gunzipData(_ url: URL) throws -> Data {
     } catch {
         throw ParseError.io(path: url.path, reason: "could not launch gunzip: \(error)")
     }
-    let data = output.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
+    var total = 0
+    let limit = 200 * 1024 * 1024
+    var data = Data()
+    func finish() {
+        process.terminate()
+        process.waitUntilExit()
+        try? output.fileHandleForReading.close()
+    }
+    var capped = false
+    while true {
+        let bytes = output.fileHandleForReading.availableData
+        if bytes.isEmpty { break }
+        total += bytes.count
+        if total > limit {
+            capped = true
+            finish()
+            throw ParseError.io(path: url.path, reason: "decompressed data exceeds 200 MB limit")
+        }
+        data.append(bytes)
+    }
+    finish()
+    guard !capped, process.terminationStatus == 0 else {
         throw ParseError.io(path: url.path, reason: "gunzip failed (exit \(process.terminationStatus))")
     }
     return data
@@ -561,7 +580,11 @@ enum Parser {
             let eTok = tok(elemLine)
             var Z = 0
             for (i, tk) in eTok.enumerated() where tk == "Z:" && i+1 < eTok.count {
-                Z = Int(Float(eTok[i+1]) ?? 0)   // "78.0" -> Float -> Int
+                // Bound the Float before converting: a non-finite or out-of-range Z must
+                // not trap and must fall back to the symbol-based resolution below.
+                if let f = Float(eTok[i+1]), f.isFinite, f >= Float(Int.min), f <= Float(Int.max) {
+                    Z = Int(f)
+                }
             }
             let symbol = eTok.first ?? ""
             // skip optional 3x3 rotation matrix (3 lines, each 3 pure numbers)
@@ -684,10 +707,16 @@ enum Parser {
 
         // natoms, then atom lines. CRYSTAL/SLAB coords are fractional; POLYMER are Cartesian.
         let isPolymer = (kind == "POLYMER")
-        let natoms = Int(tok(next() ?? "").first ?? "") ?? 0
+        let natoms = max(0, Int(tok(next() ?? "").first ?? "") ?? 0)
         var atoms: [Atom] = []
+        guard natoms > 0 else {
+            throw ParseError.parse(path: url.path, line: idx, reason: "no atoms in CRYSCAL file")
+        }
+        var read = 0
         for _ in 0..<natoms {
-            guard let line = next() else { break }
+            guard let line = next() else {
+                throw ParseError.parse(path: url.path, line: idx, reason: "truncated CRYSCAL atom block")
+            }
             let t = tok(line)
             guard t.count >= 4, let Z = Int(t[0]) else { continue }
             guard let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else { continue }
@@ -697,9 +726,13 @@ enum Parser {
             } else {
                 atoms.append(Atom(coord: cell.cartesian(SIMD3<Float>(x, y, z)), atomicNumber: Z, label: sym))
             }
+            read += 1
             if isPolymer {
                 // polymer atom lines occasionally carry extra integers (bonding) — ignore
             }
+        }
+        guard read == natoms else {
+            throw ParseError.parse(path: url.path, line: idx, reason: "CRYSCAL atom count mismatch (\(read)/\(natoms))")
         }
 
         var out = LoadedScene()
@@ -714,18 +747,15 @@ enum Parser {
 
     private static func loadCube(_ url: URL) throws -> LoadedScene {
         let raw = try String(contentsOf: url, encoding: .utf8)
-        var lines = raw.components(separatedBy: "\n")
-        guard lines.count >= 2 else {
+        let allLines = raw.components(separatedBy: "\n")
+        guard allLines.count >= 2 else {
             throw ParseError.parse(path: url.path, line: 1, reason: "missing cube comments")
         }
-        // Cube always has two physical comment records; consume them directly so
-        // an empty comment does not shift the numeric header.
-        lines.removeFirst(2)
+        var lineIdx = 2
         func nextTokenLine() -> [String]? {
-            while !lines.isEmpty {
-                let line = lines.removeFirst()
-                // only skip truly-empty separator lines; keep lines with content
-                // (even if just whitespace) as they may carry tokens.
+            while lineIdx < allLines.count {
+                let line = allLines[lineIdx]
+                lineIdx += 1
                 if line.isEmpty { continue }
                 return line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
             }
@@ -1005,7 +1035,10 @@ enum OrcaParser {
         var blockStarts: [Int] = []
         for (i, line) in lines.enumerated() where line.contains(coordHeader) { blockStarts.append(i) }
         guard !blockStarts.isEmpty else { enum E: Error { case noCoords }; throw E.noCoords }
-        let target = frameIndex < 0 ? blockStarts.count - 1 : min(max(0, frameIndex), blockStarts.count - 1)
+        guard frameIndex < 0 || frameIndex < blockStarts.count else {
+            enum E: Error { case noCoords }; throw E.noCoords
+        }
+        let target = frameIndex < 0 ? blockStarts.count - 1 : frameIndex
         let start = blockStarts[target]
 
         // The block begins after the "-------------------" separator following the
@@ -1075,7 +1108,7 @@ internal func loadFHIaims(_ url: URL) throws -> LoadedScene {
                      firstNonBlank?.lowercased().hasPrefix("atom") == true
 
     if isStandard {
-        return try loadFHIaimsGeometryIn(lines: lines)
+        return try loadFHIaimsGeometryIn(lines: lines, url: url)
     }
     return try loadFHIaimsCoordOut(lines: lines)
 }
@@ -1085,7 +1118,7 @@ internal func loadFHIaims(_ url: URL) throws -> LoadedScene {
 ///   `atom_frac x y z Elem`  — fractional coordinate
 ///   `atom x y z Elem`       — Cartesian coordinate (Angstrom)
 ///   `constrain_relaxation .true.` / `.false.` — ignored
-internal func loadFHIaimsGeometryIn(lines: [String]) throws -> LoadedScene {
+internal func loadFHIaimsGeometryIn(lines: [String], url: URL) throws -> LoadedScene {
     enum E: Error { case malformed(String) }
     func tok(_ s: String) -> [String] { s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init) }
 
@@ -1120,12 +1153,15 @@ internal func loadFHIaimsGeometryIn(lines: [String]) throws -> LoadedScene {
         }
     }
 
-    guard latticeVecs.count == 3 else {
+    let hasCell = latticeVecs.count == 3
+    if latticeVecs.count > 0 && !hasCell {
         throw E.malformed("geometry.in needs exactly 3 lattice_vector lines (found \(latticeVecs.count))")
     }
-    let cell = Cell(a: latticeVecs[0], b: latticeVecs[1], c: latticeVecs[2])
+    if !fracAtoms.isEmpty && !hasCell {
+        throw ParseError.parse(path: url.path, line: 0, reason: "atom_frac coordinates require a lattice (3 lattice_vector lines)")
+    }
+    let cell = hasCell ? Cell(a: latticeVecs[0], b: latticeVecs[1], c: latticeVecs[2]) : nil
 
-    // Convert fractional atoms to Cartesian using the lattice vectors.
     func fracToCart(_ f: SIMD3<Float>) -> SIMD3<Float> {
         f.x * latticeVecs[0] + f.y * latticeVecs[1] + f.z * latticeVecs[2]
     }
@@ -1133,7 +1169,9 @@ internal func loadFHIaimsGeometryIn(lines: [String]) throws -> LoadedScene {
     var atoms: [Atom] = []
     for (coord, sym) in fracAtoms {
         let Z = ElementTable.atomicNumber(sym)
-        atoms.append(Atom(coord: fracToCart(coord), atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
+        if hasCell {
+            atoms.append(Atom(coord: fracToCart(coord), atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
+        }
     }
     for (coord, sym) in cartAtoms {
         let Z = ElementTable.atomicNumber(sym)
@@ -1142,8 +1180,15 @@ internal func loadFHIaimsGeometryIn(lines: [String]) throws -> LoadedScene {
 
     var out = LoadedScene()
     out.atoms = atoms
-    out.cell = cell
-    out.isCrystal = true
+    if hasCell {
+        out.cell = cell
+        out.isCrystal = true
+        out.periodicDim = 3
+    } else {
+        out.cell = nil
+        out.isCrystal = false
+        out.periodicDim = 0
+    }
     out.title = "geometry.in"
     return out
 }
@@ -1168,12 +1213,12 @@ internal func loadFHIaimsCoordOut(lines: [String]) throws -> LoadedScene {
     let cell = Cell(a: cols[0], b: cols[1], c: cols[2])
 
     // number of species
-    guard let nsLine = next(), let nSpecies = Int(tok(nsLine).first ?? "") else {
+    guard let nsLine = next(), let nSpecies = Int(tok(nsLine).first ?? ""), nSpecies > 0 else {
         throw E.malformed("bad n_all_species")
     }
     var atoms: [Atom] = []
     for _ in 0..<nSpecies {
-        guard let cLine = next(), let count = Int(tok(cLine).first ?? "") else {
+        guard let cLine = next(), let count = Int(tok(cLine).first ?? ""), count > 0 else {
             throw E.malformed("bad species count")
         }
         guard let nameLine = next() else { throw E.malformed("bad species name") }

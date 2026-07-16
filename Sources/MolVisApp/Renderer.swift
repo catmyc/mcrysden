@@ -39,6 +39,7 @@ final class Renderer: NSObject {
     private let library: MTLLibrary
 
     private let overlayDepthState: MTLDepthStencilState?
+    private let depthStencilState: MTLDepthStencilState?
     private var lastW: Int = 0, lastH: Int = 0    // viewport size from last encode()
     private let sphereMesh: Mesh
     private let cylinderMesh: Mesh
@@ -66,17 +67,9 @@ final class Renderer: NSObject {
     // Without this, drawBrillouinZone rebuilds an O(m^3) Wigner-Seitz cell every
     // frame; a large G-star (GaAsH, ~164 vectors) makes mouse-drag seconds-laggy.
     private var cachedBZ: BrillouinZone?
-    private var cachedBZKey: BZCacheKey?
+    private var bzBuilt = false          // true once build() has run (even if it returned nil)
     private(set) var bzRebuildCount = 0
-    private struct BaseAtomKey: Equatable {
-        var coord: SIMD3<Float>
-        var atomicNumber: Int
-    }
-    private struct BZCacheKey: Equatable {
-        var cellA: SIMD3<Float>; var cellB: SIMD3<Float>; var cellC: SIMD3<Float>
-        var baseAtoms: [BaseAtomKey]
-    }
-    private func invalidateBrillouinZoneCache() { cachedBZ = nil; cachedBZKey = nil }
+    private func invalidateBrillouinZoneCache() { cachedBZ = nil; bzBuilt = false }
 
     // Isosurface cache. Marching cubes over a large grid is comparable in cost to
     // the BZ build (cubic in the sample counts); the result depends only on the
@@ -89,6 +82,12 @@ final class Renderer: NSObject {
         var values: [Float]
     }
     var background: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)
+
+    /// Test-only seam: when false, the next per-frame buffer allocation in
+    /// `encode` fails, exercising the makeBuffer → encode → exporter failure path
+    /// deterministically (CI Metal allocations never fail on their own). Reset to
+    /// true after use. Not consulted anywhere except the frame-buffer allocation.
+    static var forceNextBufferAllocationSuccess = true
 
     /// Last computed world-space light direction — exposed so the orientation
     /// gizmo (a mini-scene drawn with its own FrameData) can light its arrows
@@ -361,6 +360,7 @@ final class Renderer: NSObject {
         self.coneIB = gib
         self.quadVB = qvb
         self.overlayDepthState = Renderer.makeOverlayDepthState(device: device)
+        self.depthStencilState = Renderer.makeDepthStencilState(device: device)
     }
 
     /// Depth state for the orientation gizmo: always pass, never write, so the
@@ -398,7 +398,11 @@ final class Renderer: NSObject {
                                        proj: cam.projectionMatrix(aspect: aspect),
                                        lighting: scene.lighting,
                                        eye: cam.eyePosition())
-        let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: [])
+        if !Renderer.forceNextBufferAllocationSuccess {
+            Renderer.forceNextBufferAllocationSuccess = true
+            return false
+        }
+        guard let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
         guard ensureDepthTexture(width: w, height: h) else { return false }
 
         // Clear color reflects the CURRENT background type + hex, recomputed every
@@ -424,8 +428,11 @@ final class Renderer: NSObject {
         enc.setCullMode(.none)
         // Standard less-than depth test for the scene. The gradient pass (below)
         // and the gizmo/measurements both swap this to an overlay state of their
-        // own and restore it, so this is the authoritative default.
-        enc.setDepthStencilState(makeDepthStencilState())
+        // own and restore it, so this is the authoritative default. The state is
+        // cached at init; if it could not be created, disable rendering rather than
+        // submit a frame with no depth test.
+        guard let depthStencilState else { enc.endEncoding(); return false }
+        enc.setDepthStencilState(depthStencilState)
 
         // Vertical-gradient backdrop: a fullscreen quad at the far plane, drawn
         // with the always-pass / never-write overlay depth state so the scene
@@ -439,59 +446,33 @@ final class Renderer: NSObject {
         // frame/axes/BZ branches below draw regardless.
         if scene.showStructure {
             if scene.displayMode.is2D {
-                // True 2D: flat screen-space atom discs + 1px bond lines. The cell
-                // frame and axes already draw correctly in 2D and stay on.
-                drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h)
-                drawBonds2D(enc, frameBuffer: frameBuffer)
+                guard drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h) else { enc.endEncoding(); return false }
+                guard drawBonds2D(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
             } else if scene.displayMode == .polyhedral {
-                // Polyhedral: hide spheres/bonds, build+draw convex cells.
-                drawPolyhedral(enc, frameBuffer: frameBuffer)
+                guard drawPolyhedral(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
             } else {
-                // Atoms (instanced spheres)
-                drawAtoms(enc, frameBuffer: frameBuffer)
-
-                // Bonds (instanced cylinders)
-                drawBonds(enc, frameBuffer: frameBuffer)
+                guard drawAtoms(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+                guard drawBonds(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
             }
-            // Force arrows (instanced lines): drawn for any 3D mode that shows real
-            // atom positions in world space (ball-stick/space-fill/wireframe AND
-            // polyhedral), so the vectors map to the same coordinates as the atoms.
-            // 2D modes are excluded: they route through Renderer2D (a separate
-            // renderer with no arrow path) and project atoms to screen space, where
-            // a world-space arrow has no meaningful projection.
             if !scene.displayMode.is2D {
-                drawForceArrows(enc, frameBuffer: frameBuffer)
+                guard drawForceArrows(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
             }
         }
 
-        // Cell frame + axes
-        drawCell(enc, frameBuffer: frameBuffer)
+        guard drawCell(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
 
-        // Brillouin-zone wireframe overlay (crystal only): the Wigner-Seitz cell
-        // of the reciprocal lattice, drawn depth-tested so it sits correctly
-        // around the structure and rotates with the camera.
         if scene.showBrillouinZone {
-            drawBrillouinZone(enc, frameBuffer: frameBuffer)
+            guard drawBrillouinZone(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
         }
 
-        // Isosurface over a volumetric scalar field (DATAGRID / .cube), drawn as a
-        // depth-tested lit surface so it sits correctly among the atoms.
-        drawIsosurface(enc, frameBuffer: frameBuffer)
+        guard drawIsosurface(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+        guard drawFermiSurface(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
 
-        // Fermi surface: one isosurface per band, all at the Fermi energy, tinted
-        // per band. Drawn after the scalar iso so both can coexist.
-        drawFermiSurface(enc, frameBuffer: frameBuffer)
-
-        // Screen-space orientation gizmo (fixed-size x/y/z arrows pinned to the
-        // corner; rotates with the camera, never scales with zoom).
         if scene.showAxes {
-            drawOrientationGizmo(enc, camera: cam, w: w, h: h)
+            guard drawOrientationGizmo(enc, camera: cam, w: w, h: h) else { enc.endEncoding(); return false }
         }
 
-        // Measurement lines between selected atoms — drawn last as a depth-
-        // disabled overlay so they stay readable through bonds, plus a small
-        // dot at any locked-in measurement atom.
-        drawMeasurements(enc, frameBuffer: frameBuffer)
+        guard drawMeasurements(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
 
         enc.endEncoding()
         return true
@@ -501,7 +482,8 @@ final class Renderer: NSObject {
     /// == .gradient_top). Held at NDC z = 1.0 (far) with the overlay depth state
     /// (always-pass, never-write) so it never occludes the scene; the scene draw
     /// resets the depth state to .less afterwards.
-    private func drawGradient(_ enc: MTLRenderCommandEncoder) {
+    @discardableResult
+    private func drawGradient(_ enc: MTLRenderCommandEncoder) -> Bool {
         enc.setDepthStencilState(overlayDepthState)          // always-pass, never-write
         enc.setRenderPipelineState(gradPipeline)
         enc.setVertexBuffer(quadVB, offset: 0, index: 0)
@@ -510,12 +492,14 @@ final class Renderer: NSObject {
         enc.setFragmentBytes(&top, length: MemoryLayout<SIMD3<Float>>.stride, index: 1)
         enc.setFragmentBytes(&bottom, length: MemoryLayout<SIMD3<Float>>.stride, index: 2)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-        enc.setDepthStencilState(makeDepthStencilState())     // restore for the scene
+        enc.setDepthStencilState(depthStencilState)           // restore for the scene
+        return true
     }
 
     // MARK: - Atoms
 
-    private func drawAtoms(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
+    @discardableResult
+    private func drawAtoms(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
         let selected = Set(scene.selectedAtoms)
         var inst: [InstanceData] = []
         inst.reserveCapacity(scene.atoms.count)
@@ -530,11 +514,11 @@ final class Renderer: NSObject {
                                      color: SIMD4(c.x, c.y, c.z, 1.0),
                                      radius: radius, metalness: 0.0))
         }
-        if inst.isEmpty { return }
+        if inst.isEmpty { return true }
 
-        let buf = device.makeBuffer(bytes: inst,
-                                    length: inst.count * MemoryLayout<InstanceData>.stride,
-                                    options: [])
+        guard let buf = device.makeBuffer(bytes: inst,
+                                          length: inst.count * MemoryLayout<InstanceData>.stride,
+                                          options: []) else { return false }
         enc.setRenderPipelineState(atomPipeline)
         enc.setVertexBuffer(sphereVB, offset: 0, index: 0)
         enc.setVertexBuffer(buf, offset: 0, index: 1)
@@ -546,6 +530,7 @@ final class Renderer: NSObject {
                                   indexBuffer: sphereIB,
                                   indexBufferOffset: 0,
                                   instanceCount: inst.count)
+        return true
     }
 
     private func atomRadius(z: Int) -> Float {
@@ -563,11 +548,12 @@ final class Renderer: NSObject {
 
     // MARK: - Bonds
 
-    private func drawBonds(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
+    @discardableResult
+    private func drawBonds(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
         let bondsDrawn: [DisplayMode] = [.ballStick, .wireFrame, .line2D, .point2D, .ballStick2D]
-        guard bondsDrawn.contains(scene.displayMode) else { return }
+        guard bondsDrawn.contains(scene.displayMode) else { return true }
         let atoms = scene.atoms
-        guard atoms.count > 1 else { return }
+        guard atoms.count > 1 else { return true }
 
         var inst: [InstanceData] = []
         inst.reserveCapacity(scene.bonds.count)
@@ -584,11 +570,11 @@ final class Renderer: NSObject {
             let c = ElementTable.color(atoms[b.i].atomicNumber)
             inst.append(InstanceData(model: model, color: SIMD4(c.x, c.y, c.z, 1.0), radius: 1.0, metalness: 0.0))
         }
-        if inst.isEmpty { return }
+        if inst.isEmpty { return true }
 
-        let buf = device.makeBuffer(bytes: inst,
-                                    length: inst.count * MemoryLayout<InstanceData>.stride,
-                                    options: [])
+        guard let buf = device.makeBuffer(bytes: inst,
+                                          length: inst.count * MemoryLayout<InstanceData>.stride,
+                                          options: []) else { return false }
         enc.setRenderPipelineState(atomPipeline)
         enc.setVertexBuffer(cylinderVB, offset: 0, index: 0)
         enc.setVertexBuffer(buf, offset: 0, index: 1)
@@ -600,6 +586,7 @@ final class Renderer: NSObject {
                                   indexBuffer: cylinderIB,
                                   indexBufferOffset: 0,
                                   instanceCount: inst.count)
+        return true
     }
 
     // MARK: - Force arrows
@@ -609,29 +596,23 @@ final class Renderer: NSObject {
     /// atom to atom+force; the head is a short barbed fork at the tip, all drawn
     /// through the existing line pipeline. Gated on `scene.forceSet` presence and
     /// the `showForces` toggle, so files without forces draw nothing.
-    private func drawForceArrows(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        guard scene.forceSet != nil, scene.showForces else { return }
+    @discardableResult
+    private func drawForceArrows(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard scene.forceSet != nil, scene.showForces else { return true }
         let atoms = scene.atoms
-        guard !atoms.isEmpty else { return }
+        guard !atoms.isEmpty else { return true }
         var verts: [SIMD3<Float>] = []
         verts.reserveCapacity(atoms.count * 8)
         let scale = scene.forceScale
-        let headFrac: Float = 0.18      // head length as a fraction of shaft
+        let headFrac: Float = 0.18
         let headSpread: Float = 0.5
         for a in atoms {
-            // After supercell widening every replica carries its own `force`
-            // (copied from its base atom in widenSuperCell), so the arrow is
-            // drawn from each atom's own guard — NOT truncated to the base-cell
-            // count. (Each replica's force vector is identical to its base's,
-            // which is physically correct for a periodic structure.)
             guard let f = a.force else { continue }
             let flen = length(f)
-            guard flen > 1e-6 else { continue }    // no arrow for a ~zero force
+            guard flen > 1e-6 else { continue }
             let start = a.coord
             let tip = start + f * scale
             verts.append(start); verts.append(tip)
-            // Head: two short segments splaying back from the tip along a
-            // perpendicular to the shaft. Build a stable perpendicular.
             let dir = f / flen
             let perp = makePerpendicular(dir)
             let side = simd_length(f) * scale * headFrac
@@ -641,8 +622,8 @@ final class Renderer: NSObject {
             verts.append(tip); verts.append(left)
             verts.append(tip); verts.append(right)
         }
-        if verts.isEmpty { return }
-        drawLineBuffer(verts, color: SIMD3<Float>(1.0, 0.55, 0.1), enc: enc, frameBuffer: frameBuffer)
+        if verts.isEmpty { return true }
+        return drawLineBuffer(verts, color: SIMD3<Float>(1.0, 0.55, 0.1), enc: enc, frameBuffer: frameBuffer)
     }
 
     /// A unit vector perpendicular to `d` (assumed unit-length).
@@ -675,11 +656,12 @@ final class Renderer: NSObject {
     /// 2D atoms: a filled disc per atom, drawn as a small screen-space quad that
     /// the flat shader masks to a unit circle. Avoids the tessellated sphere so
     /// these modes are cheap and resolution-independent.
-    private func drawAtoms2D(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?, w: Int, h: Int) {
+    @discardableResult
+    private func drawAtoms2D(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?, w: Int, h: Int) -> Bool {
         let view = sceneView(frameBuffer)
         let proj = sceneProj(frameBuffer)
         let atoms = scene.atoms
-        guard !atoms.isEmpty else { return }
+        guard !atoms.isEmpty else { return true }
         let selected = Set(scene.selectedAtoms)
 
         struct V { var px: Float; var py: Float; var lx: Float; var ly: Float; var r: Float; var g: Float; var b: Float }
@@ -688,8 +670,6 @@ final class Renderer: NSObject {
         let wF = Float(w), hF = Float(h)
         for (i, a) in atoms.enumerated() {
             let ndc = projectNDC(a.coord, view: view, proj: proj)
-            // Pixel radius: a couple px for points; a scaled covalent radius for
-            // ball-stick. Converted to NDC via the viewport size.
             let rPx: Float = scene.displayMode == .point2D
                 ? 2.5
                 : max(3.0, ElementTable.covalentRadius(a.atomicNumber) * scene.atomScale * 12.0)
@@ -697,27 +677,27 @@ final class Renderer: NSObject {
             let ry = rPx / (hF * 0.5)
             var c = ElementTable.color(a.atomicNumber)
             if selected.contains(i) { c = SIMD3<Float>(1, 1, 0.2) }
-            // Two triangles (6 verts), each carrying its local (±1) coord so the
-            // fragment shader discards outside the unit circle.
             let corners: [(Float, Float)] = [(-1, -1), (1, -1), (-1, 1), (-1, 1), (1, -1), (1, 1)]
             for (lx, ly) in corners {
                 verts.append(V(px: ndc.x + lx * rx, py: ndc.y + ly * ry, lx: lx, ly: ly, r: c.x, g: c.y, b: c.z))
             }
         }
-        if verts.isEmpty { return }
-        let buf = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: [])
+        if verts.isEmpty { return true }
+        guard let buf = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: []) else { return false }
         enc.setRenderPipelineState(flat2DPipeline)
         enc.setVertexBuffer(buf, offset: 0, index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: verts.count)
+        return true
     }
 
     /// 2D bonds: 1px lines between projected atom endpoints, reusing the line
     /// pipeline (which already draws crisp 1px strokes). The frame's ortho
     /// view/proj carries the projection; we just feed world-space endpoints.
-    private func drawBonds2D(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        guard scene.displayMode == .ballStick2D || scene.displayMode == .line2D else { return }
+    @discardableResult
+    private func drawBonds2D(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard scene.displayMode == .ballStick2D || scene.displayMode == .line2D else { return true }
         let atoms = scene.atoms
-        guard atoms.count > 1 else { return }
+        guard atoms.count > 1 else { return true }
         var lineVerts: [SIMD3<Float>] = []
         lineVerts.reserveCapacity(scene.bonds.count * 2)
         for b in scene.bonds {
@@ -725,8 +705,8 @@ final class Renderer: NSObject {
             lineVerts.append(atoms[b.i].coord)
             lineVerts.append(atoms[b.j].coord)
         }
-        if lineVerts.isEmpty { return }
-        drawLineBuffer(lineVerts, color: SIMD3<Float>(0.35, 0.35, 0.35), enc: enc, frameBuffer: frameBuffer)
+        if lineVerts.isEmpty { return true }
+        return drawLineBuffer(lineVerts, color: SIMD3<Float>(0.35, 0.35, 0.35), enc: enc, frameBuffer: frameBuffer)
     }
 
     // MARK: - Polyhedral display mode (convex Voronoi-like cells)
@@ -753,15 +733,29 @@ final class Renderer: NSObject {
     /// perpendicular-bisector half-spaces to build a convex cell and render it
     /// as flat-shaded triangles through the lit polyhedron pipeline. Atoms with
     /// too few neighbors (termini) are skipped — the surrounding cells expand to
-    /// fill the gap.
-    private func drawPolyhedral(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
+    /// fill the gap. Caches vertex buffer across camera-only frames.
+    @discardableResult
+    private func drawPolyhedral(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
         let atoms = scene.atoms
-        guard atoms.count > 1 else { return }
+        guard atoms.count > 1 else { return true }
+        let key = (atoms: atoms, bonds: scene.bonds, selected: scene.selectedAtoms)
+        if let pk = cachedPolyKey,
+           pk.selected == key.selected,
+           pk.atoms.count == key.atoms.count, zip(pk.atoms, key.atoms).allSatisfy({ $0.coord == $1.coord && $0.atomicNumber == $1.atomicNumber }),
+           pk.bonds.count == key.bonds.count, zip(pk.bonds, key.bonds).allSatisfy({ $0.i == $1.i && $0.j == $1.j }) {
+            // cache hit (possibly an empty mesh). Draw only if geometry is present.
+            if cachedPolyVertexCount > 0, let cachedPolyBuffer {
+                enc.setRenderPipelineState(polyPipeline)
+                enc.setVertexBuffer(cachedPolyBuffer, offset: 0, index: 0)
+                enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
+                enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cachedPolyVertexCount)
+            }
+            return true
+        }
         let neigh = buildNeighborCoords()
         let selected = Set(scene.selectedAtoms)
 
-        // Packed vertex: world pos (3) + face normal (3) + color (3). Drawn as a
-        // plain triangle list through the lit poly pipeline (no instancing).
         struct V { var x: Float; var y: Float; var z: Float; var nx: Float; var ny: Float; var nz: Float; var r: Float; var g: Float; var b: Float }
         var verts: [V] = []
         for (i, a) in atoms.enumerated() {
@@ -769,8 +763,6 @@ final class Renderer: NSObject {
             guard let tris = Geometry.polyhedronFaces(center: a.coord, neighbors: neigh[i], maxNeighbors: 12) else { continue }
             var col = ElementTable.color(a.atomicNumber)
             if selected.contains(i) { col = SIMD3<Float>(1, 1, 0.2) }
-            // tris is a flat list of triangle vertices (groups of 3). Compute a
-            // flat normal per triangle and assign it to each of its 3 vertices.
             var j = 0
             while j < tris.count {
                 let p0 = tris[j], p1 = tris[j + 1], p2 = tris[j + 2]
@@ -781,13 +773,27 @@ final class Renderer: NSObject {
                 j += 3
             }
         }
-        if verts.isEmpty { return }
-        let buf = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: [])
+        // negative-cache empty geometry so camera-only frames skip the rebuild.
+        if verts.isEmpty {
+            cachedPolyKey = key
+            cachedPolyBuffer = nil
+            cachedPolyVertexCount = 0
+            return true
+        }
+        guard let buf = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: []) else {
+            // Don't commit the key on allocation failure, or the hit branch would
+            // persistently skip the now-nil buffer and never retry.
+            return false
+        }
+        cachedPolyKey = key
+        cachedPolyBuffer = buf
+        cachedPolyVertexCount = verts.count
         enc.setRenderPipelineState(polyPipeline)
         enc.setVertexBuffer(buf, offset: 0, index: 0)
-        enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)   // FrameData for lighting
+        enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
         enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: verts.count)
+        return true
     }
 
     // MARK: - Cell frame + axes
@@ -800,8 +806,21 @@ final class Renderer: NSObject {
         (0,4),(1,5),(2,7),(3,6), // verticals
     ]
 
-    private func drawCell(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        guard let cell = scene.cell else { return }
+    /// Overflow-safe, strictly-positive supercell replica count; nil if any factor is
+    /// non-positive or the product overflows. Mirrors `Scene.positiveProduct` (kept
+    /// file-private there) so `drawCell` can bound its box reserve and nested loops
+    /// without importing the GUI's widenSuperCell path.
+    private static func cellBoxCount(_ sc: SuperCell) -> Int? {
+        guard sc.n1 > 0, sc.n2 > 0, sc.n3 > 0 else { return nil }
+        let ab = sc.n1.multipliedReportingOverflow(by: sc.n2)
+        guard !ab.overflow else { return nil }
+        let abc = ab.partialValue.multipliedReportingOverflow(by: sc.n3)
+        return abc.overflow ? nil : abc.partialValue
+    }
+
+    @discardableResult
+    private func drawCell(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard let cell = scene.cell else { return true }
         let a = cell.a, b = cell.b, c = cell.c
         // Center the displayed cells on the structure centroid so the set of
         // supercell boxes encloses the atoms (otherwise atoms at negative
@@ -820,8 +839,15 @@ final class Renderer: NSObject {
                           - (Float(sc.n3) * 0.5) * c
         if scene.showCellFrame {
             let edges = Renderer.cellEdges
+            // A direct Scene construction can carry a pathological supercell (a product
+            // that overflows Int, or a zero/negative factor) that the GUI's widenSuperCell
+            // refuses — bound the replica count by the same atom cap the GUI enforces so
+            // the reserve + loops never allocate gigabytes or hang. Any legitimately-built
+            // scene stays under that ceiling, so normal rendering is unaffected.
+            guard let replicas = Renderer.cellBoxCount(sc),
+                  replicas <= Scene.superCellAtomCap else { return false }
             var frameVerts: [SIMD3<Float>] = []
-            frameVerts.reserveCapacity(24 * sc.total)
+            frameVerts.reserveCapacity(replicas * 24)
             for i in 0..<sc.n1 {
                 for j in 0..<sc.n2 {
                     for k in 0..<sc.n3 {
@@ -832,35 +858,29 @@ final class Renderer: NSObject {
                     }
                 }
             }
-            drawLineBuffer(frameVerts, color: SIMD3<Float>(0.75, 0.75, 0.75), enc: enc, frameBuffer: frameBuffer)
+            return drawLineBuffer(frameVerts, color: SIMD3<Float>(0.75, 0.75, 0.75), enc: enc, frameBuffer: frameBuffer)
         }
-
+        return true
     }
 
     /// Draw measurement lines between selected atoms in 3D space.
-    private func drawMeasurements(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        // Only draw connecting lines while a measurement mode is active — never
-        // in plain Selection mode (.none).
-        guard scene.measurementMode != .none else { return }
+    @discardableResult
+    private func drawMeasurements(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard scene.measurementMode != .none else { return true }
         let sel = scene.selectedAtoms
-        guard sel.count >= 2 else { return }
+        guard sel.count >= 2 else { return true }
         let atoms = scene.atoms
-        // connect consecutive selected atoms in order
         var verts: [SIMD3<Float>] = []
         verts.reserveCapacity(sel.count * 2)
         for i in 0..<(sel.count - 1) {
-            guard sel[i] < atoms.count, sel[i+1] < atoms.count else { return }
+            guard sel[i] < atoms.count, sel[i+1] < atoms.count else { return true }
             verts.append(atoms[sel[i]].coord)
             verts.append(atoms[sel[i+1]].coord)
         }
-        // The orientation gizmo sets a corner sub-viewport; restore the full
-        // target viewport before drawing measurement lines.
         enc.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(lastW), height: Double(lastH),
                                     znear: 0, zfar: 1))
-        // Draw as a depth-disabled overlay (like the orientation gizmo) so the
-        // lines stay readable where they pass behind bonds or atoms.
         enc.setDepthStencilState(overlayDepthState)
-        drawLineBuffer(verts, color: SIMD3<Float>(0.2, 0.6, 1), enc: enc, frameBuffer: frameBuffer)
+        return drawLineBuffer(verts, color: SIMD3<Float>(0.2, 0.6, 1), enc: enc, frameBuffer: frameBuffer)
     }
 
     /// Screen-space orientation gizmo: a fixed-size triad of bold arrows pinned
@@ -874,17 +894,13 @@ final class Renderer: NSObject {
     /// triad spins with your orbit) and a fixed orthographic projection sized
     /// to a corner sub-viewport (so the arrows keep a constant pixel size at
     /// any zoom). This is the standard orientation-gizmo construction.
-    private func drawOrientationGizmo(_ enc: MTLRenderCommandEncoder, camera: Camera, w: Int, h: Int) {
-        // Corner sub-viewport (pixels); Metal origin is top-left, +y down.
+    @discardableResult
+    private func drawOrientationGizmo(_ enc: MTLRenderCommandEncoder, camera: Camera, w: Int, h: Int) -> Bool {
         let gSize = max(72.0, Double(min(w, h)) * 0.16)
         let margin = 14.0
         enc.setViewport(MTLViewport(originX: margin, originY: Double(h) - gSize - margin,
                                     width: gSize, height: gSize, znear: 0, zfar: 1))
 
-        // Rotate the axis directions into camera space before instancing. The
-        // arrows can then use an identity view with a viewer-fixed light and eye,
-        // avoiding a second world/view conversion that made their shading appear
-        // attached to the gizmo while it rotated.
         let worldToView = float4x4(camera.rotation).transpose
         let half: Float = 1.05
         let proj = float4x4(orthographicLeft: -half, right: half, bottom: -half, top: half,
@@ -892,18 +908,16 @@ final class Renderer: NSObject {
         var arrowFrame = Renderer.makeFrame(view: matrix_identity_float4x4, proj: proj,
                                             lighting: scene.lighting,
                                             eye: SIMD3<Float>(0, 0, 100))
-        let arrowFB = device.makeBuffer(bytes: &arrowFrame, length: MemoryLayout<FrameData>.stride, options: [])
-        // Labels remain in world-axis coordinates and need the rotation-only view.
+        guard let arrowFB = device.makeBuffer(bytes: &arrowFrame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
         var labelFrame = Renderer.makeFrame(view: worldToView, proj: proj,
                                             lighting: scene.lighting,
                                             eye: SIMD3<Float>(0, 0, 100))
-        let labelFB = device.makeBuffer(bytes: &labelFrame, length: MemoryLayout<FrameData>.stride, options: [])
+        guard let labelFB = device.makeBuffer(bytes: &labelFrame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
         enc.setRenderPipelineState(atomPipeline)
         enc.setDepthStencilState(overlayDepthState)
 
         let shaftLen: Float = 0.62, shaftR: Float = 0.05
         let headLen: Float = 0.22, headR: Float = 0.13
-        // Unit cylinder/cone point +Y; rotate each onto its axis direction.
         func shaftModel(_ dir: SIMD3<Float>) -> float4x4 {
             float4x4(translation: dir * shaftLen * 0.5) * .rotation(fromYTo: dir) *
             float4x4(scale: SIMD3<Float>(shaftR, shaftLen, shaftR))
@@ -914,20 +928,19 @@ final class Renderer: NSObject {
         }
         struct Axis { let dir: SIMD3<Float>; let color: SIMD3<Float> }
         let axes = [
-            Axis(dir: (worldToView * SIMD4<Float>(1, 0, 0, 0)).xyz, color: SIMD3<Float>(1, 0.2, 0.2)), // x red
-            Axis(dir: (worldToView * SIMD4<Float>(0, 1, 0, 0)).xyz, color: SIMD3<Float>(0.2, 1, 0.2)), // y green
-            Axis(dir: (worldToView * SIMD4<Float>(0, 0, 1, 0)).xyz, color: SIMD3<Float>(0.2, 0.2, 1)), // z blue
+            Axis(dir: (worldToView * SIMD4<Float>(1, 0, 0, 0)).xyz, color: SIMD3<Float>(1, 0.2, 0.2)),
+            Axis(dir: (worldToView * SIMD4<Float>(0, 1, 0, 0)).xyz, color: SIMD3<Float>(0.2, 1, 0.2)),
+            Axis(dir: (worldToView * SIMD4<Float>(0, 0, 1, 0)).xyz, color: SIMD3<Float>(0.2, 0.2, 1)),
         ]
 
-        // Draw shafts (cylinders) and heads (cones) as two instanced passes.
         func drawInstances(_ meshVB: MTLBuffer, _ meshIB: MTLBuffer,
-                           _ model: (SIMD3<Float>) -> float4x4) {
+                           _ model: (SIMD3<Float>) -> float4x4) -> Bool {
             var inst: [InstanceData] = []
             for a in axes {
                 inst.append(InstanceData(model: model(a.dir), color: SIMD4(a.color, 1),
                                          radius: 1.0, metalness: 0.0))
             }
-            let buf = device.makeBuffer(bytes: inst, length: inst.count * MemoryLayout<InstanceData>.stride, options: [])
+            guard let buf = device.makeBuffer(bytes: inst, length: inst.count * MemoryLayout<InstanceData>.stride, options: []) else { return false }
             enc.setVertexBuffer(meshVB, offset: 0, index: 0)
             enc.setVertexBuffer(buf, offset: 0, index: 1)
             enc.setVertexBuffer(arrowFB, offset: 0, index: 2)
@@ -936,15 +949,14 @@ final class Renderer: NSObject {
                                       indexCount: meshIB.length / MemoryLayout<UInt16>.stride,
                                       indexType: .uint16, indexBuffer: meshIB, indexBufferOffset: 0,
                                       instanceCount: inst.count)
+            return true
         }
-        drawInstances(cylinderVB, cylinderIB, shaftModel)
-        drawInstances(coneVB, coneIB, headModel)
+        guard drawInstances(cylinderVB, cylinderIB, shaftModel) else { return false }
+        guard drawInstances(coneVB, coneIB, headModel) else { return false }
 
-        // x/y/z letter labels at each arrow tip (line-pipeline strokes).
-        // Letters are short line segments in the xy-plane, offset past the tip.
         let tipLen = shaftLen + headLen
-        let lo: Float = tipLen + 0.07         // distance from origin
-        let hs: Float = 0.04                  // half-size of each letter
+        let lo: Float = tipLen + 0.07
+        let hs: Float = 0.04
         typealias V = SIMD3<Float>
         let labelData: [(V, V, [V])] = [
             (V(lo,0,0), V(1,0.2,0.2), [V(-hs,-hs,0),V(hs,hs,0), V(-hs,hs,0),V(hs,-hs,0)]),
@@ -953,89 +965,79 @@ final class Renderer: NSObject {
         ]
         enc.setRenderPipelineState(linePipeline)
         for (pos, col, segs) in labelData {
-            let verts = segs.map { $0 + pos }    // offset from local origin to arrow tip
+            let verts = segs.map { $0 + pos }
             var c = col
-            let cb = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: [])!
-            let vb = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<SIMD3<Float>>.stride, options: [])
+            guard let cb = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: []) else { return false }
+            guard let vb = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<SIMD3<Float>>.stride, options: []) else { return false }
             enc.setVertexBuffer(vb, offset: 0, index: 0)
             enc.setVertexBuffer(cb, offset: 0, index: 3)
             enc.setVertexBuffer(labelFB, offset: 0, index: 2)
             enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: segs.count)
         }
+        return true
     }
 
+    @discardableResult
     private func drawLineBuffer(_ verts: [SIMD3<Float>], color: SIMD3<Float>,
-                                enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        let lineVB = device.makeBuffer(bytes: verts,
-                                       length: verts.count * MemoryLayout<SIMD3<Float>>.stride,
-                                       options: [])
+                                enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard let lineVB = device.makeBuffer(bytes: verts,
+                                             length: verts.count * MemoryLayout<SIMD3<Float>>.stride,
+                                             options: []) else { return false }
         var c = color
-        let colorBuf = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: [])
+        guard let colorBuf = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: []) else { return false }
         enc.setRenderPipelineState(linePipeline)
         enc.setVertexBuffer(lineVB, offset: 0, index: 0)
         enc.setVertexBuffer(colorBuf, offset: 0, index: 3)
         enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
         enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: verts.count)
+        return true
     }
 
     /// Draw the Brillouin-zone wireframe of the crystal's reciprocal lattice.
     /// The BZ lives in reciprocal space (units of 2pi/A); we normalise it by its
     /// largest extent and overlay it centered on the structure so it sits around
-    /// the atoms like a reciprocal-space cage.
-    private func drawBrillouinZone(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        guard let cell = scene.cell else { return }
-        // baseAtoms are the pristine atoms in the conventional cell; their
-        // fractional offsets reveal the centering so the BZ shape is right. The BZ
-        // is cached because it's purely a function of (cell, baseAtoms) and those
-        // don't change between frames — rebuilding the O(m^3) Wigner-Seitz cell
-        // every frame is what made dragging laggy for large G-stars.
-        let key = BZCacheKey(cellA: cell.a, cellB: cell.b, cellC: cell.c,
-                             baseAtoms: scene.baseAtoms.map {
-                                 BaseAtomKey(coord: $0.coord, atomicNumber: $0.atomicNumber)
-                             })
-        if cachedBZKey != key {
+    /// the atoms like a reciprocal-space cage. BZ cache is invalidated by
+    /// invalidateCaches when cell or baseAtoms change; this method just checks
+    /// cachedBZ == nil instead of reconstructing the cache key every frame.
+    @discardableResult
+    private func drawBrillouinZone(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard let cell = scene.cell else { return true }
+        // negative-cache a nil BZ so a failed build() does not rebuild every frame.
+        if !bzBuilt {
             cachedBZ = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms)
-            cachedBZKey = key
+            bzBuilt = true
             bzRebuildCount += 1
         }
-        guard let bz = cachedBZ else { return }
-        // The BZ lives in reciprocal space (units of 2pi/A). Scale it to a fixed
-        // fraction of the structure's bounding sphere so it renders as a visible
-        // cage around the atoms — an absolute normalisation would make it a
-        // microscopic speck for large cells (e.g. GaAsH, ~20 A wide) and hide it
-        // among the front atoms. Centered on the structure centroid.
+        guard let bz = cachedBZ else { return true }
         var extent: Float = 0
         for face in bz.faces { for v in face { extent = max(extent, length(v)) } }
-        guard extent > 1e-5 else { return }
+        guard extent > 1e-5 else { return true }
         let (_, radius) = scene.boundingSphere()
         let targetExtent = max(1.0, radius) * 0.45
         let inv = targetExtent / extent
         let center = sceneCentroid()
         let bzColor = SIMD3<Float>(0.85, 0.30, 0.95)
+        // Batch the face wireframe (purple) in one buffer, then the special-point
+        // crosses (white) in another — they differ in color, so they must be drawn
+        // through separate line passes.
+        var faceSegs: [SIMD3<Float>] = []
         for face in bz.faces {
             let mapped = face.map { center + $0 * inv }
-            // drawLineBuffer draws with Metal .line (independent vertex PAIRS), so
-            // to trace a closed polygon we must emit consecutive edge pairs
-            // (v0,v1),(v1,v2),...,(vN,v0) explicitly — passing the raw loop would
-            // skip every other edge.
-            var segs: [SIMD3<Float>] = []
             for i in 0..<mapped.count {
-                let a = mapped[i]
-                let b = mapped[(i + 1) % mapped.count]
-                segs.append(a); segs.append(b)
+                faceSegs.append(mapped[i])
+                faceSegs.append(mapped[(i + 1) % mapped.count])
             }
-            drawLineBuffer(segs, color: bzColor, enc: enc, frameBuffer: frameBuffer)
         }
-        // Special points as tiny crosses (instanced points would need a
-        // pipeline; reuse short line segments for a simple marker).
+        let faceOK = faceSegs.isEmpty ? true : drawLineBuffer(faceSegs, color: bzColor, enc: enc, frameBuffer: frameBuffer)
+        var spSegs: [SIMD3<Float>] = []
         for sp in bz.specialPoints where sp.type != .center {
             let p = center + sp.coord * inv
             let d: Float = 0.012
-            drawLineBuffer([p - SIMD3(d,0,0), p + SIMD3(d,0,0)], color: SIMD3(1,1,1),
-                           enc: enc, frameBuffer: frameBuffer)
-            drawLineBuffer([p - SIMD3(0,d,0), p + SIMD3(0,d,0)], color: SIMD3(1,1,1),
-                           enc: enc, frameBuffer: frameBuffer)
+            spSegs.append(p - SIMD3(d,0,0)); spSegs.append(p + SIMD3(d,0,0))
+            spSegs.append(p - SIMD3(0,d,0)); spSegs.append(p + SIMD3(0,d,0))
         }
+        let spOK = spSegs.isEmpty ? true : drawLineBuffer(spSegs, color: SIMD3(1,1,1), enc: enc, frameBuffer: frameBuffer)
+        return faceOK && spOK
     }
 
     // MARK: - Isosurface
@@ -1044,8 +1046,9 @@ final class Renderer: NSObject {
     /// a depth-tested triangle surface. Two complementary shells are drawn at
     /// +iso and -iso, tinted differently so positive and negative orbital lobes
     /// remain distinguishable. Cached per (field signature + iso level + sign).
-    private func drawIsosurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        guard let field = scene.scalarField, scene.showIsoSurface else { return }
+    @discardableResult
+    private func drawIsosurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard let field = scene.scalarField, scene.showIsoSurface else { return true }
         let iso = scene.isoLevel
         // Draw the positive shell first, then the negative shell.
         let shells: [(sign: Float, color: SIMD3<Float>)] = [
@@ -1062,9 +1065,25 @@ final class Renderer: NSObject {
             if needsBuild {
                 isoRebuildCount += 1
                 let mesh = IsoMesh(field: field, isoLevel: iso, sign: shell.sign, color: shell.color)
-                cachedIsoBuffers[cacheIndex] = mesh.triangleCount > 0
-                    ? device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: [])
-                    : nil
+                // A truncated shell (triangle cap hit or Int-overflowed grid) is a
+                // partial surface — never cache or render it as a complete one. Surface
+                // the failure so the frame drops rather than silently drawing a
+                // truncated shell. A valid empty surface (no crossing) has overflow==false
+                // and falls through to the triangleCount==0 branch below.
+                if mesh.overflow {
+                    return false
+                }
+                if mesh.triangleCount > 0 {
+                    // A non-empty mesh that fails to allocate is a real failure — do not
+                    // cache nil as "empty", or the frame would silently drop the surface
+                    // and never retry. Surface the failure instead.
+                    guard let buf = device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: []) else {
+                        return false
+                    }
+                    cachedIsoBuffers[cacheIndex] = buf
+                } else {
+                    cachedIsoBuffers[cacheIndex] = nil
+                }
                 cachedIsoKeys[cacheIndex] = key
                 cachedIsoTriangleCounts[cacheIndex] = mesh.triangleCount
             }
@@ -1075,9 +1094,15 @@ final class Renderer: NSObject {
             enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cachedIsoTriangleCounts[cacheIndex] * 3)
         }
+        return true
     }
 
     // Per-shell isosurface cache (index 0 = outside/sign>0, 1 = inside/sign<0).
+    // Polyhedral cache: reuses vertex buffer across camera-only frames.
+    private var cachedPolyBuffer: MTLBuffer?
+    private var cachedPolyVertexCount: Int = 0
+    private var cachedPolyKey: (atoms: [Atom], bonds: [Bond], selected: [Int])?
+
     private var cachedIsoBuffers: [MTLBuffer?] = [nil, nil]
     private var cachedIsoKeys: [IsoCacheKey?] = [nil, nil]
     private var cachedIsoTriangleCounts: [Int] = [0, 0]
@@ -1109,21 +1134,41 @@ final class Renderer: NSObject {
     /// Draw each band of a Fermi surface as an independent isosurface at the
     /// Fermi energy, tinted per band. Depth-tested so the bands interleave
     /// correctly as the user orbits.
-    private func drawFermiSurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) {
-        guard let fs = scene.fermiSurface, scene.showFermiSurface else { return }
+    @discardableResult
+    private func drawFermiSurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard let fs = scene.fermiSurface, scene.showFermiSurface else { return true }
         // Rebuild only when the band COUNT changes. Because cachedFermiBuffers
         // keeps one slot per band (nil for a no-crossing band), the slot count
         // always equals fs.bands.count after the first build — a noncrossing
         // band therefore never triggers a rebuild.
         if cachedFermiBuffers.count != fs.bands.count {
             var bufs: [MTLBuffer?] = []
+            var ok = true
             for (idx, band) in fs.bands.enumerated() {
                 let color = Renderer.fermiPalette[idx % Renderer.fermiPalette.count]
                 let mesh = IsoMesh(field: band, isoLevel: fs.fermiEnergy, sign: 1, color: color)
-                bufs.append(mesh.triangleCount > 0
-                    ? device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: [])
-                    : nil)
+                // A truncated band shell is a partial surface — never commit a partial
+                // buffer array (its length would match fs.bands.count and defeat the
+                // rebuild guard, silently dropping that band). Abort and surface it.
+                if mesh.overflow {
+                    ok = false
+                    break
+                }
+                if mesh.triangleCount > 0 {
+                    // A non-empty band that fails to allocate must not commit a partial
+                    // array (its length would then match fs.bands.count and defeat the
+                    // rebuild guard, silently dropping that band). Abort and surface it.
+                    if let buf = device.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<Float>.stride, options: []) {
+                        bufs.append(buf)
+                    } else {
+                        ok = false
+                        break
+                    }
+                } else {
+                    bufs.append(nil)   // no-crossing band: keep a nil slot
+                }
             }
+            guard ok else { return false }
             cachedFermiBuffers = bufs
             fermiRebuildCount += 1
         }
@@ -1132,11 +1177,10 @@ final class Renderer: NSObject {
             enc.setVertexBuffer(buf, offset: 0, index: 0)
             enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
             enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
-            // buf.length / (9 floats/vertex) is already the vertex count (3 per
-            // triangle) — drawing triCount*3 reads past the populated buffer.
             let vertexCount = buf.length / (9 * MemoryLayout<Float>.stride)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
         }
+        return true
     }
 
     /// Conditional cache invalidation. The renderer's `scene` is reassigned on
@@ -1156,6 +1200,13 @@ final class Renderer: NSObject {
         if oldCell?.a != newCell?.a || oldCell?.b != newCell?.b
             || oldCell?.c != newCell?.c || !sameBase {
             invalidateBrillouinZoneCache()
+        }
+        if let oldPolyKey = cachedPolyKey, oldPolyKey.selected != scene.selectedAtoms
+            || oldPolyKey.atoms.count != scene.atoms.count
+            || zip(oldPolyKey.atoms, scene.atoms).contains(where: { $0.coord != $1.coord || $0.atomicNumber != $1.atomicNumber })
+            || oldPolyKey.bonds.count != scene.bonds.count
+            || zip(oldPolyKey.bonds, scene.bonds).contains(where: { $0.i != $1.i || $0.j != $1.j }) {
+            cachedPolyBuffer = nil; cachedPolyVertexCount = 0; cachedPolyKey = nil
         }
         if !isoInputsUnchanged(old: old) {
             cachedIsoBuffers = [nil, nil]
@@ -1237,7 +1288,10 @@ final class Renderer: NSObject {
         return depthTexture != nil
     }
 
-    private func makeDepthStencilState() -> MTLDepthStencilState? {
+    /// Authoritative scene depth state: less-than compare, write enabled. Cached
+    /// at init (see `depthStencilState`); this factory exists so init can build it
+    /// the same way as `makeOverlayDepthState`.
+    private static func makeDepthStencilState(device: MTLDevice) -> MTLDepthStencilState? {
         let d = MTLDepthStencilDescriptor()
         d.depthCompareFunction = .less
         d.isDepthWriteEnabled = true

@@ -29,7 +29,14 @@ enum DisplayMode: String, Codable, CaseIterable {
 // Equatable is synthesized (all fields are Int) so replication DIRECTION is
 // compared, not just total count — 2×1×1 vs 1×2×1 must differ.
 struct SuperCell: Codable, Equatable { var n1: Int = 1; var n2: Int = 1; var n3: Int = 1
-    var total: Int { n1 * n2 * n3 }
+    // Saturating product so a malicious/huge supercell can't trap Swift's Int.
+    // `total > 1` comparisons at call sites still read correctly (Int.max > 1).
+    var total: Int {
+        let ab = n1.multipliedReportingOverflow(by: n2)
+        guard !ab.overflow else { return Int.max }
+        let abc = ab.partialValue.multipliedReportingOverflow(by: n3)
+        return abc.overflow ? Int.max : abc.partialValue
+    }
 }
 
 /// What the next atom click measures. Caps selection at the needed count.

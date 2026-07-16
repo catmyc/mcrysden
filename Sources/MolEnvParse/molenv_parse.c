@@ -102,12 +102,18 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
         for (int i = 0; i < 119; i++) cov[i] = (i < n) ? 1.05f * rcovdef[i] : 0.0f;
         ready = 1;
     }
-    /* Cap natoms before the bond-pass: a huge atom count would overflow the
-       signed cap below (natoms*4) and is never realistic for a structure file. */
-    if (s->natoms > 500000) { set_error(path,0,"too many atoms for bond heuristic"); *out_nbonds=0; return NULL; }
+    /* Documented workload guard: the O(n^2) bond pass is skipped above this count
+       (n^2/2 pair comparisons: 8000 atoms => ~32M, well under a second in C). A
+       scene can still render (bonds == 0); bonds are recomputed on demand in
+       Scene+Init if a smaller structure legitimately needs them. The guard reads
+       natoms (an int) before dereferencing the atom buffer, so any size is refused
+       promptly and never allocates. */
+    #define MOLENV_BOND_MAX_ATOMS 8000
+    #define MOLENV_BOND_MAX_CAP 100000000  /* ~160 MB bond buffer ceiling */
+    if (s->natoms > MOLENV_BOND_MAX_ATOMS) { set_error(path,0,"too many atoms for bond heuristic"); *out_nbonds=0; return NULL; }
     int cap = s->natoms * 4, nb = 0;
     if (cap < 4) cap = 4;
-    MolEnvBond *b = calloc(cap, sizeof(MolEnvBond));
+    MolEnvBond *b = calloc((size_t)cap, sizeof(MolEnvBond));
     if (!b) { set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
     for (int i=0;i<s->natoms;i++) for (int j=i+1;j<s->natoms;j++) {
         int zi=s->atoms[i].atomic_number, zj=s->atoms[j].atomic_number;
@@ -119,10 +125,14 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
         float r=cov[zi]+cov[zj];
         if (d2 <= (r*factor)*(r*factor)) {
             if (nb>=cap) {
-                cap*=2;
-                MolEnvBond *t=realloc(b,cap*sizeof(MolEnvBond));
+                /* Checked growth: double the cap but never past MOLENV_BOND_MAX_CAP,
+                   and bail rather than wrap cap (which would corrupt the heap). */
+                if (cap > MOLENV_BOND_MAX_CAP / 2) { free(b); set_error(path,0,"bond capacity exceeded"); *out_nbonds=0; return NULL; }
+                int ncap = cap * 2;
+                if (ncap < cap || ncap > MOLENV_BOND_MAX_CAP) ncap = MOLENV_BOND_MAX_CAP;
+                MolEnvBond *t=realloc(b, (size_t)ncap * sizeof(MolEnvBond));
                 if (!t) { free(b); set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
-                b=t;
+                b=t; cap = ncap;
             }
             b[nb].i=i; b[nb].j=j; nb++;
         }
@@ -156,12 +166,37 @@ static int first_tok(const char *line, char *out, int cap) {
     return i;
 }
 
-/* True if line looks like an atom record: first non-blank token starts with
-   a digit, '+' or '-' (Z number). Used to know when an ATOMS/ATOMS_FRAC block ends. */
+/* True if `line` is an atom record: a leading token that is a numeric Z
+   (+/- optional digits) or an element symbol (letters), followed by three
+   floats (x y z). Used to know where an ATOMS/ATOMS_FRAC block ends — any line
+   that is not a well-formed atom record (an XSF section keyword, prose, or a
+   malformed row) terminates the block. Requiring the full "token + 3 floats"
+   shape keeps arbitrary prose and section keywords (which are never followed by
+   three floats) from being mistaken for atoms, while accepting symbol rows such
+   as "Si 0 0 0" that the block body already parses. */
 static int atom_line_p(const char *line) {
-    while (*line==' '||*line=='	') line++;
-    char c=*line;
-    return (c>='0'&&c<='9') || c=='+' || c=='-';
+    while (*line == ' ' || *line == '\t') line++;
+    if (!*line) return 0;
+    /* First whitespace-delimited token. */
+    char tok[16];
+    int i = 0;
+    while (*line && *line != ' ' && *line != '\t' && *line != '\n' && *line != '\r' && i < 15)
+        tok[i++] = *line++;
+    tok[i] = '\0';
+    if (i == 0) return 0;
+    int numeric = 1, alpha = 1, digits = 0;
+    for (int k = 0; k < i; k++) {
+        char c = tok[k];
+        if (k == 0 && (c == '+' || c == '-')) { alpha = 0; continue; }
+        if (c >= '0' && c <= '9') { alpha = 0; digits++; }
+        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) { numeric = 0; }
+        else { numeric = 0; alpha = 0; }
+    }
+    if (!((numeric && digits >= 1) || alpha)) return 0;
+    /* Three coordinates must follow the token. */
+    double x, y, z;
+    if (sscanf(line, "%lf %lf %lf", &x, &y, &z) < 3) return 0;
+    return 1;
 }
 
 /* True if `line` (first whitespace-delimited token, uppercased) opens a DATAGRID
@@ -176,6 +211,19 @@ static int is_datagrid_opener(const char *line, char *tok) {
            strcmp(tok,"DATAGRID_3D")==0 || strcmp(tok,"DATAGRID_2D")==0 ||
            strcmp(tok,"DATAGRID3D")==0 || strcmp(tok,"DATAGRID2D")==0 ||
            strncmp(tok,"BEGIN_BLOCK_DATAGRID",20)==0;
+}
+
+/* True if the uppercased tok is a DATAGRID opener whose ident is embedded in the
+   token itself (the caller consumed that line), so read_datagrid_block must skip the
+   separate comment+ident read and extract dim/ident from the token. Covers the bare
+   "DATAGRID_3D_<name>" form and the direct "BEGIN_DATAGRID_3D_<name>" form (no block
+   wrapper, no preceding comment line). The block-wrapped form (BEGIN_BLOCK_DATAGRID_3D)
+   is handled separately and is NOT matched here. */
+static int is_bare_datagrid(const char *tok) {
+    return strncmp(tok,"DATAGRID_",8)==0 ||
+           strcmp(tok,"DATAGRID_3D")==0 || strcmp(tok,"DATAGRID_2D")==0 ||
+           strcmp(tok,"DATAGRID3D")==0 || strcmp(tok,"DATAGRID2D")==0 ||
+           strncmp(tok,"BEGIN_DATAGRID",14)==0;
 }
 
 /* Read a single DATAGRID block's body. On entry `fp` is positioned right after
@@ -195,32 +243,53 @@ static int is_datagrid_opener(const char *line, char *tok) {
    unconditional 3-vector read would mis-align the values. Returns 0 and fills
    `g` on success, -1 on failure (error set). The grid is left in `g` as-is on
    failure (caller frees in molenv_scene_free). */
+static int read_datagrid_block_ex(FILE *fp, MolEnvGrid *g, const char *path, int *ln,
+                                   const char *opener_tok);
+static MolEnvScene* parse_xsf_gridonly(const char *path);
+
+/* Wrapper for wrapped/block DATAGRID (BEGIN_DATAGRID or block form). */
 static int read_datagrid_block(FILE *fp, MolEnvGrid *g, const char *path, int *ln) {
+    return read_datagrid_block_ex(fp, g, path, ln, NULL);
+}
+
+/* Read a single DATAGRID block's body. For the wrapped (BLOCK/BEGIN_) form,
+   `opener_tok` is NULL and the body is <comment> <ident-line> <dims> ... . For the
+   bare/standalone form ("DATAGRID_3D_<name>" consumed by the caller), `opener_tok`
+   holds that uppercased opener: dim and ident are extracted from it and dims are read
+   directly (there is no separate comment or ident line in that form). */
+static int read_datagrid_block_ex(FILE *fp, MolEnvGrid *g, const char *path, int *ln,
+                                   const char *opener_tok) {
     char line[256], tok[64];
     memset(g, 0, sizeof(*g));
     g->dim = 3;
 
-    /* comment line */
-    if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
-    (*ln)++;
-    snprintf(g->ident, sizeof(g->ident), "%.*s", (int)(sizeof(g->ident)-1), line);
-    g->ident[strcspn(g->ident,"\r\n")] = '\0';
-
-    /* ident line: "BEGIN_DATAGRID_3D_<ident>" (XCrySDen's own form) or the bare
-       "DATAGRID_3D_<ident>"/"DATAGRID_2D_<ident>" some generators emit. Accept
-       both by stripping a leading "BEGIN_" if present. */
-    if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
-    (*ln)++;
-    if (first_tok(line, tok, sizeof(tok))==0) { set_error(path,*ln,"expected DATAGRID ident line"); return -1; }
-    const char *id = tok;
-    if (strncmp(tok,"BEGIN_",6)==0) id = tok + 6;
-    /* Match only the "DATAGRID_" prefix: the ident token continues with the
-       user's label (e.g. "DATAGRID_2D_Charge_Density_Difference"), so a fixed-
-       width compare of the whole literal would fail past the dim digit. */
-    if (strncmp(id,"DATAGRID_",9)!=0) {
-        set_error(path,*ln,"expected DATAGRID_3D/DATAGRID_2D ident line"); return -1;
+    if (opener_tok) {
+        /* Bare form: the opener line ("DATAGRID_3D_<name>") was consumed by the
+           caller. Identify the dimension from the token and read dims directly. */
+        g->dim = (strstr(opener_tok,"2D") && !strstr(opener_tok,"3D")) ? 2 : 3;
+        const char *id = strstr(opener_tok,"DATAGRID_");
+        if (id) {
+            id += 9;
+            while (*id && (*id == '2' || *id == '3' || *id == 'D')) id++;
+            while (*id == '_') id++;
+            if (*id) snprintf(g->ident, sizeof(g->ident), "%.*s", (int)(sizeof(g->ident)-1), id);
+        }
+    } else {
+        /* Wrapped form: read comment + ident lines. */
+        if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
+        (*ln)++;
+        snprintf(g->ident, sizeof(g->ident), "%.*s", (int)(sizeof(g->ident)-1), line);
+        g->ident[strcspn(g->ident,"\r\n")] = '\0';
+        if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
+        (*ln)++;
+        if (first_tok(line, tok, sizeof(tok))==0) { set_error(path,*ln,"expected DATAGRID ident line"); return -1; }
+        const char *id = tok;
+        if (strncmp(tok,"BEGIN_",6)==0) id = tok + 6;
+        if (strncmp(id,"DATAGRID_",9)!=0) {
+            set_error(path,*ln,"expected DATAGRID_3D/DATAGRID_2D ident line"); return -1;
+        }
+        g->dim = (id[9]=='2') ? 2 : 3;
     }
-    g->dim = (id[9]=='2') ? 2 : 3;   /* "DATAGRID_2D" vs "DATAGRID_3D" */
 
     /* dimensions */
     if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
@@ -359,11 +428,19 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             for (int i=0;i<na;i++) {
                 if (!fgets(line,sizeof(line),fp)) { free(at); set_error(path,*ln,"unexpected end in PRIMCOORD"); return -1; }
                 (*ln)++;
-                double Z,x,y,z;
-                if (sscanf(line,"%lf %lf %lf %lf",&Z,&x,&y,&z)<4) { free(at); set_error(path,*ln,"malformed PRIMCOORD atom"); return -1; }
-                at[i].atomic_number = (int)Z;
+                char Zstr[16]; double x,y,z;
+                int nf = sscanf(line,"%15s %lf %lf %lf",Zstr,&x,&y,&z);
+                if (nf < 4) { free(at); set_error(path,*ln,"malformed PRIMCOORD atom"); return -1; }
+                char *endp = NULL;
+                long Znum = strtol(Zstr, &endp, 10);
+                if (endp && *endp == '\0') {
+                    at[i].atomic_number = (int)Znum;
+                    snprintf(at[i].label,sizeof(at[i].label),"%ld",Znum);
+                } else {
+                    at[i].atomic_number = molenv_symbol_to_z(Zstr);
+                    snprintf(at[i].label,sizeof(at[i].label),"%s",Zstr);
+                }
                 at[i].coord[0]=(float)x; at[i].coord[1]=(float)y; at[i].coord[2]=(float)z;
-                snprintf(at[i].label,sizeof(at[i].label),"%d",(int)Z);
             }
             free(*atoms);
             *atoms = at; *natoms = na;
@@ -379,10 +456,26 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                 if (first_tok(line,tok,sizeof(tok))==0) continue;
                 if (tok[0]=='#') continue;
                 if (!atom_line_p(line)) { strcpy(held,line); have_held=1; break; }
-                double Z,x,y,z;
-                if (sscanf(line,"%lf %lf %lf %lf",&Z,&x,&y,&z)<4) continue;
+                /* First token is a Z number or element symbol; then three coords.
+                   Accept both so "Si"/"O" work in ATOMS/ATOMS_FRAC as in PRIMCOORD. */
+                double x, y, z;
+                int zi = 0;
+                char lbl[16] = {0};
+                {
+                    char Zstr[16];
+                    if (sscanf(line,"%15s %lf %lf %lf",Zstr,&x,&y,&z) < 4) continue;
+                    char *endp = NULL;
+                    long Znum = strtol(Zstr, &endp, 10);
+                    if (endp && *endp == '\0') {
+                        zi = (int)Znum;
+                        snprintf(lbl,sizeof(lbl),"%ld",Znum);
+                    } else {
+                        zi = molenv_symbol_to_z(Zstr);
+                        snprintf(lbl,sizeof(lbl),"%s",Zstr);
+                    }
+                }
                 if (na>=acap) { acap = acap?acap*2:16; MolEnvAtom *t=realloc(at,acap*sizeof(MolEnvAtom)); if(!t){free(at);set_error(path,*ln,"out of memory");return -1;} at=t; }
-                int zi=(int)Z; if(zi<0)zi=0; if(zi>118)zi=118;
+                if (zi<0) zi=0; if (zi>118) zi=118;
                 float fx=(float)x, fy=(float)y, fz=(float)z;
                 if (frac) {
                     at[na].coord[0] = fx*cell[0][0]+fy*cell[1][0]+fz*cell[2][0];
@@ -392,11 +485,11 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                     at[na].coord[0]=fx; at[na].coord[1]=fy; at[na].coord[2]=fz;
                 }
                 at[na].atomic_number=zi;
-                snprintf(at[na].label,sizeof(at[na].label),"%d",zi);
+                /* Use the parsed symbol/number label; fall back to Z for plain integers. */
+                if (lbl[0] != '\0') snprintf(at[na].label,sizeof(at[na].label),"%s",lbl);
+                else snprintf(at[na].label,sizeof(at[na].label),"%d",zi);
                 na++;
             }
-            free(*atoms);
-            *atoms = at; *natoms = na;
             saw_primcoord = 1;
             // A DATAGRID block can follow the atoms (e.g. a molecule's color-plane
             // grid, DATAGRID_2D after ATOMS). The held line holds its opener; capture
@@ -404,25 +497,34 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             // path below expects to be — so the trailing scan isn't left hunting
             // from a mis-positioned cursor. Without this the rigid comment-then-ident
             // read fails and the 2D grid is silently lost.
+            //
+            // Ownership rule: *atoms/*gridOut are only ever mutated on the success
+            // path, after every fallible operation has completed. On any error the
+            // caller's pointers are left untouched (caller retains ownership of its
+            // prior value, usually NULL) and every locally-allocated buffer is freed
+            // here. This keeps the contract uniform across all error sites and lets
+            // both callers treat a -1 return as "nothing to free".
             if (have_held && is_datagrid_opener(held, tok) && gridOut && *gridOut == NULL) {
                 MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
-                if (!g) { set_error(path,*ln,"out of memory for DATAGRID"); return -1; }
-                if (read_datagrid_block(fp, g, path, ln) < 0) { molenv_grid_free(g); free(g); return -1; }
+                if (!g) { free(at); set_error(path,*ln,"out of memory for DATAGRID"); return -1; }
+                const char *opener = is_bare_datagrid(tok) ? tok : NULL;
+                if (read_datagrid_block_ex(fp, g, path, ln, opener) < 0) { free(at); molenv_grid_free(g); free(g); return -1; }
                 *gridOut = g;
             }
+            free(*atoms);
+            *atoms = at; *natoms = na;
             break;
         }
         if (strncmp(tok,"BEGIN_DATAGRID",14)==0 ||
-            strncmp(tok,"DATAGRID_",8)==0 ||
-            strcmp(tok,"DATAGRID_3D")==0 || strcmp(tok,"DATAGRID_2D")==0 ||
-            strcmp(tok,"DATAGRID3D")==0 || strcmp(tok,"DATAGRID2D")==0 ||
+            is_bare_datagrid(tok) ||
             strncmp(tok,"BEGIN_BLOCK_DATAGRID",20)==0) {
             /* Capture the first DATAGRID block into the scene (subsequent ones
                are skipped by advancing past the END_DATAGRID line). */
             if (gridOut && *gridOut == NULL) {
                 MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
                 if (!g) { set_error(path,*ln,"out of memory for DATAGRID"); return -1; }
-                if (read_datagrid_block(fp, g, path, ln) < 0) { molenv_grid_free(g); free(g); return -1; }
+                const char *opener = is_bare_datagrid(tok) ? tok : NULL;
+                if (read_datagrid_block_ex(fp, g, path, ln, opener) < 0) { molenv_grid_free(g); free(g); return -1; }
                 *gridOut = g;
             } else {
                 /* skip the block body so the structure scan can continue */
@@ -449,6 +551,42 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
     return *natoms;
 }
 
+/* Scan an XSF file for the presence of a structure section. Returns 1 if any
+    structure keyword is found, 0 otherwise. Lets parse_xsf distinguish a
+    genuinely structure-free DATAGRID file (which may fall back to a grid-only
+    parse) from a truncated/malformed one (where the real parsing error must
+    surface instead of being masked by the fallback).
+
+    Structure intent is signaled by the atomic-data keywords (PRIMCOORD, ATOMS,
+    ATOMS_FRAC) but also by the lattice/crystal headers that precede them: a
+    file beginning CRYSTAL/PRIMVEC (or MOLECULE/SLAB/POLYMER) is meant to carry
+    a structure even if its atom block is missing or truncated. Without this, a
+    truncated "CRYSTAL + PRIMVEC" file falls through to the grid-only path and
+    loses the useful "no PRIMCOORD found" error behind "no DATAGRID block". */
+static int xsf_has_structure(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    char line[256], tok[64];
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (first_tok(line, tok, sizeof(tok)) == 0) continue;
+        if (tok[0] == '#') continue;
+        if (strcmp(tok, "CRYSTAL") == 0 ||
+            strcmp(tok, "MOLECULE") == 0 ||
+            strcmp(tok, "SLAB") == 0 ||
+            strcmp(tok, "POLYMER") == 0 ||
+            strcmp(tok, "PRIMVEC") == 0 ||
+            strcmp(tok, "PRIMCOORD") == 0 ||
+            strcmp(tok, "ATOMS") == 0 ||
+            strcmp(tok, "ATOMS_FRAC") == 0) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
 MolEnvScene* parse_xsf(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
@@ -459,7 +597,23 @@ MolEnvScene* parse_xsf(const char *path) {
     MolEnvAtom *atoms=NULL; int natoms=0;
     MolEnvGrid *grid=NULL;
     int rc = read_chunk(fp, cell,&pd,&have_cell,&atoms,&natoms,&grid,path,&ln);
-    if (rc < 0) { fclose(fp); molenv_scene_free(s); return NULL; }
+    if (rc < 0) {
+        /* Only fall back to a structure-free DATAGRID parse when the file truly
+           has no structure section. A malformed PRIMCOORD/ATOMS that read_chunk
+           failed on means the file WAS meant to carry a structure — surface that
+           error instead of silently returning a grid-only scene. */
+        if (xsf_has_structure(path)) {
+            if (grid) { molenv_grid_free(grid); free(grid); }
+            fclose(fp); molenv_scene_free(s);
+            return NULL;
+        }
+        /* No structure section at all: fall back to structure-free DATAGRID.
+           read_chunk may have captured a grid before hitting EOF; free it so the
+           grid-only path re-reads it from scratch (its own grid is heap-owned). */
+        if (grid) { molenv_grid_free(grid); free(grid); grid = NULL; }
+        fclose(fp); molenv_scene_free(s);
+        return parse_xsf_gridonly(path);
+    }
     s->atoms = atoms; s->natoms = natoms;
     s->grid = grid;
     memcpy(s->cell, cell, sizeof(s->cell));
@@ -475,13 +629,13 @@ MolEnvScene* parse_xsf(const char *path) {
             ln++;
             if (first_tok(line, tok, sizeof(tok)) == 0 || tok[0]=='#') continue;
             if (strncmp(tok,"BEGIN_DATAGRID",14)==0 ||
-                strncmp(tok,"DATAGRID_",8)==0 ||
-                strcmp(tok,"DATAGRID_3D")==0 || strcmp(tok,"DATAGRID_2D")==0 ||
+                is_bare_datagrid(tok) ||
                 strncmp(tok,"BEGIN_BLOCK_DATAGRID",20)==0) {
                 MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
                 if (!g) { fclose(fp); set_error(path,ln,"out of memory for DATAGRID");
                            molenv_scene_free(s); return NULL; }
-                if (read_datagrid_block(fp, g, path, &ln) < 0) { molenv_grid_free(g); free(g);
+                const char *opener = is_bare_datagrid(tok) ? tok : NULL;
+                if (read_datagrid_block_ex(fp, g, path, &ln, opener) < 0) { molenv_grid_free(g); free(g);
                     fclose(fp); molenv_scene_free(s); return NULL; }
                 s->grid = g;
                 break;
@@ -491,6 +645,46 @@ MolEnvScene* parse_xsf(const char *path) {
     fclose(fp);
 
     s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
+    return s;
+}
+
+/* Parse a genuinely structure-free DATAGRID file (no atoms): a standalone
+    2D/3D grid with no structure headers (CRYSTAL/MOLECULE/SLAB/POLYMER/PRIMVEC).
+    Returns NULL with error set if no DATAGRID block is found. Used for grid-only
+    XSF files, consistent with how grid2D/scalarField scenes render without atoms.
+    Note: a grid-only file that DOES carry PRIMVEC is treated as structure intent
+    and routed to the structure path, so it never reaches here. */
+static MolEnvScene* parse_xsf_gridonly(const char *path) {
+    last_error[0] = '\0';
+    FILE *fp = fopen(path, "r");
+    if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    char line[256], tok[64];
+    MolEnvGrid *grid = NULL;
+    int ln = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        ln++;
+        if (first_tok(line, tok, sizeof(tok)) == 0 || tok[0]=='#') continue;
+        if (strncmp(tok,"BEGIN_DATAGRID",14)==0 ||
+            is_bare_datagrid(tok) ||
+            strncmp(tok,"BEGIN_BLOCK_DATAGRID",20)==0) {
+            MolEnvGrid *g = calloc(1, sizeof(MolEnvGrid));
+            if (!g) { fclose(fp); set_error(path,ln,"out of memory for DATAGRID"); return NULL; }
+            const char *opener = is_bare_datagrid(tok) ? tok : NULL;
+            if (read_datagrid_block_ex(fp, g, path, &ln, opener) < 0) { molenv_grid_free(g); free(g);
+                fclose(fp); return NULL; }
+            grid = g;
+            break;
+        }
+    }
+    fclose(fp);
+    if (!grid) { set_error(path,0,"no DATAGRID block found"); return NULL; }
+    MolEnvScene *s = new_scene(path);
+    if (!s) { molenv_grid_free(grid); free(grid); return NULL; }
+    s->grid = grid;
+    s->natoms = 0;
+    s->is_crystal = 0;
+    s->periodic_dim = 0;
+    snprintf(s->title,sizeof(s->title),"%s", "grid data");
     return s;
 }
 
@@ -520,7 +714,7 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
     int current = 0;
     while (current <= frame_index) {
         int rc = read_chunk(fp, cell,&pd,&have_cell,&atoms,&natoms,&grid,path,&lnb);
-        if (rc < 0) { fclose(fp); molenv_scene_free(s); return NULL; }
+        if (rc < 0) { molenv_grid_free(grid); free(grid); fclose(fp); molenv_scene_free(s); return NULL; }
         if (current == frame_index) break;
         /* discard this frame's atoms (and grid); keep cell/is_crystal */
         free(atoms); atoms=NULL; natoms=0;
@@ -599,6 +793,7 @@ MolEnvScene* parse_pdb(const char *path) {
     while (fgets(line,sizeof(line),fp) && i < count) {
         if (strncmp(line,"ATOM",4)!=0 && strncmp(line,"HETATM",6)!=0) continue;
         if (strncmp(line,"END",3)==0 || strncmp(line,"ENDMDL",6)==0) break;
+        int have_coord = 0;
         double x=0,y=0,z=0;
         /* Columns 31-38,39-46,47-54 (1-based) == line[30..], using 8-char fields. */
         char xs[9]={0}, ys[9]={0}, zs[9]={0};
@@ -606,18 +801,31 @@ MolEnvScene* parse_pdb(const char *path) {
             memcpy(xs, line+30, 8); xs[8]='\0';
             memcpy(ys, line+38, 8); ys[8]='\0';
             memcpy(zs, line+46, 8); zs[8]='\0';
-            sscanf(xs,"%lf",&x); sscanf(ys,"%lf",&y); sscanf(zs,"%lf",&z);
+            if (sscanf(xs,"%lf",&x) == 1 && sscanf(ys,"%lf",&y) == 1 && sscanf(zs,"%lf",&z) == 1
+                && isfinite(x) && isfinite(y) && isfinite(z))
+                have_coord = 1;
         }
-        /* Atom name: PDB cols 13-16 (line[12..15]); resolve element symbol. */
+        if (!have_coord) continue;
+        /* Element symbol: PDB cols 77-78 (line[76..77]) are the authoritative
+           element source per PDB 3.x; fall back to atom name (cols 13-16). */
         char sym[4]={0};
-        char c0 = '\0', c1 = '\0';
-        if ((int)strlen(line) >= 14) { c0 = line[12]; c1 = line[13]; }
-        if (c0==' ') {              /* single-letter element, e.g. " N " */
-            sym[0]=c1; sym[1]='\0';
-        } else if (c0!='\0') {      /* two-letter, e.g. "CA " */
-            sym[0]=toupper((unsigned char)c0);
-            sym[1]=tolower((unsigned char)c1);
-            sym[2]='\0';
+        if ((int)strlen(line) >= 78) {
+            char e0 = line[76], e1 = line[77];
+            if (e0 != ' ' && e0 != '\0') {
+                sym[0] = toupper((unsigned char)e0);
+                sym[1] = (e1 != ' ' && e1 != '\0') ? (char)tolower((unsigned char)e1) : '\0';
+                sym[2] = '\0';
+            }
+        }
+        if (sym[0] == '\0' && (int)strlen(line) >= 14) {
+            char c0 = line[12], c1 = line[13];
+            if (c0==' ') {
+                sym[0]=c1; sym[1]='\0';
+            } else if (c0!='\0') {
+                sym[0]=toupper((unsigned char)c0);
+                sym[1]=tolower((unsigned char)c1);
+                sym[2]='\0';
+            }
         }
         MolEnvAtom *a = &s->atoms[i];
         a->coord[0]=(float)x; a->coord[1]=(float)y; a->coord[2]=(float)z;
@@ -635,6 +843,7 @@ MolEnvScene* parse_pdb(const char *path) {
 }
 
 /* ----- Quantum Espresso PWscf input (.pwi / .in / .inp) ----- */
+
 
 /* 1 Bohr in Angstroms (QE constant bohr_radius_angs). */
 #define BOHR_TO_ANG 0.529177210903f
@@ -663,31 +872,30 @@ static int latgen(int ibrav, const double celldm[6], double cell[3][3]) {
         cell[0][0] = a;
         cell[1][0] = -a/2; cell[1][1] = a * sq3;
         cell[2][2] = c; break;
-    case 5: { /* trigonal R, 3-fold along (111) */
-        t = sqrt((1.0 - cosbc) / 3.0);
-        cell[0][0] = a * t;
-        cell[0][1] = a * t / sqrt3;
-        cell[0][2] = a * sqrt(1.0 - 2.0*cosbc*cosbc) / sqrt3;
-        cell[1][0] = -a * t;
-        cell[1][1] = a * t / sqrt3;
-        cell[1][2] = a * sqrt(1.0 - 2.0*cosbc*cosbc) / sqrt3;
-        cell[2][0] = -a * t;
-        cell[2][1] = -a * t / sqrt3;
-        cell[2][2] = a * sqrt(1.0 - 2.0*cosbc*cosbc) / sqrt3;
-        /* rotate so 3-fold is along c: standard QE convention */
+    case 5: { /* Trigonal R, 3-fold axis along (001) c: three length-a vectors, pairwise cos == celldm(4). */
+        if (cosbc < -0.5 || cosbc > 1.0) return -1;
+        double sr2 = sqrt(2.0);
+        double term1 = sqrt(1.0 + 2.0 * cosbc);
+        double term2 = sqrt(1.0 - cosbc);
+        cell[0][0] = a * term2 / sr2;
+        cell[0][1] = -cell[0][0] / sqrt3;
+        cell[0][2] = a * term1 / sqrt3;
+        cell[1][1] = sr2 * a * term2 / sqrt3;
+        cell[1][2] = a * term1 / sqrt3;
+        cell[2][0] = -a * term2 / sr2;
+        cell[2][1] = cell[0][1];
+        cell[2][2] = a * term1 / sqrt3;
         break;
     }
-    case -5: { /* trigonal R, 3-fold along <111> (reverse) */
-        t = sqrt((1.0 - cosbc) / 3.0);
-        cell[0][0] = a * t * 2.0 / sqrt3;
-        cell[0][1] = 0.0;
-        cell[0][2] = a * sqrt(1.0 - cosbc*cosbc) / sqrt3;
-        cell[1][0] = -a * t / sqrt3;
-        cell[1][1] = a * t * sqrt(2.0);
-        cell[1][2] = a * sqrt(1.0 - cosbc*cosbc) / sqrt3;
-        cell[2][0] = -a * t / sqrt3;
-        cell[2][1] = -a * t * sqrt(2.0);
-        cell[2][2] = a * sqrt(1.0 - cosbc*cosbc) / sqrt3;
+    case -5: { /* Trigonal R, 3-fold axis along (111): three length-a vectors, pairwise cos == celldm(4). */
+        if (cosbc < -0.5 || cosbc > 1.0) return -1;
+        double term1 = sqrt(1.0 + 2.0 * cosbc);
+        double term2 = sqrt(1.0 - cosbc);
+        double f1 = a * (term1 - 2.0 * term2) / 3.0;
+        double f2 = a * (term1 + term2) / 3.0;
+        cell[0][0] = f1; cell[0][1] = f2; cell[0][2] = f2;
+        cell[1][0] = f2; cell[1][1] = f1; cell[1][2] = f2;
+        cell[2][0] = f2; cell[2][1] = f2; cell[2][2] = f1;
         break;
     }
     case 6: /* tetragonal */
@@ -708,8 +916,8 @@ static int latgen(int ibrav, const double celldm[6], double cell[3][3]) {
         cell[2][2] = c; break;
     case 91: /* orthorhombic one-face base-centered (A) */
         cell[0][0] = a;
-        cell[1][0] =  b/2; cell[1][2] = -c/2;
-        cell[2][0] =  b/2; cell[2][2] =  c/2; break;
+        cell[1][1] =  b/2; cell[1][2] = -c/2;
+        cell[2][1] =  b/2; cell[2][2] =  c/2; break;
     case 10: /* orthorhombic face-centered */
         cell[0][0] =  a/2; cell[0][2] =  c/2;
         cell[1][0] =  a/2; cell[1][1] =  b/2;
@@ -718,16 +926,38 @@ static int latgen(int ibrav, const double celldm[6], double cell[3][3]) {
         cell[0][0] =  a/2; cell[0][1] =  b/2; cell[0][2] =  c/2;
         cell[1][0] = -a/2; cell[1][1] =  b/2; cell[1][2] =  c/2;
         cell[2][0] = -a/2; cell[2][1] = -b/2; cell[2][2] =  c/2; break;
-    case 12: /* monoclinic P, unique axis c */
-        cell[0][0] = a; cell[1][1] = b;
-        cell[2][0] = c * cosab; cell[2][2] = c * sin(acos(cosab)); break;
-    case -12: /* monoclinic P, unique axis b */
+    case 12: /* monoclinic P, unique axis c: tilt in the a-b plane, cos = celldm(4). */
+        if (cosbc < -1.0 || cosbc > 1.0) return -1;
+        double sc = sin(acos(cosbc));
         cell[0][0] = a; cell[2][2] = c;
-        cell[1][0] = b * cosab; cell[1][1] = b * sin(acos(cosab)); break;
-    case 13: /* monoclinic base-centered, unique axis c */
-        cell[0][0] =  a/2; cell[1][1] =  b/2;
-        cell[2][0] = -a/2; cell[2][1] =  b/2;
-        cell[2][0] = c * cosab; cell[2][2] = c * sin(acos(cosab)); break;
+        cell[1][0] = b * cosbc; cell[1][1] = b * sc; break;
+    case -12: /* monoclinic P, unique axis b: tilt in the a-c plane, cos = celldm(5). */
+        if (cosac < -1.0 || cosac > 1.0) return -1;
+        double sb = sin(acos(cosac));
+        cell[0][0] = a; cell[1][1] = b;
+        cell[2][0] = c * cosac; cell[2][2] = c * sb; break;
+    case 13: { /* One-face centered monoclinic, unique axis c: cos == celldm(4). */
+        if (cosbc < -1.0 || cosbc > 1.0) return -1;
+        double sen = sqrt(1.0 - cosbc * cosbc);
+        cell[0][0] =  a / 2.0;
+        cell[0][2] = -(a * celldm[3]) / 2.0;   /* a1(3) = -a1(1)*(c/a) = -c/2 */
+        cell[1][0] =  b * cosbc;               /* a2(1) = a*(b/a)*cos */
+        cell[1][1] =  b * sen;                 /* a2(2) = a*(b/a)*sen */
+        cell[2][0] =  a / 2.0;
+        cell[2][2] =  (a * celldm[3]) / 2.0;    /* a3(3) = -a1(3) = c/2 */
+        break;
+    }
+    case -13: { /* One-face centered monoclinic, unique axis b: cos == celldm(5). */
+        if (cosac < -1.0 || cosac > 1.0) return -1;
+        double sen = sqrt(1.0 - cosac * cosac);
+        cell[0][0] =  a / 2.0;
+        cell[0][1] =  b / 2.0;
+        cell[1][0] = -a / 2.0;
+        cell[1][1] =  b / 2.0;
+        cell[2][0] =  c * cosac;
+        cell[2][2] =  c * sen;
+        break;
+    }
     case 14: { /* triclinic */
         double sinab = sin(acos(cosab));
         double omega = a*b*c * sqrt(1.0 - cosab*cosab - cosac*cosac - cosbc*cosbc
@@ -765,9 +995,11 @@ static void trim_in_place(char *s) {
     while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = '\0';
 }
 
-/* Parse a celldm(N) key. Returns the index (1..6) or 0 if not celldm. */
+/* Parse a celldm(N) key. Returns the index (1..6) or 0 if not celldm.
+    Case-insensitive so "CELldm(1)", "Celldm(1)" etc. all resolve (QE input is
+    case-insensitive). */
 static int celldm_index(const char *key) {
-    if (strncmp(key, "celldm(", 7) != 0) return 0;
+    if (strncasecmp(key, "celldm(", 7) != 0) return 0;
     return atoi(key + 7);
 }
 
@@ -840,50 +1072,58 @@ MolEnvScene* parse_pwi(const char *path) {
 
         if (in_system) {
             if (*p == '/') { in_system = 0; continue; }
-            /* key = value */
-            char *eq = strchr(p, '=');
-            if (!eq) continue;
-            char key[64];
-            int klen = (int)(eq - p);
-            if (klen >= (int)sizeof(key)) klen = (int)sizeof(key) - 1;
-            memcpy(key, p, klen); key[klen] = '\0';
-            while (klen > 0 && key[klen-1] == ' ') key[--klen] = '\0';
-            char *vp = eq + 1;
-            while (*vp == ' ') vp++;
-            size_t vlen = strlen(vp);
-            if (vlen >= 2 && ((vp[0]=='\'' && vp[vlen-1]=='\'') || (vp[0]=='"' && vp[vlen-1]=='"'))) {
-                vp[vlen-1] = '\0'; vp++;
-            }
+            /* key = value (support multiple comma-separated assignments per line) */
+            char *scan = p;
+            while (scan && *scan) {
+                while (*scan == ' ' || *scan == '\t') scan++;
+                if (*scan == '\0' || *scan == '!' || *scan == '/') break;
+                char *eq = strchr(scan, '=');
+                if (!eq) break;
+                char key[64];
+                int klen = (int)(eq - scan);
+                if (klen >= (int)sizeof(key)) klen = (int)sizeof(key) - 1;
+                memcpy(key, scan, klen); key[klen] = '\0';
+                while (klen > 0 && key[klen-1] == ' ') key[--klen] = '\0';
+                char *vp = eq + 1;
+                while (*vp == ' ') vp++;
+                /* find end of value: comma, ! comment, or end of string */
+                char *vend = vp;
+                while (*vend && *vend != ',' && *vend != '!' && *vend != '/') vend++;
+                char saved = *vend;
+                if (*vend == ',' || *vend == '!' || *vend == '/') *vend = '\0';
+                /* strip trailing spaces from value */
+                char *ve = vend - 1;
+                while (ve >= vp && (*ve == ' ' || *ve == '\t')) *ve-- = '\0';
+                size_t vlen = strlen(vp);
+                if (vlen >= 2 && ((vp[0]=='\'' && vp[vlen-1]=='\'') || (vp[0]=='"' && vp[vlen-1]=='"'))) {
+                    vp[vlen-1] = '\0'; vp++;
+                }
 
-            int ci = celldm_index(key);
-            if (ci >= 1 && ci <= 6) {
-                celldm[ci] = atof(vp);
-            } else if (strcmp(key, "ibrav") == 0) {
-                ibrav = atoi(vp);
-            } else if (strcmp(key, "nat") == 0) {
-                char *endp = NULL;
-                long v = strtol(vp, &endp, 10);
-                while (endp && (*endp == ' ' || *endp == '\t')) endp++;
-                if (endp && *endp == ',') endp++;
-                while (endp && (*endp == ' ' || *endp == '\t')) endp++;
-                if (endp == vp || !endp || (*endp != '\0' && *endp != '!') || v < 1 || v > 500000) {
-                    free(ax); free(ay); free(az); free(asym);
-                    fclose(fp); set_error(path, ln, "nat out of range (1..500000)"); return NULL;
+                int ci = celldm_index(key);
+                if (ci >= 1 && ci <= 6) {
+                    celldm[ci] = atof(vp);
+                } else if (strcasecmp(key, "ibrav") == 0) {
+                    ibrav = atoi(vp);
+                } else if (strcasecmp(key, "nat") == 0) {
+                    char *endp = NULL;
+                    long v = strtol(vp, &endp, 10);
+                    if (endp == vp || !endp || (*endp != '\0' && *endp != ' ') || v < 1 || v > 500000) {
+                        free(ax); free(ay); free(az); free(asym);
+                        fclose(fp); set_error(path, ln, "nat out of range (1..500000)"); return NULL;
+                    }
+                    nat = (int)v;
+                } else if (strcasecmp(key, "ntyp") == 0) {
+                    char *endp = NULL;
+                    long v = strtol(vp, &endp, 10);
+                    if (endp == vp || !endp || (*endp != '\0' && *endp != ' ') || v < 1 || v > 32) {
+                        free(ax); free(ay); free(az); free(asym);
+                        fclose(fp); set_error(path, ln, "ntyp out of range (1..32)"); return NULL;
+                    }
+                    ntyp = (int)v;
                 }
-                nat = (int)v;
-            } else if (strcmp(key, "ntyp") == 0) {
-                /* Strict ntyp range (1..32). An out-of-range or non-integer ntyp
-                   must not silently default to 0/bogus. */
-                char *endp = NULL;
-                long v = strtol(vp, &endp, 10);
-                while (endp && (*endp == ' ' || *endp == '\t')) endp++;
-                if (endp && *endp == ',') endp++;
-                while (endp && (*endp == ' ' || *endp == '\t')) endp++;
-                if (endp == vp || !endp || (*endp != '\0' && *endp != '!') || v < 1 || v > 32) {
-                    free(ax); free(ay); free(az); free(asym);
-                    fclose(fp); set_error(path, ln, "ntyp out of range (1..32)"); return NULL;
-                }
-                ntyp = (int)v;
+                if (saved == '!') break;
+                if (saved == ',') { scan = vend + 1; continue; }
+                break;
             }
             continue;
         }
@@ -1196,15 +1436,38 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
         /* CELL_PARAMETERS block: latest overrides current cell. */
         if (strncmp(p, "CELL_PARAMETERS", 15) == 0) {
             char unit[16] = "alat";
+            double local_alat = 0;
             char *op = strchr(p, '(');
             if (op) {
                 char *cp = strchr(op, ')');
-                if (cp) { *cp = '\0'; snprintf(unit, sizeof(unit), "%s", op + 1); }
+                if (cp) {
+                    *cp = '\0';
+                    char *u = op + 1;
+                    while (*u == ' ') u++;
+                    char *eq = strchr(u, '=');
+                    if (eq && strncmp(u, "alat", 4) == 0) {
+                        snprintf(unit, sizeof(unit), "alat");
+                        char *val = eq + 1;
+                        while (*val == ' ') val++;
+                        double va = atof(val);
+                        if (va > 0) local_alat = va * (double)BOHR_TO_ANG;
+                    } else {
+                        snprintf(unit, sizeof(unit), "%s", u);
+                    }
+                }
+            } else {
+                char *u = p + 15;
+                while (*u == ' ' || *u == '\t') u++;
+                char *e = u;
+                while (*e && *e != ' ' && *e != '\t') e++;
+                *e = '\0';
+                if (*u) snprintf(unit, sizeof(unit), "%s", u);
             }
             double raw[3][3];
             if (read_3x3(fp, raw, &ln) == 0) {
                 double scale = 1.0; int frac_dummy = 0;
-                double alat_ang = have_alat ? alat_bohr * (double)BOHR_TO_ANG : 0.0;
+                double base_alat_ang = have_alat ? alat_bohr * (double)BOHR_TO_ANG : 0.0;
+                double alat_ang = (local_alat > 0) ? local_alat : base_alat_ang;
                 unit_scales(unit, alat_ang, &scale, &frac_dummy);
                 for (int i = 0; i < 3; i++)
                     for (int j = 0; j < 3; j++)
@@ -1485,20 +1748,26 @@ MolEnvScene* parse_cif(const char *path) {
 
         if (state == LOOP_DATA) {
             char *toks[64];
+            char saved[2048];
+            strcpy(saved, line);                         /* preserve un-tokenized line for redispatch */
             int nt = split_tokens(p, toks, 64);
-            if (nt != ncols || ncols == 0) {            /* loop ended */
+            if (nt != ncols || ncols == 0 ||
+                (nt > 0 && (toks[0][0] == '_' || strcmp(toks[0], "loop_") == 0))) {
+                /* loop ended: token count mismatch, or a new tag/loop_ boundary (which may
+                   coincidentally have the same column count) -> re-dispatch in NORM. */
                 state = NORM;
-                if (natoms > 0) break;
-                strcpy(held, line); have_held = 1;      /* re-dispatch in NORM */
+                strcpy(held, saved); have_held = 1;      /* re-dispatch the full line in NORM */
                 continue;
             }
             if (atom_loop && (col_fx >= 0 || col_cx >= 0)) {
                 int is_frac = (col_fx >= 0);
-                int ci = is_frac ? col_fx : col_cx;
-                if (ci >= 0 && ci + 2 < nt) {
-                    double fx = cif_float(toks[ci]);
-                    double fy = cif_float(toks[ci + 1]);
-                    double fz = cif_float(toks[ci + 2]);
+                int cx = is_frac ? col_fx : col_cx;
+                int cy = is_frac ? col_fy : col_cy;
+                int cz = is_frac ? col_fz : col_cz;
+                if (cx >= 0 && cy >= 0 && cz >= 0 && cx < nt && cy < nt && cz < nt) {
+                    double fx = cif_float(toks[cx]);
+                    double fy = cif_float(toks[cy]);
+                    double fz = cif_float(toks[cz]);
                     const char *lbl = NULL;
                     if (col_label >= 0 && col_label < nt) lbl = toks[col_label];
                     char el[8] = {0};

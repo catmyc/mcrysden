@@ -1,5 +1,54 @@
 import simd
 
+// MARK: - Camera validation
+
+/// Thrown by `Camera.validated(_:)` when a decoded camera fails a geometric
+/// sanity check (non-finite center/distance, non-positive distance,
+/// non-finite or near-zero/overflowed quaternion). Kept as a plain
+/// LocalizedError so callers can wrap it into a domain-specific error.
+struct CameraValidationError: Error {
+    let reason: String
+    var errorDescription: String? { reason }
+}
+
+extension Camera {
+    /// Geometric minimum: a valid unit quaternion must have a finite norm well
+    /// above zero (rejects a zero / near-zero quaternion whose normalization
+    /// flips to NaN) and well below infinity (rejects a float whose squared
+    /// length overflows during normalization). Chosen to fit comfortably inside
+    /// Float's dynamic range.
+    static let minQuaternionNorm: Float = 1e-3
+    static let maxQuaternionNorm: Float = 1e15
+
+    /// Validate a decoded camera and return it with a NORMALIZED quaternion.
+    /// Rejects:
+    ///  - non-finite center, non-positive or non-finite distance,
+    ///  - any non-finite quaternion component,
+    ///  - near-zero quaternion norm (would normalize to NaN),
+    ///    overflowed norm (components that would overflow on squaring).
+    /// A valid but non-unit quaternion is normalized before commit so the
+    /// rotation matrix stays orthonormal; a unit quaternion passes through.
+    static func validated(_ camera: Camera) throws -> Camera {
+        guard camera.distance.isFinite, camera.distance > 0 else {
+            throw CameraValidationError(reason: "camera distance must be finite and positive")
+        }
+        guard camera.center.x.isFinite, camera.center.y.isFinite, camera.center.z.isFinite else {
+            throw CameraValidationError(reason: "camera center must be finite")
+        }
+        let r = camera.rotation.vector
+        guard r.x.isFinite, r.y.isFinite, r.z.isFinite, r.w.isFinite else {
+            throw CameraValidationError(reason: "camera rotation components must be finite")
+        }
+        let norm = simd_length(r)
+        guard norm.isFinite, norm >= minQuaternionNorm, norm <= maxQuaternionNorm else {
+            throw CameraValidationError(reason: "camera rotation quaternion norm is invalid (\(norm))")
+        }
+        var result = camera
+        result.rotation = simd_normalize(camera.rotation)
+        return result
+    }
+}
+
 // MARK: - Camera transforms
 
 extension Camera {

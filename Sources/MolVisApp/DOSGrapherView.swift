@@ -254,16 +254,21 @@ enum DOSExporter {
         switch url.pathExtension.lowercased() {
         case "pdf", "svg", "eps", "ps":
             try RasterExporter.write(cgImage: image, to: url, size: size)
-        default:
+        case "png":
             try PngExporter.write(cgImage: image, to: url)
+        default:
+            // An unsupported extension must not silently produce PNG bytes; fail clearly
+            // with a truthful unsupported-format error (matches the outer gate).
+            throw App.CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
         return image
     }
 
     @MainActor
     static func render(_ dos: DensityOfStates, size: CGSize) throws -> CGImage {
-        let width = Int(size.width.rounded()), height = Int(size.height.rounded())
-        guard width > 0, height > 0 else { throw DOSExportError.invalidSize }
+        // Share the App-side size validator so a huge/NaN/infinite size throws a clear
+        // error instead of trapping on the Int cast or hanging on a giant allocation.
+        let (width, height) = try App.validatedExportSize(size)
         guard let bitmap = NSBitmapImageRep(
             bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,

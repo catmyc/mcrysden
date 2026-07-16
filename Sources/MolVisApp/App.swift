@@ -130,6 +130,40 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
 
     private static let supportedExportExtensions: Set<String> = ["png", "pdf", "svg", "eps", "ps"]
     private static let maxExportDimension: CGFloat = 16_384
+    /// Total-pixel ceiling for offscreen graph/bitmap allocation. Matches the per-frame
+    /// export cap so a 16384×16384 (or any Int-overflowing) graph size is refused with a
+    /// clear error instead of trapping on the Int cast or hanging on a huge allocation.
+    private static let maxExportTotalPixels = 16_000_000
+
+    /// Validate an export size for offscreen graph/bitmap allocation: must be finite,
+    /// positive, representable as Int on each axis, within the per-axis cap, and the
+    /// total pixel count must not overflow Int or exceed the ceiling. Returns the
+    /// validated (width, height) as Int so callers never trap on an Int cast or
+    /// allocate a pathological buffer. Used by every graph route before its first
+    /// CGContext/NSBitmapImageRep allocation (DOSExporter mirrors this inside render()).
+    static func validatedExportSize(_ size: CGSize) throws -> (width: Int, height: Int) {
+        let w = size.width, h = size.height
+        guard w.isFinite, h.isFinite else {
+            throw CLIError.invalid("export size must be finite")
+        }
+        guard w > 0, h > 0 else {
+            throw CLIError.invalid("export size must be positive")
+        }
+        guard w <= maxExportDimension, h <= maxExportDimension,
+              w <= CGFloat(Int.max), h <= CGFloat(Int.max) else {
+            throw CLIError.invalid("export size exceeds allowable dimensions")
+        }
+        let iw = Int(w.rounded()), ih = Int(h.rounded())
+        // Re-check after rounding: 0.4 → 0 is a degenerate, non-drawable size.
+        guard iw >= 1, ih >= 1 else {
+            throw CLIError.invalid("export size rounds to zero pixels")
+        }
+        let total = iw.multipliedReportingOverflow(by: ih)
+        guard !total.overflow, total.partialValue <= maxExportTotalPixels else {
+            throw CLIError.invalid("export pixel count exceeds the allowed maximum")
+        }
+        return (iw, ih)
+    }
 
     /// Parse a structure at the CLI frame, apply a companion state (which widens
     /// the supercell, applies the slab, and may encode a saved animation frame),
@@ -273,6 +307,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
                 }
             } catch {
                 print("[mcrysden] failed to open \(inURL.path): \(error)")
+                exit(EXIT_FAILURE)
             }
         } else {
             mainWC = MainWindowController(scene: Scene())
@@ -378,10 +413,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         guard supportedExportExtensions.contains(url.pathExtension.lowercased()) else {
             throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
-        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
-              size.width <= maxExportDimension, size.height <= maxExportDimension else {
-            throw CLIError.invalid("export size must be finite and positive")
-        }
+        // Route size through the shared validator so the DOS/band/plane graph routes
+        // below never trap on an Int cast or allocate an absurd buffer; any
+        // non-finite/non-positive/oversized/overflowing size throws here first.
+        let _ = try validatedExportSize(size)
         if let dos = scene.densityOfStates {
             return try DOSExporter.export(dos, to: url, size: size)
         }
@@ -412,11 +447,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     }
 
     @MainActor
-    private static func exportGraph<View: NSView>(_ view: View, configure: (View) -> Void,
-                                                   to url: URL, size: CGSize) throws -> CGImage {
-        let width = Int(size.width.rounded()), height = Int(size.height.rounded())
-        guard width > 0, height > 0,
-              let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+    static func exportGraph<View: NSView>(_ view: View, configure: (View) -> Void,
+                                           to url: URL, size: CGSize) throws -> CGImage {
+        let (width, height) = try validatedExportSize(size)
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
                                             isPlanar: false, colorSpaceName: .deviceRGB,
                                             bytesPerRow: 0, bitsPerPixel: 0),
@@ -430,10 +464,15 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         context.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()
         guard let image = bitmap.cgImage else { throw DOSExportError.noImage }
-        if ["pdf", "svg", "eps", "ps"].contains(url.pathExtension.lowercased()) {
+        switch url.pathExtension.lowercased() {
+        case "pdf", "svg", "eps", "ps":
             try RasterExporter.write(cgImage: image, to: url, size: size)
-        } else {
+        case "png":
             try PngExporter.write(cgImage: image, to: url)
+        default:
+            // A non-pdf/svg/eps/ps/png extension must not silently write PNG bytes;
+            // report the truthful unsupported-format reason (matches the outer gate).
+            throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
         return image
     }
@@ -481,7 +520,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.13"
+    static let appVersion = "1.1.14"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

@@ -116,22 +116,31 @@ extension Scene {
 
     func widenSuperCell(_ sc: SuperCell) -> Scene {
         guard let cell else { return self }
-        let total = sc.n1 * sc.n2 * sc.n3
-        // When reducing to (1,1,1) restore the pristine base set.
+        // Overflow-safe, positive supercell product: a raw n1*n2*n3 wraps on
+        // overflow (silently passing the cap check) and a zero/negative factor is
+        // nonsensical. Refuse (returning self) rather than expand.
+        guard let total = Scene.positiveProduct(sc.n1, sc.n2, sc.n3) else { return self }
+        // When reducing to (1,1,1) restore the pristine base set. If there is NO
+        // pristine set (manual scene, baseAtoms empty) keep the current atoms so
+        // the identity operation does not wipe a hand-built structure.
         if total <= 1 {
             var out = self
-            out.atoms = baseAtoms
-            out.bonds = baseBonds
-            out.preslabAtoms = baseAtoms      // so slab always has a full set
+            out.atoms = baseAtoms.isEmpty ? atoms : baseAtoms
+            out.bonds = baseBonds.isEmpty ? bonds : baseBonds
+            out.preslabAtoms = out.atoms
             out.superCell = SuperCell()
             return out
         }
         // Always expand from the base atoms so the operation is idempotent
         // and reversible: calling widen(2) → widen(1) returns the original.
         let src = baseAtoms.isEmpty ? atoms : baseAtoms
-        if total * src.count > Scene.superCellAtomCap { return self }   // refused — caller alerts
+        let projected = total.multipliedReportingOverflow(by: src.count)
+        if projected.overflow || projected.partialValue > Scene.superCellAtomCap {
+            print("[mcrysden] warning: supercell \(sc.n1)×\(sc.n2)×\(sc.n3) would exceed \(Scene.superCellAtomCap) atom cap (\(total)×\(src.count)); refused")
+            return self
+        }
         var newAtoms: [Atom] = []
-        newAtoms.reserveCapacity(src.count * total)
+        newAtoms.reserveCapacity(projected.partialValue)
         for i in 0..<sc.n1 { for j in 0..<sc.n2 { for k in 0..<sc.n3 {
             let t = cell.a * Float(i) + cell.b * Float(j) + cell.c * Float(k)
             for a in src {
@@ -146,6 +155,13 @@ extension Scene {
         out.bonds = Self.rebond(newAtoms, cell: cell)
         out.preslabAtoms = newAtoms    // snapshot for `applySlab`
         out.superCell = sc
+        // For a hand-built scene (no pristine base yet), snapshot the pre-expansion
+        // source atoms/bonds as the base so shrinking back (widen 1,1,1) recovers the
+        // original instead of being stuck on the widened set.
+        if baseAtoms.isEmpty {
+            out.baseAtoms = src
+            out.baseBonds = self.bonds
+        }
         return out
     }
 
@@ -197,7 +213,7 @@ extension Scene {
         // No-op: clearing a slab that isn't applied. Avoids an O(n) rebond every
         // frame when the controller re-runs applySlab(nil) on an unslabbed scene.
         if slab == nil && self.slab == nil { return self }
-        guard let slab, let cell else {
+        guard let slab else {
             // Removing the slab — restore the full pre-slab atom set.
             var s = self
             s.atoms = preslabAtoms.isEmpty ? s.atoms : preslabAtoms
@@ -205,6 +221,9 @@ extension Scene {
             s.slab = nil
             return s
         }
+        // A slab needs a unit cell to filter in; a molecule (no cell) can't be slabbed.
+        // Refuse rather than fall into the remove-slab branch and wipe the bonds.
+        guard let cell else { return self }
         let nA = SIMD3(Float(slab.planeA.h), Float(slab.planeA.k), Float(slab.planeA.l))
         let nB = SIMD3(Float(slab.planeB.h), Float(slab.planeB.k), Float(slab.planeB.l))
         let dA = slab.planeA.distance
@@ -214,7 +233,10 @@ extension Scene {
         let src = preslabAtoms.isEmpty ? atoms : preslabAtoms
         var kept: [Atom] = []
         for a in src {
-            let frac = cartesianToFractional(a.coord, cell: cell)
+            // A singular cell has no valid fractional coordinates — filtering
+            // against a fabricated origin would silently distort the slab, so
+            // refuse and leave the scene unchanged.
+            guard let frac = cartesianToFractional(a.coord, cell: cell) else { return self }
             let projA = frac.x*nA.x + frac.y*nA.y + frac.z*nA.z
             let projB = frac.x*nB.x + frac.y*nB.y + frac.z*nB.z
             if projA >= dA && projB <= dB { kept.append(a) }
@@ -234,13 +256,15 @@ extension Scene {
         return cartesianToFractional(p, cell: cell)
     }
 
-    private func cartesianToFractional(_ p: SIMD3<Float>, cell: Cell) -> SIMD3<Float> {
+    private func cartesianToFractional(_ p: SIMD3<Float>, cell: Cell) -> SIMD3<Float>? {
         // Cramer's rule on the 3x3 [a b c] system: p = frac.x*a + frac.y*b + frac.z*c.
         // Columns of the matrix are the cell vectors a, b, c.
         let det = cell.a.x*(cell.b.y*cell.c.z - cell.c.y*cell.b.z)
                 - cell.b.x*(cell.a.y*cell.c.z - cell.c.y*cell.a.z)
                 + cell.c.x*(cell.a.y*cell.b.z - cell.b.y*cell.a.z)
-        if abs(det) < 1e-6 { return SIMD3(0,0,0) }   // singular cell
+        // Singular (zero-volume) cell: fractional coords are undefined. Callers
+        // (applySlab) must refuse rather than fabricate an origin.
+        guard abs(det) >= 1e-6 else { return nil }
         // det([col b c]) — replace column a with col
         func det1(_ col: SIMD3<Float>) -> Float {
             return col.x*(cell.b.y*cell.c.z - cell.c.y*cell.b.z)
@@ -260,5 +284,16 @@ extension Scene {
                  + col.x*(cell.a.y*cell.b.z - cell.b.y*cell.a.z)
         }
         return SIMD3(det1(p)/det, det2(p)/det, det3(p)/det)
+    }
+
+    /// Overflow-safe, strictly positive Int triple product; nil if any factor is
+    /// non-positive or the product overflows. Used to size supercell expansions
+    /// without the raw n1*n2*n3 wrapping past the atom cap on overflow.
+    private static func positiveProduct(_ a: Int, _ b: Int, _ c: Int) -> Int? {
+        guard a > 0, b > 0, c > 0 else { return nil }
+        let ab = a.multipliedReportingOverflow(by: b)
+        guard !ab.overflow else { return nil }
+        let abc = ab.partialValue.multipliedReportingOverflow(by: c)
+        return abc.overflow ? nil : abc.partialValue
     }
 }

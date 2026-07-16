@@ -25,7 +25,8 @@ final class ColorPlaneView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext, let grid, !grid.isEmpty,
-              let firstRow = grid.first, !firstRow.isEmpty
+              let firstRow = grid.first, !firstRow.isEmpty,
+              grid.allSatisfy({ $0.allSatisfy { $0.isFinite } })
         else { NSColor.white.setFill(); dirtyRect.fill(); drawEmpty(); return }
 
         let rows = grid.count
@@ -47,7 +48,7 @@ final class ColorPlaneView: NSView {
 
         // Draw the bitmap into the projected unit square via an affine transform,
         // so a skew plane maps to a parallelogram instead of a rectangle.
-        var t = project.affine   // maps (u,v) -> pixel
+        let t = project.affine   // maps (u,v) -> pixel
         ctx.concatenate(t)
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: 1, height: 1))
         ctx.concatenate(t.inverted())
@@ -158,7 +159,22 @@ final class ColorPlaneView: NSView {
     /// Render the grid as a colormap bitmap via a viridis-style transfer.
     private func renderBitmap(_ g: [[Float]], rows: Int, cols: Int) -> CGImage? {
         let flat = g.flatMap { $0 }
-        guard let vMin = flat.min(), let vMax = flat.max(), vMax > vMin else { return nil }
+        guard let vMin = flat.min(), let vMax = flat.max() else { return nil }
+        // Constant grid: return a uniform bitmap at the value mapped to viridis.
+        guard vMax > vMin else {
+            let (r, gr, b) = viridis(vMin)
+            var filled = [UInt8](repeating: 0, count: rows * cols * 4)
+            for i in 0..<rows * cols { let o = i * 4; filled[o] = r; filled[o+1] = gr; filled[o+2] = b; filled[o+3] = 255 }
+            let cs = CGColorSpaceCreateDeviceRGB()
+            guard let bmp = CFDataCreate(nil, filled, filled.count),
+                  let provider = CGDataProvider(data: bmp),
+                  let cg = CGImage(width: cols, height: rows, bitsPerComponent: 8, bitsPerPixel: 32,
+                                  bytesPerRow: cols * 4, space: cs,
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+            else { return nil }
+            return cg
+        }
         let range = vMax - vMin
         let bytesPerRow = cols * 4
         var px = [UInt8](repeating: 0, count: rows * bytesPerRow)
@@ -284,8 +300,9 @@ final class ColorPlaneView: NSView {
     private func drawEmpty() {
         NSColor.gray.set()
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.boldSystemFont(ofSize: 14), .foregroundColor: NSColor.gray]
-        let s = NSAttributedString(string: "No 2D field", attributes: attrs)
-        var pt = NSPoint(x: bounds.midX - s.size().width/2, y: bounds.midY)
+        let msg = (grid?.first?.isEmpty ?? true) || grid == nil ? "No 2D field" : "Constant 2D field"
+        let s = NSAttributedString(string: msg, attributes: attrs)
+        let pt = NSPoint(x: bounds.midX - s.size().width/2, y: bounds.midY)
         s.draw(at: pt)
     }
 

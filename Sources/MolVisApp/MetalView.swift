@@ -51,32 +51,55 @@ final class MetalView: MTKView {
         guard let last = lastMouse else { lastMouse = p; return }
         let dx = Float(p.x - last.x), dy = Float(p.y - last.y)
         lastMouse = p
-        // The camera's right/up axes in world space are the first two columns
-        // of its rotation matrix — the same basis the orbit path recomputes,
-        // shared here so pan and orbit never disagree about screen directions.
-        let R = float4x4(self.world!.camera.rotation)
-        let viewRight = (R * SIMD4<Float>(1, 0, 0, 0)).xyz   // camera right → world
-        let viewUp    = (R * SIMD4<Float>(0, 1, 0, 0)).xyz   // camera up → world
-
+        guard let world else { return }
         if e.modifierFlags.contains(.option) {
             // Option-drag = PAN: translate the look-at center in the camera's
             // right/up plane so a grabbed point follows the mouse ("grab and
-            // drag" semantics). World units per pixel come from the projected
-            // visible height at the target plane (perspective fov = π/4).
-            let distance = max(1.0, world!.camera.distance)
-            let worldPerPixel = Float(2.0 * distance * tan(Float.pi / 8)) / Float(bounds.height)
-            world?.camera.center -= (viewRight * dx + viewUp * dy) * worldPerPixel
+            // drag" semantics). The decomposed helpers below use the camera's
+            // EFFECTIVE projection (2D modes force identity rotation +
+            // orthographic), so pan tracks the rendered pixels exactly.
+            let is2D = world.scene.displayMode.is2D
+            let axes = MetalView.panAxes(camera: world.camera, is2D: is2D)
+            let wpp = MetalView.panWorldPerPixel(camera: world.camera, viewHeight: Float(bounds.height), is2D: is2D)
+            world.camera.center -= (axes.right * dx + axes.up * dy) * wpp
         } else {
             // Plain drag = ORBIT around the camera's current up/right axes rather
             // than world-fixed axes: a horizontal drag rotates around what is
             // currently the vertical direction on screen, and a vertical drag
             // rotates around the horizontal direction — the intuitive "follow
             // your mouse" behavior.
+            let R = float4x4(world.camera.rotation)
+            let viewRight = (R * SIMD4<Float>(1, 0, 0, 0)).xyz   // camera right → world
+            let viewUp    = (R * SIMD4<Float>(0, 1, 0, 0)).xyz   // camera up → world
             let rotV = simd_quatf(angle: +dy * 0.01, axis: viewRight)
             let rotH = simd_quatf(angle: -dx * 0.01, axis: viewUp)
-            world?.camera.rotation = rotH * rotV * world!.camera.rotation
+            world.camera.rotation = rotH * rotV * world.camera.rotation
         }
-        world?.setNeedsRender()
+        world.setNeedsRender()
+    }
+
+    /// Pan basis (camera-right, camera-up) as world-space unit vectors. 2D
+    /// modes force an identity rotation in the renderer, so pan must match by
+    /// using world axes rather than the stored 3D rotation matrix.
+    static func panAxes(camera: Camera, is2D: Bool) -> (right: SIMD3<Float>, up: SIMD3<Float>) {
+        if is2D { return (SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0)) }
+        let R = float4x4(camera.rotation)
+        return ((R * SIMD4<Float>(1, 0, 0, 0)).xyz, (R * SIMD4<Float>(0, 1, 0, 0)).xyz)
+    }
+
+    /// World units per screen pixel for panning. Perspective uses
+    /// `2 · distance · tan(fov/2)` over the viewport height (fov = π/4);
+    /// orthographic uses the projection's full visible height
+    /// `2 · max(1, distance)`. 2D modes render with the orthographic path
+    /// irrespective of the stored `camera.perspective`, so the orthographic
+    /// scale applies there even if a perspective camera is set.
+    static func panWorldPerPixel(camera: Camera, viewHeight: Float, is2D: Bool) -> Float {
+        let h = viewHeight > 0 ? viewHeight : 1
+        let d = max(1.0, camera.distance)
+        if is2D || !camera.perspective {
+            return (2.0 * d) / h
+        }
+        return (2.0 * d * tan(Float.pi / 8)) / h
     }
 
     override func mouseUp(with e: NSEvent) {
@@ -88,8 +111,9 @@ final class MetalView: MTKView {
 
         // Project each atom to screen accounting for its on-screen radius AND
         // depth: the click must land inside the rendered disk, and among
-        // overlapping atoms the closest to the camera wins.
-        guard let s = world?.scene, s.atoms.count > 0 else { return }
+        // overlapping atoms the closest to the camera wins. Hidden/empty
+        // structures are not pickable (matches the renderer's visibility gate).
+        guard let s = world?.scene, MetalView.hitTestEnabled(scene: s) else { return }
         let cw = bounds.width, ch = bounds.height
         guard cw > 1, ch > 1 else { return }   // needs a drawable pixel area
         // Use the renderer's effective camera so the hit test matches the
@@ -138,6 +162,33 @@ final class MetalView: MTKView {
         }
     }
 
+    /// Distance multiplier for a pinch-gesture delta. Positive magnification
+    /// (zoom-in) reduces distance; the 0.5 damper keeps the gesture smooth. The raw
+    /// event value is clamped into a sane band and the resulting factor is then pinned
+    /// into [0.01, 2] so extreme / NaN / infinite events can never yield a zero,
+    /// negative, NaN, or infinite factor — any of which would corrupt the camera
+    /// distance. The 0.01 floor keeps an extreme-but-finite pinch from collapsing the
+    /// distance to a near-zero step (a de facto no-op that never reaches the target),
+    /// while leaving the normal 0.5 damped range untouched. A non-finite event is
+    /// treated as a no-op (factor 1.0). The view's `magnify(with:)` multiplies
+    /// `camera.distance` by the factor and the renderer clamps the result to a minimum
+    /// of 2.
+    static func clampedMagnification(_ raw: Float) -> Float {
+        guard raw.isFinite else { return 0 }
+        return min(2 - Float.ulpOfOne, max(-2, raw))
+    }
+
+    static func magnifyFactor(for magnification: Float) -> Float {
+        max(0.01, 1.0 - clampedMagnification(magnification) * 0.5)
+    }
+
+    /// Whether atom picking is enabled for this scene: requires atoms present
+    /// AND the structure not hidden. Hidden structures must not be clickable,
+    /// and there is nothing to pick in an empty scene.
+    static func hitTestEnabled(scene: Scene) -> Bool {
+        scene.atoms.count > 0 && scene.showStructure
+    }
+
     /// World-radius of an atom matching what the renderer draws, so the hit
     /// test uses the disk the user actually sees.
     private func atomWorldRadius(atomicNumber: Int, scale: Float, mode: DisplayMode) -> Float {
@@ -169,7 +220,7 @@ final class MetalView: MTKView {
         world?.setNeedsRender()
     }
     override func magnify(with e: NSEvent) {
-        let factor = Float(1.0 + e.magnification)
+        let factor = MetalView.magnifyFactor(for: Float(e.magnification))
         world?.camera.distance = max(2, (world?.camera.distance ?? 20) * factor)
         world?.setNeedsRender()
     }

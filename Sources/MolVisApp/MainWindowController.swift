@@ -16,10 +16,18 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let colorPlane: ColorPlaneView      // color-plane / 2D-contour overlay (shown when grid2D != nil and toggled)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
-    let renderer: Renderer
-    private lazy var renderer2D = try? Renderer2D(device: MTLCreateSystemDefaultDevice()!)
-    var scene: Scene { didSet { renderer.scene = scene; renderer2D?.scene = scene } }
+    /// The main Metal renderer. `nil` only if Metal is unavailable (no GPU device or the
+    /// shader library fails to compile) — exactly the case `try! Renderer(device:)` used
+    /// to trap on. All other render touches guard on this, so the GUI still opens with
+    /// graphs/labels/sidebar and only the 3D canvas stays blank (never a hard crash).
+    let renderer: Renderer?
+    private let device: MTLDevice?
+    private lazy var renderer2D: Renderer2D? = device.flatMap { try? Renderer2D(device: $0) }
+    var scene: Scene { didSet { renderer?.scene = scene; renderer2D?.scene = scene } }
     var camera = Camera()
+    /// Test-only seam: when true, renderer creation is forced to fail so the graceful
+    /// Metal-unavailable path is exercisable without a real GPU-less machine.
+    internal static var forceRendererFailure = false
     let state: SideBarState
     /// The on-disk source + forced format of the currently-loaded file, kept so
     /// the animation controls can re-parse an arbitrary frame (AXSF animation
@@ -33,9 +41,21 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     init(scene: Scene, showWindow: Bool = true) {
         self.scene = scene
-        let device = MTLCreateSystemDefaultDevice()!
-        renderer = try! Renderer(device: device)
-        renderer.scene = scene
+        let device = MTLCreateSystemDefaultDevice()
+        self.device = device
+        // Build the renderer defensively: if there is no Metal device or the shader
+        // library fails to compile, fall back to a nil renderer rather than `try!`-trapping.
+        // The window still opens — graphs, labels, and the sidebar work; only the Metal
+        // canvas stays blank. This keeps the headless export path (which constructs its
+        // OWN Renderer in PngExporter/RasterExporter) untouched.
+        if let device, !MainWindowController.forceRendererFailure {
+            do { renderer = try Renderer(device: device) }
+            catch { print("[mcrysden] Metal renderer unavailable (\(error)); 3D canvas disabled"); renderer = nil }
+        } else {
+            if device == nil { print("[mcrysden] no Metal device; 3D canvas disabled") }
+            renderer = nil
+        }
+        renderer?.scene = scene
         let state = SideBarState()
         self.state = state
         sidebar = NSHostingView(rootView: SideBar(state: state))
@@ -104,7 +124,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onExportKPath = { [weak self] path, format in self?.exportKPath(path, format) }
         canvas.delegate = renderer
         canvas.world = self
-        renderer.currentCamera = camera
+        renderer?.currentCamera = camera
         refreshDelegate()
         layoutSplit()
         window.center()
@@ -200,14 +220,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if scene.displayMode.is2D {
             canvas.delegate = renderer2D
             renderer2D?.scene = scene
-            renderer2D?.background = renderer.background
+            if let color = renderer?.background { renderer2D?.background = color }
         } else {
             canvas.delegate = renderer
         }
     }
 
     func setNeedsRender() {
-        renderer.currentCamera = camera
+        renderer?.currentCamera = camera
         renderer2D?.currentCamera = camera
         refreshDelegate()
         updateLabels()
@@ -455,11 +475,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// projection but keeps the user's distance/orientation, while 3D uses the
     /// orbit camera — both derive their center and scale from the structure's
     /// bounding sphere so a switch never produces a tiny off-centre blob.
+    ///
+    /// Same-mode changes (e.g. ballStick↔spaceFill, or line2D↔point2D) do NOT
+    /// reframe — only a real 2D↔3D transition does. The projection choice
+    /// (perspective vs orthographic, driven by `state.orthographic`) is preserved
+    /// across the transition: `applyCameraForNewSceneIfNeeded` resets the camera
+    /// to the framing default (always orthographic), so we restore the user's
+    /// projection afterward.
     private func reframeForDisplayMode(previous: DisplayMode) {
-        // No-op when toggling between two 2D modes or two 3D modes — only reframe
-        // on the 2D↔3D transition (or first load, when previous == current).
-        guard previous.is2D != scene.displayMode.is2D || previous == scene.displayMode else { return }
+        guard previous.is2D != scene.displayMode.is2D else { return }
         applyCameraForNewSceneIfNeeded()
+        camera.perspective = !state.orthographic
     }
 
     func syncFromState() {
@@ -489,10 +515,6 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
         let previousMode = scene.displayMode
         scene.displayMode = state.displayMode
-        // Reframe when crossing the 2D↔3D boundary so the structure always
-        // fills the viewport (otherwise the 3D distance carries over and the
-        // 2D view shows a tiny off-centre blob).
-        reframeForDisplayMode(previous: previousMode)
         scene.atomScale = state.atomScale
         scene.bondRadius = state.bondRadius
         scene.showCellFrame = state.showCellFrame
@@ -574,10 +596,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if superCellChanged || scene.slab != slab {
             scene = scene.applySlab(slab)
         }
+        // Reframe when crossing the 2D↔3D boundary — after supercell/slab
+        // mutations so the camera fits the final geometry.
+        reframeForDisplayMode(previous: previousMode)
         // background clear color (solid top color today; gradient rendering is
         // pending on the shader work).
         if let c = colorFromHex(state.backgroundHex) {
-            renderer.background = MTLClearColor(red: c.r, green: c.g, blue: c.b, alpha: 1)
+            renderer?.background = MTLClearColor(red: c.r, green: c.g, blue: c.b, alpha: 1)
         }
         // Playback timer follows the Play/Pause toggle: started on play,
         // torn down on pause or when not animating at all.
@@ -680,7 +705,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.backgroundBottom = state.backgroundBottomHex
         next.selectedAtoms = []                 // selection is per-frame
         next.measurementResult = nil
-        next.measurementMode = .none
+        next.measurementMode = state.measurementMode  // mode survives frame changes
         // Re-apply the current supercell and slab so the new frame matches the
         // framing the user had before the reload.
         next = next.widenSuperCell(SuperCell(n1: state.n1, n2: state.n2, n3: state.n3))

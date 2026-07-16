@@ -98,11 +98,32 @@ struct IsoMesh {
     var vertices: [Float]
     var triangleCount: Int { vertices.count / 27 }
 
+    /// Set when marching cubes hit the practical output cap (`maxTriangles`): the
+    /// mesh is a partial shell, not a complete surface. Renderer consults this to
+    /// avoid drawing a silently-truncated surface.
+    private(set) var overflow = false
+
     /// one-sided surface: `sign > 0` renders faces where field > isoLevel.
     init(field: ScalarField, isoLevel: Float, sign: Float = 1, color: SIMD3<Float> = SIMD3<Float>(0.3, 0.6, 1.0)) {
+        let maxTriangles = 5_000_000
         var out: [Float] = []
         guard field.nx > 1, field.ny > 1, field.nz > 1 else { vertices = out; return }
+
+        // Overflow-checked product: a malicious grid whose (nx-1)(ny-1)(nz-1)*27
+        // overflows Int must never pass a naive magnitude bound check. Allocate a
+        // modest reserve and grow lazily instead of reserving hundreds of MB eagerly.
         let nx = field.nx, ny = field.ny, nz = field.nz
+        let fx = Int64(nx - 1), fy = Int64(ny - 1), fz = Int64(nz - 1)
+        guard fx > 0, fy > 0, fz > 0 else { vertices = out; return }
+        let cubes64 = fx.multipliedReportingOverflow(by: fy)
+        guard !cubes64.overflow else { overflow = true; vertices = out; return }
+        let cubes64b = cubes64.partialValue.multipliedReportingOverflow(by: fz)
+        guard !cubes64b.overflow else { overflow = true; vertices = out; return }
+        let floats64 = cubes64b.partialValue.multipliedReportingOverflow(by: Int64(27))
+        guard !floats64.overflow else { overflow = true; vertices = out; return }
+        if floats64.partialValue <= Int64(Int.max) {
+            out.reserveCapacity(min(Int(floats64.partialValue), maxTriangles * 27))
+        }
 
         // 12 edges of the cube: each connects two of the 8 corner indices.
         // Corner layout matches MarchCubes.c: 0=(0,0,0) bottom layer, then around.
@@ -189,6 +210,9 @@ struct IsoMesh {
                     let tri = marchingCubeTriTable[cubeindex]
                     var ti = 0
                     while ti < 15 && tri[ti] >= 0 {
+                        if out.count / 27 >= maxTriangles {
+                            overflow = true; vertices = out; return
+                        }
                         let i0 = Int(tri[ti]), i1 = Int(tri[ti+1]), i2 = Int(tri[ti+2])
                         let p0 = vert[i0]!, p1 = vert[i1]!, p2 = vert[i2]!
                         let f0 = frac[i0]!, f1 = frac[i1]!, f2 = frac[i2]!
@@ -196,7 +220,9 @@ struct IsoMesh {
                         let n1 = normalFromGradient(field, f1, sign: sign)
                         let n2 = normalFromGradient(field, f2, sign: sign)
                         for (p, n) in [(p0,n0),(p1,n1),(p2,n2)] {
-                            out += [p.x, p.y, p.z, n.x, n.y, n.z, color.x, color.y, color.z]
+                            out.append(p.x); out.append(p.y); out.append(p.z)
+                            out.append(n.x); out.append(n.y); out.append(n.z)
+                            out.append(color.x); out.append(color.y); out.append(color.z)
                         }
                         ti += 3
                     }
@@ -215,12 +241,6 @@ private func normalFromGradient(_ field: ScalarField, _ f: SIMD3<Float>, sign: F
     let len = simd_length(g)
     // Positive lobes face lower values; negative lobes face higher values.
     return len > 1e-9 ? -sign * g / len : SIMD3<Float>(0, 0, 1)
-}
-
-// Float literals can't be appended to `[Float]` without coercion in some
-// contexts; `+= [Float]()` friendly helpers live above via explicit typing.
-private extension Array where Element == Float {
-    static func += (lhs: inout [Float], rhs: [Float]) { lhs.append(contentsOf: rhs) }
 }
 
 // MARK: - Fermi-surface parsing (BXSF)

@@ -295,6 +295,33 @@ final class AdversarialFindingsTests: XCTestCase {
         XCTAssertEqual(renderer.bzRebuildCount, 2)
     }
 
+    // A nil BZ (zero-volume cell) must be negative-cached: build() runs exactly once
+    // and never again, even across many frames. Without the flag, cachedBZ == nil
+    // rebuilds every frame (rebuild count climbs without bound).
+    func testBZNegativeCachesNilBuild() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw NoGpu() }
+        let renderer = try Renderer(device: device)
+        let texture = device.makeTexture(descriptor: wtx(64, 64))!
+        let queue = device.makeCommandQueue()!
+        var scene = Scene()
+        // a, b parallel (+ c zero) => zero volume => primitiveReciprocal == .zero => nil BZ.
+        scene.cell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 0))
+        scene.showStructure = false
+        scene.showBrillouinZone = true
+        scene.baseAtoms = [Atom(coord: .zero, atomicNumber: 6, label: "C")]
+        for _ in 0..<5 {
+            renderer.scene = scene
+            let cb = queue.makeCommandBuffer()!
+            XCTAssertTrue(renderer.encode(to: cb, target: texture,
+                                           viewport: MTLViewport(originX: 0, originY: 0,
+                                                                 width: 64, height: 64,
+                                                                 znear: 0, zfar: 1),
+                                           camera: Camera()))
+            cb.commit(); cb.waitUntilCompleted()
+        }
+        XCTAssertEqual(renderer.bzRebuildCount, 1, "nil BZ must build exactly once")
+    }
+
     // applySlab(nil) on an already-unslabbed scene is a no-op (no rebond).
     func testApplySlabNilIsNoopWhenUnslabbed() {
         var s = Scene()
@@ -315,7 +342,8 @@ final class AdversarialFindingsTests: XCTestCase {
     func testPngExportSurfacesEncodeFailureViaStatus() throws {
         // A valid export must succeed and return a non-blank image.
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let scene = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf")))
+        var scene = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf")))
+        scene.background = "#000000"
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("adv_out.png")
         let cg = try PngExporter.export(scene: scene, camera: nil, to: out,
                                         size: CGSize(width: 200, height: 200))
@@ -333,7 +361,8 @@ final class AdversarialFindingsTests: XCTestCase {
 
     func testVectorExportReturnsNonBlankRaster() throws {
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let scene = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf")))
+        var scene = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf")))
+        scene.background = "#000000"
         for ext in ["pdf", "svg", "eps"] {
             let out = FileManager.default.temporaryDirectory.appendingPathComponent("adv_out.\(ext)")
             let cg = try RasterExporter.export(scene: scene, camera: nil, to: out,
@@ -348,5 +377,50 @@ final class AdversarialFindingsTests: XCTestCase {
             for i in stride(from: 0, to: px.count, by: 4) where px[i] != 0 || px[i+1] != 0 || px[i+2] != 0 { n += 1 }
             XCTAssertGreaterThan(n, 0, "\(ext) export must wrap a non-blank raster")
         }
+    }
+
+    // The polyhedral cache key must include bond topology, not just atom
+    // species/coords: cutting a bond must change the rendered cell.
+    func testPolyhedralCacheKeyIncludesBonds() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw NoGpu() }
+        let r = try Renderer(device: device)
+        let texture = device.makeTexture(descriptor: wtx(80, 80))!
+        let queue = device.makeCommandQueue()!
+        func renderHash(scene: Scene) -> UInt64 {
+            r.scene = scene
+            let cb = queue.makeCommandBuffer()!
+            XCTAssertTrue(r.encode(to: cb, target: texture,
+                                   viewport: MTLViewport(originX: 0, originY: 0, width: 80, height: 80,
+                                                         znear: 0, zfar: 1),
+                                   camera: Camera()))
+            cb.commit(); cb.waitUntilCompleted()
+            var px = [UInt8](repeating: 0, count: 80 * 80 * 4)
+            texture.getBytes(&px, bytesPerRow: 80 * 4, from: MTLRegionMake2D(0, 0, 80, 80), mipmapLevel: 0)
+            return px.reduce(into: UInt64(0xcbf29ce484222325)) { $0 ^= UInt64($1); $0 &*= 0x100000001b3 }
+        }
+        var scene = Scene()
+        scene.displayMode = .polyhedral
+        scene.showAxes = false; scene.showCellFrame = false
+        scene.isCrystal = true
+        // Cell large enough to enclose the centered cell.
+        scene.cell = Cell(a: SIMD3(4,0,0), b: SIMD3(0,4,0), c: SIMD3(0,0,4))
+        // A center atom surrounded by a tetrahedral set of neighbors — a bounded 3D
+        // cell needs >=4 non-coplanar neighbors, so coplanar/under-constrained sets
+        // here would render empty (and negative-cache) and mask the bond effect.
+        scene.atoms = [
+            Atom(coord: .zero, atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(1,1,1), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(1,-1,-1), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(-1,1,-1), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(-1,-1,1), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(0,0,2), atomicNumber: 6, label: "C"),
+        ]
+        // Center atom (0) bonded to the four tetrahedral corners (4 neighbors => bounded cell).
+        scene.bonds = [Bond(i: 0, j: 1), Bond(i: 0, j: 2), Bond(i: 0, j: 3), Bond(i: 0, j: 4)]
+        let hashBefore = renderHash(scene: scene)
+        // Add the fifth bond to atom 5 — topology changes, so the cell must differ.
+        scene.bonds = [Bond(i: 0, j: 1), Bond(i: 0, j: 2), Bond(i: 0, j: 3), Bond(i: 0, j: 4), Bond(i: 0, j: 5)]
+        let hashAfter = renderHash(scene: scene)
+        XCTAssertNotEqual(hashBefore, hashAfter, "changing bond topology must change polyhedral output")
     }
 }

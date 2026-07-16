@@ -42,7 +42,8 @@ final class BzCacheTests: XCTestCase {
     func testBZVisibleForSlabViaRenderer() throws {
         // GaAsH slab (originally returned NIL and lagged): with BZ on the render MUST
         // differ from BZ off, and both builds return a closed polyhedron.
-        let assets = URL(fileURLWithPath: "/Users/mao/dev/mcrysden/Assets")
+        let assets = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Assets")
         var scene = Scene(loaded: try Parser.load(assets.appendingPathComponent("GaAsH.xsf")))
         scene.displayMode = .ballStick
         let off = try render(scene)
@@ -90,7 +91,8 @@ final class BzCacheTests: XCTestCase {
     }
 
     func testIsosurfaceRendersForSlabViaRenderer() throws {
-        let assets = URL(fileURLWithPath: "/Users/mao/dev/mcrysden/Assets")
+        let assets = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Assets")
         var scene = Scene(loaded: try Parser.load(assets.appendingPathComponent("volumetric_grid.xsf")))
         guard scene.scalarField != nil else { return XCTFail("expected a scalar field") }
         scene.displayMode = .ballStick
@@ -105,8 +107,8 @@ final class BzCacheTests: XCTestCase {
 
         // Gating: a structure-only file must NOT draw a surface regardless of
         // the toggle (no scalarField present).
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        var plain = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf")))
+        let dir2 = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        var plain = Scene(loaded: try Parser.load(dir2.appendingPathComponent("Fixtures/si110.xsf")))
         XCTAssertNil(plain.scalarField, "si110 has no field")
         plain.showIsoSurface = false
         let pOff = try render(plain)

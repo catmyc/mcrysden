@@ -132,10 +132,13 @@ enum StateStore {
            let a = slab["planeA"] as? [String: Any], let b = slab["planeB"] as? [String: Any] {
             let distanceA = try finiteFloat(a["distance"], field: "slab.planeA.distance") ?? 0
             let distanceB = try finiteFloat(b["distance"], field: "slab.planeB.distance") ?? 0
+            // Miller indices mirror the sidebar stepper contract exactly (-8...8),
+            // so valid negatives (e.g. the default planeB k = -1) round-trip intact.
+            func clampSlabIndex(_ v: Any?) -> Int { min(8, max(-8, v as? Int ?? 0)) }
             let sl = Slab(
-                planeA: Plane(h: a["h"] as? Int ?? 0, k: a["k"] as? Int ?? 1, l: a["l"] as? Int ?? 0,
+                planeA: Plane(h: clampSlabIndex(a["h"]), k: clampSlabIndex(a["k"]), l: clampSlabIndex(a["l"]),
                               distance: distanceA),
-                planeB: Plane(h: b["h"] as? Int ?? 0, k: b["k"] as? Int ?? -1, l: b["l"] as? Int ?? 0,
+                planeB: Plane(h: clampSlabIndex(b["h"]), k: clampSlabIndex(b["k"]), l: clampSlabIndex(b["l"]),
                               distance: distanceB))
             candidate = candidate.applySlab(sl)
         } else {
@@ -173,7 +176,7 @@ enum StateStore {
         if let v = try finiteFloat(obj["forceScale"], field: "forceScale") {
             candidate.forceScale = min(200, max(5, v))
         }
-        if let v = try finiteFloat(obj["atomScale"], field: "atomScale") { candidate.atomScale = v }
+        if let v = try finiteFloat(obj["atomScale"], field: "atomScale") { candidate.atomScale = min(1.0, max(0.05, v)) }
         if let v = try finiteFloat(obj["bondRadius"], field: "bondRadius") {
             candidate.bondRadius = min(1, max(0.001, v))
         }
@@ -193,7 +196,8 @@ enum StateStore {
         // committed at the end, so a throw here leaves the caller's state intact).
         if let c = obj["camera"] {
             do {
-                candidateCamera = try dec.decode(Camera.self, from: try JSONSerialization.data(withJSONObject: c))
+                let decoded = try dec.decode(Camera.self, from: try JSONSerialization.data(withJSONObject: c))
+                candidateCamera = try Camera.validated(decoded)   // rejects non-finite / non-positive / invalid quaternion; normalizes
             } catch {
                 throw ParseError.parse(path: url.path, line: 0, reason: "malformed camera: \(error)")
             }

@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-15 (v1.1.13 shipped)**.
+Last updated: **2026-07-16 (v1.1.14 shipped)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
