@@ -215,9 +215,20 @@ final class MetalView: MTKView {
         lastMouse = nil
     }
     override func scrollWheel(with e: NSEvent) {
-        let factor = Float(1.0 + e.scrollingDeltaY * 0.001)
+        // A non-finite scrolling delta (garbage trackpad event) would make the
+        // factor NaN/Inf and corrupt camera.distance, so treat it as a no-op.
+        // Swift's `max(2, x)` collapses NaN to 2 but NOT Inf, so guard explicitly.
+        guard let factor = MetalView.scrollZoomFactor(e.scrollingDeltaY) else { return }
         world?.camera.distance = max(2, (world?.camera.distance ?? 20) * factor)
         world?.setNeedsRender()
+    }
+
+    /// Distance scale factor for a scroll delta, or `nil` for a non-finite delta
+    /// (a malformed trackpad event that must NOT corrupt the camera distance to
+    /// NaN/Inf). Mirrors the `magnifyFactor`/`clampedMagnification` seam.
+    static func scrollZoomFactor(_ delta: CGFloat) -> Float? {
+        guard delta.isFinite else { return nil }
+        return Float(1.0 + delta * 0.001)
     }
     override func magnify(with e: NSEvent) {
         let factor = MetalView.magnifyFactor(for: Float(e.magnification))

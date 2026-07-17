@@ -148,6 +148,39 @@ final class ParserTests: XCTestCase {
         XCTAssertFalse(sc.isCrystal)
     }
 
+    // The Swift atom bridge (`readAtoms`) reads the imported `MolEnvAtom` BY FIELD,
+    // not by a hand-computed byte offset — so a C-side relayout of the struct fails
+    // to compile rather than silently mapping coords/Z/label onto the wrong bytes.
+    // This locks in reading integer-Z numeric labels, element-symbol labels, and
+    // fractional->cartesian coords exactly as the C parsers wrote them.
+    func testAtomBridgeReadsCoordsZAndLabelByField() throws {
+        // Single XSF structure block: read_chunk reads ATOMS_FRAC once, then stops.
+        // This locks the field-based bridge for the trickiest cases — mixed integer-Z
+        // / symbol-Z rows AND their written labels, including the NUL-terminated
+        // `label[8]` -> String conversion under the old hand-computed offsets.
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("bridge.xsf")
+        try """
+        CRYSTAL
+        PRIMVEC
+         4.0 0.0 0.0
+         0.0 4.0 0.0
+         0.0 0.0 4.0
+        ATOMS_FRAC
+         29 0.0 0.0 0.0
+         Si 0.25 0.25 0.25
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        let sc = try Parser.load(tmp)
+        XCTAssertEqual(sc.atoms.count, 2)
+        // Integer-Z ATOMS_FRAC row -> coord (0,0,0), Z 29 with numeric label.
+        XCTAssertEqual(sc.atoms[0].atomicNumber, 29)
+        XCTAssertEqual(sc.atoms[0].label, "29")
+        XCTAssertEqual(sc.atoms[0].coord, SIMD3<Float>(0, 0, 0))
+        // Symbol ATOMS_FRAC row -> Z 14, label "Si", frac (0.25,0.25,0.25)*4 => (1,1,1).
+        XCTAssertEqual(sc.atoms[1].atomicNumber, 14)
+        XCTAssertEqual(sc.atoms[1].label, "Si")
+        XCTAssertEqual(sc.atoms[1].coord, SIMD3<Float>(1, 1, 1))
+    }
+
     // A hybrid XSF with a malformed PRIMCOORD followed by a valid DATAGRID must be
     // REJECTED with the original parser error — the grid-only fallback must not mask
     // it. Before the fix, read_chunk's failure silently fell through to
@@ -177,6 +210,46 @@ final class ParserTests: XCTestCase {
             guard case ParseError.parse = err else { return XCTFail("expected parse error, got \(err)") }
         }
         XCTAssertFalse(String(cString: molenv_last_error()).isEmpty, "error must explain the malformed structure")
+    }
+
+    // An AXSF whose frame carries an ATOMS block followed by a 2D DATAGRID must
+    // capture BOTH the structure and that frame's grid, and each frame must re-read
+    // independently (no cross-frame atom reuse, no grid leak/deferred double-free).
+    // This is the deferred-DATAGRID capture path a reviewer flagged around
+    // read_chunk's ATOMS branch — it must hold for multi-frame files.
+    func testAXSFDeferredGridPerFrame() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("anim2d.axsf")
+        try """
+        ANIMSTEPS 2
+        CRYSTAL
+        PRIMVEC
+         5.0 0.0 0.0
+         0.0 5.0 0.0
+         0.0 0.0 5.0
+        ATOMS
+         14 0.0 0.0 0.0
+        DATAGRID_2D_colorplane
+         2 2
+         0.0 0.0 0.0
+         5.0 0.0 0.0
+         0.0 5.0 0.0
+         1.0 2.0 3.0 4.0
+        END_DATAGRID_2D
+        ATOMS
+         14 1.0 0.0 0.0
+        """.write(to: tmp, atomically: true, encoding: .utf8)
+        XCTAssertEqual(Parser.frameCount(tmp), 2)
+        // Frame 0: ATOMS + a 2D grid captured via the deferred path.
+        let f0 = try Parser.load(tmp, as: nil, frameIndex: 0)
+        XCTAssertEqual(f0.atoms.count, 1, "frame 0 must keep its single atom")
+        XCTAssertEqual(f0.atoms[0].coord, SIMD3<Float>(0, 0, 0), "frame 0 atom coord must not be frame 1's")
+        XCTAssertNotNil(f0.grid2D, "frame 0 must capture the deferred 2D grid")
+        XCTAssertNil(f0.scalarField, "2D grids must route to grid2D, not scalarField")
+        // Frame 1: ATOMS only (no grid). Reading it must not inherit frame 0's grid.
+        let f1 = try Parser.load(tmp, as: nil, frameIndex: 1)
+        XCTAssertEqual(f1.atoms.count, 1)
+        XCTAssertEqual(f1.atoms[0].coord, SIMD3<Float>(1, 0, 0), "frame 1 atom must be independent of frame 0")
+        XCTAssertNil(f1.grid2D, "frame 1 with no grid must not leak frame 0's grid")
     }
 
     // A structure-free DATAGRID XSF (no atoms at all) must still parse via the
@@ -378,6 +451,300 @@ final class ParserTests: XCTestCase {
         // Cartesian coords: O at origin
         XCTAssertEqual(s.atoms[0].coord.x, 0.0, accuracy: 0.001)
         XCTAssertEqual(s.atoms[1].coord.x, 0.7572, accuracy: 0.001)
+    }
+
+    // A CIF fractional atom coordinate that is NaN/Inf must be rejected outright.
+    func testCIFRejectsNonfiniteFracAtomCoordinate() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cif_nan_frac.cif")
+        try """
+        data_x
+        _cell_length_a 5.0
+        _cell_length_b 5.0
+        _cell_length_c 5.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 NaN 0.25 0.25
+         O1  0.50 0.50 0.50
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite coordinate, got: \(reason)")
+        }
+    }
+
+    // A CIF Cartesian atom coordinate that is inf must be rejected outright.
+    func testCIFRejectsNonfiniteCartAtomCoordinate() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cif_inf_cart.cif")
+        try """
+        data_water
+        loop_
+        _atom_site_label
+        _atom_site_Cartn_x
+        _atom_site_Cartn_y
+        _atom_site_Cartn_z
+        O1  Inf  0.0000  0.0000
+        H1  0.7572  0.5860  0.0000
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite coordinate, got: \(reason)")
+        }
+    }
+
+    // An XSF PRIMVEC row with a non-finite lattice component must be rejected.
+    func testXSFRejectsNonfinitePRIMVEC() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("xsf_nan_cell.xsf")
+        try """
+        CRYSTAL
+        PRIMVEC
+         NaN 0.0 0.0
+         0.0 5.0 0.0
+         0.0 0.0 5.0
+        PRIMCOORD
+         1 1
+         14 0 0 0
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite cell row, got: \(reason)")
+        }
+    }
+
+    // An XSF PRIMCOORD atom with an inf coordinate must be rejected.
+    func testXSFRejectsNonfinitePRIMCOORDAtom() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("xsf_inf_atom.xsf")
+        try """
+        MOLECULE
+        PRIMCOORD
+         1 1
+         8 0 0 Inf
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite PRIMCOORD atom, got: \(reason)")
+        }
+    }
+
+    // An XSF ATOMS block (direct coordinates) with a NaN coordinate must be rejected.
+    func testXSFRejectsNonfiniteATOMSAtom() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("xsf_nan_atom.xsf")
+        try """
+        CRYSTAL
+        PRIMVEC
+         5.0 0.0 0.0
+         0.0 5.0 0.0
+         0.0 0.0 5.0
+        ATOMS
+         6 0.0 0.0 NaN
+         8 1.0 0.0 0.0
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite ATOMS coordinate, got: \(reason)")
+        }
+    }
+
+    // An XYZ atom record with a NaN coordinate must be rejected.
+    func testXYZRejectsNonfiniteAtomCoordinate() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("xyz_nan.xyz")
+        try """
+        2
+        bad
+        O  NaN 0.0 0.0
+        H  0.7572 0.5860 0.0
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite coordinate, got: \(reason)")
+        }
+    }
+
+    // A CIF _cell_length_a (or angle) that is non-finite must be rejected — it would
+    // otherwise poison cif_build_cell and every derived cartesian coordinate.
+    func testCIFRejectsNonfiniteCellLength() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cif_nan_cella.cif")
+        try """
+        data_x
+        _cell_length_a NaN
+        _cell_length_b 5.0
+        _cell_length_c 5.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 0.25 0.25 0.25
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite cell parameter, got: \(reason)")
+        }
+    }
+
+    // A finite double whose magnitude exceeds FLT_MAX overflows to +inf on a (float)
+    // cast — passing a plain isfinite() check, but not the cast. Such a coordinate
+    // must be rejected as non-finite rather than silently becoming inf in the scene.
+    // A finite _cell_length_a whose magnitude exceeds FLT_MAX must be rejected:
+    // it would overflow to +inf when cif_build_cell casts it to float, poisoning
+    // the whole lattice. Mirrors the coordinate overflow guard.
+    func testCIFRejectsFloatOverflowCellLength() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cif_huge_cella.cif")
+        try """
+        data_x
+        _cell_length_a 1e40
+        _cell_length_b 5.0
+        _cell_length_c 5.0
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 0.25 0.25 0.25
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the overflowing cell parameter, got: \(reason)")
+        }
+    }
+
+    // ATOMS_FRAC with finite, in-range cell and fractional coordinates can still
+    // overflow to ±inf when the product is computed and cast to float. The new
+    // guard computes in double and rejects rather than store an Inf coordinate.
+    func testXSFRejectsATOMSFracDerivedOverflow() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("xsf_frac_overflow.xsf")
+        try """
+        CRYSTAL
+        PRIMVEC
+         1e38 0 0
+         0 1e38 0
+         0 0 1e38
+        ATOMS_FRAC
+         29 4.0 0.0 0.0
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite Cartesian coordinate, got: \(reason)")
+        }
+    }
+
+    // cif_build_cell can derive a ±inf component from extreme finite lengths and
+    // a near-zero gamma (division by the clamped tiny sin(gamma) blows up cy).
+    // All inputs here are finite and within FLT_MAX — only the derived lattice
+    // overflows on the (float) cast.
+    func testCIFRejectsDerivedCellOverflow() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cif_cell_overflow.cif")
+        try """
+        data_x
+        _cell_length_a 1.0
+        _cell_length_b 1.0
+        _cell_length_c 1e38
+        _cell_angle_alpha 60.0
+        _cell_angle_beta 70.0
+        _cell_angle_gamma 1e-11
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 0.5 0.5 0.5
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite cell components, got: \(reason)")
+        }
+    }
+
+    // With a cell that itself passes cif_build_cell (cubic 1e38), a finite
+    // fractional coordinate can still overflow the frac->Cartesian product when
+    // cast to float. The conversion guard must reject it.
+    func testCIFRejectsDerivedCartesianOverflow() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cif_cart_overflow.cif")
+        try """
+        data_x
+        _cell_length_a 1e38
+        _cell_length_b 1e38
+        _cell_length_c 1e38
+        _cell_angle_alpha 90.0
+        _cell_angle_beta 90.0
+        _cell_angle_gamma 90.0
+
+        loop_
+        _atom_site_label
+        _atom_site_fract_x
+        _atom_site_fract_y
+        _atom_site_fract_z
+        Fe1 4.0 0.0 0.0
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the non-finite Cartesian coordinate, got: \(reason)")
+        }
+    }
+
+    func testXYZRejectsFloatOverflowCoordinate() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("xyz_huge.xyz")
+        try """
+        2
+        bad
+        O  1e40 0.0 0.0
+        H  0.7572 0.5860 0.0
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url)) { err in
+            guard case ParseError.parse(_, _, let reason) = err else {
+                return XCTFail("expected ParseError.parse, got \(err)")
+            }
+            XCTAssertTrue(reason.lowercased().contains("non-finite"),
+                          "error must call out the overflowing coordinate, got: \(reason)")
+        }
     }
 
     // ----- POSCAR -----

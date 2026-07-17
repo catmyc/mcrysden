@@ -52,6 +52,22 @@ final class Round2FindingsTests: XCTestCase {
         XCTAssertFalse(encode(r, tex), "frame must drop when the isosurface overflows")
     }
 
+    // The IsoMesh boundary must reject a ScalarField whose nx*ny*nz != values.count
+    // rather than trap on an out-of-bounds read. The field here is small enough that
+    // the cubes-overflow guard does NOT trip (so it reaches the shape guard), and its
+    // count is deliberately one short of the product. Result: empty, non-overflowing,
+    // no crash. A parser-produced field always satisfies the product, so this only
+    // affects malformed input.
+    func testIsosurfaceRejectsShapeMismatchedField() {
+        let field = ScalarField(nx: 4, ny: 4, nz: 4, origin: .zero,
+                                vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
+                                values: [Float](repeating: 1, count: 63), // 4*4*4 == 64
+                                minValue: 1, maxValue: 1)
+        let mesh = IsoMesh(field: field, isoLevel: 0.5, sign: 1)
+        XCTAssertFalse(mesh.overflow, "shape-mismatched field must not set overflow")
+        XCTAssertEqual(mesh.triangleCount, 0, "shape-mismatched field must yield an empty mesh")
+    }
+
     func testIsosurfaceEmptyShellStillCachedAsEmpty() throws {
         // A field that never crosses the iso level yields overflow==false, triangleCount==0:
         // a valid empty surface that must NOT drop the frame.
@@ -67,6 +83,66 @@ final class Round2FindingsTests: XCTestCase {
         XCTAssertTrue(encode(r, tex), "valid empty isosurface must render without dropping the frame")
         // Second identical frame must reuse the cached empty surface (no rebuild, no failure).
         XCTAssertTrue(encode(r, tex))
+    }
+
+    // A field with very large but arithmetic-non-overflowing dimensions and a tiny
+    // values array must NOT reserve up to maxTriangles*27 floats (~540 MB) before being
+    // rejected: the shape guard now runs before reserveCapacity. The declared grid
+    // here is (10^5)^3 samples while values holds only 8 — and (99999^3)*27 ≈ 2.7e16 is
+    // below both Int64.max and Int.max, so the OLD reserve path (shape check after the
+    // reserve) would have reserved maxTriangles*27 == 135M floats (~540 MB). Result is an
+    // empty, non-overflowing mesh, never a trap or a giant allocation.
+    func testMalformedHugeDimsShapeGuardPrecedesReserve() {
+        let field = ScalarField(nx: 100_000, ny: 100_000, nz: 100_000, origin: .zero,
+                                vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
+                                values: [0, 0, 0, 0, 1, 1, 1, 1], minValue: 0, maxValue: 1)
+        let mesh = IsoMesh(field: field, isoLevel: 0.5, sign: 1)
+        XCTAssertFalse(mesh.overflow, "huge-but-finite malformed dims must not set overflow")
+        XCTAssertEqual(mesh.triangleCount, 0, "huge-but-finite malformed dims must yield an empty mesh")
+    }
+
+    // Through the renderer: huge-but-finite malformed dims must render without a giant
+    // allocation or a trap — the shape guard rejects the field, the empty surface is
+    // cached, and the frame succeeds.
+    func testMalformedHugeDimsRenderWithoutLargeAlloc() throws {
+        let field = ScalarField(nx: 100_000, ny: 100_000, nz: 100_000, origin: .zero,
+                                vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
+                                values: [0, 0, 0, 0, 1, 1, 1, 1], minValue: 0, maxValue: 1)
+        var s = Scene()
+        s.showStructure = false
+        s.showIsoSurface = true
+        s.isoLevel = 0.5
+        s.scalarField = field
+        let (r, tex) = try makeRenderer(s)
+        XCTAssertTrue(encode(r, tex), "huge-but-finite malformed field must render without hanging")
+    }
+
+    // Degenerate geometry: a ScalarField with fewer than 3 span vectors must not trap on
+    // the vec[0..2] indexing inside marching cubes. Rejected as an empty, non-overflowing
+    // mesh — the same safe outcome as a shape mismatch.
+    func testShortVecFieldYieldsEmptyMesh() {
+        let field = ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
+                                vec: [SIMD3(1,0,0)],   // only 1 span vector
+                                values: [Float](repeating: 1, count: 8), minValue: 1, maxValue: 1)
+        let mesh = IsoMesh(field: field, isoLevel: 0.5, sign: 1)
+        XCTAssertFalse(mesh.overflow, "short-vec field must not set overflow")
+        XCTAssertEqual(mesh.triangleCount, 0, "short-vec field must yield an empty mesh")
+    }
+
+    // Through the renderer: a scalar field with fewer than 3 span vectors must not trap
+    // during IsoCacheKey construction (which indexes vec[0..2] before IsoMesh runs). The
+    // frame encodes cleanly, skipping the isosurface.
+    func testShortVecFieldDoesNotTrapInRenderer() throws {
+        let field = ScalarField(nx: 3, ny: 3, nz: 3, origin: .zero,
+                                vec: [SIMD3(1,0,0), SIMD3(0,1,0)],   // only 2 span vectors
+                                values: [Float](repeating: 1, count: 27), minValue: 1, maxValue: 1)
+        var s = Scene()
+        s.showStructure = false
+        s.showIsoSurface = true
+        s.isoLevel = 0.5
+        s.scalarField = field
+        let (r, tex) = try makeRenderer(s)
+        XCTAssertTrue(encode(r, tex), "short-vec field must not trap the renderer cache-key path")
     }
 
     func testFermiSurfaceOverflowFailsFrame() throws {

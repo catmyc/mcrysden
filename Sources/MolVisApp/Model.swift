@@ -2,7 +2,7 @@ import Foundation
 import simd
 import AppKit
 
-struct Atom: Codable { var coord: SIMD3<Float>; var atomicNumber: Int; var label: String
+struct Atom: Codable, Equatable { var coord: SIMD3<Float>; var atomicNumber: Int; var label: String
     /// Optional force on this atom (eV/Å), parsed from a QE `Forces acting on atoms`
     /// block when present. Drives the force-arrow overlay.
     var force: SIMD3<Float>?

@@ -386,16 +386,31 @@ enum Parser {
     private static func readAtoms(_ s: MolEnvScene) -> [Atom] {
         let natoms = Int(s.natoms)
         guard natoms > 0, let atomsPtr = s.atoms else { return [] }
-        let stride = MemoryLayout<MolEnvAtom>.stride
-        return (0..<natoms).map { idx -> Atom in
-            let base = UnsafeRawPointer(atomsPtr).advanced(by: idx * stride)
-            let coord = base.withMemoryRebound(to: Float.self, capacity: 3) {
-                SIMD3<Float>($0[0], $0[1], $0[2])
-            }
-            let atomicNumber = Int(base.load(fromByteOffset: MemoryLayout<Float>.stride * 3, as: Int32.self))
-            let label = String(cString: base.advanced(by: MemoryLayout<Float>.stride * 3 + MemoryLayout<Int32>.stride).assumingMemoryBound(to: CChar.self))
-            return Atom(coord: coord, atomicNumber: atomicNumber, label: label)
+        // Read each MolEnvAtom BY FIELD, not by a hand-computed byte offset. The
+        // Swift/C bridge imports the C layout verbatim, so every access below is
+        // compiled against the real field offsets of `struct MolEnvAtom`. If that
+        // struct is ever relaid out or a field renamed, this fails to compile
+        // instead of silently mapping coordinates, Z and label onto the wrong
+        // bytes (which was the risk of the raw-offset version above).
+        let buffer = UnsafeBufferPointer(start: atomsPtr, count: natoms)
+        return buffer.map { a -> Atom in
+            let coord = a.coord
+            let atomicNumber = Int(a.atomic_number)
+            return Atom(coord: SIMD3<Float>(coord.0, coord.1, coord.2),
+                        atomicNumber: atomicNumber,
+                        label: labelString(a.label))
         }
+    }
+
+    /// Convert a C `char label[8]` (imported as an 8-CChar tuple) into a String,
+    /// stopping at the first NUL. The C parsers always NUL-terminate via
+    /// `snprintf(..., sizeof-1)`, so at least the final byte is `\0`.
+    private static func labelString(_ label: (CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar)) -> String {
+        let all = [label.0, label.1, label.2, label.3, label.4, label.5, label.6, label.7]
+        let end = all.firstIndex(of: 0) ?? all.count
+        var chars = Array(all[0..<end])
+        chars.append(0)
+        return chars.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
     }
 
     private static func readBonds(_ s: MolEnvScene) -> [Bond] {

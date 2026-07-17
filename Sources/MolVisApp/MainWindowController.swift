@@ -418,7 +418,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             lines.append("---  ----   ----------------------------")
         }
         for idx in sel {
-            guard idx < atoms.count else { continue }
+            // sel holds Int, so a stale -1 passes an upper-bound check and would
+            // trap on atoms[idx]; reject negatives as well as out-of-range indices.
+            guard idx >= 0, idx < atoms.count else { continue }
             let a = atoms[idx]
             // %@ with a Swift String and String(format:) is UNSAFE on arm64:
             // small strings are stored as tagged pointers, and the formatter
@@ -468,6 +470,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     func resetView() {
         camera.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         applyCameraForNewSceneIfNeeded()
+        // applyCameraForNewSceneIfNeeded() replaces the camera with
+        // scene.defaultCamera(), whose projection defaults to orthographic — restore
+        // the user's choice from state.orthographic, exactly as reframeForDisplayMode
+        // does on a real 2D↔3D transition.
+        camera.perspective = !state.orthographic
     }
 
     /// Reframe the camera when the display mode changes so the structure always
@@ -695,6 +702,15 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showIsoSurface = scene.showIsoSurface
         next.isoLevel = scene.isoLevel
         next.showFermiSurface = scene.showFermiSurface
+        // The freshly parsed frame may carry a scalar field whose value range differs
+        // from the frame we carried the level over (e.g. animated XSF). Clamp the
+        // carried level into the new field's range so it stays meaningful; when the
+        // level already fits, its value and iso-surface visibility both pass through
+        // unchanged. With a no-field frame the level is inert (the renderer gates on
+        // scalarField), so leave it untouched.
+        if let field = next.scalarField {
+            next.isoLevel = min(field.maxValue, max(field.minValue, next.isoLevel))
+        }
         // Force-arrow settings: carry them across the frame reload so scrubbing an
         // animated .pwo doesn't silently drop the visibility / scale the user set.
         next.showForces = scene.showForces
@@ -715,15 +731,71 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             next = next.applySlab(slab)
         }
         next.currentFrame = index
+        // Apply the live sidebar's preserved orbital selection and clamp the carried
+        // isoLevel to the new field's range. Note: the multi-orbital branch below is
+        // unreachable for AXSF animations (which yield no multi-orbital frames) but is the
+        // source of truth for Gaussian-style multi-orbital cubes; it's covered by a
+        // focused unit test (testMultiOrbitalSelectionAppliedDuringReload).
+        let nOrbitals = next.multiOrbitalFields.count
+        applySelectedOrbitalAndClampIso(scene: &next, currentOrbital: state.currentOrbital)
+        // ---- Side-bar per-frame metadata transaction ----
+        // Hold BOTH isSyncingState AND isReloadingFrame true for the metadata writes
+        // below so (a) the @Published didSet -> onChange -> syncFromState short-circuits
+        // at the isSyncingState guard there, and (b) syncFromState's frame-recursion
+        // branch (state.frameIndex != scene.currentFrame) does not re-enter reloadFrame
+        // with the OLD scene still in place. We have not yet assigned self.scene = next,
+        // so that branch WOULD otherwise loop until the stack overflows. Save/restore
+        // both flags — isReloadingFrame is initialized true to fence the
+        // frameIndex = index assignment below; isSyncingState is what we add on top.
+        let outerSyncingState = isSyncingState
+        isSyncingState = true
         isReloadingFrame = true
+        defer {
+            isReloadingFrame = false
+            isSyncingState = outerSyncingState
+        }
         state.frameIndex = index     // keep the two in sync; guarded from re-entry
-        isReloadingFrame = false
-        self.scene = next
-        // The newly parsed frame may have gained or lost a forceSet (e.g. one ionic
-        // step truncated without forces). Refresh the sidebar Forces-section gate so the
-        // section hides when scrubbing onto a force-less frame or appears when forces exist.
+        // Presence gates (no @Published, but harmlessly inside the held guard).
+        state.hasScalarField = (next.scalarField != nil)
+        state.hasFermiSurface = (next.fermiSurface != nil)
+        state.hasGrid2D = (next.grid2D != nil)
         state.hasForceSet = (next.forceSet != nil)
+        // Orbital picker: mirror the preserved & validated scene selection exactly
+        // (applySelectedOrbitalAndClampIso already clamped + bounded it) so the
+        // sidebar always agrees with the rendered frame, even for negative injected
+        // state that has not yet been sanitized by syncFromState.
+        state.orbitalCount = nOrbitals
+        state.currentOrbital = next.currentOrbital
+        // iso level: the just-carried next.isoLevel (already field-range-clamped above)
+        // is mirrored so the slider matches the rendered frame's level.
+        state.isoLevel = next.isoLevel
+        // Slider range: use the field's actual bounds when present, otherwise clear
+        // stale slider bounds back to the neutral default so they don't leak across.
+        if let field = next.scalarField {
+            state.isoRange = field.minValue...field.maxValue
+        } else {
+            state.isoRange = 0...1
+        }
+        // ---- end of held-guard transaction ----
+        self.scene = next
         setNeedsRender()
+    }
+
+    /// Apply a sidebar's preserved orbital selection to a freshly reloaded frame, and
+    /// clamp the carried isoLevel into the selected field's range. Mirrors the logic
+    /// `syncFromState()` uses for a multi-orbital scene but operates on the new frame
+    /// before it is installed, so the renderer and the slider agree on which orbital
+    /// is shown. Called from `reloadFrame` just before the metadata transaction.
+    internal func applySelectedOrbitalAndClampIso(scene: inout Scene, currentOrbital: Int) {
+        let nOrbitals = scene.multiOrbitalFields.count
+        if nOrbitals > 0 {
+            let idx = min(max(0, currentOrbital), nOrbitals - 1)
+            scene.currentOrbital = idx
+            scene.scalarField = scene.multiOrbitalFields[idx]
+        }
+        if let field = scene.scalarField {
+            scene.isoLevel = min(field.maxValue, max(field.minValue, scene.isoLevel))
+        }
     }
 
     /// Begin (or restart) the playback timer. Repeating at ~10 Hz; each tick

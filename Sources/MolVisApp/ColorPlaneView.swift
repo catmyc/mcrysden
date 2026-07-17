@@ -300,10 +300,28 @@ final class ColorPlaneView: NSView {
     private func drawEmpty() {
         NSColor.gray.set()
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.boldSystemFont(ofSize: 14), .foregroundColor: NSColor.gray]
-        let msg = (grid?.first?.isEmpty ?? true) || grid == nil ? "No 2D field" : "Constant 2D field"
+        let msg = Self.diagnosticLabel(for: grid)
         let s = NSAttributedString(string: msg, attributes: attrs)
         let pt = NSPoint(x: bounds.midX - s.size().width/2, y: bounds.midY)
         s.draw(at: pt)
+    }
+
+    /// Truthful empty-state label for a 2D grid. A nil/empty grid is "No 2D
+    /// field"; a genuinely finite, constant grid is "Constant 2D field";
+    /// everything else (non-finite, jagged, or non-constant) is "Invalid 2D
+    /// field". Pure and `@testable` so the draw-path diagnostic is unit-testable
+    /// without standing up an AppKit bitmap context.
+    static func diagnosticLabel(for grid: [[Float]]?) -> String {
+        guard let grid, !grid.isEmpty, let firstRow = grid.first, !firstRow.isEmpty else {
+            return "No 2D field"
+        }
+        let cols = firstRow.count
+        // Rectangular and fully finite: otherwise the grid is render-invalid.
+        guard grid.allSatisfy({ $0.count == cols && $0.allSatisfy({ $0.isFinite }) }) else {
+            return "Invalid 2D field"
+        }
+        let v0 = firstRow[0]
+        return grid.allSatisfy({ $0.allSatisfy({ $0 == v0 }) }) ? "Constant 2D field" : "Invalid 2D field"
     }
 
     private func drawTitle() {

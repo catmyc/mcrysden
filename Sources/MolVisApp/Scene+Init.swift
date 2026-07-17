@@ -129,6 +129,13 @@ extension Scene {
             out.bonds = baseBonds.isEmpty ? bonds : baseBonds
             out.preslabAtoms = out.atoms
             out.superCell = SuperCell()
+            // Shrinking to (1,1,1) restores the base atom set; selection indices into
+            // the previous (widened) set are now stale. Leave them only when the set
+            // is genuinely unchanged (a hand-built scene snaps back to `atoms`).
+            if out.atoms != atoms {
+                out.selectedAtoms = []
+                out.measurementResult = nil
+            }
             return out
         }
         // Always expand from the base atoms so the operation is idempotent
@@ -162,6 +169,10 @@ extension Scene {
             out.baseAtoms = src
             out.baseBonds = self.bonds
         }
+        // Atom set was rebuilt; any selected indices and the locked measurement now
+        // point at the wrong atoms.
+        out.selectedAtoms = []
+        out.measurementResult = nil
         return out
     }
 
@@ -219,6 +230,12 @@ extension Scene {
             s.atoms = preslabAtoms.isEmpty ? s.atoms : preslabAtoms
             if let c = s.cell { s.bonds = Self.rebond(s.atoms, cell: c) } else { s.bonds = [] }
             s.slab = nil
+            // Restoring the pre-slab set invalidates indices into the filtered set;
+            // leave selection untouched only when the set is genuinely unchanged.
+            if s.atoms != atoms {
+                s.selectedAtoms = []
+                s.measurementResult = nil
+            }
             return s
         }
         // A slab needs a unit cell to filter in; a molecule (no cell) can't be slabbed.
@@ -246,6 +263,12 @@ extension Scene {
         out.atoms = kept
         out.bonds = Self.rebond(kept, cell: cell)
         out.slab = slab
+        // A filter that drops atoms invalidates selection indices; if the filtered
+        // set is identical to the current one the indices are still valid.
+        if kept != atoms {
+            out.selectedAtoms = []
+            out.measurementResult = nil
+        }
         return out
     }
 

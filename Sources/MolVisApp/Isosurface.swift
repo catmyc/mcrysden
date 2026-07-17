@@ -107,7 +107,12 @@ struct IsoMesh {
     init(field: ScalarField, isoLevel: Float, sign: Float = 1, color: SIMD3<Float> = SIMD3<Float>(0.3, 0.6, 1.0)) {
         let maxTriangles = 5_000_000
         var out: [Float] = []
-        guard field.nx > 1, field.ny > 1, field.nz > 1 else { vertices = out; return }
+        // A degenerate geometry (fewer than 3 span vectors) would trap on the
+        // `vec[0..2]` indexing in worldPosition/worldGradient and in IsoMesh's edge
+        // interpolation. Reject it as an empty, non-overflowing mesh — the same safe
+        // outcome as a shape mismatch — so a malformed field never traps inside
+        // marching cubes.
+        guard field.nx > 1, field.ny > 1, field.nz > 1, field.vec.count >= 3 else { vertices = out; return }
 
         // Overflow-checked product: a malicious grid whose (nx-1)(ny-1)(nz-1)*27
         // overflows Int must never pass a naive magnitude bound check. Allocate a
@@ -121,6 +126,24 @@ struct IsoMesh {
         guard !cubes64b.overflow else { overflow = true; vertices = out; return }
         let floats64 = cubes64b.partialValue.multipliedReportingOverflow(by: Int64(27))
         guard !floats64.overflow else { overflow = true; vertices = out; return }
+
+        // Shape validation, overflow-safe: marching cubes indexes `values` by
+        // ix + nx*(iy + ny*iz), i.e. over nx*ny*nz samples, so it would over-run
+        // (or under-read) a buffer whose count doesn't equal nx*ny*nz and trap.
+        // Reject a malformed field as an empty, non-overflowing mesh rather than
+        // crash. The product is computed in Int64 with overflow reporting so an
+        // astronomical dimension can never wrap to a value that matches the count
+        // and slip past. Placed after the cubes/floats-overflow guard above (so a
+        // grid whose cubes product genuinely overflows still trips that path and
+        // reports overflow=true) but BEFORE reserveCapacity: a non-overflowing field
+        // with a tiny values array would otherwise reserve up to maxTriangles*27
+        // floats (~540 MB) here before being rejected.
+        let cells64 = Int64(nx).multipliedReportingOverflow(by: Int64(ny))
+        guard !cells64.overflow else { vertices = out; return }
+        let cells64b = cells64.partialValue.multipliedReportingOverflow(by: Int64(nz))
+        guard !cells64b.overflow else { vertices = out; return }
+        guard cells64b.partialValue == Int64(field.values.count) else { vertices = out; return }
+
         if floats64.partialValue <= Int64(Int.max) {
             out.reserveCapacity(min(Int(floats64.partialValue), maxTriangles * 27))
         }

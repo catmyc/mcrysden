@@ -243,9 +243,24 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
             scene.forceScale = restored.forceScale
             scene.atomScale = restored.atomScale
             scene.bondRadius = restored.bondRadius
-            scene.selectedAtoms = restored.selectedAtoms
             scene.measurementMode = restored.measurementMode
-            scene.measurementResult = restored.measurementResult
+            // A selection/measurement is only portable when EVERY saved index still
+            // points at a real atom in the REBUILT frame (a different animation frame —
+            // or a supercell/slab it predates — may shrink the atom count). Carry a
+            // valid selection intact (preserving the saved picks and the locked
+            // measurement); clear the lock and the selection if ANY saved index is
+            // out of range for the new atom set. This mirrors the supercell/slab guards
+            // in Scene+Init, which already cleared selectedAtoms when they rebuild.
+            let atomCount = scene.atoms.count
+            var savedIndices = restored.selectedAtoms
+            if let r = restored.measurementResult { savedIndices.append(contentsOf: r.atomIndices) }
+            if savedIndices.allSatisfy({ $0 >= 0 && $0 < atomCount }) {
+                scene.selectedAtoms = restored.selectedAtoms
+                scene.measurementResult = restored.measurementResult
+            } else {
+                scene.selectedAtoms = []
+                scene.measurementResult = nil
+            }
             scene.currentFrame = restored.currentFrame
             // Do NOT restore scalarField/fermiSurface from the initial scene: the freshly
             // parsed frame carries its own volumetric data; keep the new frame's fields.

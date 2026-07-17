@@ -74,14 +74,49 @@ final class Renderer: NSObject {
     // Isosurface cache. Marching cubes over a large grid is comparable in cost to
     // the BZ build (cubic in the sample counts); the result depends only on the
     // scalar field + the iso level, so build once and replay the vertex buffer.
+    //
+    // The key deliberately does NOT carry the values array (storing [Float] in the
+    // per-frame key and comparing element-wise would be O(n) every frame). Instead it
+    // carries a renderer-owned `generation` token: a counter bumped only when the
+    // field's content, geometry, or iso level actually change (see
+    // `scalarFieldGeneration`). The per-frame key comparison — including that token
+    // — is therefore O(1) and retains no array.
     private struct IsoCacheKey: Equatable {
         var nx: Int, ny: Int, nz: Int
         var origin: SIMD3<Float>, vec0: SIMD3<Float>, vec1: SIMD3<Float>, vec2: SIMD3<Float>
         var isoLevel: Float
         var sign: Float
-        var values: [Float]
+        var generation: UInt64
     }
     var background: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)
+
+    /// Renderer-owned token for the current scalar field. Bumped in
+    /// `invalidateCaches` exactly when the iso field's content, geometry, or iso
+    /// level change — so two frames built against the SAME cacheable field share a
+    /// generation, while any content change yields a new one and forces a rebuild.
+    ///
+    /// Content changes are detected exactly (no hashing) via CoW storage-identity:
+    /// `ScalarField.values` is immutable and Swift Array is copy-on-write, so two
+    /// arrays sharing a storage base address hold identical content. See
+    /// `sameValueStorage`. A freed-and-reused buffer address cannot alias a stale
+    /// value because the base-address check is exact, not probabilistic.
+    private var scalarFieldGeneration: UInt64 = 1
+
+    /// Exact content equality for two immutable [Float] value arrays, with an O(1)
+    /// copy-on-write fast path — no hashing, no dimension truncation.
+    ///
+    /// Swift Array is CoW and `ScalarField.values` is never mutated, so two arrays
+    /// whose non-empty storage shares a base address hold identical content: the
+    /// `sameBase` check is both sound and O(1). Empty arrays share a nil base and
+    /// are always equal (`[] == []`), so the nil-base case is exact too. When
+    /// storage differs we fall back to exact `==` — but that only happens at a real
+    /// content mutation, never on an appearance-only edit or per-frame.
+    private func sameValueStorage(_ a: [Float], _ b: [Float]) -> Bool {
+        let sameBase = a.withUnsafeBufferPointer { ba in
+            b.withUnsafeBufferPointer { bb in ba.baseAddress == bb.baseAddress }
+        }
+        return sameBase || a == b
+    }
 
     /// Test-only seam: when false, the next per-frame buffer allocation in
     /// `encode` fails, exercising the makeBuffer → encode → exporter failure path
@@ -873,10 +908,16 @@ final class Renderer: NSObject {
         var verts: [SIMD3<Float>] = []
         verts.reserveCapacity(sel.count * 2)
         for i in 0..<(sel.count - 1) {
-            guard sel[i] < atoms.count, sel[i+1] < atoms.count else { return true }
-            verts.append(atoms[sel[i]].coord)
-            verts.append(atoms[sel[i+1]].coord)
+            let a = sel[i], b = sel[i+1]
+            // Skip a single bad pair rather than bailing and dropping the valid
+            // segments collected so far; guard negatives (sel holds Int, so a stale
+            // -1 passes an upper-bound check) as well as out-of-range indices.
+            guard a >= 0, b >= 0, a < atoms.count, b < atoms.count else { continue }
+            verts.append(atoms[a].coord)
+            verts.append(atoms[b].coord)
         }
+        // All pairs invalid: nothing to draw, but still a successful no-op.
+        guard !verts.isEmpty else { return true }
         enc.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(lastW), height: Double(lastH),
                                     znear: 0, zfar: 1))
         enc.setDepthStencilState(overlayDepthState)
@@ -1049,6 +1090,12 @@ final class Renderer: NSObject {
     @discardableResult
     private func drawIsosurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
         guard let field = scene.scalarField, scene.showIsoSurface else { return true }
+        // A degenerate geometry (fewer than 3 span vectors) would trap on the
+        // `field.vec[0..2]` indexing below when building the IsoCacheKey. Skip the
+        // isosurface rather than trap; the Fermi path is protected the same way
+        // through IsoMesh's own vec-count guard, so a malformed band never reaches
+        // here with a short vec either.
+        guard field.vec.count >= 3 else { return true }
         let iso = scene.isoLevel
         // Draw the positive shell first, then the negative shell.
         let shells: [(sign: Float, color: SIMD3<Float>)] = [
@@ -1056,10 +1103,16 @@ final class Renderer: NSObject {
             (-1, SIMD3<Float>(0.95, 0.45, 0.25)),   // inside:  warm orange
         ]
         for shell in shells {
+            // The field's content is represented by the renderer-owned generation
+            // token, not the values array. The token is O(1) to read, so this key
+            // comparison is O(1) per frame instead of O(n). The token only changes
+            // when the field's content/geometry/iso level actually change (see
+            // invalidateCaches), so unchanged fields reuse the cached mesh.
             let key = IsoCacheKey(nx: field.nx, ny: field.ny, nz: field.nz,
                                   origin: field.origin,
                                   vec0: field.vec[0], vec1: field.vec[1], vec2: field.vec[2],
-                                  isoLevel: iso, sign: shell.sign, values: field.values)
+                                  isoLevel: iso, sign: shell.sign,
+                                  generation: scalarFieldGeneration)
             let cacheIndex = shell.sign > 0 ? 0 : 1
             let needsBuild = cachedIsoKeys[cacheIndex] != key
             if needsBuild {
@@ -1209,11 +1262,22 @@ final class Renderer: NSObject {
             cachedPolyBuffer = nil; cachedPolyVertexCount = 0; cachedPolyKey = nil
         }
         if !isoInputsUnchanged(old: old) {
+            // Content, geometry, or iso level changed: any existing mesh/vertex-data
+            // is stale. Bump the renderer-owned generation so the per-frame
+            // IsoCacheKey comparison below forces a rebuild, and drop the cached
+            // buffers/counts. Because content change is detected exactly via
+            // CoW storage identity (see sameValueStorage), no O(n) scan happens on
+            // an appearance-only edit where the field array storage is unchanged.
+            scalarFieldGeneration += 1
             cachedIsoBuffers = [nil, nil]
             cachedIsoKeys = [nil, nil]
             cachedIsoTriangleCounts = [0, 0]
         }
         if !fermiInputsUnchanged(old: old) {
+            // A Fermi band's content, geometry, band count, or Fermi energy changed:
+            // drop the cached per-band buffers. The per-frame rebuild guard then sees
+            // the buffer count fall below fs.bands.count and rebuilds. Per-band
+            // content change is detected exactly via CoW storage identity.
             cachedFermiBuffers = []
         }
     }
@@ -1223,7 +1287,7 @@ final class Renderer: NSObject {
         guard let a, let b else { return a == nil && b == nil }
         return a.nx == b.nx && a.ny == b.ny && a.nz == b.nz
             && a.origin == b.origin && a.vec == b.vec
-            && a.values == b.values
+            && sameValueStorage(a.values, b.values)
             && old.isoLevel == scene.isoLevel
     }
 
@@ -1233,7 +1297,7 @@ final class Renderer: NSObject {
         guard a.bands.count == b.bands.count, a.fermiEnergy == b.fermiEnergy else { return false }
         for (x, y) in zip(a.bands, b.bands) {
             if (x.nx, x.ny, x.nz, x.origin, x.vec) != (y.nx, y.ny, y.nz, y.origin, y.vec)
-                || x.values != y.values {
+                || !sameValueStorage(x.values, y.values) {
                 return false
             }
         }

@@ -306,7 +306,108 @@ final class ReviewRegressions: XCTestCase {
         XCTAssertEqual(first, second, "non-finite grid fallback must be deterministic across draws")
     }
 
+    // MARK: - drawEmpty() diagnostic must be truthful: it must not label a
+    // non-finite (or otherwise invalid) grid "Constant 2D field".
+
+    func testColorPlaneEmptyLabelIsTruthful() {
+        // No field at all.
+        XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: nil), "No 2D field")
+        XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: []), "No 2D field")
+        XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: [[]]), "No 2D field")
+        // A genuinely finite, constant grid → the only case that is constant.
+        XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: [[5, 5], [5, 5]]), "Constant 2D field")
+        // Non-finite value: NOT "Constant".
+        XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: [[1.0, Float.nan], [3.0, 4.0]]), "Invalid 2D field")
+        XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: [[Float.infinity, 1], [2, 3]]), "Invalid 2D field")
+        // Jagged (non-rectangular) grid: render-invalid.
+        XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: [[1, 2], [3]]), "Invalid 2D field")
+        // Finite but genuinely varying: NOT "Constant" (it's a real field, not a flat one).
+        XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: [[1, 2], [3, 4]]), "Invalid 2D field")
+    }
+
     // MARK: - Helpers
+
+    // MARK: - Issue: resetView() must preserve the user's perspective/orthographic
+    // projection after it replaces the camera with scene.defaultCamera().
+
+    @MainActor
+    func testResetViewPreservesProjection() throws {
+        let wc = MainWindowController(scene: sceneWithAtoms(), showWindow: false)
+        // Perspective: state.orthographic false => camera.perspective true.
+        wc.state.orthographic = false
+        XCTAssertTrue(wc.camera.perspective)
+        wc.resetView()
+        XCTAssertTrue(wc.camera.perspective,
+                      "resetView must preserve a perspective projection (state.orthographic=false)")
+
+        // Orthographic: state.orthographic true => camera.perspective false.
+        wc.state.orthographic = true
+        XCTAssertFalse(wc.camera.perspective)
+        wc.resetView()
+        XCTAssertFalse(wc.camera.perspective,
+                       "resetView must preserve an orthographic projection (state.orthographic=true)")
+    }
+
+    // MARK: - Issue: structural atom mutations must not leave stale selectedAtoms or
+    // measurementResult; true no-op paths must preserve them.
+
+    func testWidenSuperCellClearsStaleSelection() {
+        var s = sceneWithCell()
+        s.selectedAtoms = [0]
+        s.measurementResult = MeasurementResult(mode: .distance, atomIndices: [0, 1], value: 1.5, summary: "x")
+        // Widening to (2,1,1) rebuilds the atom set.
+        let widened = s.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
+        XCTAssertGreaterThan(widened.atoms.count, s.atoms.count, "supercell actually expanded")
+        XCTAssertTrue(widened.selectedAtoms.isEmpty, "widening must clear stale selection indices")
+        XCTAssertNil(widened.measurementResult, "widening must clear the locked measurement")
+    }
+
+    func testWidenIdentityPreservesSelection() {
+        var s = sceneWithCell()
+        s.selectedAtoms = [0]
+        s.measurementResult = MeasurementResult(mode: .distance, atomIndices: [0], value: 0, summary: "x")
+        // (1,1,1) on a scene whose baseAtoms == atoms is a no-op on the atom set.
+        let same = s.widenSuperCell(SuperCell(n1: 1, n2: 1, n3: 1))
+        XCTAssertEqual(same.atoms, s.atoms, "identity widen leaves the atom set unchanged")
+        XCTAssertEqual(same.selectedAtoms, [0], "identity widen must preserve selection")
+        XCTAssertNotNil(same.measurementResult, "identity widen must preserve the locked measurement")
+    }
+
+    func testApplySlabClearsStaleSelection() {
+        var s = sceneWithCell()
+        // Two atoms at distinct fractional heights so a slab plane can drop one.
+        s.atoms = [Atom(coord: SIMD3(0, 1, 0), atomicNumber: 14, label: "Si"),
+                   Atom(coord: SIMD3(0, 3, 0), atomicNumber: 14, label: "Si")]
+        s.baseAtoms = s.atoms
+        s.isCrystal = true
+        s.selectedAtoms = [0, 1]
+        s.measurementResult = MeasurementResult(mode: .distance, atomIndices: [0, 1], value: 2, summary: "x")
+        // planeA n=(0,1,0) dA=0.4 keeps frac.y >= 0.4; planeB n=(0,1,0) dB=0.8 keeps frac.y<=0.8.
+        // frac.y are 0.2 and 0.6 => only the second atom survives.
+        var planeA = Plane(); planeA.k = 1; planeA.distance = 0.4
+        var planeB = Plane(); planeB.k = 1; planeB.distance = 0.8
+        let slab = Slab(planeA: planeA, planeB: planeB)
+        let out = s.applySlab(slab)
+        XCTAssertEqual(out.atoms.count, 1, "slab should filter down to one atom")
+        XCTAssertTrue(out.selectedAtoms.isEmpty, "slab filter must clear stale selection indices")
+        XCTAssertNil(out.measurementResult, "slab filter must clear the locked measurement")
+    }
+
+    func testApplySlabNoOpPreservesSelection() {
+        var s = sceneWithCell()
+        s.selectedAtoms = [0]
+        s.measurementResult = MeasurementResult(mode: .distance, atomIndices: [0], value: 0, summary: "x")
+        // A trivial slab that keeps every atom (wide bounds) leaves the set unchanged.
+        var planeA = Plane(); planeA.k = 1; planeA.distance = -0.1
+        var planeB = Plane(); planeB.k = 1; planeB.distance = 1.1
+        let slab = Slab(planeA: planeA, planeB: planeB)
+        let out = s.applySlab(slab)
+        XCTAssertEqual(out.atoms, s.atoms, "all-keeping slab leaves the atom set unchanged")
+        XCTAssertEqual(out.selectedAtoms, [0], "no-op slab must preserve selection")
+        XCTAssertNotNil(out.measurementResult, "no-op slab must preserve the locked measurement")
+        // Removing a slab that was never applied is a no-op and must preserve selection too.
+        XCTAssertEqual(s.applySlab(nil).selectedAtoms, [0])
+    }
 
     private func sceneWithAtoms() -> Scene {
         var s = Scene()
@@ -502,5 +603,133 @@ final class ReviewRegressions: XCTestCase {
         wc.state.displayMode = .ballStick2D
         XCTAssertTrue(wc.scene.displayMode.is2D)
         XCTAssertNoThrow(wc.setNeedsRender())
+    }
+
+    // MARK: - Round: an animated XSF carries a SINGLE volumetric grid that the
+    // XCrySDen parser attaches to the LAST animation frame (frame 0 has none).
+    // reloadFrame copies scene.isoLevel onto the freshly parsed frame; if that
+    // frame's scalarField span is narrower than the carried level, the level must
+    // be clamped into the new range so it stays meaningful (out-of-range levels
+    // must never leak through). Valid values and showIsoSurface visibility are
+    // preserved across the reload.
+
+    @MainActor
+    func testReloadFrameClampsIsoLevelIntoNarrowerRangeOnAnimatedGrid() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_grid.axsf")
+        // Sanity-check the fixture: grid lives on frame 1 (range [0, 1.4]); frame 0 none.
+        XCTAssertNil(try Parser.load(url, as: nil, frameIndex: 0).scalarField, "frame 0 must carry no grid")
+        let f1 = try Parser.load(url, as: nil, frameIndex: 1).scalarField
+        guard let field1 = f1 else { return XCTFail("frame 1 expected the single animation grid") }
+        XCTAssertEqual(field1.minValue, 0.0, accuracy: 1e-4)
+        XCTAssertEqual(field1.maxValue, 1.4, accuracy: 1e-4)
+
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        // Load frame 0 (no grid -> isoLevel is currently inert).
+        controller.loadFile(try Scene(loaded: Parser.load(url, as: nil, frameIndex: 0)),
+                            from: url, format: nil, frameIndex: 0)
+        XCTAssertEqual(controller.state.frameCount, 2)
+
+        // A level valid for any sensible field but OUT OF RANGE for frame 1 (max 1.4).
+        controller.scene.isoLevel = 10.0
+        controller.scene.showIsoSurface = true
+
+        // Reload into frame 1 (production sync->reloadFrame path).
+        controller.state.frameIndex = 1
+        XCTAssertEqual(controller.scene.currentFrame, 1)
+        guard controller.scene.scalarField != nil else { return XCTFail("frame 1 lost its grid after reload") }
+        // Carried level (10) clamped into [0, 1.4]; visibility preserved.
+        XCTAssertEqual(controller.scene.isoLevel, 1.4, accuracy: 1e-4,
+                       "carried isoLevel must be clamped into the destination frame's scalar range")
+        XCTAssertTrue(controller.scene.showIsoSurface, "isoSurface visibility must survive the reload")
+    }
+
+    @MainActor
+    func testReloadFramePreservesValidIsoLevelWhenInDestRange() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_grid.axsf")
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(try Scene(loaded: Parser.load(url, as: nil, frameIndex: 0)),
+                            from: url, format: nil, frameIndex: 0)
+        // 0.7 sits inside frame 1's span [0, 1.4] -> must survive unchanged.
+        controller.scene.isoLevel = 0.7
+        controller.scene.showIsoSurface = true
+        controller.state.frameIndex = 1
+        XCTAssertEqual(controller.scene.currentFrame, 1)
+        XCTAssertEqual(controller.scene.isoLevel, 0.7, accuracy: 1e-4,
+                       "an in-destination-range isoLevel must be preserved exactly")
+        XCTAssertTrue(controller.scene.showIsoSurface)
+    }
+
+    // MARK: - Round: a non-finite scrolling delta must not corrupt the camera
+    // distance to NaN/Inf. scrollZoomFactor() collapses non-finite input to a
+    // no-op (= nil) so scrollWheel() returns early; finite input scales normally.
+
+    func testScrollZoomFactorRejectsNonFinitePreservesFinite() {
+        XCTAssertNil(MetalView.scrollZoomFactor(CGFloat.nan), "NaN delta -> no-op")
+        XCTAssertNil(MetalView.scrollZoomFactor(CGFloat.infinity), "+Inf delta -> no-op")
+        XCTAssertNil(MetalView.scrollZoomFactor(-CGFloat.infinity), "-Inf delta -> no-op")
+        // The helper returns Float?, so unwrap with a sentinel for finite-input comparisons.
+        func f(_ d: CGFloat) -> Float { MetalView.scrollZoomFactor(d) ?? Float.nan }
+        // Zero delta is a no-op zoom; finite zooms scale as before.
+        XCTAssertEqual(f(0), 1.0, accuracy: 1e-5)
+        XCTAssertEqual(f(200), 1.2, accuracy: 1e-4)
+        XCTAssertEqual(f(-200), 0.8, accuracy: 1e-4)
+        XCTAssertEqual(f(1000), 2.0, accuracy: 1e-4, "large finite delta -> factor 2")
+    }
+
+    // MARK: - Round: restoring a saved animation frame rebuilds the atom set.
+    // A saved selection/measurement is only portable when EVERY saved index is
+    // valid for the REBUILT frame (a different cycle / supercell / slab can shrink
+    // the count). resolveAnimationFrame must preserve a valid selection AND clear
+    // the lock when ANY saved index is out of range for the new atom count.
+
+    func testResolveAnimationFrameClearsStaleSelectionOnFrameRebuild() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_3to1.axsf")
+        // Frame 0 parses to 3 atoms; frame 1 parses to 1 atom.
+        let fc0 = Scene(loaded: try Parser.load(url, as: nil, frameIndex: 0))
+        let fc1Count = try Scene(loaded: Parser.load(url, as: nil, frameIndex: 1)).atoms.count
+        XCTAssertEqual(fc0.atoms.count, 3)
+        XCTAssertEqual(fc1Count, 1)
+
+        var scene = fc0
+        let savedSel = [0, 2]      // valid in the 3-atom frame
+        let savedResult = MeasurementResult(mode: .distance, atomIndices: [0, 2], value: 2.0, summary: "d")
+        scene.selectedAtoms = savedSel
+        scene.measurementResult = savedResult
+        scene.currentFrame = 1     // diverge from loadedFrame(0) so the rebuild path runs
+        scene.measurementMode = .distance
+
+        try App.resolveAnimationFrame(scene: &scene, from: url, format: nil, loadedFrame: 0, fc: 2)
+        XCTAssertEqual(scene.currentFrame, 1)
+        XCTAssertEqual(scene.atoms.count, 1, "rebuild must reflect the 1-atom frame")
+        // Index 2 is invalid for the 1-atom -> selection cleared, lock released.
+        XCTAssertTrue(scene.selectedAtoms.isEmpty, "stale selection indices must be dropped")
+        XCTAssertNil(scene.measurementResult, "locked measurement must be cleared with stale indices")
+        XCTAssertEqual(scene.measurementMode, .distance, "measurement MODE survives (only indices are stale)")
+    }
+
+    func testResolveAnimationFramePreservesValidSelectionOnFrameRebuild() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_3to1.axsf")
+        // Frame 0: 3 atoms; frame 1: 1 atom. Only index 0 survives into the 1-atom frame.
+        let fc0 = Scene(loaded: try Parser.load(url, as: nil, frameIndex: 0))
+        let fc1Count = try Scene(loaded: Parser.load(url, as: nil, frameIndex: 1)).atoms.count
+        XCTAssertEqual(fc0.atoms.count, 3)
+        XCTAssertEqual(fc1Count, 1)
+        var scene = fc0
+        // EVERY reference (selectedAtoms + measurementResult.atomIndices) points at index 0,
+        // the only valid index in the 1-atom rebuilt frame -- so all of it must survive.
+        let savedResult = MeasurementResult(mode: .distance, atomIndices: [0, 0], value: 1.5, summary: "d")
+        scene.selectedAtoms = [0]
+        scene.measurementResult = savedResult
+        scene.currentFrame = 1
+        try App.resolveAnimationFrame(scene: &scene, from: url, format: nil, loadedFrame: 0, fc: 2)
+        XCTAssertEqual(scene.atoms.count, 1)
+        XCTAssertEqual(scene.selectedAtoms, [0], "a selection valid for the new frame must be preserved")
+        XCTAssertNotNil(scene.measurementResult, "the locked measurement must survive when all indices are valid")
+        XCTAssertEqual(scene.measurementResult?.atomIndices, [0, 0],
+                       "saved measurement atomIndices (all valid for new count) preserved in full")
     }
 }

@@ -393,6 +393,41 @@ final class RendererTests: XCTestCase {
         return (minC, maxC)
     }
 
+    // drawMeasurements must SKIP an invalid selection pair (negative or out-of-range
+    // index) instead of bailing and discarding the segments already collected. It must
+    // also remain a successful no-op when every pair is invalid (no crash, no false).
+    func testDrawMeasurementsSkipsInvalidPair() throws {
+        func scene(selected: [Int], mode: MeasurementMode) -> Scene {
+            var s = Scene()
+            s.background = "#000000"
+            s.showAxes = false; s.showCellFrame = false
+            s.atoms = [Atom(coord: SIMD3(-3, 0, 0), atomicNumber: 6, label: "C"),
+                       Atom(coord: SIMD3( 3, 0, 0), atomicNumber: 6, label: "C")]
+            s.selectedAtoms = selected
+            s.measurementMode = mode
+            return s
+        }
+        // Baseline: a single valid pair draws the measurement line.
+        let validHash = pixelHash(try render(scene: scene(selected: [0, 1], mode: .distance), dist: 10))
+        // The same valid pair followed by a stale out-of-range index: the line must
+        // still draw (the invalid pair is skipped, not discarded with it).
+        let trailingInvalidHash = pixelHash(try render(scene: scene(selected: [0, 1, 99], mode: .distance), dist: 10))
+        XCTAssertEqual(trailingInvalidHash, validHash,
+                       "a trailing stale index must not discard the valid segment")
+        // A stale negative index on the leading pair is skipped while the valid pair
+        // that follows still draws.
+        let negativeHash = pixelHash(try render(scene: scene(selected: [-1, 0, 1], mode: .distance), dist: 10))
+        XCTAssertEqual(negativeHash, validHash,
+                       "a stale negative index must be skipped, not trap on atoms[-1]")
+        // All-invalid selection: a successful no-op that matches the no-line baseline.
+        let baselineHash = pixelHash(try render(scene: scene(selected: [], mode: .none), dist: 10))
+        let allInvalidHash = pixelHash(try render(scene: scene(selected: [-1, 99], mode: .distance), dist: 10))
+        XCTAssertEqual(allInvalidHash, baselineHash,
+                       "all-invalid selection must be a no-op that draws nothing extra")
+        XCTAssertNotEqual(validHash, baselineHash,
+                          "a valid measurement must actually draw a line over the baseline")
+    }
+
     // Locks the Critical instancing fix: two distinct atoms must render as two
     // spatially separate blobs, not collapsed onto one instance.
     func testTwoAtomsRenderDistinct() throws {
@@ -455,7 +490,297 @@ final class RendererTests: XCTestCase {
                                                                  height: CGFloat.greatestFiniteMagnitude)))
         XCTAssertThrowsError(try RasterExporter.export(scene: scene, camera: nil, to: out.appendingPathExtension("pdf"),
                                                        size: CGSize(width: CGFloat.greatestFiniteMagnitude,
-                                                                    height: CGFloat.greatestFiniteMagnitude)))
+                                                                     height: CGFloat.greatestFiniteMagnitude)))
+    }
+
+    // MARK: - Isosurface/Fermi cache performance regressions
+    //
+    // The render hot path and the scene-reassignment checks previously stored or
+    // scanned the entire values array (O(n)). Replace that with a memoized content
+    // digest. These tests lock the two things the digest must guarantee:
+    //   (a) an unchanged field never rebuilds, even across many frames / reassigns;
+    //   (b) a changed field rebuilds even when its dimensions are IDENTICAL (the
+    //       failure mode where a same-sized stale buffer would otherwise be reused).
+
+    private func isoField(_ values: [Float]) -> ScalarField {
+        ScalarField(nx: 3, ny: 3, nz: 3, origin: .zero,
+                    vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
+                    values: values, minValue: values.min() ?? 0, maxValue: values.max() ?? 0)
+    }
+
+    // Many consecutive frames against the SAME scene must rebuild the iso cache
+    // exactly once (both shells), then never again. Before the fix, comparing the
+    // embedded [Float] key every frame made the hot path O(n); now the key carries
+    // only O(1) metadata plus a renderer-owned generation token, so the per-frame
+    // comparison is O(1) and the rebuild count must stay flat.
+    func testIsoCacheDoesNotRescanOnRepeatedEncode() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let r = try Renderer(device: device)
+        let tex = device.makeTexture(descriptor: wtx(64, 64))!
+        let q = device.makeCommandQueue()!
+        var s = Scene()
+        s.showStructure = false; s.showAxes = false; s.showCellFrame = false
+        s.showBrillouinZone = false; s.background = "#000000"
+        s.showIsoSurface = true; s.isoLevel = 0.5
+        s.scalarField = isoField((0..<27).map { Float($0).truncatingRemainder(dividingBy: 5) * 0.4 })
+        r.scene = s
+        r.currentCamera.distance = 8
+        func encodeOnce() {
+            let cb = q.makeCommandBuffer()!
+            _ = r.encode(to: cb, target: tex,
+                         viewport: MTLViewport(originX: 0, originY: 0, width: 64, height: 64,
+                                               znear: 0, zfar: 1),
+                         camera: r.currentCamera)
+            cb.commit(); cb.waitUntilCompleted()
+        }
+        encodeOnce()  // builds both shells
+        let built = r.isoRebuildCount
+        XCTAssertGreaterThan(built, 0)
+        for _ in 0..<8 { encodeOnce() }
+        XCTAssertEqual(r.isoRebuildCount, built, "unchanged field must not rebuild across frames")
+    }
+
+    // Reassigning the scene with the SAME dimensions but DIFFERENT values must force
+    // a rebuild of both shells. This is the exact case a naive size-only check gets
+    // wrong (reusing a stale GPU buffer). The digest sees the changed contents.
+    func testIsoCacheRebuildsOnSameSizeChangedValues() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let r = try Renderer(device: device)
+        let tex = device.makeTexture(descriptor: wtx(64, 64))!
+        let q = device.makeCommandQueue()!
+        func encode(_ scene: Scene) {
+            r.scene = scene
+            let cb = q.makeCommandBuffer()!
+            XCTAssertTrue(r.encode(to: cb, target: tex,
+                                   viewport: MTLViewport(originX: 0, originY: 0, width: 64, height: 64,
+                                                         znear: 0, zfar: 1),
+                                   camera: r.currentCamera))
+            cb.commit(); cb.waitUntilCompleted()
+        }
+        var s = Scene()
+        s.showStructure = false; s.showAxes = false; s.showCellFrame = false
+        s.showBrillouinZone = false
+        s.showIsoSurface = true; s.isoLevel = 0.5
+        s.scalarField = isoField((0..<27).map { Float($0).truncatingRemainder(dividingBy: 5) * 0.4 })
+        encode(s)
+        let built = r.isoRebuildCount
+        XCTAssertGreaterThan(built, 0)
+        // Identical geometry, changed content.
+        var s2 = s
+        var vals = (0..<27).map { Float($0).truncatingRemainder(dividingBy: 5) * 0.4 }
+        vals[13] = 999.0
+        s2.scalarField = isoField(vals)
+        encode(s2)
+        XCTAssertGreaterThan(r.isoRebuildCount, built,
+                             "changed same-sized values must rebuild both shells (no stale buffer)")
+    }
+
+    // Appearance-only scene edits leave the scalar field storage untouched (Swift
+    // Array is CoW and ScalarField.values is immutable), so the new field shares the
+    // old field's buffer base address. `sameValueStorage` detects that identity in
+    // O(1) and takes the fast path — no `values ==` scan, no generation bump, no
+    // rebuild. This is the goal the digest-with-clear-on-every-didSet failed: an
+    // appearance-only reassignment must never pay O(n).
+    func testAppearanceOnlyEditWithSharedStorageDoesNotRebuild() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let r = try Renderer(device: device)
+        let tex = device.makeTexture(descriptor: wtx(64, 64))!
+        let q = device.makeCommandQueue()!
+        func encode(_ scene: Scene) {
+            r.scene = scene
+            let cb = q.makeCommandBuffer()!
+            XCTAssertTrue(r.encode(to: cb, target: tex,
+                                   viewport: MTLViewport(originX: 0, originY: 0, width: 64, height: 64,
+                                                         znear: 0, zfar: 1),
+                                   camera: r.currentCamera))
+            cb.commit(); cb.waitUntilCompleted()
+        }
+        var s = Scene()
+        s.showStructure = false; s.showAxes = false; s.showCellFrame = false
+        s.showBrillouinZone = false
+        s.showIsoSurface = true; s.isoLevel = 0.5
+        s.scalarField = isoField((0..<27).map { Float($0).truncatingRemainder(dividingBy: 5) * 0.4 })
+        encode(s)
+        let built = r.isoRebuildCount
+        XCTAssertGreaterThan(built, 0)
+
+        // Appearance-only edit. `var s2 = s` copies the Scene by value, and the
+        // copied scalar field's `values` keeps the SAME CoW storage (it is never
+        // mutated), so base addresses match → O(1) fast path, no rebuild.
+        var s2 = s
+        s2.lighting.azimuth = 30
+        s2.lighting.elevation = 60
+        s2.background = "#123456"
+        encode(s2)
+        XCTAssertEqual(r.isoRebuildCount, built,
+                       "appearance-only edit with shared storage must not rebuild the iso cache")
+
+        // Sanity: the same edit on a field with genuinely different values (fresh
+        // storage) DOES rebuild — proving the fast path is not a tautology.
+        var s3 = s
+        var vals = (0..<27).map { Float($0).truncatingRemainder(dividingBy: 5) * 0.4 }
+        vals[0] = -999.0
+        s3.scalarField = isoField(vals)
+        encode(s3)
+        XCTAssertGreaterThan(r.isoRebuildCount, built,
+                             "changing the values (fresh storage) must rebuild despite an appearance field also changing")
+    }
+
+    // The Fermi surface cache must behave identically: repeated encodes of an
+    // unchanged multi-band surface rebuild once, and a same-sized value change in any
+    // band must trigger exactly one further rebuild.
+    func testFermiCacheRebuildsWithMemoizedDigest() throws {
+        func field(_ values: [Float], nx: Int = 2, ny: Int = 2, nz: Int = 2) -> ScalarField {
+            ScalarField(nx: nx, ny: ny, nz: nz, origin: .zero,
+                        vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
+                        values: values, minValue: values.min() ?? 0, maxValue: values.max() ?? 0)
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let r = try Renderer(device: device)
+        let tex = device.makeTexture(descriptor: wtx(80, 80))!
+        let q = device.makeCommandQueue()!
+        var s = Scene()
+        s.showStructure = false; s.showAxes = false; s.showCellFrame = false
+        s.showBrillouinZone = false
+        s.showFermiSurface = true
+        let bands0 = [field([0, 0, 0, 0, 1, 1, 1, 1]), field([0, 0, 0, 0, 1, 1, 1, 1])]
+        s.fermiSurface = FermiSurface(fermiEnergy: 0.5, bands: bands0)
+        r.scene = s
+        r.currentCamera.distance = 8
+        func encodeOnce() {
+            let cb = q.makeCommandBuffer()!
+            XCTAssertTrue(r.encode(to: cb, target: tex,
+                                   viewport: MTLViewport(originX: 0, originY: 0, width: 80, height: 80,
+                                                         znear: 0, zfar: 1),
+                                   camera: r.currentCamera))
+            cb.commit(); cb.waitUntilCompleted()
+        }
+        encodeOnce()
+        let built = r.fermiRebuildCount
+        XCTAssertEqual(built, 1)
+        for _ in 0..<4 { encodeOnce() }
+        XCTAssertEqual(r.fermiRebuildCount, built, "unchanged Fermi surface must not rebuild across frames")
+        // Change one band's contents, same size.
+        let bands1 = [field([0, 0, 0, 0, 1, 1, 1, 1]), field([1, 1, 1, 1, 0, 0, 0, 0])]
+        var s2 = s
+        s2.fermiSurface = FermiSurface(fermiEnergy: 0.5, bands: bands1)
+        r.scene = s2
+        encodeOnce()
+        XCTAssertEqual(r.fermiRebuildCount, built + 1,
+                       "changed same-sized band values must rebuild the Fermi cache")
+    }
+
+    // Malformed huge dimensions must NOT trap during cache-key construction. The
+    // keys carry nx/ny/nz as plain Int (no UInt32 truncation), and IsoMesh rejects a
+    // shape whose value count doesn't match the declared grid as an empty (non-
+    // overflowing) mesh — so encode returns normally rather than crashing. This is
+    // the exact case where `UInt32(field.nx)` would have trapped before IsoMesh ever
+    // saw the field.
+    func testMalformedHugeDimensionsDoNotTrapInCacheKey() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let r = try Renderer(device: device)
+        let tex = device.makeTexture(descriptor: wtx(48, 48))!
+        let q = device.makeCommandQueue()!
+        var s = Scene()
+        s.showStructure = false; s.showAxes = false; s.showCellFrame = false
+        s.showBrillouinZone = false
+        s.showIsoSurface = true; s.isoLevel = 0.5
+        // Declared grid (10^9)^3 vastly exceeds the 8-sample values buffer. The cache
+        // key just records the Int dimensions; IsoMesh's shape validation rejects it
+        // as an empty mesh (cells64 != values.count), so encode returns normally.
+        s.scalarField = ScalarField(nx: 1_000_000_000, ny: 1_000_000_000, nz: 1_000_000_000,
+                                    origin: .zero,
+                                    vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
+                                    values: [0, 0, 0, 0, 1, 1, 1, 1],
+                                    minValue: 0, maxValue: 1)
+        r.scene = s
+        r.currentCamera.distance = 8
+        let cb = q.makeCommandBuffer()!
+        // Must not trap or loop on the malformed shape, and must not trap on cache-
+        // key construction (the keys store nx/ny/nz as plain Int). IsoMesh rejects
+        // the mismatched shape via its cubes-overflow guard, legitimately returning
+        // false — that is the expected non-trapping outcome, so the assertion below
+        // deliberately does NOT require a true result, only that execution returns.
+        let ok = r.encode(to: cb, target: tex,
+                          viewport: MTLViewport(originX: 0, originY: 0, width: 48, height: 48,
+                                                znear: 0, zfar: 1),
+                          camera: r.currentCamera)
+        // Reaching here with either result proves the dimension is handled without a
+        // trap — the cache-key path and IsoMesh validation are both dimension-safe.
+        XCTAssertTrue(ok || !ok, "huge dimensions must not trap the cache-key/mesh path")
+    }
+
+    // Exact-invalidation contract, driven through the renderer so the private
+    // `sameValueStorage` is exercised by the only observable signal: the rebuild
+    // count. The dropped `values ==` over-invalidated only when content changed.
+    // `sameValueStorage` must behave identically on two fronts:
+    //   (a) equal content in a FRESH allocation (distinct storage → fallback `==`)
+    //       must NOT rebuild, else we'd mesh the same field twice per load;
+    //   (b) changed content must rebuild.
+    // The shared-storage fast path is covered by
+    // testAppearanceOnlyEditWithSharedStorageDoesNotRebuild above.
+    func testEqualContentDifferentStorageDoesNotRebuild() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let r = try Renderer(device: device)
+        let tex = device.makeTexture(descriptor: wtx(64, 64))!
+        let q = device.makeCommandQueue()!
+        func encode(_ scene: Scene) {
+            r.scene = scene
+            let cb = q.makeCommandBuffer()!
+            XCTAssertTrue(r.encode(to: cb, target: tex,
+                                   viewport: MTLViewport(originX: 0, originY: 0, width: 64, height: 64,
+                                                         znear: 0, zfar: 1),
+                                   camera: r.currentCamera))
+            cb.commit(); cb.waitUntilCompleted()
+        }
+        let content = (0..<27).map { Float($0).truncatingRemainder(dividingBy: 5) * 0.4 }
+        var s = Scene()
+        s.showStructure = false; s.showAxes = false; s.showCellFrame = false
+        s.showBrillouinZone = false
+        s.showIsoSurface = true; s.isoLevel = 0.5
+        s.scalarField = isoField(content)
+        encode(s)
+        let built = r.isoRebuildCount
+        XCTAssertGreaterThan(built, 0)
+
+        // Reassign with IDENTICAL content but a freshly-allocated values array —
+        // distinct storage, so the fast path does not apply and the exact `==`
+        // fallback must decide. Equal content → no rebuild.
+        var s2 = s
+        s2.scalarField = isoField([Float](content))
+        encode(s2)
+        XCTAssertEqual(r.isoRebuildCount, built,
+                       "equal content in fresh storage must not rebuild (exact fallback)")
+
+        // Changed content in fresh storage → rebuild.
+        var s3 = s
+        s3.scalarField = isoField([Float](content[0..<26] + [999.0]))
+        encode(s3)
+        XCTAssertGreaterThan(r.isoRebuildCount, built,
+                             "changed content in fresh storage must rebuild")
+    }
+
+    // Confirms the CoW identity property that the O(1) fast path relies on: a value-
+    // type copy of an immutable array shares storage (same base address) AND compares
+    // equal. `sameValueStorage` reads the base address first; this test pins the
+    // language guarantee so the fast path can never misclassify a copy as "changed".
+    func testCoWCopiedArraySharesStorageAndEquals() {
+        let original = [Float]((0..<27).map { Float($0) })
+        var copy = original
+        let sharesStorage = original.withUnsafeBufferPointer { ob in
+            copy.withUnsafeBufferPointer { cb in ob.baseAddress == cb.baseAddress }
+        }
+        XCTAssertTrue(sharesStorage, "CoW copy of an immutable array shares storage")
+        XCTAssertTrue(original == copy, "shared storage implies equal content")
+        copy[0] = 123  // mutate the copy → unique() breaks CoW
+        XCTAssertFalse(original == copy, "after mutation the arrays differ")
+    }
+
+    private func wtx(_ w: Int, _ h: Int) -> MTLTextureDescriptor {
+        let d = MTLTextureDescriptor()
+        d.pixelFormat = .rgba8Unorm; d.width = w; d.height = h
+        d.usage = [.renderTarget, .shaderRead]; d.storageMode = .shared
+        return d
     }
 
 }

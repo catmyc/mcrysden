@@ -18,6 +18,14 @@ static void set_error(const char *path, int line, const char *reason) {
     else          snprintf(last_error, sizeof(last_error), "%s: %s", path, reason);
 }
 
+/* True only if `x` is a finite double that still fits a float. sscanf %lf can
+   parse a value like 1e39 (finite, within DBL_RANGE) that overflows to +inf on a
+   (float) cast — an isfinite() check alone would let that non-finite float into
+   the scene. Guard the cast the same way a human would inspect a value. */
+static int in_float_range(double x) {
+    return isfinite(x) && x >= -FLT_MAX && x <= FLT_MAX;
+}
+
 void molenv_grid_free(MolEnvGrid *g) {
     if (!g) return;
     free(g->values);
@@ -405,6 +413,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                 (*ln)++;
                 double a,b,c;
                 if (sscanf(line,"%lf %lf %lf",&a,&b,&c)<3) { set_error(path,*ln,"malformed PRIMVEC row"); return -1; }
+                if (!in_float_range(a) || !in_float_range(b) || !in_float_range(c)) { set_error(path,*ln,"non-finite PRIMVEC row"); return -1; }
                 cell[r][0]=(float)a; cell[r][1]=(float)b; cell[r][2]=(float)c;
             }
             *have_cell = 1;
@@ -431,6 +440,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                 char Zstr[16]; double x,y,z;
                 int nf = sscanf(line,"%15s %lf %lf %lf",Zstr,&x,&y,&z);
                 if (nf < 4) { free(at); set_error(path,*ln,"malformed PRIMCOORD atom"); return -1; }
+                if (!in_float_range(x) || !in_float_range(y) || !in_float_range(z)) { free(at); set_error(path,*ln,"non-finite PRIMCOORD atom"); return -1; }
                 char *endp = NULL;
                 long Znum = strtol(Zstr, &endp, 10);
                 if (endp && *endp == '\0') {
@@ -464,6 +474,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                 {
                     char Zstr[16];
                     if (sscanf(line,"%15s %lf %lf %lf",Zstr,&x,&y,&z) < 4) continue;
+                    if (!in_float_range(x) || !in_float_range(y) || !in_float_range(z)) { free(at); set_error(path,*ln,"non-finite ATOMS coordinate"); return -1; }
                     char *endp = NULL;
                     long Znum = strtol(Zstr, &endp, 10);
                     if (endp && *endp == '\0') {
@@ -478,9 +489,19 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                 if (zi<0) zi=0; if (zi>118) zi=118;
                 float fx=(float)x, fy=(float)y, fz=(float)z;
                 if (frac) {
-                    at[na].coord[0] = fx*cell[0][0]+fy*cell[1][0]+fz*cell[2][0];
-                    at[na].coord[1] = fx*cell[0][1]+fy*cell[1][1]+fz*cell[2][1];
-                    at[na].coord[2] = fx*cell[0][2]+fy*cell[1][2]+fz*cell[2][2];
+                    /* Compute in double: individually finite x/y/z and cell
+                       components can still overflow to ±inf when multiplied in
+                       float. Validate the derived Cartesian components before
+                       casting to float and committing the atom. */
+                    double dx = x*cell[0][0] + y*cell[1][0] + z*cell[2][0];
+                    double dy = x*cell[0][1] + y*cell[1][1] + z*cell[2][1];
+                    double dz = x*cell[0][2] + y*cell[1][2] + z*cell[2][2];
+                    if (!in_float_range(dx) || !in_float_range(dy) || !in_float_range(dz)) {
+                        free(at); set_error(path,*ln,"non-finite Cartesian coordinate"); return -1;
+                    }
+                    at[na].coord[0] = (float)dx;
+                    at[na].coord[1] = (float)dy;
+                    at[na].coord[2] = (float)dz;
                 } else {
                     at[na].coord[0]=fx; at[na].coord[1]=fy; at[na].coord[2]=fz;
                 }
@@ -1627,10 +1648,14 @@ static int cif_resolve_z(const char *label, char *el) {
 }
 
 /* Build a row-major 3x3 lattice from a,b,c,alpha,beta,gamma (degrees):
-   a along x, b in the xy-plane. */
-static void cif_build_cell(double a, double b, double c,
-                           double alpha, double beta, double gamma,
-                           float cell[3][3]) {
+   a along x, b in the xy-plane. Returns 0 on success, -1 if any derived
+   component is non-finite or out of float range. The cell overflows to ±inf
+   on the (float) cast when extreme lengths meet a near-zero sin(gamma)
+   (division blows up); bounds are already checked on the inputs, so any
+   failure here is the derived arithmetic, not a bad input. */
+static int cif_build_cell(double a, double b, double c,
+                          double alpha, double beta, double gamma,
+                          float cell[3][3]) {
     double gal = gamma * PI / 180.0;
     double alr = alpha * PI / 180.0;
     double ber = beta * PI / 180.0;
@@ -1639,9 +1664,16 @@ static void cif_build_cell(double a, double b, double c,
     double cx = c * cber;
     double cy = c * (cal - cber * cgal) / sg;
     double cz = sqrt(fmax(0.0, c * c - cx * cx - cy * cy));
+    /* Validate every derived component in double before the (float) cast —
+       cx/cy/cz can overflow to ±inf even from finite a/b/c/angles. */
+    if (!in_float_range(a) || !in_float_range(b * cgal) || !in_float_range(b * sg) ||
+        !in_float_range(cx) || !in_float_range(cy) || !in_float_range(cz)) {
+        return -1;
+    }
     cell[0][0] = (float)a; cell[0][1] = 0.0f; cell[0][2] = 0.0f;
     cell[1][0] = (float)(b * cgal); cell[1][1] = (float)(b * sg); cell[1][2] = 0.0f;
     cell[2][0] = (float)cx; cell[2][1] = (float)cy; cell[2][2] = (float)cz;
+    return 0;
 }
 
 MolEnvScene* parse_cif(const char *path) {
@@ -1712,13 +1744,25 @@ MolEnvScene* parse_cif(const char *path) {
                 char *toks[4];
                 int nt = split_tokens(p, toks, 4);
                 if (nt >= 2) {
+                    char *tag = toks[0];
                     double v = cif_float(toks[1]);
-                    if (strcmp(toks[0], "_cell_length_a") == 0)        len_a = v;
-                    else if (strcmp(toks[0], "_cell_length_b") == 0)   len_b = v;
-                    else if (strcmp(toks[0], "_cell_length_c") == 0)   len_c = v;
-                    else if (strcmp(toks[0], "_cell_angle_alpha") == 0) al_deg = v;
-                    else if (strcmp(toks[0], "_cell_angle_beta") == 0)  be_deg = v;
-                    else if (strcmp(toks[0], "_cell_angle_gamma") == 0) ga_deg = v;
+                    /* Resolve the cell tag (if any) first, validate, then assign —
+                       so an invalid length/angle is never stored. cif_build_cell
+                       casts to float, so use in_float_range to catch both NaN/Inf and
+                       finite doubles whose magnitude exceeds FLT_MAX (which would
+                       overflow to ±inf on the cast, poisoning the whole lattice). */
+                    int is_cell = 0;
+                    double *dst = NULL;
+                    if (strcmp(tag, "_cell_length_a") == 0)        { is_cell = 1; dst = &len_a; }
+                    else if (strcmp(tag, "_cell_length_b") == 0)   { is_cell = 1; dst = &len_b; }
+                    else if (strcmp(tag, "_cell_length_c") == 0)   { is_cell = 1; dst = &len_c; }
+                    else if (strcmp(tag, "_cell_angle_alpha") == 0) { is_cell = 1; dst = &al_deg; }
+                    else if (strcmp(tag, "_cell_angle_beta") == 0)  { is_cell = 1; dst = &be_deg; }
+                    else if (strcmp(tag, "_cell_angle_gamma") == 0) { is_cell = 1; dst = &ga_deg; }
+                    if (is_cell && !in_float_range(v)) {
+                        free(at); fclose(fp); set_error(path, ln, "non-finite cell parameter"); return NULL;
+                    }
+                    if (dst) *dst = v;
                 }
                 continue;
             }
@@ -1768,6 +1812,9 @@ MolEnvScene* parse_cif(const char *path) {
                     double fx = cif_float(toks[cx]);
                     double fy = cif_float(toks[cy]);
                     double fz = cif_float(toks[cz]);
+                    if (!in_float_range(fx) || !in_float_range(fy) || !in_float_range(fz)) {
+                        free(at); fclose(fp); set_error(path, ln, "non-finite atom coordinate"); return NULL;
+                    }
                     const char *lbl = NULL;
                     if (col_label >= 0 && col_label < nt) lbl = toks[col_label];
                     char el[8] = {0};
@@ -1816,13 +1863,24 @@ MolEnvScene* parse_cif(const char *path) {
        known (cell tags may have come before or after the atom loop). */
     float cell[3][3] = {{0}};
     if (saw_cell) {
-        cif_build_cell(len_a, len_b, len_c, al_deg, be_deg, ga_deg, cell);
+        if (cif_build_cell(len_a, len_b, len_c, al_deg, be_deg, ga_deg, cell) < 0) {
+            free(at); set_error(path, 0, "non-finite cell components"); return NULL;
+        }
         for (int i = 0; i < natoms; i++) {
             if (!at[i].frac) continue;
             double fx = at[i].coord[0], fy = at[i].coord[1], fz = at[i].coord[2];
-            at[i].coord[0] = (float)(fx*cell[0][0] + fy*cell[1][0] + fz*cell[2][0]);
-            at[i].coord[1] = (float)(fx*cell[0][1] + fy*cell[1][1] + fz*cell[2][1]);
-            at[i].coord[2] = (float)(fx*cell[0][2] + fy*cell[1][2] + fz*cell[2][2]);
+            /* Compute in double and validate: individually finite fractions
+               and cell components can still overflow to ±inf when the product
+               is cast to float, poisoning the derived Cartesian coordinate. */
+            double dx = fx*cell[0][0] + fy*cell[1][0] + fz*cell[2][0];
+            double dy = fx*cell[0][1] + fy*cell[1][1] + fz*cell[2][1];
+            double dz = fx*cell[0][2] + fy*cell[1][2] + fz*cell[2][2];
+            if (!in_float_range(dx) || !in_float_range(dy) || !in_float_range(dz)) {
+                free(at); set_error(path, 0, "non-finite Cartesian coordinate"); return NULL;
+            }
+            at[i].coord[0] = (float)dx;
+            at[i].coord[1] = (float)dy;
+            at[i].coord[2] = (float)dz;
         }
     }
 
@@ -2136,6 +2194,9 @@ static MolEnvScene* parse_xyz_impl(const char *path) {
         double x, y, z;
         if (sscanf(line, "%15s %lf %lf %lf", sym, &x, &y, &z) < 4) {
             fclose(fp); set_error(path, i + 3, "malformed atom line"); molenv_scene_free(s); return NULL;
+        }
+        if (!in_float_range(x) || !in_float_range(y) || !in_float_range(z)) {
+            fclose(fp); set_error(path, i + 3, "non-finite atom coordinate"); molenv_scene_free(s); return NULL;
         }
         MolEnvAtom *a = &s->atoms[i];
         a->coord[0] = (float)x;
