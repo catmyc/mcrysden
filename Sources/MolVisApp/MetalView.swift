@@ -228,7 +228,12 @@ final class MetalView: MTKView {
     /// NaN/Inf). Mirrors the `magnifyFactor`/`clampedMagnification` seam.
     static func scrollZoomFactor(_ delta: CGFloat) -> Float? {
         guard delta.isFinite else { return nil }
-        return Float(1.0 + delta * 0.001)
+        // A finite CGFloat (e.g. CGFloat.greatestFiniteMagnitude) can overflow the
+        // Float conversion and yield ±infinity, which scrollWheel would multiply
+        // into the camera distance. Guard on the factor that is actually used.
+        let factor = Float(1.0 + delta * 0.001)
+        guard factor.isFinite else { return nil }
+        return factor
     }
     override func magnify(with e: NSEvent) {
         let factor = MetalView.magnifyFactor(for: Float(e.magnification))

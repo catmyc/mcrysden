@@ -325,6 +325,38 @@ final class ReviewRegressions: XCTestCase {
         XCTAssertEqual(ColorPlaneView.diagnosticLabel(for: [[1, 2], [3, 4]]), "Invalid 2D field")
     }
 
+    // MARK: - The finite jagged-grid guard must draw the diagnostic, not a blank white view.
+
+    @MainActor
+    func testJaggedGridDrawPathDrawsDiagnosticNotBlankWhite() {
+        // A finite jagged grid passes the isFinite guard but fails the rectangularity
+        // guard. That guard must paint the white background AND call drawEmpty() so the
+        // "Invalid 2D field" diagnostic is actually visible (the helper test passes
+        // regardless; this exercises the real draw path).
+        let view = ColorPlaneView(frame: NSRect(x: 0, y: 0, width: 120, height: 120))
+        view.grid = [[1.0, 2.0, 3.0], [4.0, 5.0]]   // finite but non-rectangular
+        let (w, h) = (120, 120)
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                            isPlanar: false, colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: bitmap) else { return XCTFail("no bitmap") }
+        NSGraphicsContext.saveGraphicsState(); defer { NSGraphicsContext.restoreGraphicsState() }
+        NSGraphicsContext.current = ctx
+        view.draw(view.bounds)
+        ctx.flushGraphics()
+        // The diagnostic text is drawn in gray, so any pixel that isn't white (255,255,255)
+        // proves drawEmpty() ran. A blank-white view has none.
+        var nonWhite = 0
+        for y in 0..<h { for x in 0..<w {
+            var px = [Int](repeating: 0, count: 4)
+            bitmap.getPixel(&px, atX: x, y: y)
+            if px[0] < 250 || px[1] < 250 || px[2] < 250 { nonWhite += 1 }
+        } }
+        XCTAssertGreaterThan(nonWhite, 0,
+            "finite jagged-grid guard must draw the diagnostic label, not a blank white view")
+    }
+
     // MARK: - Helpers
 
     // MARK: - Issue: resetView() must preserve the user's perspective/orthographic
@@ -669,6 +701,13 @@ final class ReviewRegressions: XCTestCase {
         XCTAssertNil(MetalView.scrollZoomFactor(CGFloat.nan), "NaN delta -> no-op")
         XCTAssertNil(MetalView.scrollZoomFactor(CGFloat.infinity), "+Inf delta -> no-op")
         XCTAssertNil(MetalView.scrollZoomFactor(-CGFloat.infinity), "-Inf delta -> no-op")
+        // A finite CGFloat whose magnitude overflows Float (e.g. greatestFiniteMagnitude)
+        // is finite as CGFloat but converts to ±infinity as Float; must be a no-op so
+        // scrollWheel never multiplies the camera distance by infinity.
+        XCTAssertNil(MetalView.scrollZoomFactor(CGFloat.greatestFiniteMagnitude),
+                     "finite CGFloat overflowing +Float -> no-op")
+        XCTAssertNil(MetalView.scrollZoomFactor(-CGFloat.greatestFiniteMagnitude),
+                     "finite CGFloat overflowing -Float -> no-op")
         // The helper returns Float?, so unwrap with a sentinel for finite-input comparisons.
         func f(_ d: CGFloat) -> Float { MetalView.scrollZoomFactor(d) ?? Float.nan }
         // Zero delta is a no-op zoom; finite zooms scale as before.
@@ -731,5 +770,50 @@ final class ReviewRegressions: XCTestCase {
         XCTAssertNotNil(scene.measurementResult, "the locked measurement must survive when all indices are valid")
         XCTAssertEqual(scene.measurementResult?.atomIndices, [0, 0],
                        "saved measurement atomIndices (all valid for new count) preserved in full")
+    }
+
+    // MARK: - Round: resolveAnimationFrame (state/headless resolver) must clamp a carried
+    // isoLevel into the REPARSED destination frame's scalar range, mirroring reloadFrame.
+    // si.anim_grid.axsf: frame 0 has no scalar field, frame 1 has range [0, 1.4]. A carried
+    // isoLevel of 10 survives the initial parse and must clamp to 1.4 after resolution.
+
+    func testResolveAnimationFrameClampsIsoLevelIntoNarrowerRangeOnAnimatedGrid() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_grid.axsf")
+        // Sanity-check the fixture: grid lives on frame 1 (range [0, 1.4]); frame 0 none.
+        XCTAssertNil(try Parser.load(url, as: nil, frameIndex: 0).scalarField)
+        let f1 = try Parser.load(url, as: nil, frameIndex: 1).scalarField
+        guard let field1 = f1 else { return XCTFail("frame 1 expected the single animation grid") }
+        XCTAssertEqual(field1.minValue, 0.0, accuracy: 1e-4)
+        XCTAssertEqual(field1.maxValue, 1.4, accuracy: 1e-4)
+
+        // Load frame 0 (no grid), then point the saved frame at 1 to force the rebuild path.
+        var scene = Scene(loaded: try Parser.load(url, as: nil, frameIndex: 0))
+        scene.currentFrame = 1
+        scene.isoLevel = 10.0   // valid for many fields but OUT OF RANGE for frame 1 (max 1.4)
+        scene.showIsoSurface = true
+
+        try App.resolveAnimationFrame(scene: &scene, from: url, format: nil, loadedFrame: 0, fc: 2)
+        // Destination frame 1 was actually re-parsed and loaded.
+        XCTAssertEqual(scene.currentFrame, 1)
+        XCTAssertNotNil(scene.scalarField, "destination frame 1 must carry its scalar grid")
+        // Carried level 10 clamped into [0, 1.4]; visibility preserved.
+        XCTAssertEqual(scene.isoLevel, 1.4, accuracy: 1e-4,
+                       "carried isoLevel must be clamped into the destination frame's scalar range")
+        XCTAssertTrue(scene.showIsoSurface, "isoSurface visibility must survive the rebuild")
+    }
+
+    func testResolveAnimationFramePreservesValidIsoLevelOnAnimatedGrid() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_grid.axsf")
+        var scene = Scene(loaded: try Parser.load(url, as: nil, frameIndex: 0))
+        scene.currentFrame = 1
+        scene.isoLevel = 0.7   // inside frame 1's span [0, 1.4] -> must survive unchanged
+
+        try App.resolveAnimationFrame(scene: &scene, from: url, format: nil, loadedFrame: 0, fc: 2)
+        XCTAssertEqual(scene.currentFrame, 1)
+        XCTAssertNotNil(scene.scalarField)
+        XCTAssertEqual(scene.isoLevel, 0.7, accuracy: 1e-4,
+                       "an in-destination-range isoLevel must be preserved exactly")
     }
 }

@@ -236,6 +236,15 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
             scene.showBrillouinZone = restored.showBrillouinZone
             scene.showIsoSurface = restored.showIsoSurface
             scene.isoLevel = restored.isoLevel
+            // The freshly parsed frame may carry a scalar field whose value range differs
+            // from the frame we carried the level over (e.g. animated XSF). Clamp the
+            // carried level into the new field's range so it stays meaningful; when the
+            // level already fits, its value passes through unchanged. With a no-field
+            // frame the level is inert (the renderer gates on scalarField), so leave it
+            // untouched. Mirrors the reloadFrame clamp in MainWindowController.
+            if let field = scene.scalarField {
+                scene.isoLevel = min(field.maxValue, max(field.minValue, scene.isoLevel))
+            }
             // Force-arrow settings: carry across the frame rebuild so restoring a saved
             // animation frame (headless --frame or GUI saved currentFrame) keeps the
             // visibility/scale the user set, matching the other appearance fields.

@@ -23,18 +23,6 @@
         "edit": "allow",
         "bash": "allow"
       }
-    },
-    "Reviewer_Expert": {
-      "description": "Expert reviewer for codes and docs with best intelligence",
-      "prompt":"Review the designated project, codes or documents and find there issues. Give fix suggestions.",
-      "mode": "Plan",
-      "variant":"max",
-      "model": "openai/GPT-5.6 Sol",
-      "variant":"high",
-      "permission": {
-        "edit": "",
-        "bash": ""
-      }
     }
   }
 }
