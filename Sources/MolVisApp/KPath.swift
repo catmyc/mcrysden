@@ -16,17 +16,32 @@ extension KPath {
     /// the shared endpoint of each segment emitted once.
     func interpolated() -> [SIMD3<Float>] {
         let pts = points.map { $0.frac }
+        guard pts.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { return [] }
         guard pts.count >= 2 else { return pts }
         var segLens: [Float] = []
         var total: Float = 0
         for i in 0..<pts.count - 1 {
             let d = sqrt(dot(pts[i+1] - pts[i], pts[i+1] - pts[i]))
+            guard d.isFinite else { return [] }
             segLens.append(d); total += d
         }
-        let perSeg = pointsPerSegment
+        guard total.isFinite else { return [] }
+        // This value is UI-controlled in normal use, but KPath is also constructed
+        // programmatically. Bound it so a malformed value cannot trap during the
+        // Float-to-Int conversion or request an effectively unbounded array.
+        let perSeg = min(1_000_000, max(2, pointsPerSegment))
+        let maxOutputPoints = 1_000_000
         var out: [SIMD3<Float>] = []
         for i in 0..<pts.count - 1 {
-            let n = max(2, total > 0 ? Int(round(Float(perSeg) * segLens[i] / total)) : perSeg)
+            guard out.count < maxOutputPoints else { return out }
+            let apportioned = total > 0 ? round(Float(perSeg) * segLens[i] / total) : Float(perSeg)
+            guard apportioned.isFinite else { return [] }
+            var n = max(2, min(perSeg, Int(apportioned)))
+            // Account for the shared point skipped on later segments while
+            // enforcing a global output cap, including all-zero paths.
+            let available = maxOutputPoints - out.count
+            n = min(n, available + (i == 0 ? 0 : 1))
+            guard n >= 2 else { return out }
             // Half-open segments: emit the start point only for the first
             // segment; subsequent segments skip j=0 (the shared endpoint that
             // closed the previous segment). No trailing append — the last
@@ -147,9 +162,13 @@ enum KPathExport {
     static func xcrysdnenKPF(_ path: KPath) -> String {
         let mul = KPathExport.issMultiplier(path)
         var s = "\(mul)\n"
+        func integer(_ value: Float) -> Int {
+            guard value.isFinite else { return 0 }
+            return Int(exactly: value.rounded()) ?? 0
+        }
         for kp in path.points {
             let m = kp.frac * Float(mul)
-            s += "\(Int(m.x.rounded())) \(Int(m.y.rounded())) \(Int(m.z.rounded()))  \(kp.label)\n"
+            s += "\(integer(m.x)) \(integer(m.y)) \(integer(m.z))  \(kp.label)\n"
         }
         return s
     }
@@ -158,19 +177,28 @@ enum KPathExport {
     /// every special-point coordinate times M is (near-)integral. Port of
     /// XCrySDen C/xcBz.c BzGetISS: rational approx (denominator <= 100) then LCM.
     static func issMultiplier(_ path: KPath, maxDen: Int = 100) -> Int {
+        let denominatorLimit = min(10_000, max(1, maxDen))
         func denominator(_ x: Float) -> Int {
+            guard x.isFinite else { return 1 }
             let ax = abs(x)
             if ax < 1e-5 { return 1 }
             var best = 1
             var bestErr = Float.infinity
-            for d in 1...maxDen {
+            for d in 1...denominatorLimit {
                 let n = (ax * Float(d)).rounded()
                 let err = abs(ax - n / Float(d))
                 if err < bestErr { bestErr = err; best = d }
             }
             return best
         }
-        func lcm(_ a: Int, _ b: Int) -> Int { a / gcd(a, b) * b }
+        func lcm(_ a: Int, _ b: Int) -> Int {
+            let product = (a / gcd(a, b)).multipliedReportingOverflow(by: b)
+            // KPF's multiplier is ultimately converted through Float and back to
+            // Int. Keep it exactly representable and bounded if many unrelated
+            // denominators would otherwise overflow.
+            guard !product.overflow, product.partialValue <= 16_777_216 else { return 16_777_216 }
+            return product.partialValue
+        }
         func gcd(_ a: Int, _ b: Int) -> Int {
             var a = abs(a), b = abs(b)
             while b != 0 { (a, b) = (b, a % b) }

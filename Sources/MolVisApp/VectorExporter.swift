@@ -54,7 +54,18 @@ enum RasterExporter {
     /// Wrap an already-rendered AppKit graph in the requested vector container.
     static func write(cgImage: CGImage, to url: URL, size: CGSize) throws {
         let ext = url.pathExtension.lowercased()
-        let w = Int(size.width.rounded()), h = Int(size.height.rounded())
+        let rw = size.width.rounded(), rh = size.height.rounded()
+        guard rw.isFinite, rh.isFinite, rw >= 1, rh >= 1,
+              rw <= maxAxisDimension, rh <= maxAxisDimension,
+              rw <= CGFloat(Int.max), rh <= CGFloat(Int.max) else {
+            throw RasterExportError.noTex
+        }
+        let w = Int(rw), h = Int(rh)
+        let pixels = w.multipliedReportingOverflow(by: h)
+        guard !pixels.overflow, pixels.partialValue <= 16_000_000,
+              w == cgImage.width, h == cgImage.height else {
+            throw RasterExportError.noTex
+        }
         switch ext {
         case "pdf": try emitPDF(cgImage: cgImage, w: w, h: h, to: url)
         case "svg": try emitSVG(cgImage: cgImage, w: w, h: h, to: url)
@@ -163,7 +174,9 @@ enum RasterExporter {
         let tmp = url.deletingLastPathComponent()
             .appendingPathComponent(ProcessInfo.processInfo.globallyUniqueString + ".eps.tmp")
         try? FileManager.default.removeItem(at: tmp)
-        FileManager.default.createFile(atPath: tmp.path, contents: nil)
+        guard FileManager.default.createFile(atPath: tmp.path, contents: nil) else {
+            throw RasterExportError.noData
+        }
         var moved = false
         defer {
             if !moved { try? FileManager.default.removeItem(at: tmp) }
@@ -171,7 +184,8 @@ enum RasterExporter {
         let fh = try FileHandle(forWritingTo: tmp)
         let header = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 \(w) \(h)\n%%EndComments\n"
             + "/picstr \(w * 3) string def\n\(w) \(h) 8 [\(w) 0 0 \(-h) 0 \(h)]\n{ currentfile picstr readhexstring pop } false 3 colorimage\n"
-        try fh.write(contentsOf: header.data(using: .utf8)!)
+        guard let headerData = header.data(using: .utf8) else { throw RasterExportError.noData }
+        try fh.write(contentsOf: headerData)
         let tbl: [UInt8] = [0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
                             0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66]
         var rowBuf = [UInt8]()
@@ -191,10 +205,18 @@ enum RasterExporter {
             rowBuf.append(0x0A)
             try fh.write(contentsOf: rowBuf)
         }
-        try fh.write(contentsOf: "%%EOF\n".data(using: .utf8)!)
+        guard let trailerData = "%%EOF\n".data(using: .utf8) else { throw RasterExportError.noData }
+        try fh.write(contentsOf: trailerData)
         try fh.close()
-        // Atomic replacement: the original destination survives if placing tmp fails.
-        try FileManager.default.replaceItem(at: url, withItemAt: tmp, backupItemName: nil, options: [], resultingItemURL: nil)
+        // replaceItem requires an existing destination. New exports therefore move
+        // the completed temporary into place; overwrites retain replacement's
+        // rollback semantics so an old valid document survives any failure.
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.replaceItem(at: url, withItemAt: tmp, backupItemName: nil,
+                                                options: [], resultingItemURL: nil)
+        } else {
+            try FileManager.default.moveItem(at: tmp, to: url)
+        }
         moved = true
     }
 

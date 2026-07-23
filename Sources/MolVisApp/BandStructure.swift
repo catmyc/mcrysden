@@ -228,7 +228,7 @@ enum BandParser {
                 if parseKHeader(t) != nil { break }
                 var row: [Float] = []
                 for s in t.split(whereSeparator: { $0 == " " || $0 == "\t" }) {
-                    if let v = Float(s) { row.append(v) }
+                    if let v = Float(s), v.isFinite { row.append(v) }
                 }
                 if row.isEmpty { break }
                 energies.append(contentsOf: row)
@@ -559,7 +559,10 @@ enum BandParser {
             for i in 0..<d { c[i] = simd_dot(basis[i], r) }
             var f = [Float](repeating: 0, count: d)
             for i in 0..<d { for j in 0..<d { f[i] += gi[i][j] * c[j] } }
-            let ri = f.map { Int($0.rounded()) }
+            guard f.allSatisfy(\.isFinite) else { return false }
+            let converted = f.map { Int(exactly: $0.rounded()) }
+            guard converted.allSatisfy({ $0 != nil }) else { return false }
+            let ri = converted.map { $0! }
             // reconstruct & verify integer lattice maps back onto the real point.
             var recon = p0
             for i in 0..<d { recon += basis[i] * Float(ri[i]) }
@@ -570,7 +573,16 @@ enum BandParser {
         for cc in coords.dropFirst() { for i in 0..<d { lo[i] = min(lo[i], cc[i]); hi[i] = max(hi[i], cc[i]) } }
         var sizes = [Int](repeating: 0, count: d)
         var prod = 1
-        for i in 0..<d { sizes[i] = hi[i] - lo[i] + 1; prod *= sizes[i] }
+        for i in 0..<d {
+            let span = hi[i].subtractingReportingOverflow(lo[i])
+            guard !span.overflow else { return false }
+            let size = span.partialValue.addingReportingOverflow(1)
+            guard !size.overflow, size.partialValue > 0 else { return false }
+            sizes[i] = size.partialValue
+            let next = prod.multipliedReportingOverflow(by: sizes[i])
+            guard !next.overflow else { return false }
+            prod = next.partialValue
+        }
         guard prod == points.count else { return false }
         var seen = Set<Int>()
         for cc in coords {
@@ -629,7 +641,8 @@ enum BandParser {
     private static func parseWeight(_ line: String) -> Float? {
         guard let wkRange = line.range(of: "wk =") else { return nil }
         let after = String(line[wkRange.upperBound...])
-        return after.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.flatMap { Float($0) }
+        return after.split(whereSeparator: { $0 == " " || $0 == "\t" }).first
+            .flatMap { Float($0) }.flatMap { $0.isFinite ? $0 : nil }
     }
 
     /// Parse the reciprocal lattice vectors b1..b3 from the QE "reciprocal axes"
@@ -647,7 +660,7 @@ enum BandParser {
                   let rpar = lines[idx].lastIndex(of: ")"), rpar > lpar else { return nil }
             let body = String(lines[idx][lines[idx].index(after: lpar)..<rpar])
             let nums = body.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "," }).compactMap { Float($0) }
-            guard nums.count >= 3 else { return nil }
+            guard nums.count >= 3, nums[0].isFinite, nums[1].isFinite, nums[2].isFinite else { return nil }
             vecs.append(SIMD3<Float>(nums[0], nums[1], nums[2]))
         }
         return vecs.count == 3 ? vecs : nil
@@ -669,7 +682,7 @@ enum BandParser {
             if let v = Float(t) { nums.append(v) }
             if nums.count == 3 { break }   // kx, ky, kz only — skip the PW count
         }
-        guard nums.count >= 3 else { return nil }
+        guard nums.count >= 3, nums[0].isFinite, nums[1].isFinite, nums[2].isFinite else { return nil }
         return SIMD3<Float>(nums[0], nums[1], nums[2])
     }
 
@@ -690,7 +703,7 @@ enum BandParser {
         let pattern = #"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?"#
         guard let r = tail.range(of: pattern, options: .regularExpression) else { return nil }
         let token = String(tail[r]).replacingOccurrences(of: "D", with: "e").replacingOccurrences(of: "d", with: "e")
-        return Float(token)
+        return Float(token).flatMap { $0.isFinite ? $0 : nil }
     }
 
     /// Most common value in `xs`, or nil if empty. Used to pick the representative

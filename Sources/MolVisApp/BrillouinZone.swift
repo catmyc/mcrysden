@@ -39,22 +39,40 @@ struct BrillouinZone {
     /// the intersection of the bisectors of ALL G up to the first complete shell
     /// in every direction. Correct for any lattice: fcc -> 14, slab -> 6, etc.
     static func build(cell: Cell, atoms: [Atom]) -> BrillouinZone? {
+        // Centering detection verifies candidate translations against the basis.
+        // Bound that work for directly-constructed/pathological scenes; real unit
+        // cells are far smaller, and omitting an optional overlay is safer than an
+        // O(n²) UI stall on a massive atom list.
+        guard atoms.count <= 4_096 else { return nil }
         // True reciprocal generator (primitive = respects centering), the dense
         // lattice whose Wigner-Seitz cell is the first BZ.
         let (astar, bstar, cstar) = Lattice.primitiveReciprocal(cell: cell, atoms: atoms)
-        guard astar != .zero else { return nil }
+        let vectors = [astar, bstar, cstar]
+        guard vectors.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }),
+              vectors.allSatisfy({ length($0).isFinite && length($0) > 1e-9 }) else { return nil }
 
         // Complete per-direction G-star: along primitive reciprocal axis i we
         // enumerate enough integer multiples to reach (at least) the longest
         // primitive reciprocal |G| — guaranteeing a complete first shell in every
         // direction. An isotropic radius cut would discard the dense directions of
         // anisotropic cells (e.g. slabs) and leave too few planes to close the cell.
-        let nrm = [length(astar), length(bstar), length(cstar)]
-        let longest = max(nrm[0], max(nrm[1], nrm[2]))
-        let r0 = max(1, Int(ceil(longest / max(nrm[0], 1e-9))))
-        let r1 = max(1, Int(ceil(longest / max(nrm[1], 1e-9))))
-        let r2 = max(1, Int(ceil(longest / max(nrm[2], 1e-9))))
+        let nrm = vectors.map(length)
+        let longest = nrm.max() ?? 0
+        let ratios = nrm.map { ceil(longest / $0) }
+        // Geometry.polyhedronFaces is cubic in the plane count (with another
+        // feasibility scan inside). A malicious, extremely anisotropic cell used
+        // to turn these ratios into an unrepresentable Int or billions of loop
+        // iterations. Refuse a BZ overlay that cannot be built promptly; the
+        // structure itself remains renderable.
+        guard ratios.allSatisfy({ $0.isFinite && $0 >= 1 && $0 <= 16 }) else { return nil }
+        let radii = ratios.map(Int.init)
+        let r0 = radii[0], r1 = radii[1], r2 = radii[2]
+        let c0 = (2 * r0 + 1), c1 = (2 * r1 + 1), c2 = (2 * r2 + 1)
+        let p01 = c0.multipliedReportingOverflow(by: c1)
+        let p012 = p01.partialValue.multipliedReportingOverflow(by: c2)
+        guard !p01.overflow, !p012.overflow, p012.partialValue - 1 <= 512 else { return nil }
         var gstar: [SIMD3<Float>] = []
+        gstar.reserveCapacity(p012.partialValue - 1)
         for i in -r0...r0 { for j in -r1...r1 { for k in -r2...r2 {
             if i == 0 && j == 0 && k == 0 { continue }
             gstar.append(Float(i)*astar + Float(j)*bstar + Float(k)*cstar)

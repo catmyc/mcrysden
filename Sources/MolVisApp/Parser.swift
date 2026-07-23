@@ -597,8 +597,8 @@ enum Parser {
             for (i, tk) in eTok.enumerated() where tk == "Z:" && i+1 < eTok.count {
                 // Bound the Float before converting: a non-finite or out-of-range Z must
                 // not trap and must fall back to the symbol-based resolution below.
-                if let f = Float(eTok[i+1]), f.isFinite, f >= Float(Int.min), f <= Float(Int.max) {
-                    Z = Int(f)
+                if let f = Float(eTok[i+1]), f.isFinite, let exact = Int(exactly: f.rounded(.towardZero)) {
+                    Z = exact
                 }
             }
             let symbol = eTok.first ?? ""

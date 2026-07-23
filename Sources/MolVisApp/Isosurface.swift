@@ -68,6 +68,8 @@ struct ScalarField: Codable {
     /// fractional coordinates obey grad_f = B^T grad_world, hence
     /// grad_world = B^-T grad_f.
     func worldGradient(_ fx: Float, _ fy: Float, _ fz: Float) -> SIMD3<Float> {
+        guard nx > 0, ny > 0, nz > 0, vec.count >= 3,
+              fx.isFinite, fy.isFinite, fz.isFinite else { return .zero }
         let ix = max(0, min(nx - 1, Int((fx * Float(nx - 1)).rounded())))
         let iy = max(0, min(ny - 1, Int((fy * Float(ny - 1)).rounded())))
         let iz = max(0, min(nz - 1, Int((fz * Float(nz - 1)).rounded())))
@@ -112,7 +114,12 @@ struct IsoMesh {
         // interpolation. Reject it as an empty, non-overflowing mesh — the same safe
         // outcome as a shape mismatch — so a malformed field never traps inside
         // marching cubes.
-        guard field.nx > 1, field.ny > 1, field.nz > 1, field.vec.count >= 3 else { vertices = out; return }
+        guard field.nx > 1, field.ny > 1, field.nz > 1, field.vec.count >= 3,
+              isoLevel.isFinite, sign.isFinite, sign != 0,
+              color.x.isFinite, color.y.isFinite, color.z.isFinite,
+              field.origin.x.isFinite, field.origin.y.isFinite, field.origin.z.isFinite,
+              field.vec.prefix(3).allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }),
+              field.values.allSatisfy(\.isFinite) else { vertices = out; return }
 
         // Overflow-checked product: a malicious grid whose (nx-1)(ny-1)(nz-1)*27
         // overflows Int must never pass a naive magnitude bound check. Allocate a
