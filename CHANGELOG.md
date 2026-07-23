@@ -2,6 +2,21 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.15] — 2026-07-23
+
+### Fixed
+- Rejected non-finite and out-of-range coordinates in XSF, CIF, and XYZ input, and hardened the C-to-Swift atom bridge against C-structure layout changes.
+- Rejected non-finite Quantum Espresso band energies, k-points, weights, reciprocal vectors, and Fermi energies before mesh inference; overflow-prone lattice indexing now fails safely.
+- Bounded Brillouin-zone construction for pathological atom counts and highly anisotropic or non-finite cells, preventing unrepresentable conversions and excessive geometry work.
+- Bounded k-path interpolation and XCrySDen KPF multiplier arithmetic, with safe handling for non-finite coordinates, extreme sampling counts, and integer overflow.
+- Hardened isosurface generation and caching against malformed dimensions, short or non-finite geometry, non-finite field values, and stale same-sized fields without rescanning unchanged shared value storage per frame.
+- Kept animation reload and saved-frame restoration consistent by synchronizing field metadata, clamping isovalues to each destination field, and clearing only stale atom selections and measurements.
+- Prevented finite-but-unrepresentable scroll deltas from corrupting camera distance, preserved the selected projection on Reset View, and made invalid color-plane data display a truthful diagnostic.
+- Validated raster-backed vector export dimensions and source-image size before writing, and made EPS creation work for both new destinations and atomic overwrites without leaving partial output.
+
+### Tests
+- Expanded the macOS test suite to 362 tests, including pathological band, Brillouin-zone, k-path, isosurface, animation, input, cache, and vector-export regressions.
+
 ## [1.1.14] — 2026-07-16
 
 ### Fixed
