@@ -150,15 +150,16 @@ enum Lattice {
 }
 
 /// A k-point in fractional (crystal) coordinates, with an optional label
-/// (Gamma/X/K/L/W...).
-struct KPoint {
+/// (Gamma/X/K/L/W...). Fractional coords are in the CONVENTIONAL reciprocal
+/// basis (the band-plot basis the BZ reports).
+struct KPoint: Codable, Equatable {
     var frac: SIMD3<Float>
     var label: String
     init(_ frac: SIMD3<Float>, _ label: String = "") { self.frac = frac; self.label = label }
 }
 
 /// A k-path: an ordered list of special k-points with per-segment interpolation.
-struct KPath {
+struct KPath: Codable, Equatable {
     var points: [KPoint]
     // Number of interpolated points per segment (distance-weighted rounding).
     var pointsPerSegment: Int = 20

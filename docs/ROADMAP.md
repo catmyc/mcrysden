@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-23 (v1.1.15 shipped)**.
+Last updated: **2026-07-26 (v1.1.16 shipped; symmetry and standard paths accepted next)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -48,6 +48,59 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Animation frame changes keep sidebar field metadata synchronized, clamp isovalues to destination ranges, and invalidate stale selections and measurements.
 - [x] Raster-backed PDF/SVG/EPS/PS wrapping validates dimensions against the source image; EPS supports safe creation and replacement without partial files.
 - [x] Camera projection reset, extreme scroll input, and invalid color-plane diagnostics have dedicated regression coverage.
+
+## v1.1.16 interactive k-path editor
+- [x] Interactive BZ landmark picking with deterministic Γ, vertex, edge-midpoint, and face-center candidates; click-to-append takes precedence over atom selection while edit mode is active.
+- [x] Ordered sidebar route editing with bounded labels and routes, move/delete, undo, clear, generated defaults, and QE/KPF export controls.
+- [x] Shared conventional reciprocal-basis mapping for picking, rendering, state persistence, and export, including corrected fcc/bcc default conversion and bcc `N` coordinates.
+- [x] Editor-only white landmarks and persistent amber-route/cyan-node overlays share the cached BZ geometry and remain available when band, DOS, or color-plane views would normally replace the Metal canvas.
+- [x] Edited routes persist through `.molvis-state`, animation reloads, and unrelated sidebar changes; malformed saved route data fails transactionally.
+- [x] 69 focused editor tests; 433 tests in the full macOS suite.
+
+## Next priority: crystallographic symmetry and standard paths
+- [ ] Detect crystal system, Bravais lattice, space group, point group, Wyckoff positions, and symmetry-equivalent atoms.
+- [ ] Standardize primitive and conventional cells while preserving species and coordinate mappings.
+- [ ] Generate conventional high-symmetry labels and recommended paths for every three-dimensional Bravais lattice, including triclinic, monoclinic, orthorhombic, tetragonal, trigonal/rhombohedral, hexagonal, and cubic variants.
+- [ ] Keep symmetry/path generation deterministic, tolerance-aware, safe for malformed cells, and consistent with BZ rendering, picking, persistence, and QE/KPF export.
+
+## Proposed function backlog
+
+### Workflow and application integration
+- [ ] GUI Save State, Save State As, Revert, recent files, reopen last file, drag-and-drop, file watching, and multiple structure windows.
+- [ ] File-menu export, configurable image dimensions/background/transparency/anti-aliasing, and copy-current-view to clipboard.
+- [ ] Standard Edit menu with undo/redo, collapsible remembered sidebar sections, and a command palette.
+
+### Reciprocal space and k-paths
+- [ ] Direct fractional-coordinate editing, per-segment sampling, disconnected path segments, cumulative reciprocal distance, and selected-node highlighting between sidebar and BZ.
+- [ ] Candidate hover tooltips, viewport node labels, automatic BZ framing, and imports from QE, VASP, Wannier90, and KPF.
+- [ ] Export VASP `KPOINTS`, Wannier90 `kpoint_path`, and additional QE band-path forms.
+- [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
+
+### Structure information and analysis
+- [ ] Structure summary with lattice lengths/angles, volume, density, composition, formula, symmetry, atom table, fractional/Cartesian coordinates, and coordination numbers.
+- [ ] Coordination shells, coordination coloring, nearest-neighbor tables, bond/angle distributions, radial distribution functions, and minimum-image periodic measurements.
+- [ ] Polyhedron volume/distortion metrics and two-structure comparison with displacement vectors and RMS displacement.
+- [ ] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels.
+
+### Structure editing and generation
+- [ ] Insert, remove, substitute, and displace atoms; edit Cartesian/fractional coordinates and lattice parameters; and maintain full undo/redo history.
+- [ ] Primitive/conventional transformations, elastic cell deformation, cluster cutting, multi-slab construction, Miller-index surface generation, termination selection, and vacuum control.
+- [ ] Defect workflows for vacancies, substitutions, and interstitials, with export to XSF, CIF, POSCAR, XYZ, and QE input.
+
+### Electronic-structure analysis
+- [ ] Interactive band/DOS zoom, pan, cursor readout, energy windows, Fermi adjustment, linked plots, and projected species/orbital coloring.
+- [ ] Automatic VBM/CBM, direct/indirect band-gap, and effective-mass analysis.
+
+### Volumetric data and rendering
+- [ ] Arbitrary 3D-grid slices and clipping planes, multiple independently colored/transparent isovalues, paired orbital lobes, region integration, configurable colormaps, and contour levels.
+- [ ] Composite structure/color-plane/isosurface views instead of mutually exclusive layers.
+- [ ] Multisample anti-aliasing, configurable line widths, transparency, depth cueing, ambient occlusion/soft shadows, standard `[100]`/`[110]`/`[111]` views, camera bookmarks, scale indicators, and publication presets.
+- [ ] Higher-resolution labels and true vector export for cells, BZs, k-paths, and graphs; image backgrounds, printing, and stereo/anaglyph rendering.
+
+### Animation, conversion, and extensibility
+- [ ] Timeline thumbnails, playback speed/looping, GIF/APNG/video export, trajectory alignment, displacement trails, interpolation, and per-frame energy/force/volume/distance plots.
+- [ ] Batch conversion/rendering and external-code converters such as `pwi2xsf`, `pwo2xsf`, and `struct2xsf`.
+- [ ] Embedded scripting, parser/analysis plugins, and project/session files combining structures, bands, DOS, and volumetric datasets.
 
 ## Half-done (mechanism exists, UI missing)
 - [~] **Save-state menu item** — `StateStore.save` writer is implemented and load is wired to the CLI and headless export, but there is **no menu item or button** to trigger a save from the GUI. A one-line UI hook onto the existing writer.

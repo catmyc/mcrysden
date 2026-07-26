@@ -7,21 +7,30 @@ extension Scene {
     /// pick order matters: angle uses the middle atom as vertex; dihedral is
     /// signed by the plane normals of (a,b,c) and (b,c,d).
     static func computeMeasurement(mode: MeasurementMode, atoms: [Atom], selected: [Int]) -> MeasurementResult? {
+        guard mode != .none, selected.count == mode.selectionCap,
+              selected.allSatisfy({ $0 >= 0 && $0 < atoms.count }) else { return nil }
         let sel = selected.map { atoms[$0].coord }
+        guard sel.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { return nil }
         var value: Float = 0
         switch mode {
         case .distance:
             value = length(sel[1] - sel[0])
         case .angle:
-            let v0 = normalize(sel[0] - sel[1]), v2 = normalize(sel[2] - sel[1])
+            let d0 = sel[0] - sel[1], d2 = sel[2] - sel[1]
+            guard length(d0) > 1e-8, length(d2) > 1e-8 else { return nil }
+            let v0 = normalize(d0), v2 = normalize(d2)
             value = acos(min(max(dot(v0, v2), -1), 1)) * 180 / .pi
         case .dihedral:
-            let ba = normalize(sel[0] - sel[1]), cb = normalize(sel[1] - sel[2]), dc = normalize(sel[2] - sel[3])
+            let d0 = sel[0] - sel[1], d1 = sel[1] - sel[2], d2 = sel[2] - sel[3]
+            guard length(d0) > 1e-8, length(d1) > 1e-8, length(d2) > 1e-8 else { return nil }
+            let ba = normalize(d0), cb = normalize(d1), dc = normalize(d2)
             let n1 = cross(ba, cb), n2 = cross(cb, dc)
+            guard length(n1) > 1e-8, length(n2) > 1e-8 else { return nil }
             value = acos(min(max(dot(normalize(n1), normalize(n2)), -1), 1)) * 180 / .pi
         case .none:
             return nil
         }
+        guard value.isFinite else { return nil }
         let idxStr = selected.map { "\($0 + 1)" }.joined(separator: "-")
         let unit = (mode == .distance) ? "Å" : "°"
         let summary = "\(mode.label) (\(idxStr)): \(String(format: mode == .distance ? "%.3f" : "%.1f", value)) \(unit)"
@@ -50,6 +59,14 @@ extension Scene {
         self.multiOrbitalFields = loaded.multiOrbitalFields
         self.baseAtoms = loaded.atoms
         self.baseBonds = loaded.bonds
+        // Seed the editable k-path with the generated high-symmetry default for
+        // crystals (matches MainWindowController.makeDefaultKPath); molecules keep
+        // an empty route. Edited by the k-path editor in later phases.
+        if loaded.isCrystal, let cell = loaded.cell {
+            self.kPathPoints = KPath.defaultPath(cell: cell, atoms: loaded.atoms.map { $0.coord }).points
+        } else {
+            self.kPathPoints = []
+        }
     }
 
     var centroid: SIMD3<Float> {

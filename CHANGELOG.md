@@ -2,6 +2,23 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.16] — 2026-07-26
+
+### Added
+- Added an interactive Brillouin-zone k-path editor: click deterministic Γ/vertex/edge/face landmarks to append nodes, orbit while editing, rename/reorder/delete points, undo or clear edits, restore the generated default, and export QE or XCrySDen KPF paths.
+- Rendered selectable BZ landmarks as white crosses only while editing, and the active route as depth-tested amber segments with cyan nodes; editing keeps the Metal canvas available even when graph or color-plane data is loaded.
+- Persisted edited routes in `.molvis-state` files and preserved them across animation-frame rebuilds and unrelated view changes.
+- Added a conventional File menu containing Open (`⌘O`), with Quit in the macOS application menu.
+
+### Fixed
+- Kept editor, renderer, and export coordinates in the conventional reciprocal basis, including correct primitive-to-conventional conversion for fcc/bcc defaults and a distinct canonical bcc `N` point.
+- Rejected malformed, non-finite, oversized, or overlong persisted k-path data transactionally, capped routes at 1,024 nodes, and safely skipped malformed render points.
+- Made measurements reject invalid indices, non-finite coordinates, and degenerate angle/dihedral geometry instead of indexing or normalizing unsafe data.
+- Made band plotting and distance generation degrade safely for malformed channel layouts, jagged energy rows, non-finite values, and invalid drawing bounds.
+
+### Tests
+- Expanded the macOS suite to 433 tests, including 69 focused k-path geometry, picking, editing, persistence, cache, animation, and Metal-render regressions.
+
 ## [1.1.15] — 2026-07-23
 
 ### Fixed

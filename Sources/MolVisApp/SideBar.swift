@@ -110,21 +110,60 @@ struct SideBar: View {
             if state.isCrystal {
                 Section("K-Path") {
                     Toggle("Brillouin Zone", isOn: $state.showBrillouinZone)
+                    Toggle("Edit on BZ", isOn: $state.editKPathOnBZ)
+                    if state.editKPathOnBZ {
+                        // Concise active instruction. The controller shows white
+                        // BZ-landmark crosses; clicking appends one to the route.
+                        Text("Click a white landmark to append it. Drag to orbit.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
                     ForEach(Array(state.kPathPoints.enumerated()), id: \.offset) { i, kp in
-                        HStack {
-                            Text(kp.label.isEmpty ? "k\(i)" : kp.label)
-                                .font(.system(.body, design: .monospaced))
-                            Spacer()
-                            Text(String(format: "(%.2f,%.2f,%.2f)", kp.frac.x, kp.frac.y, kp.frac.z))
-                                .font(.caption).foregroundColor(.secondary)
+                        // Two-line row: keeps each route item narrow enough for the ~20%
+                        // sidebar (a single line of label + 3 controls + coordinates overflows).
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 4) {
+                                Text("\(i + 1).")
+                                    .font(.caption).foregroundColor(.secondary)
+                                TextField("", text: Binding(
+                                    // Bounds-safe: a row closure can outlive a deletion/reorder.
+                                    get: { state.kPathPoints.indices.contains(i) ? state.kPathPoints[i].label : "" },
+                                    set: { state.updateLabel(at: i, to: $0) }
+                                ))
+                                .frame(maxWidth: 40)
+                                Text(String(format: "(%.2f,%.2f,%.2f)", kp.frac.x, kp.frac.y, kp.frac.z))
+                                    .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                            }
+                            HStack(spacing: 2) {
+                                Spacer()
+                                Button(action: { state.moveUp(at: i) }) {
+                                    Image(systemName: "arrow.up")
+                                }
+                                .buttonStyle(.borderless).disabled(i == 0)
+                                Button(action: { state.moveDown(at: i) }) {
+                                    Image(systemName: "arrow.down")
+                                }
+                                .buttonStyle(.borderless).disabled(i == state.kPathPoints.count - 1)
+                                Button(action: { state.remove(at: i) }) {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                            }
                         }
                     }
+                    HStack {
+                        // Undo stays enabled after a Clear (the pre-clear route is restorable);
+                        // it is gated on undo availability, not on whether the route is empty.
+                        Button("Undo") { state.undoLast() }.disabled(!state.canUndo)
+                        Button("Clear") { state.clear() }.disabled(state.kPathPoints.isEmpty)
+                        Button("Default") { state.resetToDefault() }
+                    }
+                    .buttonStyle(.bordered).font(.caption)
                     HStack {
                         Button("QE (.pwscf)") { state.onExportKPath?(KPath(points: state.kPathPoints), .qe) }
                         Button("kpf") { state.onExportKPath?(KPath(points: state.kPathPoints), .kpf) }
                     }
-                    .buttonStyle(.bordered)
-                    .font(.caption)
+                    .buttonStyle(.bordered).font(.caption)
+                    .disabled(state.kPathPoints.count < 2)
                 }
             }
             Section("Supercell") {

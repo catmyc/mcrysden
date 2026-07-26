@@ -45,6 +45,17 @@ final class SideBarState: ObservableObject {
     /// k-path state (crystal only). points carry fractional coords + labels; when
     /// empty the editor offers the default high-symmetry path for the structure.
     @Published var kPathPoints: [KPoint] = [] { didSet { onChange?() } }
+    /// UI-only: when true the user is editing the k-path by clicking BZ landmarks.
+    /// Forces Brillouin-zone visibility on (handled in syncFromState). Exiting
+    /// this mode does not itself change the route.
+    @Published var editKPathOnBZ: Bool = false { didSet { onChange?() } }
+    /// UI-only undo stack of prior routes (snapshots before each mutation), so the
+    /// "Undo" control can step back. Bounded to 1024 entries.
+    private var kPathUndo: [[KPoint]] = []
+    /// Whether an undo is available. Drives the "Undo" control's disabled state so it
+    /// stays enabled after a Clear (the pre-clear route is restorable) and is cleared
+    /// whenever the route is reset/loaded.
+    var canUndo: Bool { !kPathUndo.isEmpty }
     /// Isosurface controls (only meaningful when the scene carries a scalarField).
     /// sliderRange is set by the controller from the field's [minValue, maxValue].
     @Published var showIsoSurface: Bool = true { didSet { onChange?() } }
@@ -93,6 +104,10 @@ final class SideBarState: ObservableObject {
     /// a save panel and writes the text). `.qe` => QE K_POINTS crystal;
     /// `.kpf` => XCrySDen native k-path file.
     var onExportKPath: ((KPath, KPathExportFormat) -> Void)?
+    /// Recalculate the default high-symmetry route for the current scene and
+    /// install it (the "Default" control). The controller owns the scene, so it
+    /// wires this to recompute `makeDefaultKPath`.
+    var onResetKPath: (() -> Void)?
 
     /// Reflect a loaded scene's controls into the sidebar WITHOUT triggering
     /// onChange (so we don't immediately re-mutate the scene we just loaded).
@@ -107,7 +122,12 @@ final class SideBarState: ObservableObject {
         showLabels = scene.showLabels
         showBrillouinZone = scene.showBrillouinZone
         isCrystal = scene.isCrystal
-        kPathPoints = MainWindowController.makeDefaultKPath(for: scene)
+        // Mirror the scene's route: for a freshly-loaded crystal this is the
+        // generated high-symmetry default; once the user edits it, the edited
+        // route lives in the scene and must be copied back, never regenerated.
+        kPathPoints = scene.kPathPoints
+        editKPathOnBZ = false   // loading a new scene exits edit mode
+        kPathUndo = []          // drop stale undo history from the previous scene
         measurementMode = scene.measurementMode
         backgroundHex = scene.background
         backgroundBottomHex = scene.backgroundBottom
@@ -150,5 +170,79 @@ final class SideBarState: ObservableObject {
         showForces = scene.showForces
         forceScale = scene.forceScale
         onChange = saved
+    }
+
+    // MARK: - k-path editing (UI-only mutations; each fires onChange → sync)
+
+    /// Record the current route on the undo stack before mutating it. Bounded so a
+    /// long editing session cannot grow the stack without limit.
+    private func pushUndo() {
+        if kPathUndo.count >= 1024 { kPathUndo.removeFirst() }
+        kPathUndo.append(kPathPoints)
+    }
+
+    /// Bound a single node's label to 64 chars. No-op for an out-of-range index or when
+    /// the bounded value is unchanged (no undo entry pushed in that case).
+    func updateLabel(at index: Int, to label: String) {
+        guard kPathPoints.indices.contains(index) else { return }
+        let bounded = String(label.prefix(64))
+        guard kPathPoints[index].label != bounded else { return }
+        pushUndo()
+        kPathPoints[index].label = bounded
+    }
+
+    /// Swap a node with its predecessor. No-op at the top or out of range.
+    func moveUp(at index: Int) {
+        guard index > 0, index < kPathPoints.count else { return }
+        pushUndo()
+        kPathPoints.swapAt(index, index - 1)
+    }
+
+    /// Swap a node with its successor. No-op at the bottom or out of range.
+    func moveDown(at index: Int) {
+        guard index >= 0, index < kPathPoints.count - 1 else { return }
+        pushUndo()
+        kPathPoints.swapAt(index, index + 1)
+    }
+
+    /// Remove a node. No-op for an out-of-range index.
+    func remove(at index: Int) {
+        guard kPathPoints.indices.contains(index) else { return }
+        pushUndo()
+        kPathPoints.remove(at: index)
+    }
+
+    /// Undo the last mutation, restoring the route snapshot taken beforehand.
+    /// No-op when there is nothing to undo.
+    func undoLast() {
+        guard let prev = kPathUndo.popLast() else { return }
+        kPathPoints = prev
+    }
+
+    /// Clear the whole route. No-op (no undo entry) when already empty.
+    func clear() {
+        guard !kPathPoints.isEmpty else { return }
+        pushUndo()
+        kPathPoints = []
+    }
+
+    /// Reset to the generated default for the current scene. The controller owns
+    /// the scene, so it recomputes the route via `onResetKPath`. No-op when no reset
+    /// callback is wired.
+    func resetToDefault() {
+        guard onResetKPath != nil else { return }
+        pushUndo()
+        onResetKPath?()
+    }
+
+    /// Append a picked BZ landmark, capping the route at 1024 nodes and suppressing
+    /// an exact fractional-coordinate repeat of the current last node (renaming a node
+    /// must not defeat the duplicate check). Non-consecutive repeats (Gamma-X-Gamma)
+    /// remain allowed.
+    func append(_ point: KPoint) {
+        if let last = kPathPoints.last, last.frac == point.frac { return }
+        guard kPathPoints.count < 1024 else { return }
+        pushUndo()
+        kPathPoints.append(point)
     }
 }

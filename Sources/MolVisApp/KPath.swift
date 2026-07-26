@@ -78,7 +78,7 @@ extension KPath {
             return KPath(points: [
                 KPoint(SIMD3(0,0,0), "G"),
                 KPoint(SIMD3(0.5,-0.5,0.5), "H"),
-                KPoint(SIMD3(0.25,0.25,0.25), "N"),
+                KPoint(SIMD3(0,0,0.5), "N"),
                 KPoint(SIMD3(0,0,0), "G"),
                 KPoint(SIMD3(0.25,0.25,0.25), "P"),
             ])
@@ -103,12 +103,35 @@ enum KPathExportFormat: String { case qe = "qe", kpf = "kpf" }
 
 extension KPath {
     /// Detect the cubic Bravais type from the conventional cell + its atomic
-    /// basis offsets and return the matching canonical k-path. Non-cubic (or
-    /// undetectable) inputs fall back to a simple Gamma-X path so export always
-    /// works.
+    /// basis offsets and return the matching canonical k-path, expressed in
+    /// CONVENTIONAL reciprocal fractional coordinates (the basis the editor and
+    /// QE export use). `defaultPath(lattice:)` emits canonical primitive-basis
+    /// coords; for fcc/bcc we map primitive fractional -> Cartesian reciprocal ->
+    /// conventional fractional so the route's geometry is preserved. sc is
+    /// unchanged (primitive == conventional). A singular/non-finite conversion
+    /// falls back to the canonical primitive route so export always works.
     static func defaultPath(cell: Cell, atoms: [SIMD3<Float>]) -> KPath {
-        classifyCubic(cell: cell, atoms: atoms).map { defaultPath(lattice: $0) }
-            ?? defaultPath(lattice: .sc)
+        guard let cubic = classifyCubic(cell: cell, atoms: atoms) else {
+            return defaultPath(lattice: .sc)
+        }
+        let primitive = defaultPath(lattice: cubic)
+        // sc: primitive and conventional reciprocal bases coincide.
+        guard cubic != .sc else { return primitive }
+
+        // Primitive direct basis from the classified centering, then its reciprocal.
+        let centering: LatticeCentering = (cubic == .fcc) ? .face : .body
+        let primDir = Lattice.primitiveDirect(centering: centering, cell)
+        let primRecip = Cell(a: primDir.a, b: primDir.b, c: primDir.c).reciprocalVectors
+        let convRecip = cell.reciprocalVectors
+
+        let converted = primitive.points.compactMap { kp -> KPoint? in
+            let cart = BrillouinZone.cartesianFromFractional(kp.frac, reciprocal: primRecip)
+            guard let f = BrillouinZone.fractionalFromCartesian(cart, reciprocal: convRecip) else { return nil }
+            return KPoint(f, kp.label)
+        }
+        // Drop no points: if any conversion failed, return the primitive route.
+        guard converted.count == primitive.points.count else { return primitive }
+        return KPath(points: converted, pointsPerSegment: primitive.pointsPerSegment)
     }
 }
 

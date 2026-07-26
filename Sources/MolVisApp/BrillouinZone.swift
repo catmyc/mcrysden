@@ -135,5 +135,136 @@ struct BrillouinZone {
     }
 }
 
+/// A single deterministic BZ landmark for the k-path editor: the fractional
+/// coordinate (conventional reciprocal basis, in `point.frac`), the BZ-space
+/// Cartesian coordinate it came from, and which kind of landmark it is.
+struct BZCandidate {
+    var point: KPoint
+    var cartesian: SIMD3<Float>
+    var type: BZPointType
+}
+
+extension BrillouinZone {
+    /// Fractional (in the given reciprocal basis) -> Cartesian reciprocal position.
+    static func cartesianFromFractional(_ frac: SIMD3<Float>,
+                                        reciprocal: (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>))
+        -> SIMD3<Float> {
+        reciprocal.a * frac.x + reciprocal.b * frac.y + reciprocal.c * frac.z
+    }
+
+    /// Cartesian -> fractional in the given reciprocal basis. Returns nil if the
+    /// basis is singular or the result is non-finite.
+    static func fractionalFromCartesian(_ cart: SIMD3<Float>,
+                                        reciprocal: (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>))
+        -> SIMD3<Float>? {
+        let m = simd_float3x3(columns: (reciprocal.a, reciprocal.b, reciprocal.c))
+        guard isFiniteInvertible(m) else { return nil }
+        let f = m.inverse * cart
+        guard f.x.isFinite && f.y.isFinite && f.z.isFinite else { return nil }
+        return f
+    }
+
+    /// Scale-relative invertibility test on a basis matrix. The dimensionless
+    /// ratio `|det(M)| / (|c0||c1||c2|)` is the signed volume of the
+    /// parallelepiped scaled to its enclosing rectangular box (bounded by 1); an
+    /// absolute `|det|` floor would wrongly reject valid tiny reciprocal zones
+    /// (huge real cells) and wrongly accept near-degenerate large ones. Require the
+    /// ratio to be well above machine epsilon, with all lengths finite and >0.
+    static func isFiniteInvertible(_ m: simd_float3x3, tol: Float = 1e-6) -> Bool {
+        let la = length(m.columns.0), lb = length(m.columns.1), lc = length(m.columns.2)
+        guard la.isFinite, lb.isFinite, lc.isFinite, la > 0, lb > 0, lc > 0 else { return false }
+        let det = m.determinant
+        return det.isFinite && abs(det) > tol * la * lb * lc
+    }
+
+    /// Deterministic BZ landmark candidates for the k-path editor: Gamma plus the
+    /// unique vertices, edge midpoints, and face centers, de-duplicated within a
+    /// scale-relative tolerance and labeled stably. Non-finite or singular
+    /// Cartesian→fractional conversions are dropped rather than trapped.
+    func candidates() -> [BZCandidate] {
+        let basis = (a: reciprocal.a, b: reciprocal.b, c: reciprocal.c)
+        func toFractional(_ p: SIMD3<Float>) -> SIMD3<Float>? {
+            Self.fractionalFromCartesian(p, reciprocal: basis)
+        }
+        // Scale-relative de-dup tolerance: a fraction of the BZ extent with only
+        // a tiny machine floor. A fixed floor would merge distinct landmarks of a
+        // tiny reciprocal zone (large real cell) and is unnecessary for big zones,
+        // where the relative term dominates.
+        var extent: Float = 0
+        for face in faces { for v in face { extent = max(extent, length(v)) } }
+        let tol = max(1e-5, extent * 5e-3)
+        func dedup(_ pts: [BZSpecialPoint]) -> [BZSpecialPoint] {
+            var out: [BZSpecialPoint] = []
+            for p in pts where !out.contains(where: { length($0.coord - p.coord) < tol }) {
+                out.append(p)
+            }
+            return out
+        }
+        // Deterministic finite-Float lexicographic order — no Float-to-Int cast, so
+        // arbitrarily large fractional values cannot trap.
+        func sorted(_ pts: [(SIMD3<Float>, SIMD3<Float>)]) -> [(SIMD3<Float>, SIMD3<Float>)] {
+            pts.sorted { a, b in
+                if a.1.x != b.1.x { return a.1.x < b.1.x }
+                if a.1.y != b.1.y { return a.1.y < b.1.y }
+                return a.1.z < b.1.z
+            }
+        }
+        var result: [BZCandidate] = []
+        // Gamma (center) first.
+        for sp in specialPoints where sp.type == .center {
+            if let f = toFractional(sp.coord) {
+                result.append(BZCandidate(point: KPoint(f, "\u{0393}"), cartesian: sp.coord, type: .center))
+            }
+        }
+        // Vertices, edge midpoints, face centers: de-dup, sort, then label 1..n.
+        func addGroup(_ type: BZPointType, _ prefix: String) {
+            let fracs = dedup(specialPoints.filter { $0.type == type })
+                .map { ($0.coord, toFractional($0.coord)) }
+                .compactMap { cart, f in f.map { (cart, $0) } }
+            for (i, (cart, f)) in sorted(fracs).enumerated() {
+                result.append(BZCandidate(point: KPoint(f, "\(prefix)\(i+1)"), cartesian: cart, type: type))
+            }
+        }
+        addGroup(.edge, "V")
+        addGroup(.line, "E")
+        addGroup(.polyface, "F")
+        return result
+    }
+}
+
+/// The shared BZ↔world mapping used by both picking (phase 2) and rendering
+/// (later). Built once from an already-constructed BrillouinZone plus the
+/// Scene, and reproduces the renderer's `drawBrillouinZone` mapping exactly.
+struct BZPresentation {
+    /// Scene centroid (the renderer's `sceneCentroid()`).
+    let center: SIMD3<Float>
+    /// World-units-per-BZ-unit scale = targetExtent / bzExtent.
+    let inv: Float
+    /// Conventional reciprocal vectors (Cartesian) for fractional -> Cartesian.
+    let reciprocal: (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>)
+
+    init(bz: BrillouinZone, scene: Scene) {
+        var extent: Float = 0
+        for face in bz.faces { for v in face { extent = max(extent, length(v)) } }
+        let (_, radius) = scene.boundingSphere()
+        let targetExtent = max(1.0, radius) * 0.45
+        self.center = scene.centroid
+        self.inv = extent > 1e-5 ? targetExtent / extent : 0
+        self.reciprocal = bz.reciprocal
+    }
+
+    /// Map a BZ-space Cartesian coordinate to its rendered world position.
+    func world(cartesian: SIMD3<Float>) -> SIMD3<Float> {
+        center + cartesian * inv
+    }
+
+    /// Map a fractional k-point (conventional reciprocal basis) to its rendered
+    /// world position, converting to Cartesian first.
+    func world(frac: SIMD3<Float>) -> SIMD3<Float> {
+        let cart = BrillouinZone.cartesianFromFractional(frac, reciprocal: reciprocal)
+        return center + cart * inv
+    }
+}
+
 private func length(_ v: SIMD3<Float>) -> Float { sqrt(dot(v, v)) }
 private func normalize(_ v: SIMD3<Float>) -> SIMD3<Float> { v / (length(v) + 1e-12) }

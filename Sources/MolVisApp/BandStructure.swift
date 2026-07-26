@@ -48,9 +48,20 @@ struct BandStructure: Codable {
     /// disconnected points (a mesh is not a band path and must not be connected).
     var isMesh: Bool = false
 
-    /// Number of bands (assume uniform across k-points).
-    var nBands: Int { kPoints.first?.energies.count ?? 0 }
+    /// Number of bands safely shared by every k-point. Parser-produced data is
+    /// uniform, but taking the minimum keeps a directly-constructed malformed
+    /// value from indexing past a shorter energy row in the graph exporter.
+    var nBands: Int { kPoints.map(\.energies.count).min() ?? 0 }
     var nKPoints: Int { kPoints.count }
+
+    /// The path grapher indexes channels as `spin * kPointsPerSpin + point`.
+    /// Validate that externally/directly constructed values satisfy that layout;
+    /// parser-produced structures always do.
+    var hasValidChannelLayout: Bool {
+        guard nSpin > 0, kPointsPerSpin > 0 else { return false }
+        let total = nSpin.multipliedReportingOverflow(by: kPointsPerSpin)
+        return !total.overflow && total.partialValue == kPoints.count
+    }
 
     /// Cumulative path distance for each k-point (x-axis of the band plot).
     ///
@@ -76,21 +87,20 @@ struct BandStructure: Codable {
         // each k-point for spin-up then spin-down, and we must not accumulate a
         // spurious step across the boundary between channels.
         let n = kPointsPerSpin
-        guard n > 0 else { return .init(repeating: 0, count: kPoints.count) }
+        guard hasValidChannelLayout else { return .init(repeating: 0, count: kPoints.count) }
         // First channel starts at 0; each subsequent channel restarts at 0 too.
         var d: [Float] = .init(repeating: 0, count: kPoints.count)
         for s in 0..<nSpin {
             let base = s * n
-            d[base] = 0   // explicit per-spin restart at 0 (relies on base being untouched)
-            for i in (base + 1)..<(base + n) {
-                let dk = kPoints[i].k - kPoints[i - 1].k
-                let step: Float
-                if let G {
-                    step = sqrt(simd_dot(dk, G * dk))
-                } else {
-                    step = sqrt(dot(dk, dk))
+            d[base] = 0
+            let end = base + n
+            if base + 1 < end {
+                for i in (base + 1)..<end {
+                    let dk = kPoints[i].k - kPoints[i - 1].k
+                    let squared = G.map { simd_dot(dk, $0 * dk) } ?? dot(dk, dk)
+                    let step = squared.isFinite ? sqrt(max(0, squared)) : 0
+                    d[i] = d[i - 1] + step
                 }
-                d[i] = d[i - 1] + step
             }
         }
         return d

@@ -253,6 +253,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
             scene.atomScale = restored.atomScale
             scene.bondRadius = restored.bondRadius
             scene.measurementMode = restored.measurementMode
+            // Carry the edited k-path across the frame rebuild exactly like the
+            // other appearance/control state (the route is geometry-independent).
+            scene.kPathPoints = restored.kPathPoints
             // A selection/measurement is only portable when EVERY saved index still
             // points at a real atom in the REBUILT frame (a different animation frame —
             // or a supercell/slab it predates — may shrink the atom count). Carry a
@@ -342,14 +345,18 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
 
     private func buildMenu() -> NSMenu {
         let main = NSMenu()
+        // macOS reserves the first top-level item for the application menu. Keep
+        // Quit there so the following item is displayed as an actual File menu.
+        let appItem = NSMenuItem(); main.addItem(appItem)
+        let appMenu = NSMenu(title: "mcrysden")
+        appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "Quit mcrysden", action: #selector(NSApp.terminate), keyEquivalent: "q")
         // File
-        let fileItem = NSMenuItem(); main.addItem(fileItem)
+        let fileItem = NSMenuItem(title: "File", action: nil, keyEquivalent: ""); main.addItem(fileItem)
         let file = NSMenu(title: "File")
         fileItem.submenu = file
         let openItem = file.addItem(withTitle: "Open\u{2026}", action: #selector(openDocument), keyEquivalent: "o")
         openItem.target = self
-        file.addItem(.separator())
-        file.addItem(withTitle: "Quit", action: #selector(NSApp.terminate), keyEquivalent: "q")
         // View
         let viewItem = NSMenuItem(); main.addItem(viewItem)
         let view = NSMenu(title: "View")
@@ -544,7 +551,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.15"
+    static let appVersion = "1.1.16"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

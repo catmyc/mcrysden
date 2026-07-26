@@ -19,8 +19,14 @@ final class BandGrapherView: NSView {
     override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext,
-              let bs = bandStructure, bs.nKPoints > 1, bs.nBands > 0
+        guard NSGraphicsContext.current?.cgContext != nil,
+              let bs = bandStructure, bs.nKPoints > 1, bs.nBands > 0,
+              bs.isMesh || bs.hasValidChannelLayout,
+              bs.kPoints.allSatisfy({ point in
+                  point.k.x.isFinite && point.k.y.isFinite && point.k.z.isFinite
+                      && point.energies.prefix(bs.nBands).allSatisfy(\.isFinite)
+              }),
+              bs.fermiEnergy?.isFinite ?? true
         else { drawEmpty(dirtyRect); return }
 
         NSColor.white.setFill()
@@ -30,6 +36,7 @@ final class BandGrapherView: NSView {
         let origin = NSPoint(x: margin.x, y: bounds.height - margin.y)
         let plotW = plot.x - origin.x
         let plotH = origin.y - plot.y
+        guard plotW > 0, plotH > 0 else { drawEmpty(dirtyRect); return }
 
         let distances = bs.kDistances
         let xMin = distances.first!, xMax = distances.last!

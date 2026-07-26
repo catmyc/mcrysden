@@ -35,6 +35,22 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// single-use). Nil for the empty opening viewer.
     private var sourceURL: URL?
     private var forcedFormat: ParseFormat?
+    /// Editor BZ cache. `BrillouinZone.build` is expensive (cubic in the G-star for
+    /// anisotropic cells), so the editor builds at most once per loaded/frame scene and
+    /// reuses the result across clicks — including a negative cache of a failed build.
+    /// The BZ is fully determined by `cell` + `baseAtoms`; supercell/slab edits preserve
+    /// both, so only a file/frame install (which can change the cell) invalidates via
+    /// `bzEpoch`. `epoch == -1` marks an unpopulated cache (freshly-built controllers).
+    private struct BZEditCache {
+        var epoch: Int = -1
+        var bz: BrillouinZone? = nil
+        var candidates: [BZCandidate] = []
+    }
+    private var bzEditCache = BZEditCache()
+    private var bzEpoch = 0
+    /// Test-only count of actual editor BZ builds (cache misses). Lets tests confirm
+    /// at-most-once-per-scene construction and invalidation on file/frame install.
+    internal var bzBuildCount = 0
     /// Repeating timer driving AXSF playback. Held weakly by the runloop; we
     /// recreate it on Play and invalidate on Pause/stop in `syncFromState`.
     private var playTimer: Timer?
@@ -122,6 +138,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onChange = { [weak self] in self?.syncFromState() }
         state.onResetView = { [weak self] in self?.resetView() }
         state.onExportKPath = { [weak self] path, format in self?.exportKPath(path, format) }
+        state.onResetKPath = { [weak self] in self?.resetKPathDefault() }
         canvas.delegate = renderer
         canvas.world = self
         renderer?.currentCamera = camera
@@ -145,7 +162,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         self.scene = scene
         self.sourceURL = url
         self.forcedFormat = format
+        bzEpoch += 1   // new scene: cell/baseAtoms may differ, rebuild the editor BZ
         state.syncFromScene(scene)
+        // syncFromScene exits edit mode (editKPathOnBZ -> false); mirror that into the
+        // renderer so a freshly-loaded scene can't leave stale landmark crosses drawn.
+        renderer?.showBZLandmarks = state.editKPathOnBZ
         applyCameraForNewSceneIfNeeded()
         // Graph data replaces the Metal canvas. DOS takes precedence if a loaded
         // scene ever contains both DOS and band data.
@@ -296,6 +317,110 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         return camera
     }
 
+    /// Project BZ-candidate world positions with the effective render camera and
+    /// pick the nearest *visible* candidate to `click`. Primary ordering is screen-space
+    /// distance (closest to the pointer wins); depth is only a tie-break for markers that
+    /// overlap on screen. Returns nil on a miss or any invalid input — never traps.
+    /// `click` and `viewport` are in top-origin pixels.
+    static func pickBZCandidate(
+        candidates: [BZCandidate],
+        presentation: BZPresentation,
+        camera: Camera,
+        viewport: SIMD2<Float>,
+        click: SIMD2<Float>,
+        radiusPx: Float = 10
+    ) -> BZCandidate? {
+        // Validate the query before doing any work: a positive finite radius, a positive
+        // finite viewport, and a finite click that actually falls inside the viewport.
+        guard radiusPx > 0, radiusPx.isFinite,
+              viewport.x > 0, viewport.y > 0,
+              viewport.x.isFinite, viewport.y.isFinite,
+              click.x.isFinite, click.y.isFinite,
+              click.x >= 0, click.x <= viewport.x,
+              click.y >= 0, click.y <= viewport.y else { return nil }
+        let aspect = viewport.x / viewport.y
+        guard aspect.isFinite, aspect > 0 else { return nil }
+        let view = camera.viewMatrix()
+        let proj = camera.projectionMatrix(aspect: aspect)
+        var best: BZCandidate?
+        var bestDist = Float.infinity        // best screen-space distance squared
+        var bestDepth = Float.infinity       // tie-break: nearest (smallest view -z)
+        let radiusSq = radiusPx * radiusPx
+        for cand in candidates {
+            let world = presentation.world(cartesian: cand.cartesian)
+            guard world.x.isFinite, world.y.isFinite, world.z.isFinite else { continue }
+            let worldPos = SIMD4<Float>(world.x, world.y, world.z, 1)
+            let viewPos = view * worldPos
+            let depth = -viewPos.z           // positive into screen (Metal: -z forward)
+            guard depth > 0.01 else { continue }   // behind camera
+            let clip = proj * viewPos
+            guard clip.x.isFinite, clip.y.isFinite, clip.z.isFinite, clip.w.isFinite,
+                  abs(clip.w) > 1e-10 else { continue }
+            let ndc = clip / clip.w
+            guard ndc.x.isFinite, ndc.y.isFinite, ndc.z.isFinite else { continue }
+            // Reject landmarks outside the visible frustum (Metal NDC xy in [-1,1], z in [0,1]).
+            guard ndc.x >= -1, ndc.x <= 1, ndc.y >= -1, ndc.y <= 1,
+                  ndc.z >= 0, ndc.z <= 1 else { continue }
+            let sx = (ndc.x * 0.5 + 0.5) * viewport.x
+            let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * viewport.y   // top-origin
+            let dx = sx - click.x, dy = sy - click.y
+            let dist = dx * dx + dy * dy
+            guard dist <= radiusSq else { continue }
+            // Closer on screen wins; an actual/near screen-distance tie goes to depth.
+            if dist < bestDist - 1e-3 || (dist <= bestDist + 1e-3 && depth < bestDepth) {
+                bestDist = dist; bestDepth = depth; best = cand
+            }
+        }
+        return best
+    }
+
+    /// Returns the editor's cached BZ candidates plus a BZPresentation, building the BZ at
+    /// most once per `bzEpoch` (and caching a failed build as nil candidates). A fresh or
+    /// invalidated cache builds lazily on first use; repeated clicks within the same
+    /// loaded/frame scene reuse the result. Returns nil presentation when there is no cell
+    /// or the build failed.
+    private func editorLandmarks() -> (candidates: [BZCandidate], presentation: BZPresentation?) {
+        if bzEditCache.epoch != bzEpoch {
+            bzEditCache.epoch = bzEpoch
+            if let cell = scene.cell {
+                let bz = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms)
+                bzEditCache.bz = bz
+                bzEditCache.candidates = bz?.candidates() ?? []
+            } else {
+                bzEditCache.bz = nil
+                bzEditCache.candidates = []
+            }
+            bzBuildCount += 1
+        }
+        guard let bz = bzEditCache.bz else { return (bzEditCache.candidates, nil) }
+        return (bzEditCache.candidates, BZPresentation(bz: bz, scene: scene))
+    }
+
+    /// Reciprocal k-path edit click handler. Edit mode OFF → returns false (not
+    /// consumed) so atom picking proceeds. Edit mode ON → always consumed (so atom
+    /// selection never fires); builds the BZ (cached per loaded/frame scene), maps
+    /// candidates with BZPresentation, appends the picked landmark unless it exactly
+    /// repeats the current last node, enforces the 1024 cap, and syncs state+scene +
+    /// requests a render.
+    func handleReciprocalPathClick(at click: SIMD2<Float>, viewport: SIMD2<Float>) -> Bool {
+        guard state.editKPathOnBZ else { return false }
+        // Consume the click even on a miss so atom selection never occurs.
+        let (candidates, presentation) = editorLandmarks()
+        guard let presentation else {
+            setNeedsRender()
+            return true
+        }
+        let cam = renderCamera()
+        if let cand = Self.pickBZCandidate(candidates: candidates, presentation: presentation,
+                                           camera: cam, viewport: viewport, click: click) {
+            state.append(cand.point)
+        }
+        // Push the (possibly edited) route into the scene and re-render.
+        scene.kPathPoints = state.kPathPoints
+        setNeedsRender()
+        return true
+    }
+
     /// Toggle selection of `index`.  While a measurement result is locked the
     /// selection is frozen.  Otherwise clicking an atom toggles it; when the
     /// selection reaches the active mode's atom cap the measurement is computed
@@ -331,7 +456,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         guard scene.measurementMode != .none else { return }
         let cap = scene.measurementMode.selectionCap
         let sel = scene.selectedAtoms
-        guard sel.count == cap, sel.allSatisfy({ $0 < scene.atoms.count }) else {
+        guard sel.count == cap, sel.allSatisfy({ $0 >= 0 && $0 < scene.atoms.count }) else {
             // Not enough atoms — clear any stale lock so the user keeps picking.
             scene.measurementResult = nil
             return
@@ -520,6 +645,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         isSyncingState = true
         defer { isSyncingState = false }
 
+        // k-path edit mode needs the BZ visible. Force it on BEFORE the state->scene
+        // pushes below, so the scene receives true (we're inside the isSyncingState
+        // guard, so the onChange from this assignment returns early at the guard).
+        if state.editKPathOnBZ, !state.showBrillouinZone {
+            state.showBrillouinZone = true
+        }
+        // White BZ-landmark crosses draw only while editing the k-path on the BZ;
+        // the renderer keeps this non-persisted toggle in sync with the sidebar.
+        renderer?.showBZLandmarks = state.editKPathOnBZ
+        // k-path editing requires an orbitable 3D camera: in a 2D display mode the
+        // renderer forces identity rotation + orthographic, so drag-to-orbit would show
+        // no visible effect. On entering edit mode from a 2D mode, switch to ballStick so
+        // the existing 2D<->3D reframe logic below restores a sensible 3D view.
+        if state.editKPathOnBZ, state.displayMode.is2D {
+            state.displayMode = .ballStick
+        }
+
         let previousMode = scene.displayMode
         scene.displayMode = state.displayMode
         scene.atomScale = state.atomScale
@@ -568,9 +710,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Scene-derived mirrors flow state <- scene purely to keep the sidebar
         // indicators in sync; guarded above against re-entrant onChange.
         state.isCrystal = scene.isCrystal
-        // Default high-symmetry k-path for the active crystal (crystal only).
-        // Regenerates when the scene changes so it always matches the structure.
-        state.kPathPoints = Self.makeDefaultKPath(for: scene)
+        // k-path: the edited route lives in the sidebar state; push it into the
+        // scene (never regenerate, or a sidebar sync would clobber user edits).
+        scene.kPathPoints = state.kPathPoints
         // lighting + background — the renderer currently uses a fixed shader and
         // solid clear color (the richer shader is owned by another agent); we
         // mirror state into the scene here so the values persist via StateStore
@@ -624,6 +766,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     static func makeDefaultKPath(for scene: Scene) -> [KPoint] {
         guard let cell = scene.cell else { return [] }
         return KPath.defaultPath(cell: cell, atoms: scene.baseAtoms.map { $0.coord }).points
+    }
+
+    /// "Default" control: reinstall the generated high-symmetry route for the
+    /// current scene (wired via `state.onResetKPath`).
+    private func resetKPathDefault() {
+        state.kPathPoints = Self.makeDefaultKPath(for: scene)
     }
 
     /// Present a save panel and write the k-path text for the chosen format.
@@ -697,6 +845,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showLabels = scene.showLabels
         next.showStructure = scene.showStructure
         next.showBrillouinZone = scene.showBrillouinZone
+        // Carry the live k-path through the frame reload so scrubbing an animated
+        // crystal never resets the route the user is editing.
+        next.kPathPoints = scene.kPathPoints
         // Volumetric-surface settings: without these, scrubbing an animated scalar
         // field or Fermi surface resets the iso level / visibility to defaults.
         next.showIsoSurface = scene.showIsoSurface
@@ -778,6 +929,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         // ---- end of held-guard transaction ----
         self.scene = next
+        bzEpoch += 1   // freshly parsed frame: cell/baseAtoms may differ, rebuild the editor BZ
         setNeedsRender()
     }
 
@@ -822,13 +974,18 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Select exactly one viewport layer. Keeping the graph views as siblings of
     /// Metal avoids overlapping plots and avoids hiding a graph with its parent.
     private func updateContentVisibility() {
-        let showDOS = scene.densityOfStates != nil
-        let showBands = !showDOS && scene.bandStructure != nil
-        let showPlane = !showDOS && !showBands && state.showColorPlane && scene.grid2D != nil
+        // k-path edit mode needs the Metal canvas (the BZ is rendered there); suppress
+        // every graph/color-plane sibling so the editor is usable even on a crystal that
+        // also carries band/DOS/grid data. Exiting edit mode falls through to the normal
+        // precedence below.
+        let editingReciprocal = state.editKPathOnBZ && scene.isCrystal
+        let showDOS = !editingReciprocal && scene.densityOfStates != nil
+        let showBands = !editingReciprocal && !showDOS && scene.bandStructure != nil
+        let showPlane = !editingReciprocal && !showDOS && !showBands && state.showColorPlane && scene.grid2D != nil
         dosGrapher.isHidden = !showDOS
         bandGrapher.isHidden = !showBands
         colorPlane.isHidden = !showPlane
-        canvas.isHidden = showDOS || showBands || showPlane
+        canvas.isHidden = !editingReciprocal && (showDOS || showBands || showPlane)
         if showDOS { dosGrapher.needsDisplay = true }
         if showBands { bandGrapher.needsDisplay = true }
         if showPlane { colorPlane.needsDisplay = true }

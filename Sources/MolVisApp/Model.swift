@@ -196,6 +196,11 @@ struct Scene: Codable {
     /// Multiplier converting a force (eV/Å) to an arrow length (Å) so typical
     /// forces (0.01–1 eV/Å) span a few Å and read clearly. Sidebar-adjustable.
     var forceScale: Float = 50.0
+    /// The user-edited reciprocal-space k-path: an ordered list of special
+    /// k-points (fractional, conventional reciprocal basis) connecting BZ
+    /// landmarks. Empty for non-crystal scenes; for crystals it defaults to the
+    /// generated high-symmetry path (see Scene.init) until the user edits it.
+    var kPathPoints: [KPoint] = []
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

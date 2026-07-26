@@ -46,6 +46,12 @@ enum StateStore {
             "azimuth": scene.lighting.azimuth, "elevation": scene.lighting.elevation,
         ]
         payload["currentFrame"] = scene.currentFrame
+        // k-path: persist each point's fractional coords + label. Capped at load
+        // time; here we just serialize what the scene holds (already bounded by
+        // the editor, but keep the array compact for the flat format).
+        payload["kPathPoints"] = scene.kPathPoints.map { kp in
+            ["frac": [kp.frac.x, kp.frac.y, kp.frac.z], "label": kp.label]
+        }
         if let camera {
             payload["camera"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(camera))
         }
@@ -191,6 +197,45 @@ enum StateStore {
             candidate.lighting = l
         }
         if let v = obj["currentFrame"] as? Int { candidate.currentFrame = v }
+        // k-path (optional). An explicit [] clears the route; an absent key leaves
+        // the scene default (set at parse time). A present key that is NOT an array
+        // of {frac, label} dictionaries throws a path-bearing ParseError (so a
+        // corrupt value is never silently ignored). Validate a practical cap, finite
+        // Float-representable coordinates, and bounded labels — a malformed entry
+        // also throws (the transactional rollback below keeps the caller's scene
+        // intact).
+        if let value = obj["kPathPoints"] {
+            guard let arr = value as? [[String: Any]] else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "kPathPoints must be an array of {frac, label} dictionaries")
+            }
+            let cap = 1024
+            guard arr.count <= cap else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "kPathPoints count \(arr.count) exceeds cap \(cap)")
+            }
+            var points: [KPoint] = []
+            points.reserveCapacity(arr.count)
+            for (i, item) in arr.enumerated() {
+                guard let frac = item["frac"] as? [Double], frac.count == 3,
+                      let label = item["label"] as? String else {
+                    throw ParseError.parse(path: url.path, line: 0, reason: "malformed kPathPoints[\(i)]")
+                }
+                let fx = Float(frac[0]), fy = Float(frac[1]), fz = Float(frac[2])
+                guard frac[0].isFinite, frac[1].isFinite, frac[2].isFinite,
+                      fx.isFinite, fy.isFinite, fz.isFinite else {
+                    throw ParseError.parse(path: url.path, line: 0, reason: "non-finite kPathPoints[\(i)]")
+                }
+                // Reject overlong labels (don't silently truncate — that would
+                // mutate persisted data without the user's knowledge).
+                guard label.count <= 64 else {
+                    throw ParseError.parse(path: url.path, line: 0,
+                                           reason: "kPathPoints[\(i)] label too long (\(label.count) > 64)")
+                }
+                points.append(KPoint(SIMD3<Float>(fx, fy, fz), label))
+            }
+            candidate.kPathPoints = points
+        }
         // camera (optional). Wrap a malformed subtree as a path-bearing
         // ParseError (transactional rollback is preserved: scene/camera are only
         // committed at the end, so a throw here leaves the caller's state intact).

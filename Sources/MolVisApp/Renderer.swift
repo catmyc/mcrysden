@@ -40,6 +40,17 @@ final class Renderer: NSObject {
 
     private let overlayDepthState: MTLDepthStencilState?
     private let depthStencilState: MTLDepthStencilState?
+    /// Depth state for the BZ k-path route overlay: less-than-or-equal compare with
+    /// DEPTH WRITES DISABLED. Route segments/nodes share the BZ landmarks' depth, so
+    /// a strict `.less` compare can drop equal-depth route fragments behind the white
+    /// landmarks drawn moments earlier. `.lessEqual` lets the selected route overlay
+    /// those coincident lines while still respecting scene occlusion (unlike
+    /// `.always`). Switched in only while drawing the route overlay; the main
+    /// depthStencilState is restored immediately after so isosurfaces/Fermi surfaces
+    /// keep their existing depth behavior. Required: the route overlay cannot render
+    /// without it, so init fails (throws) if the device cannot create it rather than
+    /// silently leaving the route invisible.
+    private let routeDepthState: MTLDepthStencilState
     private var lastW: Int = 0, lastH: Int = 0    // viewport size from last encode()
     private let sphereMesh: Mesh
     private let cylinderMesh: Mesh
@@ -69,7 +80,22 @@ final class Renderer: NSObject {
     private var cachedBZ: BrillouinZone?
     private var bzBuilt = false          // true once build() has run (even if it returned nil)
     private(set) var bzRebuildCount = 0
-    private func invalidateBrillouinZoneCache() { cachedBZ = nil; bzBuilt = false }
+    // Landmark candidates derived from the cached BZ. `bz.candidates()` does scale
+    // conversion, O(n²) de-duplication, sorting and labelling — far cheaper than the
+    // BZ build but still worth computing ONCE per cached BZ, not every frame. Nil
+    // until the first build; an empty list negative-caches a nil BZ. Route-only
+    // scene changes leave this untouched (invalidation keys on cell/baseAtoms).
+    private var cachedCandidates: [BZCandidate]?
+    private(set) var bzCandidateComputeCount = 0
+    // Large white BZ-landmark crosses are clutter on the inactive overlay, so they
+    // draw only while the user is editing the k-path on the BZ (kept in sync with
+    // SideBarState.editKPathOnBZ by MainWindowController.syncFromState). Non-persisted:
+    // a pure render toggle, not part of Scene. Defaults off.
+    var showBZLandmarks = false
+    private func invalidateBrillouinZoneCache() {
+        cachedBZ = nil; bzBuilt = false
+        cachedCandidates = nil
+    }
 
     // Isosurface cache. Marching cubes over a large grid is comparable in cost to
     // the BZ build (cubic in the sample counts); the result depends only on the
@@ -396,6 +422,12 @@ final class Renderer: NSObject {
         self.quadVB = qvb
         self.overlayDepthState = Renderer.makeOverlayDepthState(device: device)
         self.depthStencilState = Renderer.makeDepthStencilState(device: device)
+        // The route overlay cannot render without this state, so fail init (rather
+        // than silently leaving the route invisible) if the device rejects it.
+        guard let routeDepthState = Renderer.makeRouteDepthState(device: device) else {
+            throw RenderError.makeBuffer
+        }
+        self.routeDepthState = routeDepthState
     }
 
     /// Depth state for the orientation gizmo: always pass, never write, so the
@@ -1019,6 +1051,17 @@ final class Renderer: NSObject {
     }
 
     @discardableResult
+    /// Endpoints of a 3-axis cross (three orthogonal line segments of half-length
+    /// `half`) centered at `world`. The segments lie along the world x/y/z axes so
+    /// the cross reads correctly from any viewpoint. Returns [] for a non-finite
+    /// center so callers never hand the line pipeline a garbage position.
+    static func crossLineSegments(_ world: SIMD3<Float>, half: Float) -> [SIMD3<Float>] {
+        guard world.x.isFinite && world.y.isFinite && world.z.isFinite else { return [] }
+        guard half.isFinite, half > 0 else { return [] }
+        let ax = SIMD3<Float>(half, 0, 0), ay = SIMD3<Float>(0, half, 0), az = SIMD3<Float>(0, 0, half)
+        return [world - ax, world + ax, world - ay, world + ay, world - az, world + az]
+    }
+
     private func drawLineBuffer(_ verts: [SIMD3<Float>], color: SIMD3<Float>,
                                 enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
         guard let lineVB = device.makeBuffer(bytes: verts,
@@ -1048,37 +1091,100 @@ final class Renderer: NSObject {
             cachedBZ = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms)
             bzBuilt = true
             bzRebuildCount += 1
+            // Compute the (static) landmark candidates once per cached BZ and reuse
+            // them across frames; an empty list negative-caches a nil build.
+            cachedCandidates = cachedBZ?.candidates() ?? []
+            bzCandidateComputeCount += 1
         }
         guard let bz = cachedBZ else { return true }
-        var extent: Float = 0
-        for face in bz.faces { for v in face { extent = max(extent, length(v)) } }
-        guard extent > 1e-5 else { return true }
-        let (_, radius) = scene.boundingSphere()
-        let targetExtent = max(1.0, radius) * 0.45
-        let inv = targetExtent / extent
-        let center = sceneCentroid()
+        // cachedCandidates is guaranteed non-nil here: a nil BZ is caught above and
+        // negative-caches an empty list, while a non-nil BZ caches its candidates.
+        let candidates = cachedCandidates ?? []
+        let pres = BZPresentation(bz: bz, scene: scene)
+        // inv==0 (degenerate BZ, extent <= 1e-5) collapses every mapped point onto
+        // the scene center; guard against a non-finite or zero scale so a malformed
+        // BZ is skipped rather than drawing a degenerate blob at the origin.
+        guard pres.inv.isFinite, pres.inv > 0 else { return true }
+        // Displayed BZ half-extent in world units (= targetExtent). Marker arms scale
+        // with it so they stay visible as the scene is zoomed; the floor keeps a
+        // tiny reciprocal zone's landmarks from collapsing to sub-pixel specks.
+        let displayedHalfExtent = max(1.0, scene.boundingSphere().1) * 0.45
+        guard displayedHalfExtent > 1e-5 else { return true }
         let bzColor = SIMD3<Float>(0.85, 0.30, 0.95)
-        // Batch the face wireframe (purple) in one buffer, then the special-point
-        // crosses (white) in another — they differ in color, so they must be drawn
-        // through separate line passes.
+        let landmarkHalf = max(0.06, displayedHalfExtent * 0.10)   // white BZ landmark crosses
+        let routeNodeHalf = max(0.10, displayedHalfExtent * 0.16)  // larger cyan k-path nodes
+
+        // Face wireframe (purple) — the static BZ geometry, drawn first.
         var faceSegs: [SIMD3<Float>] = []
         for face in bz.faces {
-            let mapped = face.map { center + $0 * inv }
+            let mapped = face.map { pres.world(cartesian: $0) }
             for i in 0..<mapped.count {
                 faceSegs.append(mapped[i])
                 faceSegs.append(mapped[(i + 1) % mapped.count])
             }
         }
         let faceOK = faceSegs.isEmpty ? true : drawLineBuffer(faceSegs, color: bzColor, enc: enc, frameBuffer: frameBuffer)
-        var spSegs: [SIMD3<Float>] = []
-        for sp in bz.specialPoints where sp.type != .center {
-            let p = center + sp.coord * inv
-            let d: Float = 0.012
-            spSegs.append(p - SIMD3(d,0,0)); spSegs.append(p + SIMD3(d,0,0))
-            spSegs.append(p - SIMD3(0,d,0)); spSegs.append(p + SIMD3(0,d,0))
+
+        // De-duplicated landmarks (white 3-axis crosses), including Gamma. The
+        // candidate list is computed once per cached BZ (see bzCandidateComputeCount);
+        // each maps its BZ-space Cartesian coordinate through the shared presentation,
+        // and non-finite positions are skipped by the cross helper. Hidden unless the
+        // user is editing the k-path on the BZ (showBZLandmarks), so the inactive
+        // overlay stays uncluttered.
+        var landmarkSegs: [SIMD3<Float>] = []
+        if showBZLandmarks {
+            for cand in candidates {
+                landmarkSegs.append(contentsOf: Renderer.crossLineSegments(pres.world(cartesian: cand.cartesian), half: landmarkHalf))
+            }
         }
-        let spOK = spSegs.isEmpty ? true : drawLineBuffer(spSegs, color: SIMD3(1,1,1), enc: enc, frameBuffer: frameBuffer)
-        return faceOK && spOK
+        let landmarkOK = landmarkSegs.isEmpty ? true : drawLineBuffer(landmarkSegs, color: SIMD3(1, 1, 1), enc: enc, frameBuffer: frameBuffer)
+
+        // k-path route overlay: amber segments between consecutive valid nodes, and a
+        // larger cyan 3-axis cross at every valid node. Drawn on top of the landmarks
+        // with a `.lessEqual`/no-write depth state so equal-depth route fragments are
+        // not dropped behind the white landmarks drawn a moment earlier.
+        // Switch to the less-equal/no-write state for the route overlay so its
+        // equal-depth fragments aren't dropped behind the landmarks drawn above,
+        // then restore the authoritative state for subsequent passes.
+        enc.setDepthStencilState(routeDepthState)
+        let routeOK = drawKPathRoute(pres: pres, routeNodeHalf: routeNodeHalf, enc: enc, frameBuffer: frameBuffer)
+        if let depthStencilState { enc.setDepthStencilState(depthStencilState) }
+
+        return faceOK && landmarkOK && routeOK
+    }
+
+    /// Draw `scene.kPathPoints` as an amber polyline (one segment per consecutive
+    /// pair of VALID nodes) plus a larger cyan 3-axis cross at each valid node.
+    /// Non-finite nodes are skipped without failing the frame and never bridge a
+    /// segment, and the route is capped at 1024 points. Empty routes draw nothing;
+    /// a one-point route draws only its node cross.
+    @discardableResult
+    private func drawKPathRoute(pres: BZPresentation, routeNodeHalf: Float,
+                                enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        let pts = Array(scene.kPathPoints.prefix(1024))
+        // Map each node once; track which map to a finite world position.
+        let mapped = pts.map { pres.world(frac: $0.frac) }
+        let valid = mapped.map { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }
+
+        var segVerts: [SIMD3<Float>] = []
+        for i in 0..<mapped.count {
+            // A segment joins i and i+1 only when BOTH map validly — this is what
+            // prevents an invalid point from bridging its valid neighbours.
+            if i + 1 < mapped.count, valid[i], valid[i + 1] {
+                segVerts.append(mapped[i])
+                segVerts.append(mapped[i + 1])
+            }
+        }
+        let amber = SIMD3<Float>(1.0, 0.55, 0.1)
+        let segOK = segVerts.isEmpty ? true : drawLineBuffer(segVerts, color: amber, enc: enc, frameBuffer: frameBuffer)
+
+        var nodeVerts: [SIMD3<Float>] = []
+        for i in 0..<mapped.count where valid[i] {
+            nodeVerts.append(contentsOf: Renderer.crossLineSegments(mapped[i], half: routeNodeHalf))
+        }
+        let cyan = SIMD3<Float>(0.2, 0.8, 1.0)
+        let nodeOK = nodeVerts.isEmpty ? true : drawLineBuffer(nodeVerts, color: cyan, enc: enc, frameBuffer: frameBuffer)
+        return segOK && nodeOK
     }
 
     // MARK: - Isosurface
@@ -1359,6 +1465,17 @@ final class Renderer: NSObject {
         let d = MTLDepthStencilDescriptor()
         d.depthCompareFunction = .less
         d.isDepthWriteEnabled = true
+        return device.makeDepthStencilState(descriptor: d)
+    }
+
+    /// Depth state for the BZ k-path route overlay. `.lessEqual` compare (route
+    /// geometry shares the landmarks' depth, so strict `.less` would drop it) with
+    /// depth writes disabled (the scene's depth buffer — written by structure/faces —
+    /// must remain authoritative so the route still occludes/is-occluded correctly).
+    private static func makeRouteDepthState(device: MTLDevice) -> MTLDepthStencilState? {
+        let d = MTLDepthStencilDescriptor()
+        d.depthCompareFunction = .lessEqual
+        d.isDepthWriteEnabled = false
         return device.makeDepthStencilState(descriptor: d)
     }
 

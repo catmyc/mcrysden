@@ -52,6 +52,30 @@ final class WholeCodeReviewTests: XCTestCase {
         XCTAssertEqual(KPathExport.issMultiplier(nonfinite, maxDen: Int.min), 1)
     }
 
+    func testMeasurementRejectsBadIndicesAndDegenerateGeometry() {
+        let atoms = [
+            Atom(coord: .zero, atomicNumber: 1, label: "H"),
+            Atom(coord: .zero, atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3<Float>(1, 0, 0), atomicNumber: 1, label: "H"),
+        ]
+        XCTAssertNil(Scene.computeMeasurement(mode: .distance, atoms: atoms, selected: [-1, 0]))
+        XCTAssertNil(Scene.computeMeasurement(mode: .angle, atoms: atoms, selected: [0, 1, 2]))
+        XCTAssertNil(Scene.computeMeasurement(mode: .dihedral, atoms: atoms, selected: [0, 1, 2]))
+    }
+
+    func testMalformedBandLayoutAndJaggedRowsDegradeSafely() {
+        let points = [
+            BandKPoint(k: .zero, weight: 1, label: "", energies: [1, 2]),
+            BandKPoint(k: SIMD3<Float>(1, 0, 0), weight: 1, label: "", energies: []),
+        ]
+        let malformed = BandStructure(kPoints: points, fermiEnergy: nil,
+                                      nSpin: Int.max, reciprocal: nil,
+                                      kPointsPerSpin: Int.max, isMesh: false)
+        XCTAssertFalse(malformed.hasValidChannelLayout)
+        XCTAssertEqual(malformed.nBands, 0)
+        XCTAssertEqual(malformed.kDistances, [0, 0])
+    }
+
     func testBandParserRejectsNonfiniteKPointRatherThanEnteringMeshMath() {
         let text = """
         number of k points= 2

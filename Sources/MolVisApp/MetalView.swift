@@ -14,6 +14,11 @@ protocol World: AnyObject {
     /// Adjust slab plane A distance by `delta` (right-drag): applies the new
     /// slab so atoms are actually filtered, instead of mutating a bare field.
     func adjustSlabPlaneA(by delta: Float)
+    /// Handle a click in reciprocal k-path edit mode. `click` is the pointer in
+    /// top-origin pixel coordinates; `viewport` is the drawable size in pixels.
+    /// Returns true if the click was consumed — when it was, the caller must skip
+    /// atom hit-testing so selection never fires while editing the route.
+    func handleReciprocalPathClick(at click: SIMD2<Float>, viewport: SIMD2<Float>) -> Bool
 }
 
 final class MetalView: MTKView {
@@ -109,20 +114,32 @@ final class MetalView: MTKView {
         mouseDownPos = nil
         guard dist < 5 else { return }   // a drag, not a click
 
+        let cw = bounds.width, ch = bounds.height
+        guard cw > 1, ch > 1 else { return }   // needs a drawable pixel area
+        // up.y is bottom-origin (AppKit); px/sy below are top-origin, so flip.
+        let px = Float(up.x), py = Float(ch) - Float(up.y)
+
+        // Reciprocal k-path edit mode (phase 2): offer the click to the BZ path
+        // handler BEFORE atom picking and BEFORE the atom-pick eligibility guard. The
+        // BZ editor must work even with the structure hidden or atoms empty (a user
+        // may focus on the BZ then), and in edit mode every click is consumed (so atom
+        // selection never occurs), whether or not it hits a landmark.
+        let click = SIMD2<Float>(px, py)
+        let viewport = SIMD2<Float>(Float(cw), Float(ch))
+        if world?.handleReciprocalPathClick(at: click, viewport: viewport) == true {
+            return
+        }
+
         // Project each atom to screen accounting for its on-screen radius AND
         // depth: the click must land inside the rendered disk, and among
         // overlapping atoms the closest to the camera wins. Hidden/empty
         // structures are not pickable (matches the renderer's visibility gate).
         guard let s = world?.scene, MetalView.hitTestEnabled(scene: s) else { return }
-        let cw = bounds.width, ch = bounds.height
-        guard cw > 1, ch > 1 else { return }   // needs a drawable pixel area
         // Use the renderer's effective camera so the hit test matches the
         // rendered image exactly (2D modes force identity rotation + ortho).
         let cam = world!.renderCamera()
         let view = cam.viewMatrix()
         let proj = cam.projectionMatrix(aspect: Float(cw / ch))
-        // up.y is bottom-origin (AppKit); sy/oy below are top-origin, so flip.
-        let px = Float(up.x), py = Float(ch) - Float(up.y)
 
         var bestIdx = -1
         var bestDepth = Float.infinity      // prefer nearest (smallest view -z)
