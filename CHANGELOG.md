@@ -4,6 +4,20 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-07-28
+
+### Added
+- Added File > Revert To Saved, File > Open Recent submenu (standard NSDocumentController recents with Clear), reopen-last-file on launch (UserDefaults-backed with empty-viewer fallback), and drag-and-drop file loading onto the viewer.
+- Added a standard Edit menu (Undo/Redo/Cut/Copy/Paste/Select All routed to first responder) with Copy Current View to clipboard.
+- Added collapsible, remembered sidebar sections across all 12 major sections (persisted independently in UserDefaults).
+
+### Changed
+- Drag-and-drop parsing now runs off the main thread with generation-ordered install and directory rejection.
+- Edit menu follows standard macOS ordering (File, Edit, View).
+
+### Tests
+- Added focused tests for revert/recents/drag-drop recovery, copy-clipboard lifecycle, and sidebar collapse persistence. Suite now at 611 tests.
+
 ## [1.1.20] — 2026-07-27
 
 ### Added

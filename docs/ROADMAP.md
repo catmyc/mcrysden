@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-27 (v1.1.20 VASP KPOINTS export implemented)**.
+Last updated: **2026-07-28 (v1.2.0 workflow features: revert, recents, drag-drop, edit menu, clipboard, collapsible sidebar)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -80,9 +80,12 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 
 ### Workflow and application integration
 - [x] GUI Save State As and File-menu Export (v1.1.17).
-- [ ] Revert, recent files, reopen last file, drag-and-drop, file watching, and multiple structure windows.
-- [ ] Configurable image dimensions/background/transparency/anti-aliasing, and copy-current-view to clipboard.
-- [ ] Standard Edit menu with undo/redo, collapsible remembered sidebar sections, and a command palette.
+- [x] Revert To Saved, Open Recent, reopen-last-file on launch, and drag-and-drop file loading (v1.2.0).
+- [x] Copy-current-view to clipboard and standard Edit menu (v1.2.0).
+- [x] Collapsible remembered sidebar sections (v1.2.0).
+- [ ] File watching and multiple structure windows.
+- [ ] Configurable image dimensions/background/transparency/anti-aliasing.
+- [ ] Command palette.
 
 ### Reciprocal space and k-paths
 - [x] Per-component sampling budgets and disconnected path components.
