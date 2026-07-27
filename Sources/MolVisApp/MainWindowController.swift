@@ -51,6 +51,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Test-only count of actual editor BZ builds (cache misses). Lets tests confirm
     /// at-most-once-per-scene construction and invalidation on file/frame install.
     internal var bzBuildCount = 0
+    /// Monotonic generation counter so out-of-order background drop loads never
+    /// overwrite a later-scrubbed or more recent load. Incremented at each
+    /// loadFile / loadDroppedFile entry; the capture before async work gates install.
+    private var loadGeneration = 0
     /// Repeating timer driving AXSF playback. Held weakly by the runloop; we
     /// recreate it on Play and invalidate on Pause/stop in `syncFromState`.
     private var playTimer: Timer?
@@ -172,9 +176,16 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// source URL/format so AXSF animation can re-parse individual frames, and
     /// populates the animation controls (frameCount > 1 => show playback).
     func loadFile(_ scene: Scene, from url: URL? = nil, format: ParseFormat? = nil, frameIndex: Int = 0) {
+        loadGeneration += 1   // cancel any pending background drop loads
         self.scene = scene
         self.sourceURL = url
         self.forcedFormat = format
+        if let url {
+            // Record in the standard recent-documents list and persist the path so
+            // the file can be reopened on the next launch when no CLI input is given.
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
+            UserDefaults.standard.set(url.path, forKey: App.lastOpenedURLKey)
+        }
         bzEpoch += 1   // new scene: cell/baseAtoms may differ, rebuild the editor BZ
         state.syncFromScene(scene)
         // syncFromScene exits edit mode (editKPathOnBZ -> false); mirror that into the
@@ -224,6 +235,40 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         setNeedsRender()
     }
 
+    /// File > Revert To Saved: re-read the current source file (with the same
+    /// forced format, if any) and reload it, exactly as Open does. No-op when no
+    /// file is loaded.
+    func revertToSource() {
+        guard let url = sourceURL else { return }
+        do {
+            let scene = Scene(loaded: try Parser.load(url, as: forcedFormat))
+            loadFile(scene, from: url, format: forcedFormat, frameIndex: 0)
+        } catch {
+            print("[mcrysden] revert failed: \(error)")
+        }
+    }
+
+    /// Parse and load a structure file dropped onto the viewer (drag-and-drop).
+    /// Mirrors the Open workflow: parse, load, non-fatal console error on failure.
+    /// Parsing runs off the main thread so a large structure never blocks the drag
+    /// session; a generation counter guards against out-of-order async completion.
+    func loadDroppedFile(_ url: URL) {
+        loadGeneration += 1
+        let gen = loadGeneration
+        let capturedURL = url
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let scene = Scene(loaded: try Parser.load(capturedURL))
+                Task { @MainActor in
+                    guard let self, self.loadGeneration == gen else { return }
+                    self.loadFile(scene, from: capturedURL, format: nil, frameIndex: 0)
+                }
+            } catch {
+                print("[mcrysden] drop open failed: \(error)")
+            }
+        }
+    }
+
     private func layoutSplit() {
         // Horizontal split: sidebar | viewport. The viewport owns sibling canvas,
         // band, DOS, and color-plane layers so hiding Metal never hides a graph.
@@ -232,6 +277,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         split.addArrangedSubview(sidebar)
         split.addArrangedSubview(viewport)
         window.contentView = split
+        // Register the content view for file drags so a structure file dropped
+        // onto the viewer is parsed and loaded (NSDraggingDestination below).
+        split.registerForDraggedTypes([.fileURL, .string])
         // Set the 1:4 sidebar‑to‑canvas ratio after the split is in the window
         // so the position isn't ignored by an unplaced view.
         split.setPosition(window.frame.width / 5, ofDividerAt: 0)
@@ -1088,6 +1136,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             state.isoRange = 0...1
         }
         // ---- end of held-guard transaction ----
+        loadGeneration += 1   // cancel any pending background drop loads
         self.scene = next
         bzEpoch += 1   // freshly parsed frame: cell/baseAtoms may differ, rebuild the editor BZ
         // Refresh the color-plane overlay when the reloaded frame changes grid2D
@@ -1168,5 +1217,44 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if s.hasPrefix("#") { s.removeFirst() }
         guard s.count == 6, let v = UInt32(s, radix: 16) else { return nil }
         return (Double((v >> 16) & 0xFF) / 255.0, Double((v >> 8) & 0xFF) / 255.0, Double(v & 0xFF) / 255.0)
+    }
+}
+
+/// Drag-and-drop onto the viewer. The content view (an NSSplitView) is registered
+/// for file drags in `layoutSplit()`; on drop it hands the file to the window's
+/// delegate (the MainWindowController) to parse and load. Reads file URLs plus
+/// string paths for compatibility with the legacy filenames pboard type.
+///
+/// NSDraggingDestination is already adopted by NSView; these are overrides of
+/// its (optional) methods, not a retroactive conformance.
+extension NSSplitView {
+    /// Validate that the drag carries a single supported file URL before
+    /// advertising a copy operation. Reads only file URLs (`urlReadingFileURLsOnly`)
+    /// and applies the same supported-file rules the Open panel uses, so an
+    /// unsupported file never advertises a drop and silently no-ops.
+    private static func supportedFileURL(from info: NSDraggingInfo) -> URL? {
+        let pb = info.draggingPasteboard
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        let url = (pb.readObjects(forClasses: [NSURL.self], options: options) as? [URL])?.first
+            ?? (pb.readObjects(forClasses: [NSString.self], options: nil) as? [String]).flatMap { strings in
+                strings.first.map { URL(fileURLWithPath: $0) }
+            }
+        guard let url else { return nil }
+        return (App.supportsOpenURL(url) && !url.hasDirectoryPath) ? url : nil
+    }
+
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return Self.supportedFileURL(from: sender) != nil ? .copy : []
+    }
+
+    public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return Self.supportedFileURL(from: sender) != nil ? .copy : []
+    }
+
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let url = Self.supportedFileURL(from: sender) else { return false }
+        guard let controller = window?.delegate as? MainWindowController else { return false }
+        controller.loadDroppedFile(url)
+        return true
     }
 }

@@ -82,4 +82,116 @@ final class AppExportTests: XCTestCase {
         XCTAssertEqual(exportItem.target as? App, app)
         XCTAssertEqual(exportItem.keyEquivalent, "e")
     }
+
+    // MARK: - Edit menu
+
+    func testEditMenuHasStandardItems() {
+        let app = App()
+        let menu = app.buildMenu()
+        guard let editMenu = menu.items.first(where: { $0.submenu?.title == "Edit" })?.submenu else {
+            return XCTFail("Edit menu missing")
+        }
+        let titles = editMenu.items.map { $0.title }
+        XCTAssertTrue(titles.contains("Undo"), "Edit menu should have Undo")
+        XCTAssertTrue(titles.contains("Redo"), "Edit menu should have Redo")
+        XCTAssertTrue(titles.contains("Cut"), "Edit menu should have Cut")
+        XCTAssertTrue(titles.contains("Copy"), "Edit menu should have Copy")
+        XCTAssertTrue(titles.contains("Paste"), "Edit menu should have Paste")
+        XCTAssertTrue(titles.contains("Select All"), "Edit menu should have Select All")
+    }
+
+    func testEditMenuKeyEquivalents() {
+        let app = App()
+        let menu = app.buildMenu()
+        guard let editMenu = menu.items.first(where: { $0.submenu?.title == "Edit" })?.submenu else {
+            return XCTFail("Edit menu missing")
+        }
+        func key(_ title: String) -> String {
+            editMenu.items.first { $0.title == title }?.keyEquivalent ?? ""
+        }
+        XCTAssertEqual(key("Undo"), "z")
+        XCTAssertEqual(key("Redo"), "Z")
+        XCTAssertEqual(key("Cut"), "x")
+        XCTAssertEqual(key("Copy"), "c")
+        XCTAssertEqual(key("Paste"), "v")
+        XCTAssertEqual(key("Select All"), "a")
+        XCTAssertEqual(key("Copy Current View"), "C")
+    }
+
+    func testEditMenuStandardActionsRouteToFirstResponder() {
+        // Cut/Copy/Paste/Select All/Undo/Redo must have nil target so AppKit
+        // routes them through the responder chain (first responder wins).
+        let app = App()
+        let menu = app.buildMenu()
+        guard let editMenu = menu.items.first(where: { $0.submenu?.title == "Edit" })?.submenu else {
+            return XCTFail("Edit menu missing")
+        }
+        for title in ["Undo", "Redo", "Cut", "Copy", "Paste", "Select All"] {
+            guard let item = editMenu.items.first(where: { $0.title == title }) else {
+                return XCTFail("\(title) missing")
+            }
+            XCTAssertNil(item.target, "\(title) target should be nil (first responder)")
+        }
+    }
+
+    func testCopyCurrentViewItemWiredToApp() {
+        let app = App()
+        let menu = app.buildMenu()
+        guard let editMenu = menu.items.first(where: { $0.submenu?.title == "Edit" })?.submenu else {
+            return XCTFail("Edit menu missing")
+        }
+        guard let copyView = editMenu.items.first(where: { $0.title == "Copy Current View" }) else {
+            return XCTFail("Copy Current View menu item missing")
+        }
+        XCTAssertEqual(copyView.action, Selector(("copyCurrentView:")))
+        XCTAssertEqual(copyView.target as? App, app)
+        XCTAssertEqual(copyView.keyEquivalent, "C")
+    }
+
+    @MainActor
+    func testCopyCurrentViewWithoutWindowIsNoOp() {
+        // No mainWC → the action must return without trapping, even though
+        // there is no pasteboard access or rendering attempted. The method is
+        // private; dispatch via selector to exercise the ObjC entry point.
+        let app = App()
+        let item = NSMenuItem(title: "Copy Current View", action: Selector(("copyCurrentView:")), keyEquivalent: "C")
+        item.target = NSApp
+        app.perform(item.action, with: item)
+        // When there is no first responder (nil mainWC), the action should
+        // silently return. If it crashed, the test would not reach here.
+    }
+
+    @MainActor
+    func testRepeatedCopyCancelsPendingResetTimer() {
+        // Two rapid copies must not let the first copy's reset timer fire and
+        // revert the title while the second copy's flash is still showing.
+        let app = App()
+        let item = NSMenuItem(title: "Copy Current View", action: #selector(NSObject.init), keyEquivalent: "")
+
+        let exp = expectation(description: "title restored after last copy")
+
+        // First copy: title → "Copied View", reset scheduled at +1.0s.
+        app.flashCopyResult(item, success: true)
+        XCTAssertEqual(item.title, "Copied View")
+
+        // Second copy at +0.1s: must cancel the first timer, schedule a fresh +1.0s.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            app.flashCopyResult(item, success: true)
+            XCTAssertEqual(item.title, "Copied View")
+        }
+
+        // At +0.5s the title must still be "Copied View" — the first timer was
+        // cancelled, so it cannot have reverted the title.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            XCTAssertEqual(item.title, "Copied View")
+        }
+
+        // After ~2.0s total the second timer has fired and the title is restored.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            XCTAssertEqual(item.title, "Copy Current View")
+            exp.fulfill()
+        }
+
+        wait(for: [exp], timeout: 5.0)
+    }
 }

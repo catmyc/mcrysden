@@ -2,8 +2,24 @@ import AppKit
 import Darwin
 import UniformTypeIdentifiers
 
-final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
+final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMenuDelegate {
     var mainWC: MainWindowController?
+
+    /// File-menu items the menu delegate (self) updates on open: Revert reflects
+    /// whether a file is loaded; Open Recent is rebuilt from NSDocumentController.
+    private weak var revertItem: NSMenuItem?
+    private weak var recentItem: NSMenuItem?
+
+    /// Pending timer that resets the Copy Current View menu title after a flash.
+    /// Cancelled before scheduling a new one so rapid copies don't race.
+    private var copyResetTimer: Timer?
+    /// The menu title to restore when the pending reset timer fires. Preserved
+    /// across cancelled timers so a rapid repeat restores to the true original.
+    private var copyResetOriginal: String?
+
+    /// UserDefaults key for the last successfully-opened file, reopened on launch
+    /// when no CLI input is given. Stores the file's path as a plain string.
+    static let lastOpenedURLKey = "mcrysden.lastOpenedURL"
 
     struct LaunchOptions {
         var inputURL: URL?
@@ -291,6 +307,21 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         }
     }
 
+    /// Resolve which file to open at launch. An explicit CLI input always wins;
+    /// with no CLI input, fall back to the stored lastOpenedURL (implicit reopen).
+    /// The `isReopen` flag lets the caller treat an implicit reopen failure as
+    /// non-fatal (clear the key, open an empty viewer) rather than exiting.
+    static func resolveLaunchURL(options: LaunchOptions) -> (url: URL?, isReopen: Bool) {
+        if let explicit = options.inputURL {
+            return (explicit, false)
+        }
+        guard let path = UserDefaults.standard.string(forKey: lastOpenedURLKey),
+              !path.isEmpty else {
+            return (nil, false)
+        }
+        return (URL(fileURLWithPath: path), true)
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.mainMenu = buildMenu()
         NSApp.activate(ignoringOtherApps: true)         // bring to front so menu bar changes
@@ -323,8 +354,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
             NSApp.terminate(nil)
             return
         }
-        // GUI path
-        if let inURL = options.inputURL {
+        // GUI path. Resolve which file to open: explicit CLI input always wins;
+        // otherwise fall back to the stored lastOpenedURL (implicit reopen).
+        let (inputURL, isReopen) = Self.resolveLaunchURL(options: options)
+        if let inURL = inputURL {
             do {
                 // loadScene honors a saved animation frame by re-parsing it (the
                 // saved frame becomes geometry, not just metadata).
@@ -347,13 +380,22 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
                     wc.camera = camera
                     // Sync the orthographic toggle from the RESTORED camera (not the
                     // scene.camera that syncFromScene already mirrored), else the
-                    // next sidebar touch re-syncs projection from a stale flag.
+                    // next sidebar sync re-syncs projection from a stale flag.
                     wc.state.orthographic = !camera.perspective
                     wc.setNeedsRender()
                 }
             } catch {
                 print("[mcrysden] failed to open \(inURL.path): \(error)")
-                exit(EXIT_FAILURE)
+                if isReopen {
+                    // An implicit reopen of a stale/missing file must not terminate
+                    // the app. Drop the broken key and open an empty viewer so the
+                    // user can continue instead of getting a blank launch on every run.
+                    UserDefaults.standard.removeObject(forKey: Self.lastOpenedURLKey)
+                    mainWC = MainWindowController(scene: Scene())
+                } else {
+                    // Explicit CLI input the user asked for: report and exit.
+                    exit(EXIT_FAILURE)
+                }
             }
         } else {
             mainWC = MainWindowController(scene: Scene())
@@ -373,13 +415,37 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         // File
         let fileItem = NSMenuItem(title: "File", action: nil, keyEquivalent: ""); main.addItem(fileItem)
         let file = NSMenu(title: "File")
+        file.delegate = self
         fileItem.submenu = file
         let openItem = file.addItem(withTitle: "Open\u{2026}", action: #selector(openDocument), keyEquivalent: "o")
         openItem.target = self
+        let recentItem = file.addItem(withTitle: "Open Recent", action: nil, keyEquivalent: "")
+        let recentMenu = NSMenu(title: "Open Recent")
+        recentItem.submenu = recentMenu
+        self.recentItem = recentItem
+        let revertItem = file.addItem(withTitle: "Revert To Saved", action: #selector(revertToSaved), keyEquivalent: "")
+        revertItem.target = self
+        self.revertItem = revertItem
         let saveStateAsItem = file.addItem(withTitle: "Save State As\u{2026}", action: #selector(saveStateAs), keyEquivalent: "S")
         saveStateAsItem.target = self
         let exportItem = file.addItem(withTitle: "Export\u{2026}", action: #selector(exportDocument), keyEquivalent: "e")
         exportItem.target = self
+        // Edit — must precede View in the standard macOS menu ordering.
+        let editItem = NSMenuItem(); main.addItem(editItem)
+        let edit = NSMenu(title: "Edit")
+        editItem.submenu = edit
+        let undoItem = edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        undoItem.target = nil; redoItem.target = nil
+        let sep1 = NSMenuItem.separator(); edit.addItem(sep1)
+        let cutItem = edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        let copyItem = edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        let pasteItem = edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        let selectAllItem = edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        cutItem.target = nil; copyItem.target = nil; pasteItem.target = nil; selectAllItem.target = nil
+        let sep2 = NSMenuItem.separator(); edit.addItem(sep2)
+        let copyViewItem = edit.addItem(withTitle: "Copy Current View", action: #selector(copyCurrentView), keyEquivalent: "C")
+        copyViewItem.target = self
         // View
         let viewItem = NSMenuItem(); main.addItem(viewItem)
         let view = NSMenu(title: "View")
@@ -476,13 +542,62 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         panel.delegate = self
         panel.beginSheetModal(for: wc.window) { result in
             guard result == .OK, let url = panel.url else { return }
-            do {
-                let scene = Scene(loaded: try Parser.load(url))
-                wc.loadFile(scene, from: url, format: nil, frameIndex: 0)
-            } catch {
-                print("[mcrysden] open failed: \(error)")
-            }
+            self.openFile(url)
         }
+    }
+
+    /// Shared Open path used by Open..., Open Recent, and drag-and-drop: parse
+    /// `url` and load it into the live window. Mirrors the Open panel's error
+    /// handling (non-fatal console error on failure).
+    private func openFile(_ url: URL) {
+        guard let wc = mainWC else { return }
+        do {
+            let scene = Scene(loaded: try Parser.load(url))
+            wc.loadFile(scene, from: url, format: nil, frameIndex: 0)
+        } catch {
+            print("[mcrysden] open failed: \(error)")
+        }
+    }
+
+    /// File > Revert To Saved: re-read the loaded source and reload it, exactly
+    /// as Open does. Disabled when no file is loaded (menu delegate). The
+    /// controller owns sourceURL/forcedFormat, so the work happens there.
+    @MainActor
+    @objc private func revertToSaved(_ sender: Any?) {
+        mainWC?.revertToSource()
+    }
+
+    /// File > Open Recent > <file>: open a recently-viewed document.
+    @objc private func openRecentFile(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        openFile(url)
+    }
+
+    /// File > Open Recent > Clear Menu: empty the recent-documents list.
+    @objc private func clearRecentDocuments(_ sender: Any?) {
+        NSDocumentController.shared.clearRecentDocuments(nil)
+    }
+
+    // MARK: - NSMenuDelegate
+
+    /// Enable/disable Revert and rebuild Open Recent each time the File menu opens.
+    @MainActor
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu.title == "File" else { return }
+        revertItem?.isEnabled = (mainWC?.currentSourceURL != nil)
+        guard let recentItem else { return }
+        let submenu = NSMenu(title: "Open Recent")
+        for url in NSDocumentController.shared.recentDocumentURLs {
+            let item = submenu.addItem(withTitle: url.lastPathComponent, action: #selector(openRecentFile(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = url
+        }
+        if !NSDocumentController.shared.recentDocumentURLs.isEmpty {
+            submenu.addItem(NSMenuItem.separator())
+        }
+        let clearItem = submenu.addItem(withTitle: "Clear Menu", action: #selector(clearRecentDocuments(_:)), keyEquivalent: "")
+        clearItem.target = self
+        recentItem.submenu = submenu
     }
 
     static func supportsOpenURL(_ url: URL) -> Bool {
@@ -600,6 +715,43 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         return image
     }
 
+    /// Edit > Copy Current View — render the live viewport scene/camera to a CGImage
+    /// and place it on the general pasteboard. Momentary menu-title change is the
+    /// lightweight success/failure feedback (no alert, no status bar).
+    @MainActor
+    @objc private func copyCurrentView(_ sender: Any?) {
+        guard let wc = mainWC, let item = sender as? NSMenuItem else { return }
+        let size = Self.exportSizeForViewport(wc.viewport.bounds.size)
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-clip-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        do {
+            let image = try wc.exportCurrentView(to: tmp, size: size)
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            let ok = pb.writeObjects([NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))])
+            flashCopyResult(item, success: ok)
+        } catch {
+            print("[mcrysden] copy current view failed: \(error)")
+            flashCopyResult(item, success: false)
+        }
+    }
+
+    /// Briefly change the Copy Current View menu title to confirm (or report) the
+    /// copy, then restore the original after a short delay.
+    func flashCopyResult(_ item: NSMenuItem, success: Bool) {
+        if copyResetOriginal == nil {
+            copyResetOriginal = item.title
+        }
+        item.title = success ? "Copied View" : "Copy Failed"
+        copyResetTimer?.invalidate()
+        copyResetTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self, weak item] _ in
+            item?.title = self?.copyResetOriginal ?? item?.title ?? "Copy Current View"
+            self?.copyResetTimer = nil
+            self?.copyResetOriginal = nil
+        }
+    }
+
     /// View > Toggle Element Labels
     @objc private func toggleLabelsFromMenu(_ sender: Any?) {
         mainWC?.state.showLabels.toggle()      // propagates via onChange -> syncFromState
@@ -643,7 +795,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.20"
+    static let appVersion = "1.2.0"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

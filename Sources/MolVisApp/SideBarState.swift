@@ -466,3 +466,25 @@ final class SideBarState: ObservableObject {
         kPathPoints.append(point)
     }
 }
+
+/// Identifiers for sidebar sections whose collapsed state is persisted in
+/// UserDefaults. Each case's rawValue IS the UserDefaults key; a missing key
+/// defaults to expanded (false). The rawValue is the single source of truth —
+/// `@AppStorage` declarations in `SideBar` reference these, so the key strings
+/// live in exactly one place.
+enum CollapsibleSidebarSection: String, CaseIterable {
+    case isosurface = "SideBarCollapsed.isosurface"
+    case fermiSurface = "SideBarCollapsed.fermiSurface"
+    case symmetry = "SideBarCollapsed.symmetry"
+    case display = "SideBarCollapsed.display"
+    case appearance = "SideBarCollapsed.appearance"
+    case structureSummary = "SideBarCollapsed.structureSummary"
+    case colorPlane = "SideBarCollapsed.colorPlane"
+    case forces = "SideBarCollapsed.forces"
+    case kPath = "SideBarCollapsed.kPath"
+    case supercell = "SideBarCollapsed.supercell"
+    case slab = "SideBarCollapsed.slab"
+    case animation = "SideBarCollapsed.animation"
+
+    var defaultsKey: String { rawValue }
+}

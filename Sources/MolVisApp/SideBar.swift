@@ -22,6 +22,22 @@ struct SideBar: View {
     // external route mutation from clobbering a draft in progress while focused.
     @FocusState private var editorFocused: Bool
 
+    // Collapsed-state for each major sidebar section, persisted in UserDefaults
+    // under CollapsibleSidebarSection.<case>.rawValue. A missing key defaults to
+    // expanded (true); toggling writes the new value straight through.
+    @AppStorage(CollapsibleSidebarSection.display.rawValue) private var displayExpanded = true
+    @AppStorage(CollapsibleSidebarSection.appearance.rawValue) private var appearanceExpanded = true
+    @AppStorage(CollapsibleSidebarSection.structureSummary.rawValue) private var structureSummaryExpanded = true
+    @AppStorage(CollapsibleSidebarSection.colorPlane.rawValue) private var colorPlaneExpanded = true
+    @AppStorage(CollapsibleSidebarSection.forces.rawValue) private var forcesExpanded = true
+    @AppStorage(CollapsibleSidebarSection.kPath.rawValue) private var kPathExpanded = true
+    @AppStorage(CollapsibleSidebarSection.supercell.rawValue) private var supercellExpanded = true
+    @AppStorage(CollapsibleSidebarSection.slab.rawValue) private var slabExpanded = true
+    @AppStorage(CollapsibleSidebarSection.animation.rawValue) private var animationExpanded = true
+    @AppStorage(CollapsibleSidebarSection.isosurface.rawValue) private var isosurfaceExpanded = true
+    @AppStorage(CollapsibleSidebarSection.fermiSurface.rawValue) private var fermiSurfaceExpanded = true
+    @AppStorage(CollapsibleSidebarSection.symmetry.rawValue) private var symmetryExpanded = true
+
     var body: some View {
         Form {
             formContent
@@ -71,7 +87,7 @@ struct SideBar: View {
             Button("Reset View") { state.onResetView?() }
                 .buttonStyle(.borderedProminent)
         }
-            Section("Display") {
+            CollapsibleSection(title: "Display", isExpanded: $displayExpanded) {
                 Picker("Mode", selection: $state.displayMode) {
                     ForEach(DisplayMode.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
@@ -81,10 +97,12 @@ struct SideBar: View {
             // Compact readout of the loaded structure. Hidden entirely for an
             // empty viewer (no atoms); crystal fields appear only for crystals.
             if let summary = state.structureSummary {
-                StructureSummarySection(summary: summary)
+                CollapsibleSection(title: "Structure Summary", isExpanded: $structureSummaryExpanded) {
+                    structureSummaryGrid(summary)
+                }
             }
             // --- Appearance: material + background ---------------------------------
-            Section("Appearance") {
+            CollapsibleSection(title: "Appearance", isExpanded: $appearanceExpanded) {
                 Slider(value: $state.atomScale, in: 0.05...1.0) { Text("Atom Scale: \(state.atomScale, specifier: "%.2f")") }
                 Slider(value: $state.bondRadius, in: 0.02...0.4) { Text("Bond Radius: \(state.bondRadius, specifier: "%.2f")") }
                 Toggle("Cell Frame", isOn: $state.showCellFrame)
@@ -132,7 +150,7 @@ struct SideBar: View {
             // scalar grid. The slider sweeps the iso level over the field's value
             // range; the surface is drawn as a depth-tested lit shell.
             if state.hasScalarField {
-                Section("Isosurface") {
+                CollapsibleSection(title: "Isosurface", isExpanded: $isosurfaceExpanded) {
                     Toggle("Show Surface", isOn: $state.showIsoSurface)
                     if state.orbitalCount > 1 {
                         Stepper("Orbital \(state.currentOrbital + 1) of \(state.orbitalCount)",
@@ -149,7 +167,7 @@ struct SideBar: View {
             // band is surfaced at the Fermi energy; the toggle hides/shows the
             // whole multi-band cage independently of the scalar isosurface.
             if state.hasFermiSurface {
-                Section("Fermi Surface") {
+                CollapsibleSection(title: "Fermi Surface", isExpanded: $fermiSurfaceExpanded) {
                     Toggle("Show Fermi Surface", isOn: $state.showFermiSurface)
                 }
             }
@@ -157,7 +175,7 @@ struct SideBar: View {
             // Shown only when the loaded file carried a DATAGRID_2D block. The
             // colormap + contour view swaps in for the 3D canvas while toggled on.
             if state.hasGrid2D {
-                Section("Color Plane") {
+                CollapsibleSection(title: "Color Plane", isExpanded: $colorPlaneExpanded) {
                     Toggle("Show Color Plane", isOn: $state.showColorPlane)
                 }
             }
@@ -165,60 +183,29 @@ struct SideBar: View {
             // Shown only when the loaded file carried a parsed `Forces acting on
             // atoms` block. The arrows are force vectors drawn from each atom.
             if state.hasForceSet {
-                ForcesSection(state: state)
+                CollapsibleSection(title: "Forces", isExpanded: $forcesExpanded) {
+                    forcesContent
+                }
             }
             // --- k-path (crystal only): Brillouin-zone overlay + band path. -----
             // The scene exposes cell + base atoms; the controller builds the
             // default high-symmetry path and writes the chosen export via a save
             // panel. Shown only for crystals (a cell with base atoms present).
             if state.isCrystal {
-                SymmetrySection(state: state)
-                Section("K-Path") {
-                    Toggle("Brillouin Zone", isOn: $state.showBrillouinZone)
-                    Toggle("Edit on BZ", isOn: $state.editKPathOnBZ)
-                    if state.editKPathOnBZ {
-                        // Concise active instruction. The controller shows white
-                        // BZ-landmark crosses; clicking appends one to the route.
-                        Text("Click a white landmark to append it. Drag to orbit.")
-                            .font(.caption).foregroundColor(.secondary)
-                    }
-                    kPathRows
-                    HStack {
-                        // Undo stays enabled after a Clear (the pre-clear route is restorable);
-                        // it is gated on undo availability, not on whether the route is empty.
-                        Button("Undo") { state.undoLast() }.disabled(!state.canUndo)
-                        Button("Clear") { state.clear() }.disabled(state.kPathPoints.isEmpty)
-                        Button("Default") { state.resetToDefault() }
-                    }
-                    .buttonStyle(.bordered).font(.caption)
-                    HStack {
-                        let route = KPath(points: state.kPathPoints, breaks: state.kPathBreaks)
-                        Button("QE (.pwscf)") { state.onExportKPath?(route, .qe) }
-                            .disabled(!KPathExport.isEnabledInEditor(route, as: .qe))
-                            .help(KPathExport.editorHelp(route, as: .qe))
-                        // KPF cannot represent disconnected segments: a repeated
-                        // label only indicates a break when the shared endpoint
-                        // happens to be that label, which is ambiguous. Disable
-                        // the button and explain why when it cannot encode the route.
-                        Button("kpf") { state.onExportKPath?(route, .kpf) }
-                            .disabled(!KPathExport.isEnabledInEditor(route, as: .kpf))
-                            .help(KPathExport.editorHelp(route, as: .kpf))
-                        Button("VASP") { state.onExportKPath?(route, .vasp) }
-                            .disabled(!KPathExport.isEnabledInEditor(route, as: .vasp))
-                            .help(KPathExport.editorHelp(route, as: .vasp))
-                    }
-                    .buttonStyle(.bordered).font(.caption)
-                    Stepper("Samples per segment \(state.kPathSampling)",
-                            value: $state.kPathSampling, in: 2...200)
+                CollapsibleSection(title: "Symmetry", isExpanded: $symmetryExpanded) {
+                    SymmetrySection(state: state)
+                }
+                CollapsibleSection(title: "K-Path", isExpanded: $kPathExpanded) {
+                    kPathContent
                 }
             }
-            Section("Supercell") {
+            CollapsibleSection(title: "Supercell", isExpanded: $supercellExpanded) {
                 Stepper("n1 = \(state.n1)", value: $state.n1, in: 1...6)
                 Stepper("n2 = \(state.n2)", value: $state.n2, in: 1...6)
                 Stepper("n3 = \(state.n3)", value: $state.n3, in: 1...6)
             }
             // --- Slab: enable + two Miller planes (h/k/l + distance each) ----------
-            Section("Slab") {
+            CollapsibleSection(title: "Slab", isExpanded: $slabExpanded) {
                 Toggle("Enable", isOn: $state.slabEnabled)
                 if state.slabEnabled {
                     Text("Plane A (h k l)").font(.subheadline).bold()
@@ -237,7 +224,7 @@ struct SideBar: View {
             // Only shown for multi-frame AXSF files (frameCount > 1); the controls
             // reload the scene frame-by-frame through Parser.load(frameIndex:).
             if state.frameCount > 1 {
-                Section("Animation") {
+                CollapsibleSection(title: "Animation", isExpanded: $animationExpanded) {
                     HStack {
                         Button("◀ Prev") { state.frameIndex = max(0, state.frameIndex - 1) }
                         Button(state.isPlaying ? "⏸ Pause" : "▶ Play") { state.isPlaying.toggle() }
@@ -409,13 +396,66 @@ struct SideBar: View {
             }
         }
     }
+
+    // Lazy section bodies: extracted so each closure stays below the type-checker's
+    // complexity threshold. Each is invoked from within a CollapsibleSection.
+
+    @ViewBuilder
+    private var forcesContent: some View {
+        Toggle("Show Force Arrows", isOn: $state.showForces)
+            .disabled(state.displayMode.is2D)
+        Slider(value: $state.forceScale, in: 5...200) { Text("Arrow Scale: \(Int(state.forceScale))") }
+        Text(state.forceSummary)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundColor(.secondary)
+    }
+
+    @ViewBuilder
+    private var kPathContent: some View {
+        Toggle("Brillouin Zone", isOn: $state.showBrillouinZone)
+        Toggle("Edit on BZ", isOn: $state.editKPathOnBZ)
+        if state.editKPathOnBZ {
+            // Concise active instruction. The controller shows white BZ-landmark
+            // crosses; clicking appends one to the route.
+            Text("Click a white landmark to append it. Drag to orbit.")
+                .font(.caption).foregroundColor(.secondary)
+        }
+        kPathRows
+        HStack {
+            // Undo stays enabled after a Clear (the pre-clear route is restorable);
+            // it is gated on undo availability, not on whether the route is empty.
+            Button("Undo") { state.undoLast() }.disabled(!state.canUndo)
+            Button("Clear") { state.clear() }.disabled(state.kPathPoints.isEmpty)
+            Button("Default") { state.resetToDefault() }
+        }
+        .buttonStyle(.bordered).font(.caption)
+        HStack {
+            let route = KPath(points: state.kPathPoints, breaks: state.kPathBreaks)
+            Button("QE (.pwscf)") { state.onExportKPath?(route, .qe) }
+                .disabled(!KPathExport.isEnabledInEditor(route, as: .qe))
+                .help(KPathExport.editorHelp(route, as: .qe))
+            // KPF cannot represent disconnected segments: a repeated label only
+            // indicates a break when the shared endpoint happens to be that label,
+            // which is ambiguous. Disable the button and explain why when it cannot
+            // encode the route.
+            Button("kpf") { state.onExportKPath?(route, .kpf) }
+                .disabled(!KPathExport.isEnabledInEditor(route, as: .kpf))
+                .help(KPathExport.editorHelp(route, as: .kpf))
+            Button("VASP") { state.onExportKPath?(route, .vasp) }
+                .disabled(!KPathExport.isEnabledInEditor(route, as: .vasp))
+                .help(KPathExport.editorHelp(route, as: .vasp))
+        }
+        .buttonStyle(.bordered).font(.caption)
+        Stepper("Samples per segment \(state.kPathSampling)",
+                value: $state.kPathSampling, in: 2...200)
+    }
 }
 
 private struct SymmetrySection: View {
     @ObservedObject var state: SideBarState
 
     var body: some View {
-        Section("Symmetry") {
+        Group {
             if let analysis = state.crystalSymmetry,
                let symmetry = analysis.symmetry {
                 // Space group / crystal system / Bravais / point group live in
@@ -442,134 +482,124 @@ private struct SymmetrySection: View {
     }
 }
 
-/// Collapsible "Structure Summary" section: lattice parameters, angles, volume,
-/// formula, atom count, density, and symmetry. Crystal-specific rows appear only
-/// when the scene is periodic. Labels are caption-sized; values are monospaced.
-/// The header toggles the body open/closed, matching the k-path node chevron.
-private struct StructureSummarySection: View {
-    let summary: StructureSummary
-    @State private var expanded = true
+/// A collapsible sidebar section: a `Section` whose header is a chevron toggle,
+/// with the body shown only when expanded. The collapsed/expanded flag is owned by
+/// the caller (typically an `@AppStorage`-backed value) so state survives restarts.
+/// Matches the grouped-form styling: subheadline bold title, caption chevron.
+private struct CollapsibleSection<Content: View>: View {
+    let title: String
+    @Binding var isExpanded: Bool
+    @ViewBuilder let content: Content
 
     var body: some View {
         Section {
-            Button(action: { expanded.toggle() }) {
+            Button(action: { isExpanded.toggle() }) {
                 HStack {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Text("Structure Summary").font(.subheadline).bold()
+                    Text(title).font(.subheadline).bold()
                     Spacer()
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            if expanded {
-                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
-                    GridRow {
-                        Text("Formula").font(.caption).foregroundColor(.secondary)
-                        Text(summary.formula)
-                            .font(.system(.caption, design: .monospaced))
-                    }
-                    GridRow {
-                        Text("Atoms").font(.caption).foregroundColor(.secondary)
-                        Text("\(summary.atomCount)")
-                            .font(.system(.caption, design: .monospaced))
-                    }
-                    if summary.isAsymmetricUnit {
-                        GridRow {
-                            Text("")
-                            Text("(asymmetric unit)")
-                                .font(.caption).foregroundColor(.secondary).gridCellColumns(1)
-                        }
-                    }
-                    if summary.isCrystal {
-                        GridRow {
-                            Text("a").font(.caption).foregroundColor(.secondary)
-                            Text(summary.latticeA.map { String(format: "%.4f", $0) } ?? "—")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("b").font(.caption).foregroundColor(.secondary)
-                            Text(summary.latticeB.map { String(format: "%.4f", $0) } ?? "—")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("c").font(.caption).foregroundColor(.secondary)
-                            Text(summary.latticeC.map { String(format: "%.4f", $0) } ?? "—")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("α").font(.caption).foregroundColor(.secondary)
-                            Text(summary.alpha.map { String(format: "%.2f°", $0) } ?? "—")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("β").font(.caption).foregroundColor(.secondary)
-                            Text(summary.beta.map { String(format: "%.2f°", $0) } ?? "—")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("γ").font(.caption).foregroundColor(.secondary)
-                            Text(summary.gamma.map { String(format: "%.2f°", $0) } ?? "—")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("Volume").font(.caption).foregroundColor(.secondary)
-                            Text(summary.cellVolume.map { String(format: "%.2f Å³", $0) } ?? "—")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("Density").font(.caption).foregroundColor(.secondary)
-                            Text(summary.density.map { String(format: "%.3f g/cm³", $0) } ?? "—")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("Space group").font(.caption).foregroundColor(.secondary)
-                            Text(spaceGroupText)
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("Crystal system").font(.caption).foregroundColor(.secondary)
-                            Text(summary.crystalSystem ?? "—")
-                        }
-                        GridRow {
-                            Text("Bravais lattice").font(.caption).foregroundColor(.secondary)
-                            Text(summary.bravaisLattice ?? "—")
-                        }
-                        GridRow {
-                            Text("Point group").font(.caption).foregroundColor(.secondary)
-                            Text(summary.pointGroup ?? "—")
-                        }
-                    }
-                }
+            if isExpanded {
+                content
             }
         }
     }
+}
 
-    private var spaceGroupText: String {
-        if let n = summary.spaceGroupNumber, let s = summary.spaceGroupSymbol {
-            return "\(n) \(s)"
+// MARK: - Lazy section bodies (extracted so each stays below the type-checker limit)
+
+@ViewBuilder
+private func structureSummaryGrid(_ summary: StructureSummary) -> some View {
+    Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
+        GridRow {
+            Text("Formula").font(.caption).foregroundColor(.secondary)
+            Text(summary.formula)
+                .font(.system(.caption, design: .monospaced))
         }
-        if let n = summary.spaceGroupNumber { return "\(n)" }
-        if let s = summary.spaceGroupSymbol { return s }
-        return "—"
+        GridRow {
+            Text("Atoms").font(.caption).foregroundColor(.secondary)
+            Text("\(summary.atomCount)")
+                .font(.system(.caption, design: .monospaced))
+        }
+        if summary.isAsymmetricUnit {
+            GridRow {
+                Text("")
+                Text("(asymmetric unit)")
+                    .font(.caption).foregroundColor(.secondary).gridCellColumns(1)
+            }
+        }
+        if summary.isCrystal {
+            GridRow {
+                Text("a").font(.caption).foregroundColor(.secondary)
+                Text(summary.latticeA.map { String(format: "%.4f", $0) } ?? "—")
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("b").font(.caption).foregroundColor(.secondary)
+                Text(summary.latticeB.map { String(format: "%.4f", $0) } ?? "—")
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("c").font(.caption).foregroundColor(.secondary)
+                Text(summary.latticeC.map { String(format: "%.4f", $0) } ?? "—")
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("α").font(.caption).foregroundColor(.secondary)
+                Text(summary.alpha.map { String(format: "%.2f°", $0) } ?? "—")
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("β").font(.caption).foregroundColor(.secondary)
+                Text(summary.beta.map { String(format: "%.2f°", $0) } ?? "—")
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("γ").font(.caption).foregroundColor(.secondary)
+                Text(summary.gamma.map { String(format: "%.2f°", $0) } ?? "—")
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("Volume").font(.caption).foregroundColor(.secondary)
+                Text(summary.cellVolume.map { String(format: "%.2f Å³", $0) } ?? "—")
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("Density").font(.caption).foregroundColor(.secondary)
+                Text(summary.density.map { String(format: "%.3f g/cm³", $0) } ?? "—")
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("Space group").font(.caption).foregroundColor(.secondary)
+                Text(spaceGroupText(summary))
+                    .font(.system(.caption, design: .monospaced))
+            }
+            GridRow {
+                Text("Crystal system").font(.caption).foregroundColor(.secondary)
+                Text(summary.crystalSystem ?? "—")
+            }
+            GridRow {
+                Text("Bravais lattice").font(.caption).foregroundColor(.secondary)
+                Text(summary.bravaisLattice ?? "—")
+            }
+            GridRow {
+                Text("Point group").font(.caption).foregroundColor(.secondary)
+                Text(summary.pointGroup ?? "—")
+            }
+        }
     }
 }
 
-/// Forces sidebar section: per-atom force arrows + energy readout. Arrows render in
-/// every 3D mode; in 2D modes atoms are screen-space (a separate Renderer2D) and
-/// world-space vectors have no meaningful projection, so the toggle is disabled there
-/// rather than promise invisible arrows.
-private struct ForcesSection: View {
-    @ObservedObject var state: SideBarState
-    var body: some View {
-        Section("Forces") {
-            Toggle("Show Force Arrows", isOn: $state.showForces)
-                .disabled(state.displayMode.is2D)
-            Slider(value: $state.forceScale, in: 5...200) { Text("Arrow Scale: \(Int(state.forceScale))") }
-            Text(state.forceSummary)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundColor(.secondary)
-        }
+private func spaceGroupText(_ summary: StructureSummary) -> String {
+    if let n = summary.spaceGroupNumber, let s = summary.spaceGroupSymbol {
+        return "\(n) \(s)"
     }
+    if let n = summary.spaceGroupNumber { return "\(n)" }
+    if let s = summary.spaceGroupSymbol { return s }
+    return "—"
 }
