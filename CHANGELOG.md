@@ -4,27 +4,15 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.20] — 2026-07-27
+
 ### Added
-- Added direct fractional-coordinate editing for k-path nodes, with Apply/focus-loss commits, round-trip-safe coordinate drafts, and selected-node highlighting in the Brillouin-zone viewport.
-- Added three-dimensional crystal-symmetry analysis through a project-owned C façade over vendored spglib 2.7.0, including space group, point group, Hall setting, symmetry operations, Wyckoff letters, equivalent atoms, and standardized primitive/conventional cells.
-- Added HPKOT/SeekPath 2.1-compatible canonical band paths for all 29 extended Bravais-lattice variants. Canonical coordinates are mapped back into the input reciprocal basis so rendering, editing, persistence, and export remain aligned with the loaded structure.
-- Added disconnected k-path components, including explicit singleton components, with per-component sampling budgets and atomic sidebar editing.
-- Added SeekPath attribution/license files to the repository and application resources.
+- Added VASP line-mode KPOINTS export with correct reciprocal-fractional header (pointsPerSegment, Line-mode, Reciprocal), endpoint-pair encoding with shared-node duplication and blank-line separators between segments, singleton rejection, and a dedicated "VASP" sidebar button.
 
 ### Changed
-- K-path undo now restores generated-route provenance and signatures exactly; route replacement, view reset, and animation reload clear stale Sidebar/BZ node selections.
-- Generated routes now carry provenance and a structure signature. Geometry or animation-frame changes regenerate canonical routes, while user-edited routes preserve their Cartesian reciprocal positions across input-cell changes.
-- `.molvis-state` files now persist disconnected boundaries, route provenance, generated-route signatures, and the input cell used by fractional k-point coordinates, with backward-compatible defaults for older files.
-- QE export preserves disconnected explicit point sets. XCrySDen KPF export is unavailable for disconnected routes because that format cannot encode path breaks.
-- Symmetry and canonical-path generation report an unavailable state for non-3D, malformed, oversized, or known-incomplete structure inputs instead of guessing a result.
-
-### Fixed
-- Removed unintended render bridges across disconnected path components and made route deletion preserve neighboring break semantics.
-- Made HPKOT variant selection deterministic at metric ties, including orthorhombic-I cases, and preserved the required Niggli-to-input mapping for rotated triclinic and cubic-equivalent cells.
-
-### Tests
-- Expanded the macOS suite to 590 tests, including coordinate-editing, provenance-undo, atomic route-publication, and selection-lifecycle regressions.
-- Expanded the macOS suite to 545 tests, including exact SeekPath-oracle coverage for all 29 HPKOT variants, rotated-cell and lifecycle regressions, disconnected-route rendering/export cases, and strict state validation.
+- Renamed per-segment sampling stepper from "QE samples" to the format-neutral "Samples per segment" since it now controls both QE and VASP interpolation counts.
+- Removed 26 stale diagnostic, trivial, and well-established tests; suite now at 585 tests.
+- Solidified the Longcat-subagent implement-review-fix workflow in documentation.
 
 ## [1.1.19] — 2026-07-27
 

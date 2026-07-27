@@ -62,4 +62,4 @@ swift test
 zsh scripts/smoke.sh
 ```
 
-The current suite contains 545 tests. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.
+The current suite contains 585 tests. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.

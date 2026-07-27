@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-27 (v1.1.19 per-segment k-path sampling implemented)**.
+Last updated: **2026-07-27 (v1.1.20 VASP KPOINTS export implemented)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -57,7 +57,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Edited routes persist through `.molvis-state`, animation reloads, and unrelated sidebar changes; malformed saved route data fails transactionally.
 - [x] 69 focused editor tests; 433 tests in the full macOS suite.
 
-## Implemented after v1.1.16: crystallographic symmetry and standard paths
+## Implemented after v1.1.16: crystallographic symmetry, structure summary, k-path editing, sampling, and VASP export
 
 The maintained coordinate, lifecycle, persistence, and export contract is documented in [`SYMMETRY_AND_KPATH.md`](SYMMETRY_AND_KPATH.md).
 
@@ -87,10 +87,11 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 ### Reciprocal space and k-paths
 - [x] Per-component sampling budgets and disconnected path components.
 - [x] Direct fractional-coordinate editing with undo/provenance preservation and selected-node highlighting between sidebar and BZ.
-- [x] User-configurable per-segment k-path sampling for QE export.
+- [x] User-configurable per-segment k-path sampling for QE and VASP export.
+- [x] Export VASP `KPOINTS` (line-mode, endpoint-pair encoding, blank-line segment separation).
 - [ ] Cumulative reciprocal distance display, candidate hover tooltips, viewport node labels, and automatic BZ framing.
 - [ ] Import k-paths from QE, VASP, Wannier90, and KPF.
-- [ ] Export VASP `KPOINTS`, Wannier90 `kpoint_path`, and additional QE band-path forms.
+- [ ] Export Wannier90 `kpoint_path` and additional QE band-path forms.
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
 
 ### Crystal input completeness
