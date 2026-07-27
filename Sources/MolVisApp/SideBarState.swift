@@ -177,7 +177,9 @@ final class SideBarState: ObservableObject {
         hasFermiSurface = (scene.fermiSurface != nil)
         showFermiSurface = scene.showFermiSurface
         hasGrid2D = (scene.grid2D != nil)
-        showColorPlane = scene.grid2D != nil   // default to shown when a grid is present
+        // Grid presence gates visibility; retain the user's preference while a
+        // trajectory frame temporarily has no plane to display.
+        showColorPlane = scene.showColorPlane
         // Forces: gate the sidebar section on presence, reflect the toggle/scale.
         hasForceSet = (scene.forceSet != nil)
         showForces = scene.showForces

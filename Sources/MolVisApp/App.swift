@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import UniformTypeIdentifiers
 
 final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     var mainWC: MainWindowController?
@@ -129,6 +130,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     }
 
     private static let supportedExportExtensions: Set<String> = ["png", "pdf", "svg", "eps", "ps"]
+    private static let stateContentType = UTType(filenameExtension: "mvis-state")!
+    private static let exportContentTypes: [UTType] = [
+        .png, .pdf,
+        UTType(filenameExtension: "svg")!,
+        UTType(filenameExtension: "eps")!,
+        UTType(filenameExtension: "ps")!,
+    ]
     private static let maxExportDimension: CGFloat = 16_384
     /// Total-pixel ceiling for offscreen graph/bitmap allocation. Matches the per-frame
     /// export cap so a 16384×16384 (or any Int-overflowing) graph size is refused with a
@@ -253,6 +261,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
             scene.atomScale = restored.atomScale
             scene.bondRadius = restored.bondRadius
             scene.measurementMode = restored.measurementMode
+            scene.showColorPlane = restored.showColorPlane
             // A rebuilt frame may have a different input reciprocal basis even
             // when its standardized symmetry signature is unchanged (for example
             // a physically rotated cell). Generated paths stay with the freshly
@@ -346,7 +355,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
 
     // MARK: - Menu bar
 
-    private func buildMenu() -> NSMenu {
+    func buildMenu() -> NSMenu {
         let main = NSMenu()
         // macOS reserves the first top-level item for the application menu. Keep
         // Quit there so the following item is displayed as an actual File menu.
@@ -360,6 +369,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         fileItem.submenu = file
         let openItem = file.addItem(withTitle: "Open\u{2026}", action: #selector(openDocument), keyEquivalent: "o")
         openItem.target = self
+        let saveStateAsItem = file.addItem(withTitle: "Save State As\u{2026}", action: #selector(saveStateAs), keyEquivalent: "S")
+        saveStateAsItem.target = self
+        let exportItem = file.addItem(withTitle: "Export\u{2026}", action: #selector(exportDocument), keyEquivalent: "e")
+        exportItem.target = self
         // View
         let viewItem = NSMenuItem(); main.addItem(viewItem)
         let view = NSMenu(title: "View")
@@ -385,6 +398,65 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         }
         return main
     }
+
+    /// File > Save State As...
+    @MainActor
+    @objc private func saveStateAs(_ sender: Any?) {
+        guard let wc = mainWC else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "state.mvis-state"
+        panel.allowedContentTypes = [Self.stateContentType]
+        panel.beginSheetModal(for: wc.window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do {
+                try Self.validateGUIWriteDestination(url, source: wc.currentSourceURL)
+                try wc.saveState(to: url)
+            } catch {
+                print("[mcrysden] save state failed: \(error)")
+                self.presentFileOperationError(error, title: "save state failed", for: wc)
+            }
+        }
+    }
+
+    /// File > Export...  Present a save panel, then render the live scene/camera
+    /// to the chosen URL at a viewport-derived size. Mirrors the Open workflow:
+    /// main-thread scene/camera handoff, size validation inside exportScene, and a
+    /// non-fatal console error on failure.
+    @MainActor
+    @objc private func exportDocument(_ sender: Any?) {
+        guard let wc = mainWC else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "export.png"
+        panel.allowedContentTypes = Self.exportContentTypes
+        panel.beginSheetModal(for: wc.window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            // Graph renderers operate in AppKit points. Export at the visible logical
+            // size so graph typography and margins match the viewport on Retina displays.
+            let size = Self.exportSizeForViewport(wc.viewport.bounds.size)
+            do {
+                try Self.validateGUIWriteDestination(url, source: wc.currentSourceURL)
+                try wc.exportCurrentView(to: url, size: size)
+            } catch {
+                print("[mcrysden] export failed: \(error)")
+                self.presentFileOperationError(error, title: "export failed", for: wc)
+            }
+        }
+    }
+
+    @MainActor
+    private func presentFileOperationError(_ error: Error, title: String, for controller: MainWindowController) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: controller.window)
+    }
+
+    /// Graphs and label overlays are defined in AppKit points, so GUI export uses
+    /// the viewport's logical size. Higher-resolution output belongs to the future
+    /// configurable-dimensions workflow rather than silently changing typography.
+    static func exportSizeForViewport(_ viewportSize: CGSize) -> CGSize { viewportSize }
 
     /// File > Open...
     @objc private func openDocument(_ sender: Any?) {
@@ -427,6 +499,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         }
     }
 
+    /// GUI writes must not replace the file currently supplying the live scene.
+    /// `sameFile` covers equal paths, symlinks, and existing hardlink aliases.
+    static func validateGUIWriteDestination(_ output: URL, source: URL?) throws {
+        guard let source, sameFile(output, source) else { return }
+        throw CLIError.invalid("destination aliases loaded source: \(source.path)")
+    }
+
     private static func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
         let left = lhs.standardizedFileURL.resolvingSymlinksInPath()
         let right = rhs.standardizedFileURL.resolvingSymlinksInPath()
@@ -443,7 +522,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
 
     @MainActor
     @discardableResult
-    static func exportScene(_ scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
+    static func exportScene(_ scene: Scene, camera: Camera?, to url: URL, size: CGSize,
+                            options: RenderExportOptions = RenderExportOptions()) throws -> CGImage {
         guard supportedExportExtensions.contains(url.pathExtension.lowercased()) else {
             throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
@@ -458,7 +538,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
             return try exportGraph(BandGrapherView(frame: NSRect(origin: .zero, size: size)),
                                    configure: { $0.bandStructure = bands }, to: url, size: size)
         }
-        if let grid = scene.grid2D {
+        if scene.showColorPlane, let grid = scene.grid2D {
             return try exportGraph(ColorPlaneView(frame: NSRect(origin: .zero, size: size)), configure: {
                 $0.grid = grid.values
                 $0.physicalSpan = Array(grid.vec.prefix(2))
@@ -472,9 +552,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         }
         switch url.pathExtension.lowercased() {
         case "pdf", "svg", "eps", "ps":
-            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size)
+            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: options)
         case "png":
-            return try PngExporter.export(scene: scene, camera: camera, to: url, size: size)
+            return try PngExporter.export(scene: scene, camera: camera, to: url, size: size, options: options)
         default:
             throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
@@ -493,7 +573,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         }
         configure(view)
         NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = context
+        context.cgContext.translateBy(x: 0, y: CGFloat(height))
+        context.cgContext.scaleBy(x: 1, y: -1)
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context.cgContext, flipped: true)
         view.draw(view.bounds)
         context.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()
@@ -578,5 +660,39 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         open a specific frame with --frame N (0-based frame index).
         Export format is chosen by extension: .png (raster) or .pdf/.svg/.eps/.ps (vector).
         """)
+    }
+}
+
+extension App.CLIError: LocalizedError {
+    var errorDescription: String? { description }
+}
+
+extension PngExportError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .noGPU: return "no Metal GPU is available"
+        case .noTex: return "the requested export dimensions are invalid or unsupported"
+        case .noCGImage: return "could not create the rendered image"
+        case .noPNG: return "could not encode PNG data"
+        case .noQueue, .noCommandBuffer: return "could not prepare the Metal export command"
+        case .encodeFailed: return "Metal could not encode the export frame"
+        case .commandBufferError(let error): return error?.localizedDescription ?? "Metal failed while rendering the export"
+        }
+    }
+}
+
+extension RasterExportError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .noGPU: return "no Metal GPU is available"
+        case .noTex: return "the requested export dimensions are invalid or unsupported"
+        case .noCGImage: return "could not create the rendered image"
+        case .noContext: return "could not create the export graphics context"
+        case .noData: return "could not write export data"
+        case .unsupported: return "the requested export format is unsupported"
+        case .noQueue, .noCommandBuffer: return "could not prepare the Metal export command"
+        case .encodeFailed: return "Metal could not encode the export frame"
+        case .commandBufferError(let error): return error?.localizedDescription ?? "Metal failed while rendering the export"
+        }
     }
 }

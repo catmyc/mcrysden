@@ -281,7 +281,9 @@ enum DOSExporter {
         let view = DOSGrapherView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         view.densityOfStates = dos
         NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = context
+        context.cgContext.translateBy(x: 0, y: CGFloat(height))
+        context.cgContext.scaleBy(x: 1, y: -1)
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context.cgContext, flipped: true)
         view.draw(view.bounds)
         context.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()

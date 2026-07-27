@@ -173,4 +173,43 @@ final class AnimationControllerTests: XCTestCase {
         XCTAssertEqual(controller.scene.currentFrame, 0)
         XCTAssertEqual(controller.state.frameIndex, 0)
     }
+
+    // MARK: - Color-plane overlay must refresh its data/labels/contours and layer
+    // visibility when a reloaded frame changes grid2D presence. Before the fix,
+    // reloadFrame never touched ColorPlaneView nor called updateContentVisibility,
+    // so scrubbing onto a grid frame left a stale (or hidden) plane.
+
+    @MainActor
+    func testReloadFrameRefreshesColorPlaneOnGridPresenceChange() throws {
+        let url = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_grid2d.axsf")
+        // Fixture: frame 0 has no 2D grid; frame 1 carries a 3x3 DATAGRID_2D
+        // "density" with range [0, 4] and two span vectors.
+        XCTAssertNil(try Parser.load(url, as: nil, frameIndex: 0).grid2D)
+        XCTAssertNotNil(try Parser.load(url, as: nil, frameIndex: 1).grid2D)
+
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(try Scene(loaded: Parser.load(url, as: nil, frameIndex: 0)),
+                            from: url, format: nil, frameIndex: 0)
+        XCTAssertEqual(controller.state.frameCount, 2)
+
+        // Step onto the grid frame. The color plane must receive the new grid's
+        // data, label, contours and span, and become visible (canvas hidden).
+        controller.state.frameIndex = 1
+        XCTAssertEqual(controller.scene.currentFrame, 1)
+        XCTAssertNotNil(controller.colorPlane.grid, "grid data must be pushed onto the plane")
+        XCTAssertEqual(controller.colorPlane.zLabel, "density")
+        XCTAssertFalse(controller.colorPlane.contourLevels.isEmpty, "contours must be refreshed")
+        XCTAssertEqual(controller.colorPlane.physicalSpan.count, 2)
+        XCTAssertFalse(controller.colorPlane.isHidden, "plane must be visible on a grid frame")
+        XCTAssertTrue(controller.canvas.isHidden, "canvas must be hidden while the plane shows")
+
+        // Step back to the no-grid frame. The plane must clear its data and hide.
+        controller.state.frameIndex = 0
+        XCTAssertEqual(controller.scene.currentFrame, 0)
+        XCTAssertNil(controller.colorPlane.grid, "grid data must be cleared off the plane")
+        XCTAssertTrue(controller.colorPlane.isHidden, "plane must hide on a no-grid frame")
+        XCTAssertFalse(controller.canvas.isHidden, "canvas must be restored when the plane hides")
+    }
 }

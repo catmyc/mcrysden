@@ -37,7 +37,8 @@ enum StateStore {
         payload["isoLevel"] = scene.isoLevel
         payload["currentOrbital"] = scene.currentOrbital
         payload["showFermiSurface"] = scene.showFermiSurface
-        payload["showForces"] = scene.showForces
+         payload["showForces"] = scene.showForces
+        payload["showColorPlane"] = scene.showColorPlane
         payload["forceScale"] = scene.forceScale
         payload["atomScale"] = scene.atomScale
         payload["bondRadius"] = scene.bondRadius
@@ -81,7 +82,7 @@ enum StateStore {
             payload["camera"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(camera))
         }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: url)
+        try data.write(to: url, options: .atomic)
     }
 
     /// Apply a saved view-state onto an already-parsed `scene` (atoms/bonds/cell
@@ -204,7 +205,10 @@ enum StateStore {
             }
         }
         if let v = obj["showFermiSurface"] as? Bool { candidate.showFermiSurface = v }
-        if let v = obj["showForces"] as? Bool { candidate.showForces = v }
+         if let v = obj["showForces"] as? Bool { candidate.showForces = v }
+        // Color-plane toggle. Absent key (old state files) falls back to the
+        // Scene default (true) — preserves the historical shown-when-present behavior.
+        if let v = obj["showColorPlane"] as? Bool { candidate.showColorPlane = v }
         // Clamp to the sidebar's 5...200 range so a malformed state file can't feed
         // a negative/zero/giant scale into Metal (reversed or infinite arrow verts).
         if let v = try finiteFloat(obj["forceScale"], field: "forceScale") {

@@ -219,4 +219,37 @@ final class AppSafetyTests: XCTestCase {
         controller.state.slabEnabled = false
         XCTAssertEqual(controller.scene.atoms.count, controller.scene.preslabAtoms.count)
     }
+
+    @MainActor
+    func testSaveStateAsMenuExists() {
+        let app = App()
+        let menu = app.buildMenu()
+        guard let fileItem = menu.items.first(where: { $0.title == "File" }),
+              let fileMenu = fileItem.submenu else {
+            return XCTFail("File menu missing")
+        }
+        let saveItem = fileMenu.items.first { $0.title == "Save State As\u{2026}" }
+        XCTAssertNotNil(saveItem, "File menu should contain 'Save State As...'")
+        XCTAssertEqual(saveItem?.action, Selector(("saveStateAs:")))
+    }
+
+    @MainActor
+    func testControllerSaveStateWritesFile() throws {
+        let fixture = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si110.xsf")
+        let scene = Scene(loaded: try Parser.load(fixture))
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(scene, from: fixture, frameIndex: 0)
+        controller.state.atomScale = 0.7
+
+        let out = FileManager.default.temporaryDirectory
+            .appendingPathComponent("save-\(UUID().uuidString).mvis-state")
+        defer { try? FileManager.default.removeItem(at: out) }
+        try controller.saveState(to: out)
+
+        let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: out)) as? [String: Any]
+        XCTAssertNotNil(obj)
+        XCTAssertEqual(obj?["source"] as? String, fixture.path)
+        XCTAssertEqual(obj?["atomScale"] as? Double ?? 0, 0.7, accuracy: 0.001)
+    }
 }

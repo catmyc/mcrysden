@@ -34,7 +34,8 @@ enum RasterExporter {
     /// CGImage raster that was wrapped, so a caller can validate pixel content (used by
     // the export tests) across all formats — not just the written file's byte size.
     @discardableResult
-    static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
+    static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize,
+                       options: RenderExportOptions = RenderExportOptions()) throws -> CGImage {
         // Validate representability before Int conversion (mirrors PngExporter) so an
         // absurd size throws instead of trapping on the Int cast.
         let rw = size.width.rounded(), rh = size.height.rounded()
@@ -46,7 +47,7 @@ enum RasterExporter {
         let w = Int(rw), h = Int(rh)
         let total = w.multipliedReportingOverflow(by: h)
         guard !total.overflow, total.partialValue <= 16_000_000 else { throw RasterExportError.noTex }
-        let cg = try render(scene: scene, camera: camera, w: w, h: h)
+        let cg = try render(scene: scene, camera: camera, w: w, h: h, options: options)
         try write(cgImage: cg, to: url, size: CGSize(width: w, height: h))
         return cg
     }
@@ -76,11 +77,13 @@ enum RasterExporter {
 
     // MARK: Metal → CGImage (mirrors PngExporter, reused for all formats)
 
-    private static func render(scene: Scene, camera: Camera?, w: Int, h: Int) throws -> CGImage {
+    private static func render(scene: Scene, camera: Camera?, w: Int, h: Int,
+                               options: RenderExportOptions) throws -> CGImage {
         guard w > 0, h > 0 else { throw RasterExportError.noTex }
         guard let device = MTLCreateSystemDefaultDevice() else { throw RasterExportError.noGPU }
         let renderer = try Renderer(device: device)
         renderer.scene = scene
+        renderer.showBZLandmarks = options.showBZLandmarks
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm
         desc.width = w; desc.height = h
@@ -114,7 +117,7 @@ enum RasterExporter {
             throw RasterExportError.noCGImage
         }
         guard let image = ctx.makeImage() else { throw RasterExportError.noCGImage }
-        return image
+        return try PngExporter.composite(labels: options.labels, onto: image)
     }
 
     // MARK: PDF
@@ -130,7 +133,7 @@ enum RasterExporter {
         ctx.draw(cgImage, in: mediaBox)
         ctx.endPDFPage()
         ctx.closePDF()
-        try data.write(to: url)
+        try (data as Data).write(to: url, options: .atomic)
     }
 
     // MARK: SVG (base64 PNG wrapper)

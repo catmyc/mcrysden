@@ -190,9 +190,12 @@ struct Scene: Codable {
     /// Parsed forces/stress/energy from a QE output (final SCF iteration). Gated in
     /// the UI on its presence: a sidebar toggle draws force arrows and a readout.
     var forceSet: ForceSet?
-    /// Draw force arrows (when `forceSet` is present). Gated in the UI on the
-    /// presence of a forceSet; the renderer scales each arrow by `forceScale`.
-    var showForces: Bool = false
+     /// Draw force arrows (when `forceSet` is present). Gated in the UI on the
+     /// presence of a forceSet; the renderer scales each arrow by `forceScale`.
+     var showForces: Bool = false
+      /// Toggle the color-plane overlay (DATAGRID_2D only). When on, the 2D
+      /// ColorPlaneView replaces the 3D canvas; gated in the UI on `grid2D != nil`.
+      @DefaultTrue var showColorPlane: Bool = true
     /// Multiplier converting a force (eV/Å) to an arrow length (Å) so typical
     /// forces (0.01–1 eV/Å) span a few Å and read clearly. Sidebar-adjustable.
     var forceScale: Float = 50.0
@@ -239,5 +242,41 @@ extension simd_quatf: @retroactive Codable {
                             try c.decode(Float.self, forKey: .z),
                             try c.decode(Float.self, forKey: .w))
         self.init(vector: v)
+    }
+}
+
+/// A Bool scene field that defaults to `true` when its key is absent from the
+/// decoded JSON. Swift's synthesized Decodable throws `keyNotFound` for missing
+/// keys rather than applying the struct's default value, so older serialized
+/// Scene documents that predate the field would otherwise fail to decode. The
+/// custom container overload below decodes the key when present and falls back
+/// to `true` when absent; encoding writes the value normally.
+@propertyWrapper
+struct DefaultTrue: Codable {
+    var wrappedValue: Bool
+
+    init() { wrappedValue = true }
+    init(wrappedValue: Bool = true) { self.wrappedValue = wrappedValue }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        wrappedValue = (try? c.decode(Bool.self)) ?? true
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(wrappedValue)
+    }
+}
+
+extension KeyedDecodingContainer {
+    func decode(_ type: DefaultTrue.Type, forKey key: Key) throws -> DefaultTrue {
+        try decodeIfPresent(Bool.self, forKey: key).map(DefaultTrue.init) ?? DefaultTrue()
+    }
+}
+
+extension KeyedEncodingContainer {
+    mutating func encode(_ value: DefaultTrue, forKey key: Key) throws {
+        try encode(value.wrappedValue, forKey: key)
     }
 }

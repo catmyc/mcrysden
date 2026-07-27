@@ -709,6 +709,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // gates the draw on forceSet + showForces, so writing is unconditional.
         scene.showForces = state.showForces
         scene.forceScale = state.forceScale
+        // Color-plane overlay: written unconditionally; the renderer/visibility
+        // gates the draw on `scene.grid2D != nil`.
+        scene.showColorPlane = state.showColorPlane
         // Color-plane overlay: a 2D grid may coexist with the 3D structure. The
         // canvas shows EITHER the 3D scene or the color plane, never both — so the
         // plane wins only while the toggle is on AND a grid is present.
@@ -845,6 +848,34 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         alert.beginSheetModal(for: window)
     }
 
+    /// Capture the live scene, camera, and current source URL and persist the
+    /// view-state to `url` via StateStore. Wired to AppDelegate save actions.
+    @MainActor
+    internal func saveState(to url: URL) throws {
+        try StateStore.save(scene, camera: camera, sourceURL: sourceURL, to: url)
+    }
+
+    /// The loaded source is needed by file actions to protect it from overwrite.
+    @MainActor
+    internal var currentSourceURL: URL? { sourceURL }
+
+    /// Export the layer currently displayed in the viewport. Graph and color-plane
+    /// payloads hidden by the view state must not supersede the Metal canvas.
+    @MainActor
+    @discardableResult
+    internal func exportCurrentView(to url: URL, size: CGSize) throws -> CGImage {
+        // The export size is the current logical viewport size; reproject labels
+        // after a resize before copying the live overlay.
+        updateLabels()
+        var visibleScene = scene
+        if dosGrapher.isHidden { visibleScene.densityOfStates = nil }
+        if bandGrapher.isHidden { visibleScene.bandStructure = nil }
+        if colorPlane.isHidden { visibleScene.grid2D = nil }
+        let options = RenderExportOptions(labels: canvas.isHidden ? [] : labelOverlay.labels,
+                                          showBZLandmarks: !canvas.isHidden && state.editKPathOnBZ && scene.isCrystal)
+        return try App.exportScene(visibleScene, camera: camera, to: url, size: size, options: options)
+    }
+
     /// Pick a small set of iso-contour levels spanning the grid's value range,
     /// for the color-plane's marching-squares contour trace. Six levels keeps the
     /// plot legible without overcrowding it.
@@ -968,6 +999,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.hasScalarField = (next.scalarField != nil)
         state.hasFermiSurface = (next.fermiSurface != nil)
         state.hasGrid2D = (next.grid2D != nil)
+        // Grid presence controls whether the plane can be shown, not the user's
+        // preference. Carry the live scene's preference so it survives frames
+        // without a grid, then mirror into state so the two agree.
+        let resolvedShowColorPlane = scene.showColorPlane
+        next.showColorPlane = resolvedShowColorPlane
+        state.showColorPlane = resolvedShowColorPlane
         state.hasForceSet = (next.forceSet != nil)
         state.isCrystal = next.isCrystal
         state.crystalSymmetry = next.crystalSymmetry
@@ -996,6 +1033,18 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // ---- end of held-guard transaction ----
         self.scene = next
         bzEpoch += 1   // freshly parsed frame: cell/baseAtoms may differ, rebuild the editor BZ
+        // Refresh the color-plane overlay when the reloaded frame changes grid2D
+        // presence or data, mirroring loadFile so the plane's data/labels/contours
+        // stay consistent across frame reloads.
+        if let grid = next.grid2D {
+            colorPlane.grid = grid.values
+            colorPlane.zLabel = grid.ident
+            colorPlane.contourLevels = defaultContourLevels(for: grid)
+            colorPlane.physicalSpan = Array(grid.vec.prefix(2))
+        } else {
+            colorPlane.grid = nil
+        }
+        updateContentVisibility()
         setNeedsRender()
     }
 

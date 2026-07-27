@@ -83,6 +83,9 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [ ] Export VASP `KPOINTS`, Wannier90 `kpoint_path`, and additional QE band-path forms.
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
 
+### Crystal input completeness
+- [ ] Expand CIF and CRYSCAL asymmetric-unit inputs through declared symmetry operations, with periodic-site deduplication and preserved species/index mappings, so they can use symmetry analysis and generated canonical k-paths.
+
 ### Structure information and analysis
 - [ ] Structure summary with lattice lengths/angles, volume, density, composition, formula, symmetry, atom table, fractional/Cartesian coordinates, and coordination numbers.
 - [ ] Coordination shells, coordination coloring, nearest-neighbor tables, bond/angle distributions, radial distribution functions, and minimum-image periodic measurements.

@@ -5,11 +5,17 @@ import simd
 
 enum PngExportError: Error { case noGPU, noTex, noCGImage, noPNG, noQueue, noCommandBuffer, encodeFailed, commandBufferError(Error?) }
 
+struct RenderExportOptions {
+    var labels: [LabelOverlayView.Label] = []
+    var showBZLandmarks = false
+}
+
 enum PngExporter {
     /// Render the scene to PNG at `size`. Returns the rendered CGImage so a caller can
     /// validate pixel content (used by the export tests) in addition to the written file.
     @discardableResult
-    static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize) throws -> CGImage {
+    static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize,
+                       options: RenderExportOptions = RenderExportOptions()) throws -> CGImage {
         // Validate the rounded dimensions are representable as Int BEFORE converting
         // (greatestFiniteMagnitude.rounded() still overflows Int → trap), then enforce
         // the per-axis Metal texture cap and an overflow-checked total-pixel cap.
@@ -25,6 +31,7 @@ enum PngExporter {
         guard let device = MTLCreateSystemDefaultDevice() else { throw PngExportError.noGPU }
         let renderer = try Renderer(device: device)
         renderer.scene = scene
+        renderer.showBZLandmarks = options.showBZLandmarks
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm
         desc.width = w; desc.height = h
@@ -55,7 +62,8 @@ enum PngExporter {
         guard let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else {
             throw PngExportError.noCGImage
         }
-        guard let cg = ctx.makeImage() else { throw PngExportError.noCGImage }
+        guard let image = ctx.makeImage() else { throw PngExportError.noCGImage }
+        let cg = try composite(labels: options.labels, onto: image)
         try write(cgImage: cg, to: url)
         return cg
     }
@@ -65,7 +73,29 @@ enum PngExporter {
     static func write(cgImage: CGImage, to url: URL) throws {
         let rep = NSBitmapImageRep(cgImage: cgImage)
         guard let png = rep.representation(using: .png, properties: [:]) else { throw PngExportError.noPNG }
-        try png.write(to: url)
+        try png.write(to: url, options: .atomic)
+    }
+
+    /// Composite AppKit's top-left-origin label overlay onto an offscreen raster.
+    static func composite(labels: [LabelOverlayView.Label], onto image: CGImage) throws -> CGImage {
+        guard !labels.isEmpty else { return image }
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else { throw PngExportError.noCGImage }
+        NSGraphicsContext.saveGraphicsState()
+        context.cgContext.translateBy(x: 0, y: CGFloat(image.height))
+        context.cgContext.scaleBy(x: 1, y: -1)
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context.cgContext, flipped: true)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.white,
+        ]
+        for label in labels {
+            (label.symbol as NSString).draw(at: NSPoint(x: label.x, y: label.y), withAttributes: attributes)
+        }
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let composited = rep.cgImage else { throw PngExportError.noCGImage }
+        return composited
     }
     static func clearColor(_ hex: String) -> MTLClearColor {
         var s = hex.trimmingCharacters(in: .whitespaces)

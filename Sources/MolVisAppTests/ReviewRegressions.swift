@@ -816,4 +816,98 @@ final class ReviewRegressions: XCTestCase {
         XCTAssertEqual(scene.isoLevel, 0.7, accuracy: 1e-4,
                        "an in-destination-range isoLevel must be preserved exactly")
     }
+
+    // MARK: - Color Plane persistence across frame rebuild/reload.
+
+    func testResolveAnimationFramePreservesShowColorPlaneOnRebuild() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_3to1.axsf")
+        // Frame 0: 3 atoms; frame 1: 1 atom. Differing atom counts force a real rebuild.
+        XCTAssertEqual(try Parser.load(url, as: nil, frameIndex: 0).atoms.count, 3)
+        XCTAssertEqual(try Parser.load(url, as: nil, frameIndex: 1).atoms.count, 1)
+
+        var scene = Scene(loaded: try Parser.load(url, as: nil, frameIndex: 0))
+        scene.currentFrame = 1        // diverge from loadedFrame -> rebuild path runs
+        scene.showColorPlane = false  // user turned the plane OFF; must survive the rebuild
+
+        try App.resolveAnimationFrame(scene: &scene, from: url, format: nil, loadedFrame: 0, fc: 2)
+        XCTAssertEqual(scene.currentFrame, 1)
+        XCTAssertEqual(scene.atoms.count, 1, "rebuild must reflect the 1-atom frame")
+        XCTAssertFalse(scene.showColorPlane, "showColorPlane must be carried across the frame rebuild")
+    }
+
+    @MainActor
+    func testReloadFramePreservesShowColorPlane() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_3to1.axsf")
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(try Scene(loaded: Parser.load(url, as: nil, frameIndex: 0)),
+                            from: url, format: nil, frameIndex: 0)
+        XCTAssertEqual(controller.state.frameCount, 2)
+
+        // User turns the color plane OFF on frame 0, then scrubs to frame 1.
+        controller.scene.showColorPlane = false
+        controller.state.frameIndex = 1    // production sync -> reloadFrame path
+        XCTAssertEqual(controller.scene.currentFrame, 1)
+        XCTAssertFalse(controller.scene.showColorPlane,
+                       "showColorPlane must survive the frame reload (pre-save)")
+    }
+
+    // MARK: - Review: showColorPlane must be resolved once and applied to both
+    // state and scene so they agree after a grid-presence frame transition.
+
+    @MainActor
+    func testReloadFrameStateSceneAgreeOnGridPresenceTransition() throws {
+        let url = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_grid2d.axsf")
+        // Fixture: frame 0 has no 2D grid; frame 1 carries a DATAGRID_2D.
+        XCTAssertNil(try Parser.load(url, as: nil, frameIndex: 0).grid2D)
+        XCTAssertNotNil(try Parser.load(url, as: nil, frameIndex: 1).grid2D)
+
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(try Scene(loaded: Parser.load(url, as: nil, frameIndex: 0)),
+                            from: url, format: nil, frameIndex: 0)
+        XCTAssertEqual(controller.state.frameCount, 2)
+
+        // No-grid frame: the user's preference survives (grid absence only gates
+        // visible content, it does not erase the preference). Default is true.
+        XCTAssertTrue(controller.state.showColorPlane, "no-grid frame preserves the preference")
+
+        // Step onto the grid frame: reloadFrame resets the toggle to its default
+        // (true) and MUST write the SAME value to both state and scene — the bug
+        // was a one-sided state write that left them divergent.
+        controller.state.frameIndex = 1
+        XCTAssertEqual(controller.scene.currentFrame, 1)
+        XCTAssertTrue(controller.state.showColorPlane, "grid frame resets the plane to shown")
+        XCTAssertEqual(controller.state.showColorPlane, controller.scene.showColorPlane,
+                       "state/scene must agree after stepping onto the grid frame")
+
+        // Step back off the grid: preference still survives (not erased by the
+        // no-grid frame), and state/scene still agree.
+        controller.state.frameIndex = 0
+        XCTAssertEqual(controller.scene.currentFrame, 0)
+        XCTAssertTrue(controller.state.showColorPlane)
+        XCTAssertEqual(controller.state.showColorPlane, controller.scene.showColorPlane,
+                       "state/scene must agree after stepping off the grid frame")
+    }
+
+    // MARK: - Review: a Scene JSON document that predates showColorPlane must
+    // decode without trapping, defaulting the field to true.
+
+    func testSceneDecodeAbsentShowColorPlaneDefaultsTrue() throws {
+        // Start from an encoded Scene, then strip the key to mimic a legacy document.
+        var s = Scene()
+        s.showColorPlane = false
+        var obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(s)) as! [String: Any]
+        XCTAssertNotNil(obj["showColorPlane"], "sanity: key present in fresh encoding")
+        obj.removeValue(forKey: "showColorPlane")
+        let legacy = try JSONSerialization.data(withJSONObject: obj)
+
+        let decoded = try JSONDecoder().decode(Scene.self, from: legacy)
+        XCTAssertTrue(decoded.showColorPlane, "absent showColorPlane must decode as true")
+
+        // A present key still round-trips its explicit value intact.
+        let fresh = try JSONDecoder().decode(Scene.self, from: JSONEncoder().encode(s))
+        XCTAssertFalse(fresh.showColorPlane, "present showColorPlane keeps its encoded value")
+    }
 }

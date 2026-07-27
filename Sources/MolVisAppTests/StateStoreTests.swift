@@ -116,6 +116,44 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(restored.isoLevel, 5)
     }
 
+    /// A DATAGRID_2D scene saved with the color plane hidden must restore
+    /// hidden BEFORE viewport visibility is chosen — the review finding.
+    func testShowColorPlaneRoundTrip() throws {
+        let grid = Grid2D(cols: 2, rows: 2, origin: .zero,
+                          vec: [SIMD3(1,0,0), SIMD3(0,1,0)], values: [[0,1],[2,3]],
+                          minValue: 0, maxValue: 3, ident: "grid")
+        var scene = Scene()
+        scene.grid2D = grid
+        scene.showColorPlane = false
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("cp.mvis-state")
+        try StateStore.save(scene, camera: nil, sourceURL: nil, to: tmp)
+
+        var restored = Scene()
+        restored.grid2D = grid
+        var camera: Camera?
+        try StateStore.load(into: &restored, camera: &camera, from: tmp)
+        XCTAssertFalse(restored.showColorPlane)
+        // The key is actually written to the flat file.
+        let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: tmp)) as? [String: Any]
+        XCTAssertEqual(obj?["showColorPlane"] as? Bool, false)
+    }
+
+    /// Old state files lack the key; the scene default (true) must keep the
+    /// historical shown-when-grid-present behavior.
+    func testShowColorPlaneBackwardsCompat() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("cp_compat.mvis-state")
+        let payload: [String: Any] = ["version": 1, "displayMode": "ballStick", "supercell": [1,1,1],
+                                      "atomScale": 0.35, "bondRadius": 0.1]
+        try JSONSerialization.data(withJSONObject: payload, options: []).write(to: tmp)
+        var scene = Scene()
+        scene.grid2D = Grid2D(cols: 2, rows: 2, origin: .zero,
+                              vec: [SIMD3(1,0,0), SIMD3(0,1,0)], values: [[0,1],[2,3]],
+                              minValue: 0, maxValue: 3, ident: "grid")
+        var camera: Camera?
+        try StateStore.load(into: &scene, camera: &camera, from: tmp)
+        XCTAssertTrue(scene.showColorPlane)
+    }
+
     func testStateRejectsFutureVersion() throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("t3.mvis-state")
         let payload: [String: Any] = ["version": 99, "scene": try JSONSerialization.jsonObject(with: JSONEncoder().encode(Scene()))]
