@@ -130,8 +130,7 @@ final class DensityOfStatesTests: XCTestCase {
         let scene = Scene(loaded: loaded)
         XCTAssertNotNil(scene.densityOfStates, "LoadedScene -> Scene must preserve DOS data")
 
-        let controller = MainWindowController(scene: Scene())
-        defer { controller.window.close() }
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
         controller.loadFile(scene)
         XCTAssertFalse(controller.dosGrapher.isHidden)
         XCTAssertTrue(controller.canvas.isHidden)

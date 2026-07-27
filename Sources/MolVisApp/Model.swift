@@ -201,6 +201,23 @@ struct Scene: Codable {
     /// landmarks. Empty for non-crystal scenes; for crystals it defaults to the
     /// generated high-symmetry path (see Scene.init) until the user edits it.
     var kPathPoints: [KPoint] = []
+    /// Indices i such that there is NO segment between kPathPoints[i] and
+    /// kPathPoints[i+1]. Represents disconnected high-symmetry segments (e.g.
+    /// Γ-H-N | Γ-P for bcc). Empty for a fully connected path. Synced with the
+    /// sidebar editor and persisted in the state file.
+    var kPathBreaks: Set<Int> = []
+    /// Provenance of the k-path: auto-generated (canonical) or user-edited.
+    /// Drives regeneration behavior: generated paths are regenerated when the
+    /// underlying structure changes; user-edited paths are preserved.
+    var kPathProvenance: KPathProvenance = .generated
+    /// Signature of the structure the kPath was generated from. Used to detect
+    /// when regeneration is needed. Format: "spaceGroup|a|b|c|alpha|beta|gamma"
+    /// from the standardized lattice. nil when the path is user-edited or no
+    /// path has been generated.
+    var kPathSignature: String? = nil
+    /// Runtime-only symmetry analysis of the pristine 3D periodic structure.
+    /// It is intentionally excluded from synthesized Scene persistence.
+    @NonPersisted var crystalSymmetry: CrystalSymmetryAnalysis?
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

@@ -16,11 +16,34 @@ let package = Package(
                 .unsafeFlags(["-fno-modules"]),
             ]
         ),
+        .target(
+            name: "SpglibCore",
+            path: "Sources/SpglibCore",
+            exclude: ["spglib_f.c"],
+            publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("."),
+                .headerSearchPath("include"),
+                .unsafeFlags(["-fno-modules"]),
+            ]
+        ),
+        .target(
+            name: "MolEnvSpglib",
+            dependencies: ["SpglibCore"],
+            path: "Sources/MolEnvSpglib",
+            publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("include"),
+                .headerSearchPath("../SpglibCore"),
+                .unsafeFlags(["-fno-modules"]),
+            ]
+        ),
         .executableTarget(
             name: "MolVisApp",
-            dependencies: ["MolEnvParse"],
+            dependencies: ["MolEnvParse", "MolEnvSpglib"],
             path: "Sources/MolVisApp",
             exclude: ["Shaders.metal"],
+            resources: [.copy("Resources/SEEKPATH_LICENSE.txt")],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("Metal"),
@@ -31,7 +54,8 @@ let package = Package(
         .testTarget(
             name: "MolVisAppTests",
             dependencies: ["MolVisApp"],
-            path: "Sources/MolVisAppTests"
+            path: "Sources/MolVisAppTests",
+            resources: [.process("Fixtures")]
         ),
     ]
 )

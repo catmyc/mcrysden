@@ -11,6 +11,9 @@ final class SideBarState: ObservableObject {
     /// True when the loaded scene is a crystal (has a cell). Drives which
     /// crystal-only controls (Brillouin zone, k-path) are shown.
     @Published var isCrystal: Bool = false { didSet { onChange?() } }
+    /// Runtime-only symmetry result for the current base crystal. It is read by
+    /// the sidebar and never participates in view-state persistence.
+    @Published var crystalSymmetry: CrystalSymmetryAnalysis?
     /// Overlay the Brillouin-zone wireframe (crystal only). Synced to
     /// scene.showBrillouinZone in syncFromState().
     @Published var showBrillouinZone: Bool = false { didSet { onChange?() } }
@@ -44,14 +47,23 @@ final class SideBarState: ObservableObject {
     @Published var measurementMode: MeasurementMode = .none { didSet { onChange?() } }
     /// k-path state (crystal only). points carry fractional coords + labels; when
     /// empty the editor offers the default high-symmetry path for the structure.
-    @Published var kPathPoints: [KPoint] = [] { didSet { onChange?() } }
+    @Published var kPathPoints: [KPoint] = [] { didSet { kPathDidChange() } }
+    /// Indices i such that there is NO segment between kPathPoints[i] and
+    /// kPathPoints[i+1]. Represents disconnected high-symmetry segments.
+    @Published var kPathBreaks: Set<Int> = [] { didSet { kPathDidChange() } }
     /// UI-only: when true the user is editing the k-path by clicking BZ landmarks.
     /// Forces Brillouin-zone visibility on (handled in syncFromState). Exiting
     /// this mode does not itself change the route.
     @Published var editKPathOnBZ: Bool = false { didSet { onChange?() } }
     /// UI-only undo stack of prior routes (snapshots before each mutation), so the
-    /// "Undo" control can step back. Bounded to 1024 entries.
-    private var kPathUndo: [[KPoint]] = []
+    /// "Undo" control can step back. Bounded to 1024 entries. Each entry captures
+    /// both the points and the break set.
+    private var kPathUndo: [([KPoint], Set<Int>)] = []
+    /// `kPathPoints` and `kPathBreaks` must reach the controller as one route
+    /// snapshot. Their `didSet`s synchronously invoke `onChange`, so compound
+    /// editor operations batch the notification until both values agree.
+    private var kPathMutationDepth = 0
+    private var pendingKPathChange = false
     /// Whether an undo is available. Drives the "Undo" control's disabled state so it
     /// stays enabled after a Clear (the pre-clear route is restorable) and is cleared
     /// whenever the route is reset/loaded.
@@ -122,10 +134,11 @@ final class SideBarState: ObservableObject {
         showLabels = scene.showLabels
         showBrillouinZone = scene.showBrillouinZone
         isCrystal = scene.isCrystal
+        crystalSymmetry = scene.crystalSymmetry
         // Mirror the scene's route: for a freshly-loaded crystal this is the
         // generated high-symmetry default; once the user edits it, the edited
         // route lives in the scene and must be copied back, never regenerated.
-        kPathPoints = scene.kPathPoints
+        replaceKPath(points: scene.kPathPoints, breaks: scene.kPathBreaks)
         editKPathOnBZ = false   // loading a new scene exits edit mode
         kPathUndo = []          // drop stale undo history from the previous scene
         measurementMode = scene.measurementMode
@@ -178,7 +191,39 @@ final class SideBarState: ObservableObject {
     /// long editing session cannot grow the stack without limit.
     private func pushUndo() {
         if kPathUndo.count >= 1024 { kPathUndo.removeFirst() }
-        kPathUndo.append(kPathPoints)
+        kPathUndo.append((kPathPoints, kPathBreaks))
+    }
+
+    /// Run a compound k-path change while deferring its synchronous state
+    /// callback. Nested calls are supported so helper methods remain safe.
+    private func mutateKPath(_ mutation: () -> Void) {
+        kPathMutationDepth += 1
+        defer {
+            kPathMutationDepth -= 1
+            if kPathMutationDepth == 0, pendingKPathChange {
+                pendingKPathChange = false
+                onChange?()
+            }
+        }
+        mutation()
+    }
+
+    private func kPathDidChange() {
+        if kPathMutationDepth > 0 {
+            pendingKPathChange = true
+        } else {
+            onChange?()
+        }
+    }
+
+    /// Replace the whole route atomically from the controller (for example when
+    /// restoring or regenerating the canonical path). Its one notification never
+    /// exposes a new point list paired with old break indices.
+    func replaceKPath(points: [KPoint], breaks: Set<Int>) {
+        mutateKPath {
+            kPathPoints = points
+            kPathBreaks = breaks
+        }
     }
 
     /// Bound a single node's label to 64 chars. No-op for an out-of-range index or when
@@ -192,6 +237,8 @@ final class SideBarState: ObservableObject {
     }
 
     /// Swap a node with its predecessor. No-op at the top or out of range.
+    /// Breaks describe positions between adjacent list entries, so an adjacent
+    /// swap deliberately leaves the break-index set unchanged.
     func moveUp(at index: Int) {
         guard index > 0, index < kPathPoints.count else { return }
         pushUndo()
@@ -199,6 +246,8 @@ final class SideBarState: ObservableObject {
     }
 
     /// Swap a node with its successor. No-op at the bottom or out of range.
+    /// Breaks describe positions between adjacent list entries, so an adjacent
+    /// swap deliberately leaves the break-index set unchanged.
     func moveDown(at index: Int) {
         guard index >= 0, index < kPathPoints.count - 1 else { return }
         pushUndo()
@@ -206,24 +255,88 @@ final class SideBarState: ObservableObject {
     }
 
     /// Remove a node. No-op for an out-of-range index.
+    /// The two gaps bordering an interior deletion collapse into one; that new
+    /// gap is broken if either original gap was broken. Boundary deletions drop
+    /// the vanished outer gap and never leave an invalid -1/last break behind.
     func remove(at index: Int) {
         guard kPathPoints.indices.contains(index) else { return }
         pushUndo()
-        kPathPoints.remove(at: index)
+        let oldBreaks = kPathBreaks
+        mutateKPath {
+            kPathPoints.remove(at: index)
+            remapBreaksForRemoval(at: index, oldBreaks: oldBreaks)
+        }
+    }
+
+    /// Remap break indices after removing the point at `index`.
+    /// For each remaining gap, look up its predecessor gap(s) before removal.
+    /// This naturally handles first/last removals and discards malformed old
+    /// break indices instead of shifting them into another invalid position.
+    private func remapBreaksForRemoval(at index: Int, oldBreaks: Set<Int>) {
+        let remainingPointCount = kPathPoints.count
+        guard remainingPointCount >= 2 else {
+            kPathBreaks = []
+            return
+        }
+        var newBreaks = Set<Int>()
+        for newGap in 0..<(remainingPointCount - 1) {
+            let isBroken: Bool
+            if index > 0, index < remainingPointCount, newGap == index - 1 {
+                // The deleted point was interior: old gaps index-1 and index
+                // both contributed to the new direct connection.
+                isBroken = oldBreaks.contains(index - 1) || oldBreaks.contains(index)
+            } else {
+                // Gaps before the deletion retain their index; gaps after it
+                // shift one slot down in the new point list.
+                let oldGap = newGap < index ? newGap : newGap + 1
+                isBroken = oldBreaks.contains(oldGap)
+            }
+            if isBroken { newBreaks.insert(newGap) }
+        }
+        kPathBreaks = newBreaks
     }
 
     /// Undo the last mutation, restoring the route snapshot taken beforehand.
     /// No-op when there is nothing to undo.
     func undoLast() {
-        guard let prev = kPathUndo.popLast() else { return }
-        kPathPoints = prev
+        guard let (points, breaks) = kPathUndo.popLast() else { return }
+        replaceKPath(points: points, breaks: breaks)
     }
 
     /// Clear the whole route. No-op (no undo entry) when already empty.
     func clear() {
         guard !kPathPoints.isEmpty else { return }
         pushUndo()
-        kPathPoints = []
+        replaceKPath(points: [], breaks: [])
+    }
+
+    /// Toggle a break at the given index. A break at i means no segment joins
+    /// kPathPoints[i] and kPathPoints[i+1]. No-op for an out-of-range index.
+    /// When inserting a break, remaps existing break indices that are >= the
+    /// insertion point (none, since the break is between existing points).
+    func toggleBreak(at index: Int) {
+        guard index >= 0, index < kPathPoints.count - 1 else { return }
+        pushUndo()
+        if kPathBreaks.contains(index) {
+            kPathBreaks.remove(index)
+        } else {
+            kPathBreaks.insert(index)
+        }
+    }
+
+    /// Insert a break at the given index. No-op if already present or out of range.
+    func insertBreak(at index: Int) {
+        guard index >= 0, index < kPathPoints.count - 1 else { return }
+        guard !kPathBreaks.contains(index) else { return }
+        pushUndo()
+        kPathBreaks.insert(index)
+    }
+
+    /// Remove a break at the given index. No-op if not present or out of range.
+    func removeBreak(at index: Int) {
+        guard kPathBreaks.contains(index) else { return }
+        pushUndo()
+        kPathBreaks.remove(index)
     }
 
     /// Reset to the generated default for the current scene. The controller owns

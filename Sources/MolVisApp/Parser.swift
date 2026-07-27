@@ -54,6 +54,26 @@ internal func gunzipData(_ url: URL) throws -> Data {
     return data
 }
 
+/// Whether the loaded atom list is sufficient for a truthful space-group
+/// analysis. CIF and CRYSCAL files commonly contain only an asymmetric unit;
+/// operation expansion is intentionally deferred to a later phase.
+enum SymmetryInputCompleteness: Equatable {
+    case complete
+    case asymmetricUnit
+    case unknown
+
+    var symmetryUnavailableReason: String {
+        switch self {
+        case .complete:
+            return ""
+        case .asymmetricUnit:
+            return "symmetry unavailable: the file contains an asymmetric unit; operation expansion is not implemented"
+        case .unknown:
+            return "symmetry unavailable: the file's symmetry-input completeness is unknown"
+        }
+    }
+}
+
 struct LoadedScene {
     var atoms: [Atom] = []
     var bonds: [Bond] = []
@@ -68,11 +88,12 @@ struct LoadedScene {
     var forceSet: ForceSet?
     var grid2D: Grid2D?
     var multiOrbitalFields: [ScalarField] = []
+    var symmetryInputCompleteness: SymmetryInputCompleteness = .complete
 }
 
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
-enum ParseFormat {
+enum ParseFormat: Equatable {
     case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi, bands, dos
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
@@ -293,7 +314,8 @@ enum Parser {
             throw ParseError.parse(path: path, line: line, reason: reason)
         }
         defer { molenv_scene_free(scene) }
-        return copyOut(scene.pointee)
+        let completeness: SymmetryInputCompleteness = effective == .cif ? .unknown : .complete
+        return copyOut(scene.pointee, symmetryInputCompleteness: completeness)
     }
 
     /// Number of animation frames in an animated file: ANIMSTEPS for AXSF, or
@@ -352,9 +374,11 @@ enum Parser {
         return copyOut(scene.pointee)
     }
 
-    private static func copyOut(_ s: MolEnvScene) -> LoadedScene {
+    private static func copyOut(_ s: MolEnvScene,
+                                symmetryInputCompleteness: SymmetryInputCompleteness = .complete) -> LoadedScene {
         var s = s
         var out = LoadedScene()
+        out.symmetryInputCompleteness = symmetryInputCompleteness
         out.isCrystal = s.is_crystal != 0
         out.periodicDim = Int(s.periodic_dim)
         out.title = withUnsafePointer(to: &s.title) { ptr in
@@ -753,6 +777,7 @@ enum Parser {
         var out = LoadedScene()
         out.title = url.lastPathComponent
         out.atoms = atoms
+        out.symmetryInputCompleteness = .asymmetricUnit
         out.isCrystal = !isPolymer
         if !isPolymer { out.cell = cell }
         return out

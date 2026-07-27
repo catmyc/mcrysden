@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 // .molvis-state persistence. Matches the documented contract
 // (docs/superpowers/specs/2026-07-06-mcrysden-design.md §8): a FLAT top-level
@@ -46,11 +47,35 @@ enum StateStore {
             "azimuth": scene.lighting.azimuth, "elevation": scene.lighting.elevation,
         ]
         payload["currentFrame"] = scene.currentFrame
-        // k-path: persist each point's fractional coords + label. Capped at load
+        // k-path: persist each point's fractional coords + label, the break set
+        // (disconnected segment indices), and the provenance. Capped at load
         // time; here we just serialize what the scene holds (already bounded by
         // the editor, but keep the array compact for the flat format).
         payload["kPathPoints"] = scene.kPathPoints.map { kp in
             ["frac": [kp.frac.x, kp.frac.y, kp.frac.z], "label": kp.label]
+        }
+        // Persist breaks as a sorted array of indices. Empty array means fully
+        // connected. Backward-compatible: old state files without this key
+        // default to no breaks.
+        payload["kPathBreaks"] = Array(scene.kPathBreaks).sorted()
+        // Persist provenance so we know whether to regenerate on reload.
+        payload["kPathProvenance"] = scene.kPathProvenance.rawValue
+        // A generated route's signature is its identity with respect to the
+        // source structure.  Do not serialize a stale signature onto a user
+        // route: user coordinates are intentionally independent data.
+        if scene.kPathProvenance == .generated, let signature = scene.kPathSignature {
+            payload["kPathSignature"] = signature
+        }
+        // Fractional k-point coordinates are expressed in the *input*
+        // reciprocal basis. Persist that direct-cell basis so an edited route
+        // can be remapped safely if the source file is later replaced by an
+        // equivalent-but-rotated/deformed input cell.
+        if let cell = scene.cell {
+            payload["kPathInputCell"] = [
+                [cell.a.x, cell.a.y, cell.a.z],
+                [cell.b.x, cell.b.y, cell.b.z],
+                [cell.c.x, cell.c.y, cell.c.z],
+            ]
         }
         if let camera {
             payload["camera"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(camera))
@@ -81,8 +106,11 @@ enum StateStore {
         } catch {
             throw ParseError.io(path: url.path, reason: "bad state file: \(error)")
         }
-        if let v = obj["version"] as? Int, v > 1 {
-            throw ParseError.parse(path: url.path, line: 0, reason: "state version \(v) too new")
+        if let value = obj["version"] {
+            let v = try strictInteger(value, field: "version", url: url)
+            if v > 1 {
+                throw ParseError.parse(path: url.path, line: 0, reason: "state version \(v) too new")
+            }
         }
         let dec = JSONDecoder()
         var candidate = scene
@@ -197,44 +225,97 @@ enum StateStore {
             candidate.lighting = l
         }
         if let v = obj["currentFrame"] as? Int { candidate.currentFrame = v }
-        // k-path (optional). An explicit [] clears the route; an absent key leaves
-        // the scene default (set at parse time). A present key that is NOT an array
-        // of {frac, label} dictionaries throws a path-bearing ParseError (so a
-        // corrupt value is never silently ignored). Validate a practical cap, finite
-        // Float-representable coordinates, and bounded labels — a malformed entry
-        // also throws (the transactional rollback below keeps the caller's scene
-        // intact).
-        if let value = obj["kPathPoints"] {
-            guard let arr = value as? [[String: Any]] else {
+        // k-path lifecycle. Keep the freshly parsed route as a snapshot before
+        // applying persisted data: it is the authoritative canonical route for
+        // the current source structure/input basis and lets old state files infer
+        // whether their route was generated or user-edited.
+        let freshPoints = candidate.kPathPoints
+        let freshBreaks = candidate.kPathBreaks
+        let freshProvenance = candidate.kPathProvenance
+        let freshSignature = candidate.kPathSignature
+
+        let hasPersistedPoints = obj["kPathPoints"] != nil
+        let persistedPoints = try obj["kPathPoints"].map { try parseKPathPoints($0, url: url) }
+        let routePoints = persistedPoints ?? freshPoints
+
+        let persistedBreaks = try obj["kPathBreaks"].map {
+            try parseKPathBreaks($0, pointCount: routePoints.count, url: url)
+        }
+        // For an old state with an explicit route but no break key, retain the
+        // historical fully-connected interpretation. If the route key is absent,
+        // preserve the freshly generated topology instead of clearing its breaks.
+        let routeBreaks = persistedBreaks ?? (hasPersistedPoints ? [] : freshBreaks)
+
+        let explicitProvenance: KPathProvenance?
+        if let raw = obj["kPathProvenance"] {
+            guard let string = raw as? String else {
                 throw ParseError.parse(path: url.path, line: 0,
-                                       reason: "kPathPoints must be an array of {frac, label} dictionaries")
+                                       reason: "kPathProvenance must be a string")
             }
-            let cap = 1024
-            guard arr.count <= cap else {
+            guard let provenance = KPathProvenance(rawValue: string) else {
                 throw ParseError.parse(path: url.path, line: 0,
-                                       reason: "kPathPoints count \(arr.count) exceeds cap \(cap)")
+                                       reason: "invalid kPathProvenance: \(string)")
             }
-            var points: [KPoint] = []
-            points.reserveCapacity(arr.count)
-            for (i, item) in arr.enumerated() {
-                guard let frac = item["frac"] as? [Double], frac.count == 3,
-                      let label = item["label"] as? String else {
-                    throw ParseError.parse(path: url.path, line: 0, reason: "malformed kPathPoints[\(i)]")
-                }
-                let fx = Float(frac[0]), fy = Float(frac[1]), fz = Float(frac[2])
-                guard frac[0].isFinite, frac[1].isFinite, frac[2].isFinite,
-                      fx.isFinite, fy.isFinite, fz.isFinite else {
-                    throw ParseError.parse(path: url.path, line: 0, reason: "non-finite kPathPoints[\(i)]")
-                }
-                // Reject overlong labels (don't silently truncate — that would
-                // mutate persisted data without the user's knowledge).
-                guard label.count <= 64 else {
-                    throw ParseError.parse(path: url.path, line: 0,
-                                           reason: "kPathPoints[\(i)] label too long (\(label.count) > 64)")
-                }
-                points.append(KPoint(SIMD3<Float>(fx, fy, fz), label))
+            explicitProvenance = provenance
+        } else {
+            explicitProvenance = nil
+        }
+
+        let persistedSignature: String?
+        if let raw = obj["kPathSignature"] {
+            guard let signature = raw as? String, !signature.isEmpty, signature.utf8.count <= 256 else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "kPathSignature must be a non-empty string up to 256 bytes")
             }
-            candidate.kPathPoints = points
+            persistedSignature = signature
+        } else {
+            persistedSignature = nil
+        }
+        let persistedInputCell = try obj["kPathInputCell"].map { try parseKPathInputCell($0, url: url) }
+
+        if hasPersistedPoints {
+            // Pre-provenance state files cannot safely default to generated: a
+            // custom route from an older app must not later be regenerated away.
+            // It is generated only when it exactly matches the new scene's own
+            // canonical route and topology.
+            let provenance = explicitProvenance
+                ?? ((routePoints == freshPoints && routeBreaks == freshBreaks) ? .generated : .userEdited)
+
+            switch provenance {
+            case .userEdited:
+                if let savedCell = persistedInputCell, let currentCell = candidate.cell,
+                   let remapped = Scene.remapKPathPoints(routePoints, from: savedCell, to: currentCell) {
+                    candidate.kPathPoints = remapped
+                } else {
+                    // No saved/valid source basis means remapping is impossible;
+                    // preserve the literal user coordinates non-destructively.
+                    candidate.kPathPoints = routePoints
+                }
+                candidate.kPathBreaks = routeBreaks
+                candidate.kPathProvenance = .userEdited
+                candidate.kPathSignature = nil
+
+            case .generated:
+                // A generated route may be copied only when the state and freshly
+                // parsed scene describe the same structure *and* input reciprocal
+                // basis. Otherwise retain the new scene's canonical route.
+                let signaturesAgree = persistedSignature == nil || freshSignature == nil
+                    || persistedSignature == freshSignature
+                let basesAgree: Bool
+                if let savedCell = persistedInputCell, let currentCell = candidate.cell {
+                    basesAgree = Scene.inputReciprocalBasesMatch(savedCell, currentCell) == true
+                } else {
+                    // Legacy state has no basis snapshot. It cannot establish a
+                    // mismatch, so retain its historical behavior non-destructively.
+                    basesAgree = true
+                }
+                if freshProvenance != .generated || (signaturesAgree && basesAgree) {
+                    candidate.kPathPoints = routePoints
+                    candidate.kPathBreaks = routeBreaks
+                    candidate.kPathProvenance = .generated
+                    candidate.kPathSignature = persistedSignature ?? freshSignature
+                }
+            }
         }
         // camera (optional). Wrap a malformed subtree as a path-bearing
         // ParseError (transactional rollback is preserved: scene/camera are only
@@ -251,5 +332,119 @@ enum StateStore {
         }
         scene = candidate
         camera = candidateCamera
+    }
+
+    private static func parseKPathPoints(_ value: Any, url: URL) throws -> [KPoint] {
+        guard let arr = value as? [[String: Any]] else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "kPathPoints must be an array of {frac, label} dictionaries")
+        }
+        let cap = 1024
+        guard arr.count <= cap else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "kPathPoints count \(arr.count) exceeds cap \(cap)")
+        }
+        var points: [KPoint] = []
+        points.reserveCapacity(arr.count)
+        for (index, item) in arr.enumerated() {
+            guard let rawFraction = item["frac"] as? [Any], rawFraction.count == 3,
+                  let label = item["label"] as? String else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "malformed kPathPoints[\(index)]")
+            }
+            guard label.count <= 64 else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "kPathPoints[\(index)] label too long (\(label.count) > 64)")
+            }
+            let x = try finiteJSONFloat(rawFraction[0], field: "kPathPoints[\(index)].frac[0]", url: url)
+            let y = try finiteJSONFloat(rawFraction[1], field: "kPathPoints[\(index)].frac[1]", url: url)
+            let z = try finiteJSONFloat(rawFraction[2], field: "kPathPoints[\(index)].frac[2]", url: url)
+            points.append(KPoint(SIMD3<Float>(x, y, z), label))
+        }
+        return points
+    }
+
+    private static func parseKPathBreaks(_ value: Any, pointCount: Int, url: URL) throws -> Set<Int> {
+        guard let rawBreaks = value as? [Any] else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "kPathBreaks must be an array of integers")
+        }
+        if pointCount > 0 {
+            guard rawBreaks.count < pointCount else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "kPathBreaks count \(rawBreaks.count) >= point count \(pointCount)")
+            }
+        } else {
+            guard rawBreaks.isEmpty else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "kPathBreaks non-empty with zero points")
+            }
+        }
+
+        var breaks = Set<Int>()
+        for (index, rawBreak) in rawBreaks.enumerated() {
+            let breakIndex = try strictInteger(rawBreak, field: "kPathBreaks[\(index)]", url: url)
+            guard breakIndex >= 0, breakIndex < pointCount - 1 else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "kPathBreaks[\(index)] = \(breakIndex) out of range for \(pointCount) points")
+            }
+            guard breaks.insert(breakIndex).inserted else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "duplicate kPathBreaks entry: \(breakIndex)")
+            }
+        }
+        return breaks
+    }
+
+    private static func parseKPathInputCell(_ value: Any, url: URL) throws -> Cell {
+        guard let rows = value as? [Any], rows.count == 3 else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "kPathInputCell must be a 3x3 numeric array")
+        }
+        var vectors: [SIMD3<Float>] = []
+        vectors.reserveCapacity(3)
+        for (rowIndex, rowValue) in rows.enumerated() {
+            guard let components = rowValue as? [Any], components.count == 3 else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "kPathInputCell[\(rowIndex)] must have three numeric components")
+            }
+            vectors.append(SIMD3<Float>(
+                try finiteJSONFloat(components[0], field: "kPathInputCell[\(rowIndex)][0]", url: url),
+                try finiteJSONFloat(components[1], field: "kPathInputCell[\(rowIndex)][1]", url: url),
+                try finiteJSONFloat(components[2], field: "kPathInputCell[\(rowIndex)][2]", url: url)
+            ))
+        }
+        return Cell(a: vectors[0], b: vectors[1], c: vectors[2])
+    }
+
+    /// JSON has a single generic number type. Accept integral numeric tokens
+    /// (including `1.0`) but reject booleans, fractions, non-finite values, and
+    /// values outside the safe `Int` conversion range.
+    private static func strictInteger(_ value: Any, field: String, url: URL) throws -> Int {
+        guard let number = value as? NSNumber, !isJSONBoolean(number) else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "\(field) must be an integer")
+        }
+        let decimal = number.doubleValue
+        guard decimal.isFinite, decimal.rounded(.towardZero) == decimal,
+              decimal > Double(Int.min), decimal < Double(Int.max) else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "\(field) must be an integer")
+        }
+        return Int(decimal)
+    }
+
+    private static func finiteJSONFloat(_ value: Any, field: String, url: URL) throws -> Float {
+        guard let number = value as? NSNumber, !isJSONBoolean(number) else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "\(field) must be a finite number")
+        }
+        let decimal = number.doubleValue
+        let converted = Float(decimal)
+        guard decimal.isFinite, converted.isFinite else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "non-finite state value: \(field)")
+        }
+        return converted
+    }
+
+    private static func isJSONBoolean(_ number: NSNumber) -> Bool {
+        CFGetTypeID(number) == CFBooleanGetTypeID()
     }
 }

@@ -253,9 +253,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
             scene.atomScale = restored.atomScale
             scene.bondRadius = restored.bondRadius
             scene.measurementMode = restored.measurementMode
-            // Carry the edited k-path across the frame rebuild exactly like the
-            // other appearance/control state (the route is geometry-independent).
-            scene.kPathPoints = restored.kPathPoints
+            // A rebuilt frame may have a different input reciprocal basis even
+            // when its standardized symmetry signature is unchanged (for example
+            // a physically rotated cell). Generated paths stay with the freshly
+            // parsed frame; user paths are carried with their breaks/provenance
+            // and safely remapped through Cartesian reciprocal space when possible.
+            scene.transferKPathAcrossGeometryChange(from: restored)
             // A selection/measurement is only portable when EVERY saved index still
             // points at a real atom in the REBUILT frame (a different animation frame —
             // or a supercell/slab it predates — may shrink the atom count). Carry a

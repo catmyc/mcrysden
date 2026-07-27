@@ -40,7 +40,7 @@ final class KPathTests: XCTestCase {
         let path = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
                                   KPoint(SIMD3(0.5,0,0), "X"),
                                   KPoint(SIMD3(0.5,0.5,0), "M")])
-        let kpf = KPathExport.xcrysdnenKPF(path)
+        let kpf = try! KPathExport.xcrysdnenKPF(path)
         let lines = kpf.split(separator: "\n").filter { !$0.isEmpty }
         XCTAssertEqual(lines.count, 4, "kpf: 1 multiplier line + 3 k-point lines")
         XCTAssertEqual(lines[0], "2", "ISS multiplier for .5 coords is 2")

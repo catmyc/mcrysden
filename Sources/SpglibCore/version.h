@@ -1,0 +1,16 @@
+// Copyright (C) 2015 Atsushi Togo
+// This file is part of spglib.
+// SPDX-License-Identifier: BSD-3-Clause
+
+#ifndef __version_H__
+#define __version_H__
+
+/* Generated from spglib v2.7.0's version.h.in. */
+#define SPGLIB_MAJOR_VERSION 2
+#define SPGLIB_MINOR_VERSION 7
+#define SPGLIB_MICRO_VERSION 0
+#define SPGLIB_VERSION "2.7.0"
+#define SPGLIB_VERSION_FULL "2.7.0"
+#define SPGLIB_COMMIT "12355c77fb7c505a55f52cae36341d73b781a065"
+
+#endif

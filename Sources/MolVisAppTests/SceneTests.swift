@@ -139,8 +139,7 @@ final class SceneTests: XCTestCase {
         var scene = Scene()
         scene.scalarField = fields[0]
         scene.multiOrbitalFields = fields
-        let wc = MainWindowController(scene: Scene())
-        defer { wc.window.close() }
+        let wc = MainWindowController(scene: Scene(), showWindow: false)
         wc.loadFile(scene)
         XCTAssertEqual(wc.state.orbitalCount, 2)
         wc.state.currentOrbital = 1

@@ -60,13 +60,140 @@ extension Scene {
         self.baseAtoms = loaded.atoms
         self.baseBonds = loaded.bonds
         // Seed the editable k-path with the generated high-symmetry default for
-        // crystals (matches MainWindowController.makeDefaultKPath); molecules keep
-        // an empty route. Edited by the k-path editor in later phases.
+        // crystals; molecules keep an empty route. Edited by the k-path editor.
+        // The path is generated from the symmetry analysis (which runs below),
+        // so we defer generation to `installCanonicalPath(for:)`.
+        self.kPathPoints = []
+        self.kPathBreaks = []
+        self.kPathProvenance = .generated
+        self.kPathSignature = nil
+        self.crystalSymmetry = CrystalSymmetryAnalyzer.analyze(
+            cell: loaded.cell,
+            atoms: loaded.atoms,
+            isCrystal: loaded.isCrystal,
+            periodicDim: loaded.periodicDim,
+            inputCompleteness: loaded.symmetryInputCompleteness
+        )
+        // Install the canonical path from the just-computed symmetry analysis.
         if loaded.isCrystal, let cell = loaded.cell {
-            self.kPathPoints = KPath.defaultPath(cell: cell, atoms: loaded.atoms.map { $0.coord }).points
-        } else {
-            self.kPathPoints = []
+            self.installCanonicalPath(cell: cell)
         }
+    }
+
+    /// Install the canonical high-symmetry path for the current symmetry.
+    /// Maps the path from the standardized reciprocal basis to the input-cell
+    /// reciprocal basis. Sets the provenance to `.generated` and records the
+    /// structure signature so future operations can detect when regeneration
+    /// is needed. No-op when symmetry is unavailable.
+    mutating func installCanonicalPath(cell: Cell) {
+        guard let symmetry = crystalSymmetry?.symmetry else {
+            kPathPoints = []
+            kPathBreaks = []
+            kPathProvenance = .generated
+            kPathSignature = nil
+            return
+        }
+        let canonical = CanonicalPathGenerator.generate(for: symmetry)
+        let mapped = CanonicalPathGenerator.mapToInputReciprocal(canonical,
+                                                                  symmetry: symmetry,
+                                                                  inputCell: cell)
+        kPathPoints = mapped.kPoints
+        kPathBreaks = mapped.breaks
+        kPathProvenance = .generated
+        kPathSignature = CanonicalPathGenerator.structureSignature(for: crystalSymmetry?.symmetry)
+    }
+
+    /// Transfer a route from a scene that is being replaced by a freshly parsed
+    /// structure/frame.  A freshly parsed `Scene` has already generated its own
+    /// canonical route in its *current input reciprocal basis*, so generated
+    /// routes deliberately stay here rather than copying stale fractional values
+    /// from the old frame.  This covers both a real structure change and a pure
+    /// physical rotation of the input cell (which leaves the standardized
+    /// signature unchanged but changes the meaning of fractional coordinates).
+    ///
+    /// A user route is data, not a request to regenerate.  When both input cells
+    /// provide finite, invertible reciprocal bases, preserve each point's
+    /// Cartesian reciprocal position by mapping old fractional coordinates into
+    /// the new basis.  If that mathematics is unavailable (e.g. a malformed or
+    /// non-periodic replacement), preserve the exact stored fractional route
+    /// instead of dropping or inventing a route.  The latter is the explicit
+    /// non-destructive fallback policy.
+    mutating func transferKPathAcrossGeometryChange(from previous: Scene) {
+        guard previous.kPathProvenance == .userEdited else {
+            // `self` is the freshly parsed scene. Its generated points, breaks,
+            // and signature are authoritative for the current geometry.
+            return
+        }
+
+        if let oldCell = previous.cell, let newCell = cell,
+           let remapped = Self.remapKPathPoints(previous.kPathPoints,
+                                                 from: oldCell, to: newCell) {
+            kPathPoints = remapped
+        } else {
+            // See the method documentation: no valid old/new reciprocal mapping
+            // means preserve the user's literal coordinates unchanged.
+            kPathPoints = previous.kPathPoints
+        }
+        kPathBreaks = previous.kPathBreaks
+        kPathProvenance = .userEdited
+        // A structure signature describes a generated route only. Never carry a
+        // stale generated signature onto a user-edited route.
+        kPathSignature = nil
+    }
+
+    /// Map route coordinates from one input reciprocal basis to another while
+    /// retaining Cartesian reciprocal positions. Returns nil when either basis
+    /// is unusable or any coordinate would become non-finite; callers use the
+    /// documented non-destructive literal-coordinate fallback in that case.
+    static func remapKPathPoints(_ points: [KPoint], from oldCell: Cell,
+                                 to newCell: Cell) -> [KPoint]? {
+        guard points.allSatisfy({ $0.frac.x.isFinite && $0.frac.y.isFinite && $0.frac.z.isFinite }) else {
+            return nil
+        }
+        guard let basesMatch = inputReciprocalBasesMatch(oldCell, newCell) else {
+            return nil
+        }
+        // Avoid a needless inverse/multiply round trip (and the associated tiny
+        // Float drift) when atom positions changed but the input basis did not.
+        guard !basesMatch else { return points }
+
+        let oldReciprocal = oldCell.reciprocalVectors
+        let newReciprocal = newCell.reciprocalVectors
+        var result: [KPoint] = []
+        result.reserveCapacity(points.count)
+        for point in points {
+            let cartesian = BrillouinZone.cartesianFromFractional(point.frac,
+                                                                    reciprocal: oldReciprocal)
+            guard cartesian.x.isFinite, cartesian.y.isFinite, cartesian.z.isFinite,
+                  let fractional = BrillouinZone.fractionalFromCartesian(cartesian,
+                                                                          reciprocal: newReciprocal) else {
+                return nil
+            }
+            result.append(KPoint(fractional, point.label))
+        }
+        return result
+    }
+
+    /// Whether two direct input cells induce the same reciprocal basis. A nil
+    /// result means at least one basis is non-finite or singular, so it is not
+    /// safe to make a coordinate-space assertion about them.
+    static func inputReciprocalBasesMatch(_ lhs: Cell, _ rhs: Cell,
+                                          relativeTolerance: Float = 1e-5) -> Bool? {
+        let left = lhs.reciprocalVectors
+        let right = rhs.reciprocalVectors
+        let leftMatrix = simd_float3x3(columns: (left.a, left.b, left.c))
+        let rightMatrix = simd_float3x3(columns: (right.a, right.b, right.c))
+        guard BrillouinZone.isFiniteInvertible(leftMatrix),
+              BrillouinZone.isFiniteInvertible(rightMatrix) else {
+            return nil
+        }
+        for (a, b) in [(left.a, right.a), (left.b, right.b), (left.c, right.c)] {
+            let scale = max(length(a), length(b))
+            guard scale.isFinite, scale > 0, length(a - b) <= relativeTolerance * scale else {
+                return false
+            }
+        }
+        return true
     }
 
     var centroid: SIMD3<Float> {
@@ -153,6 +280,9 @@ extension Scene {
                 out.selectedAtoms = []
                 out.measurementResult = nil
             }
+            // Shrinking to (1,1,1) restores the base atom set but keeps the base
+            // cell and its reciprocal structure. Both generated and user-edited
+            // paths remain valid — no mutation needed.
             return out
         }
         // Always expand from the base atoms so the operation is idempotent
@@ -190,6 +320,12 @@ extension Scene {
         // point at the wrong atoms.
         out.selectedAtoms = []
         out.measurementResult = nil
+        // Supercell widening replicates atoms but keeps the base cell and its
+        // reciprocal structure unchanged. The input-cell reciprocal basis is the
+        // same, so BOTH generated and user-edited paths remain valid. No path
+        // mutation is needed — generated paths stay generated, user paths stay
+        // user-edited. (This is the key lifecycle invariant: display-only
+        // replication must not destroy user-edited routes.)
         return out
     }
 

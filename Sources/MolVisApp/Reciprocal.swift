@@ -163,6 +163,26 @@ struct KPath: Codable, Equatable {
     var points: [KPoint]
     // Number of interpolated points per segment (distance-weighted rounding).
     var pointsPerSegment: Int = 20
+    /// Indices i such that there is NO segment between points[i] and points[i+1].
+    /// A break at i means the path "jumps" from points[i] to points[i+1] without
+    /// interpolating between them. Used to represent disconnected high-symmetry
+    /// segments (e.g. Γ-H-N | Γ-P for bcc). Empty for a fully connected path.
+    var breaks: Set<Int> = []
+
+    init(points: [KPoint], pointsPerSegment: Int = 20, breaks: Set<Int> = []) {
+        self.points = points
+        self.pointsPerSegment = pointsPerSegment
+        self.breaks = breaks
+    }
+}
+
+/// Provenance of a k-path: whether it was auto-generated (canonical) or
+/// deliberately edited by the user. Drives regeneration behavior.
+enum KPathProvenance: String, Codable {
+    /// Canonical high-symmetry path; can be regenerated when the structure changes.
+    case generated
+    /// User-edited path; must be preserved when the structure changes.
+    case userEdited
 }
 
 private func length(_ v: SIMD3<Float>) -> Float { sqrt(dot(v, v)) }

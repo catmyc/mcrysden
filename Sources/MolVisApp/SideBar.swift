@@ -108,6 +108,7 @@ struct SideBar: View {
             // default high-symmetry path and writes the chosen export via a save
             // panel. Shown only for crystals (a cell with base atoms present).
             if state.isCrystal {
+                SymmetrySection(state: state)
                 Section("K-Path") {
                     Toggle("Brillouin Zone", isOn: $state.showBrillouinZone)
                     Toggle("Edit on BZ", isOn: $state.editKPathOnBZ)
@@ -149,6 +150,21 @@ struct SideBar: View {
                                 .buttonStyle(.borderless)
                             }
                         }
+                        // Break toggle between this point and the next.
+                        if i < state.kPathPoints.count - 1 {
+                            HStack {
+                                Spacer()
+                                let isBroken = state.kPathBreaks.contains(i)
+                                Button(action: { state.toggleBreak(at: i) }) {
+                                    Image(systemName: isBroken ? "line.diagonal" : "line.horizontal")
+                                        .foregroundColor(isBroken ? .red : .green)
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel(isBroken ? "Break between \(state.kPathPoints[i].label) and \(state.kPathPoints[i+1].label)" : "Connection between \(state.kPathPoints[i].label) and \(state.kPathPoints[i+1].label)")
+                                .accessibilityHint(isBroken ? "Double tap to connect" : "Double tap to break")
+                                .help(isBroken ? "Break: no segment joins these points — click to connect" : "Connected: segment joins these points — click to break")
+                            }
+                        }
                     }
                     HStack {
                         // Undo stays enabled after a Clear (the pre-clear route is restorable);
@@ -159,11 +175,19 @@ struct SideBar: View {
                     }
                     .buttonStyle(.bordered).font(.caption)
                     HStack {
-                        Button("QE (.pwscf)") { state.onExportKPath?(KPath(points: state.kPathPoints), .qe) }
-                        Button("kpf") { state.onExportKPath?(KPath(points: state.kPathPoints), .kpf) }
+                        let route = KPath(points: state.kPathPoints, breaks: state.kPathBreaks)
+                        Button("QE (.pwscf)") { state.onExportKPath?(route, .qe) }
+                            .disabled(!KPathExport.isEnabledInEditor(route, as: .qe))
+                            .help(KPathExport.editorHelp(route, as: .qe))
+                        // KPF cannot represent disconnected segments: a repeated
+                        // label only indicates a break when the shared endpoint
+                        // happens to be that label, which is ambiguous. Disable
+                        // the button and explain why when it cannot encode the route.
+                        Button("kpf") { state.onExportKPath?(route, .kpf) }
+                            .disabled(!KPathExport.isEnabledInEditor(route, as: .kpf))
+                            .help(KPathExport.editorHelp(route, as: .kpf))
                     }
                     .buttonStyle(.bordered).font(.caption)
-                    .disabled(state.kPathPoints.count < 2)
                 }
             }
             Section("Supercell") {
@@ -209,6 +233,36 @@ struct SideBar: View {
         .formStyle(.grouped)
         .padding()
         .frame(minWidth: 200)
+    }
+}
+
+private struct SymmetrySection: View {
+    @ObservedObject var state: SideBarState
+
+    var body: some View {
+        Section("Symmetry") {
+            if let analysis = state.crystalSymmetry,
+               let symmetry = analysis.symmetry {
+                Text("Space group: \(symmetry.spaceGroupNumber) \(symmetry.internationalSymbol)")
+                Text("Point group: \(symmetry.pointGroupSymbol)")
+                Text("Crystal system: \(symmetry.crystalSystem.label)")
+                Text("Bravais lattice: \(symmetry.bravaisLattice.label)")
+                Text("Tolerance: \(symmetry.tolerance, specifier: "%.1e")")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+            } else {
+                Text("Unavailable")
+                    .foregroundColor(.secondary)
+                Text(state.crystalSymmetry?.reasonDescription ?? "symmetry was not analyzed")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                if let tolerance = state.crystalSymmetry?.tolerance {
+                    Text("Tolerance: \(tolerance, specifier: "%.1e")")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-26 (v1.1.16 shipped; symmetry and standard paths accepted next)**.
+Last updated: **2026-07-27 (post-v1.1.16 symmetry and standard-path work implemented)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -57,11 +57,17 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Edited routes persist through `.molvis-state`, animation reloads, and unrelated sidebar changes; malformed saved route data fails transactionally.
 - [x] 69 focused editor tests; 433 tests in the full macOS suite.
 
-## Next priority: crystallographic symmetry and standard paths
-- [ ] Detect crystal system, Bravais lattice, space group, point group, Wyckoff positions, and symmetry-equivalent atoms.
-- [ ] Standardize primitive and conventional cells while preserving species and coordinate mappings.
-- [ ] Generate conventional high-symmetry labels and recommended paths for every three-dimensional Bravais lattice, including triclinic, monoclinic, orthorhombic, tetragonal, trigonal/rhombohedral, hexagonal, and cubic variants.
-- [ ] Keep symmetry/path generation deterministic, tolerance-aware, safe for malformed cells, and consistent with BZ rendering, picking, persistence, and QE/KPF export.
+## Implemented after v1.1.16: crystallographic symmetry and standard paths
+
+The maintained coordinate, lifecycle, persistence, and export contract is documented in [`SYMMETRY_AND_KPATH.md`](SYMMETRY_AND_KPATH.md).
+
+- [x] Detect the crystal system, extended Bravais lattice, space group, Hall setting, point group, Wyckoff positions, symmetry operations, and symmetry-equivalent atoms through vendored spglib 2.7.0.
+- [x] Produce standardized primitive and conventional cells with copied species/index mappings while retaining a separate input-oriented basis for display and export.
+- [x] Generate HPKOT/SeekPath 2.1-compatible labels and paths for all 29 extended three-dimensional Bravais-lattice variants, including triclinic, monoclinic, orthorhombic, tetragonal, trigonal/rhombohedral, hexagonal, and cubic cases.
+- [x] Map canonical paths into the input reciprocal basis and carry disconnected boundaries through editing, interpolation, rendering, persistence, and QE export; disable KPF export when a route contains an unrepresentable break.
+- [x] Preserve generated-vs-user-edited route provenance across state reloads and geometry changes, remapping edited routes through Cartesian reciprocal space when the input cell changes.
+- [x] Keep analysis deterministic at one explicit tolerance, bounded to 4,096 base atoms, and unavailable for malformed, non-3D, or known-incomplete asymmetric-unit inputs.
+- [x] Verify all 29 variants against exact SeekPath-derived oracle fixtures; 545 tests pass in the full macOS suite.
 
 ## Proposed function backlog
 
@@ -71,7 +77,8 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [ ] Standard Edit menu with undo/redo, collapsible remembered sidebar sections, and a command palette.
 
 ### Reciprocal space and k-paths
-- [ ] Direct fractional-coordinate editing, per-segment sampling, disconnected path segments, cumulative reciprocal distance, and selected-node highlighting between sidebar and BZ.
+- [x] Per-component sampling budgets and disconnected path components, including singleton components, route rendering, strict persistence, and QE export.
+- [ ] Direct fractional-coordinate editing, user-configurable per-segment sampling, cumulative reciprocal distance, and selected-node highlighting between sidebar and BZ.
 - [ ] Candidate hover tooltips, viewport node labels, automatic BZ framing, and imports from QE, VASP, Wannier90, and KPF.
 - [ ] Export VASP `KPOINTS`, Wannier90 `kpoint_path`, and additional QE band-path forms.
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.

@@ -1165,12 +1165,15 @@ final class Renderer: NSObject {
         // Map each node once; track which map to a finite world position.
         let mapped = pts.map { pres.world(frac: $0.frac) }
         let valid = mapped.map { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }
+        let breaks = scene.kPathBreaks
 
         var segVerts: [SIMD3<Float>] = []
         for i in 0..<mapped.count {
-            // A segment joins i and i+1 only when BOTH map validly — this is what
-            // prevents an invalid point from bridging its valid neighbours.
-            if i + 1 < mapped.count, valid[i], valid[i + 1] {
+            // A segment joins i and i+1 only when BOTH map validly AND there is
+            // no break between them. This prevents an invalid point from bridging
+            // its valid neighbours and prevents a bridge across a disconnected
+            // segment boundary.
+            if i + 1 < mapped.count, valid[i], valid[i + 1], !breaks.contains(i) {
                 segVerts.append(mapped[i])
                 segVerts.append(mapped[i + 1])
             }

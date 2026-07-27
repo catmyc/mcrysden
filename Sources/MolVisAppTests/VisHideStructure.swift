@@ -21,7 +21,7 @@ final class VisHideStructure: XCTestCase {
     // on change, scene -> state on load) so the renderer's single source of
     // truth (scene.showStructure) reflects the UI.
     func testShowStructureSync() throws {
-        let wc = MainWindowController(scene: Scene())
+        let wc = MainWindowController(scene: Scene(), showWindow: false)
         let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
         wc.loadFile(Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/si110.xsf"))),
                     from: URL(fileURLWithPath:"/x"), format: nil, frameIndex: 0)

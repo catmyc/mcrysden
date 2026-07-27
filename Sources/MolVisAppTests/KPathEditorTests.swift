@@ -168,6 +168,7 @@ final class KPathEditorTests: XCTestCase {
         let route = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.5, 0, 0), "X"),
                      KPoint(SIMD3(0.5, 0.5, 0.5), "L")]
         s.kPathPoints = route
+        s.kPathBreaks = []  // clear any breaks from the generated path
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("kpath_rt.mvis-state")
         try StateStore.save(s, camera: nil, sourceURL: fixture("si110.xsf"), to: tmp)
 
@@ -175,6 +176,7 @@ final class KPathEditorTests: XCTestCase {
         var c2: Camera? = nil
         try StateStore.load(into: &s2, camera: &c2, from: tmp)
         XCTAssertEqual(s2.kPathPoints, route)
+        XCTAssertTrue(s2.kPathBreaks.isEmpty)
     }
 
     func testStateStoreExplicitEmptyRouteClearsDefault() throws {
@@ -526,13 +528,20 @@ final class KPathEditorTests: XCTestCase {
         let url = fixture("si.anim_grid.axsf")
         XCTAssertEqual(Parser.frameCount(url, as: nil), 2)
         var scene = Scene(loaded: try Parser.load(url, as: nil, frameIndex: 0))
-        let route = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.25, 0.25, 0.25), "P")]
+        let route = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.25, 0.25, 0.25), "P"),
+                     KPoint(SIMD3(0.5, 0, 0), "X")]
         scene.kPathPoints = route
+        scene.kPathBreaks = [1]
+        scene.kPathProvenance = .userEdited
+        scene.kPathSignature = nil
         scene.currentFrame = 1 // differs from loadedFrame 0 -> triggers the rebuild
 
         try App.resolveAnimationFrame(scene: &scene, from: url, format: nil, loadedFrame: 0, fc: 2)
         XCTAssertEqual(scene.currentFrame, 1)
         XCTAssertEqual(scene.kPathPoints, route, "route must survive the frame rebuild")
+        XCTAssertEqual(scene.kPathBreaks, [1], "route topology must survive the frame rebuild")
+        XCTAssertEqual(scene.kPathProvenance, .userEdited)
+        XCTAssertNil(scene.kPathSignature)
     }
 
     // MARK: - Phase 2: picking, click handling, and mutation helpers
@@ -848,6 +857,7 @@ final class KPathEditorTests: XCTestCase {
 
     func testClickConsecutiveDuplicateSuppressed() throws {
         let c = makeController(try crystalScene())
+        c.state.kPathPoints = [] // loaded controllers now correctly start with their saved/default route
         c.state.editKPathOnBZ = true
         guard let bz = BrillouinZone.build(cell: c.scene.cell!, atoms: c.scene.baseAtoms) else {
             XCTFail("no BZ"); return
@@ -867,6 +877,7 @@ final class KPathEditorTests: XCTestCase {
 
     func testClickNonConsecutiveRepeatAllowed() throws {
         let c = makeController(try crystalScene())
+        c.state.kPathPoints = [] // start this editor test from an intentionally empty route
         c.state.editKPathOnBZ = true
         guard let bz = BrillouinZone.build(cell: c.scene.cell!, atoms: c.scene.baseAtoms) else {
             XCTFail("no BZ"); return
@@ -948,13 +959,18 @@ final class KPathEditorTests: XCTestCase {
         let c = makeController(Scene())
         c.loadFile(Scene(loaded: try Parser.load(url, as: nil, frameIndex: 0)),
                    from: url, format: nil, frameIndex: 0)
-        let route = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.25, 0.25, 0.25), "P")]
+        let route = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.25, 0.25, 0.25), "P"),
+                     KPoint(SIMD3(0.5, 0, 0), "X")]
         c.state.kPathPoints = route
+        c.state.kPathBreaks = [1]
         XCTAssertEqual(c.scene.kPathPoints, route)
+        XCTAssertEqual(c.scene.kPathProvenance, .userEdited)
         // Step to frame 1, triggering reloadFrame.
         c.state.frameIndex = 1
         XCTAssertEqual(c.scene.currentFrame, 1)
         XCTAssertEqual(c.scene.kPathPoints, route, "route must survive the frame reload")
+        XCTAssertEqual(c.scene.kPathBreaks, [1], "route topology must survive the frame reload")
+        XCTAssertEqual(c.scene.kPathProvenance, .userEdited)
     }
 
     func testLoadFileExitsEditModeAndSeedsDefault() throws {
@@ -1027,16 +1043,16 @@ final class KPathEditorTests: XCTestCase {
     func testDefaultResetAndClearSemantics() throws {
         let c = makeController(try crystalScene())
         let s = c.state
-        let defaultRoute = MainWindowController.makeDefaultKPath(for: c.scene)
-        XCTAssertFalse(defaultRoute.isEmpty)
+        let defaultPath = try XCTUnwrap(MainWindowController.makeDefaultKPath(for: c.scene))
+        XCTAssertFalse(defaultPath.points.isEmpty)
         s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "only")]
         s.resetToDefault()
-        XCTAssertEqual(s.kPathPoints, defaultRoute)
+        XCTAssertEqual(s.kPathPoints, defaultPath.points)
         // Clear then undo returns to the default.
         s.clear()
         XCTAssertTrue(s.kPathPoints.isEmpty)
         s.undoLast()
-        XCTAssertEqual(s.kPathPoints, defaultRoute)
+        XCTAssertEqual(s.kPathPoints, defaultPath.points)
     }
 
     func testUndoEmptyIsNoOp() {
@@ -1045,14 +1061,24 @@ final class KPathEditorTests: XCTestCase {
         XCTAssertTrue(s.kPathPoints.isEmpty)
     }
 
-    func testExportsDisabledInUIForTooFewPoints() throws {
-        let c = makeController(try crystalScene())
-        let s = c.state
-        // The sidebar disables the export buttons unless there are >= 2 route points.
-        s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ")]
-        XCTAssertTrue(s.kPathPoints.count < 2, "single-point route: export UI must be disabled")
-        s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.5, 0, 0), "X")]
-        XCTAssertFalse(s.kPathPoints.count < 2, "two-point route: export UI must be enabled")
+    func testEditorExportAvailabilityMatchesFormatSemantics() {
+        let empty = KPath(points: [])
+        XCTAssertFalse(KPathExport.isEnabledInEditor(empty, as: .qe))
+        XCTAssertFalse(KPathExport.isEnabledInEditor(empty, as: .kpf))
+
+        // QE K_POINTS crystal is an explicit list and accepts one special point;
+        // KPF remains disabled until there is an actual connected path.
+        let singleton = KPath(points: [KPoint(SIMD3(0, 0, 0), "Γ")])
+        XCTAssertTrue(KPathExport.isEnabledInEditor(singleton, as: .qe))
+        XCTAssertFalse(KPathExport.isEnabledInEditor(singleton, as: .kpf))
+
+        let connected = KPath(points: [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.5, 0, 0), "X")])
+        XCTAssertTrue(KPathExport.isEnabledInEditor(connected, as: .qe))
+        XCTAssertTrue(KPathExport.isEnabledInEditor(connected, as: .kpf))
+
+        let disconnected = KPath(points: connected.points, breaks: [0])
+        XCTAssertTrue(KPathExport.isEnabledInEditor(disconnected, as: .qe))
+        XCTAssertFalse(KPathExport.isEnabledInEditor(disconnected, as: .kpf))
     }
 
     func testExportGuardsEmptyRoute() throws {
@@ -1082,6 +1108,7 @@ final class KPathEditorTests: XCTestCase {
 
     func testHandlerConsumesHitWhenStructureHidden() throws {
         let c = makeController(try crystalScene())
+        c.state.kPathPoints = [] // the loaded scene's default route is not part of this click assertion
         c.state.editKPathOnBZ = true
         c.scene.showStructure = false
         guard let bz = BrillouinZone.build(cell: c.scene.cell!, atoms: c.scene.baseAtoms) else {
@@ -1173,7 +1200,7 @@ final class KPathEditorTests: XCTestCase {
 
     /// fcc-Si scene whose BZ builds; atoms == baseAtoms so the BZ (built from
     /// baseAtoms) is centered on the displayed structure centroid.
-    private func bzScene(kPath: [KPoint] = []) -> Scene {
+    private func bzScene(kPath: [KPoint] = [], breaks: Set<Int> = []) -> Scene {
         let a: Float = 5.43
         let offsets: [SIMD3<Float>] = [[0, 0, 0], [0, 0.5 * a, 0.5 * a],
                                         [0.5 * a, 0, 0.5 * a], [0.5 * a, 0.5 * a, 0]]
@@ -1185,6 +1212,7 @@ final class KPathEditorTests: XCTestCase {
         s.atoms = atoms
         s.showBrillouinZone = true
         s.kPathPoints = kPath
+        s.kPathBreaks = breaks
         return s
     }
 
@@ -1382,6 +1410,21 @@ final class KPathEditorTests: XCTestCase {
         let onlyA = try renderBZ(bzScene(kPath: [a]))
         XCTAssertNotEqual(pixelHash(gap.pixels), pixelHash(onlyA.pixels),
                           "gap route must still draw node B (distinct from single-node A)")
+    }
+
+    /// A declared topology break must suppress exactly the same amber segment
+    /// that a non-finite intermediate node suppresses, while retaining both
+    /// endpoint crosses.
+    func testRouteBreakDoesNotRenderConnectingSegment() throws {
+        let a = KPoint(SIMD3(0, 0, 0), "Γ")
+        let b = KPoint(SIMD3(0.5, 0.5, 0.5), "L")
+        let connected = try renderBZ(bzScene(kPath: [a, b]))
+        let disconnected = try renderBZ(bzScene(kPath: [a, b], breaks: [0]))
+        XCTAssertGreaterThan(pixelDiff(connected.pixels, disconnected.pixels), 0,
+                             "a topology break must remove the amber A-B segment")
+        let onlyA = try renderBZ(bzScene(kPath: [a]))
+        XCTAssertNotEqual(pixelHash(disconnected.pixels), pixelHash(onlyA.pixels),
+                          "both endpoint crosses must remain visible across a break")
     }
 
     // MARK: post-phase-3 integration fixes

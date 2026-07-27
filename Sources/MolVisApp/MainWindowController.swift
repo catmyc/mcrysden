@@ -74,6 +74,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         renderer?.scene = scene
         let state = SideBarState()
         self.state = state
+        // A controller can be constructed directly with an already-loaded
+        // scene in tests and in future embedding paths. Mirror that scene
+        // before installing onChange, because every @Published assignment is
+        // synchronous and would otherwise feed default state back into it.
+        state.syncFromScene(scene)
         sidebar = NSHostingView(rootView: SideBar(state: state))
         canvas = MetalView(frame: .zero, device: device)
         canvas.autoresizingMask = [.width, .height]
@@ -300,6 +305,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Closing the main window must end the program: hide the docked readout
     // first so the app terminates cleanly instead of leaving it orphaned.
     func windowWillClose(_ notification: Notification) {
+        stopPlayback()
+        state.isPlaying = false
         infoWindow.orderOut(nil)
     }
 
@@ -712,7 +719,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.isCrystal = scene.isCrystal
         // k-path: the edited route lives in the sidebar state; push it into the
         // scene (never regenerate, or a sidebar sync would clobber user edits).
+        // The first user edit flips provenance from .generated to .userEdited
+        // so subsequent structure changes don't silently destroy the route.
+        if state.kPathPoints != scene.kPathPoints || state.kPathBreaks != scene.kPathBreaks {
+            scene.kPathProvenance = .userEdited
+            // Signatures identify canonical generated routes only. Clearing it at
+            // the first edit prevents a stale generated signature from leaking
+            // into persistence or later lifecycle decisions.
+            scene.kPathSignature = nil
+        }
         scene.kPathPoints = state.kPathPoints
+        scene.kPathBreaks = state.kPathBreaks
         // lighting + background — the renderer currently uses a fixed shader and
         // solid clear color (the richer shader is owned by another agent); we
         // mirror state into the scene here so the values persist via StateStore
@@ -760,21 +777,46 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         setNeedsRender()
     }
 
-    /// Default high-symmetry k-path for the active crystal (crystal only). Falls
-    /// back to a simple Gamma-X for non-cubic or molecule scenes so the editor
-    /// always has something to show/export.
-    static func makeDefaultKPath(for scene: Scene) -> [KPoint] {
-        guard let cell = scene.cell else { return [] }
-        return KPath.defaultPath(cell: cell, atoms: scene.baseAtoms.map { $0.coord }).points
+    /// Default high-symmetry k-path for the active crystal (crystal only).
+    /// Uses the canonical path generator with the scene's symmetry analysis.
+    /// Maps the path from the standardized reciprocal basis to the input-cell
+    /// reciprocal basis. Returns nil for molecules or when symmetry is
+    /// unavailable (the caller should then fall back to an empty route).
+    static func makeDefaultKPath(for scene: Scene) -> KPath? {
+        guard let cell = scene.cell, let symmetry = scene.crystalSymmetry?.symmetry else { return nil }
+        let canonical = CanonicalPathGenerator.generate(for: symmetry)
+        let mapped = CanonicalPathGenerator.mapToInputReciprocal(canonical, symmetry: symmetry, inputCell: cell)
+        return KPath(points: mapped.kPoints, breaks: mapped.breaks)
     }
 
     /// "Default" control: reinstall the generated high-symmetry route for the
-    /// current scene (wired via `state.onResetKPath`).
+    /// current scene (wired via `state.onResetKPath`). Regenerates the canonical
+    /// path from the current symmetry and maps it to the input-cell reciprocal
+    /// basis. Sets provenance to `.generated` and records the structure signature.
     private func resetKPathDefault() {
-        state.kPathPoints = Self.makeDefaultKPath(for: scene)
+        guard let path = Self.makeDefaultKPath(for: scene) else { return }
+        // Update the scene first, then publish the sidebar route as one snapshot.
+        // Otherwise kPathPoints.didSet synchronously re-enters syncFromState with
+        // the previous break set and can briefly mark this generated reset as a
+        // user edit.
+        scene.kPathPoints = path.points
+        scene.kPathBreaks = path.breaks
+        scene.kPathProvenance = .generated
+        scene.kPathSignature = CanonicalPathGenerator.structureSignature(for: scene.crystalSymmetry?.symmetry)
+        state.replaceKPath(points: path.points, breaks: path.breaks)
+    }
+
+    /// Install the canonical path from the scene's symmetry analysis into the
+    /// scene. Called when the structure changes and the path was auto-generated.
+    private func regenerateCanonicalPathIfNeeded() {
+        guard scene.kPathProvenance == .generated else { return }
+        guard let cell = scene.cell else { return }
+        scene.installCanonicalPath(cell: cell)
     }
 
     /// Present a save panel and write the k-path text for the chosen format.
+    /// Surfaces export errors (e.g. KPF cannot represent disconnected paths)
+    /// to the user via an alert sheet.
     private func exportKPath(_ path: KPath, _ format: KPathExportFormat) {
         guard !path.points.isEmpty else { return }
         let panel = NSSavePanel()
@@ -783,11 +825,24 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         panel.beginSheetModal(for: window) { result in
             guard result == .OK, let url = panel.url else { return }
             do {
-                try KPathExport.export(path, as: format).write(to: url, atomically: true, encoding: .utf8)
+                let text = try KPathExport.export(path, as: format)
+                try text.write(to: url, atomically: true, encoding: .utf8)
             } catch {
                 print("[mcrysden] k-path export failed: \(error)")
+                self.presentExportError(error)
             }
         }
+    }
+
+    /// Present an export-failure alert as a sheet on the main window.
+    private func presentExportError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "k-path export failed"
+        alert.informativeText = (error as? LocalizedError)?.errorDescription
+            ?? error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
     }
 
     /// Pick a small set of iso-contour levels spanning the grid's value range,
@@ -845,9 +900,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showLabels = scene.showLabels
         next.showStructure = scene.showStructure
         next.showBrillouinZone = scene.showBrillouinZone
-        // Carry the live k-path through the frame reload so scrubbing an animated
-        // crystal never resets the route the user is editing.
-        next.kPathPoints = scene.kPathPoints
+        // The freshly parsed scene already owns the right generated route for
+        // its current structure/input reciprocal basis.  Transfer only a user
+        // route, remapping fractional coordinates through Cartesian reciprocal
+        // space when this frame changed that basis.  (Supercell/slab are applied
+        // later and intentionally do not affect this base-cell decision.)
+        next.transferKPathAcrossGeometryChange(from: scene)
         // Volumetric-surface settings: without these, scrubbing an animated scalar
         // field or Fermi surface resets the iso level / visibility to defaults.
         next.showIsoSurface = scene.showIsoSurface
@@ -911,6 +969,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.hasFermiSurface = (next.fermiSurface != nil)
         state.hasGrid2D = (next.grid2D != nil)
         state.hasForceSet = (next.forceSet != nil)
+        state.isCrystal = next.isCrystal
+        state.crystalSymmetry = next.crystalSymmetry
+        // The route can have been regenerated (generated provenance) or
+        // reciprocal-basis-remapped (user provenance). Mirror BOTH pieces while
+        // the synchronous @Published callbacks are fenced; otherwise a later
+        // unrelated sidebar change would push the old fractional coordinates
+        // back into the newly installed frame and misclassify its provenance.
+        state.replaceKPath(points: next.kPathPoints, breaks: next.kPathBreaks)
         // Orbital picker: mirror the preserved & validated scene selection exactly
         // (applySelectedOrbitalAndClampIso already clamped + bounded it) so the
         // sidebar always agrees with the rendered frame, even for negative injected
