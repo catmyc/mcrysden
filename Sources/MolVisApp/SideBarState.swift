@@ -23,6 +23,10 @@ final class SideBarState: ObservableObject {
     /// Runtime-only symmetry result for the current base crystal. It is read by
     /// the sidebar and never participates in view-state persistence.
     @Published var crystalSymmetry: CrystalSymmetryAnalysis?
+    /// Point-in-time structural summary of the current scene (atom count,
+    /// formula, space group, ...). Nil when the viewer is empty. Never
+    /// participates in view-state persistence.
+    @Published var structureSummary: StructureSummary? = nil
     /// Overlay the Brillouin-zone wireframe (crystal only). Synced to
     /// scene.showBrillouinZone in syncFromState().
     @Published var showBrillouinZone: Bool = false { didSet { onChange?() } }
@@ -170,6 +174,10 @@ final class SideBarState: ObservableObject {
         showBrillouinZone = scene.showBrillouinZone
         isCrystal = scene.isCrystal
         crystalSymmetry = scene.crystalSymmetry
+        // Structural summary (nil for an empty viewer). Computed here so both
+        // init and loadFile populate it through syncFromScene — a controller
+        // constructed directly with a non-empty scene must show its summary too.
+        structureSummary = StructureSummary(scene, symmetry: crystalSymmetry)
         // Mirror the scene's route: for a freshly-loaded crystal this is the
         // generated high-symmetry default; once the user edits it, the edited
         // route lives in the scene and must be copied back, never regenerated.

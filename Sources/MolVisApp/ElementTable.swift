@@ -8,6 +8,7 @@ enum ElementTable {
     static func covalentRadius(_ z: Int) -> Float { covalent[clamp(z)] }
     static func vdwRadius(_ z: Int) -> Float { vdw[clamp(z)] }
     static func symbol(_ z: Int) -> String { symbols[clamp(z)] }
+    static func mass(_ z: Int) -> Double { masses[clamp(z)] }
 
     /// Reverse lookup: an element symbol ("C", "Cl", "AS"...) to atomic number.
     /// Case-insensitive; returns 0 for an unknown symbol so callers fall back to
@@ -191,5 +192,24 @@ enum ElementTable {
         "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es", "Fm",
         "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds",
         "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og"
+    ]
+
+    // Standard atomic weights (g/mol ≈ amu) for Z=0..118. Index 0 is the dummy
+    // element (mass 0). Values are IUPAC conventional atomic weights where
+    // available; for elements without stable isotopes, the mass number of the
+    // most stable isotope is used.
+    private static let masses: [Double] = [
+        0.0, 1.008, 4.003, 6.94, 9.012, 10.81, 12.011, 14.007, 15.999, 18.998,  // 0..9
+        20.180, 22.990, 24.305, 26.982, 28.086, 30.974, 32.06, 35.45, 39.948, 39.098,  // 10..19
+        40.078, 44.956, 47.867, 50.942, 51.996, 54.938, 55.845, 58.933, 58.693, 63.546,  // 20..29
+        65.38, 69.723, 72.630, 74.922, 78.971, 79.904, 83.798, 85.468, 87.62, 88.906,  // 30..39
+        91.224, 92.906, 95.95, 98.0, 101.07, 102.91, 106.42, 107.87, 112.41, 114.82,  // 40..49
+        118.71, 121.76, 127.60, 126.90, 131.29, 132.91, 137.33, 138.91, 140.12, 140.91,  // 50..59
+        144.24, 145.0, 150.36, 151.96, 157.25, 158.93, 162.50, 164.93, 167.26, 168.93,  // 60..69
+        173.05, 174.97, 178.49, 180.95, 183.84, 186.21, 190.23, 192.22, 195.08, 196.97,  // 70..79
+        200.59, 204.38, 207.2, 208.98, 209.0, 210.0, 222.0, 223.0, 226.0, 227.0,  // 80..89
+        232.04, 231.04, 238.03, 237.0, 244.0, 243.0, 247.0, 247.0, 251.0, 252.0,  // 90..99
+        257.0, 258.0, 259.0, 266.0, 267.0, 268.0, 269.0, 270.0, 277.0, 278.0,  // 100..109
+        281.0, 282.0, 285.0, 286.0, 289.0, 290.0, 293.0, 294.0, 294.0  // 110..118
     ]
 }

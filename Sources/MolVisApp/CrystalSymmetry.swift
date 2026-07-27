@@ -214,6 +214,15 @@ enum CrystalSymmetryUnavailableReason: Equatable, CustomStringConvertible {
     case incompleteInput(SymmetryInputCompleteness)
     case bridgeFailure(String)
 
+    var isAsymmetricUnitInput: Bool {
+        if case .incompleteInput(.asymmetricUnit) = self { return true }
+        return false
+    }
+    var isIncompleteInput: Bool {
+        if case .incompleteInput = self { return true }
+        return false
+    }
+
     var description: String {
         switch self {
         case .notThreeDimensional: return "requires a 3D periodic crystal"

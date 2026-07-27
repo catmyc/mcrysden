@@ -34,6 +34,12 @@ struct SideBar: View {
                 }
                 .pickerStyle(.menu)
             }
+            // --- Structure Summary ----------------------------------------------
+            // Compact readout of the loaded structure. Hidden entirely for an
+            // empty viewer (no atoms); crystal fields appear only for crystals.
+            if let summary = state.structureSummary {
+                StructureSummarySection(summary: summary)
+            }
             // --- Appearance: material + background ---------------------------------
             Section("Appearance") {
                 Slider(value: $state.atomScale, in: 0.05...1.0) { Text("Atom Scale: \(state.atomScale, specifier: "%.2f")") }
@@ -394,10 +400,11 @@ private struct SymmetrySection: View {
         Section("Symmetry") {
             if let analysis = state.crystalSymmetry,
                let symmetry = analysis.symmetry {
-                Text("Space group: \(symmetry.spaceGroupNumber) \(symmetry.internationalSymbol)")
-                Text("Point group: \(symmetry.pointGroupSymbol)")
-                Text("Crystal system: \(symmetry.crystalSystem.label)")
-                Text("Bravais lattice: \(symmetry.bravaisLattice.label)")
+                // Space group / crystal system / Bravais / point group live in
+                // Structure Summary; here we show only the symmetry-unique fields.
+                Text("Wyckoff: \(symmetry.wyckoffLetters.joined(separator: ", "))")
+                    .font(.system(.caption, design: .monospaced))
+                Text("Sym ops: \(symmetry.symmetryOperations.count)")
                 Text("Tolerance: \(symmetry.tolerance, specifier: "%.1e")")
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
@@ -414,6 +421,120 @@ private struct SymmetrySection: View {
                 }
             }
         }
+    }
+}
+
+/// Collapsible "Structure Summary" section: lattice parameters, angles, volume,
+/// formula, atom count, density, and symmetry. Crystal-specific rows appear only
+/// when the scene is periodic. Labels are caption-sized; values are monospaced.
+/// The header toggles the body open/closed, matching the k-path node chevron.
+private struct StructureSummarySection: View {
+    let summary: StructureSummary
+    @State private var expanded = true
+
+    var body: some View {
+        Section {
+            Button(action: { expanded.toggle() }) {
+                HStack {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text("Structure Summary").font(.subheadline).bold()
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
+                    GridRow {
+                        Text("Formula").font(.caption).foregroundColor(.secondary)
+                        Text(summary.formula)
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                    GridRow {
+                        Text("Atoms").font(.caption).foregroundColor(.secondary)
+                        Text("\(summary.atomCount)")
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                    if summary.isAsymmetricUnit {
+                        GridRow {
+                            Text("")
+                            Text("(asymmetric unit)")
+                                .font(.caption).foregroundColor(.secondary).gridCellColumns(1)
+                        }
+                    }
+                    if summary.isCrystal {
+                        GridRow {
+                            Text("a").font(.caption).foregroundColor(.secondary)
+                            Text(summary.latticeA.map { String(format: "%.4f", $0) } ?? "—")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("b").font(.caption).foregroundColor(.secondary)
+                            Text(summary.latticeB.map { String(format: "%.4f", $0) } ?? "—")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("c").font(.caption).foregroundColor(.secondary)
+                            Text(summary.latticeC.map { String(format: "%.4f", $0) } ?? "—")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("α").font(.caption).foregroundColor(.secondary)
+                            Text(summary.alpha.map { String(format: "%.2f°", $0) } ?? "—")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("β").font(.caption).foregroundColor(.secondary)
+                            Text(summary.beta.map { String(format: "%.2f°", $0) } ?? "—")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("γ").font(.caption).foregroundColor(.secondary)
+                            Text(summary.gamma.map { String(format: "%.2f°", $0) } ?? "—")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("Volume").font(.caption).foregroundColor(.secondary)
+                            Text(summary.cellVolume.map { String(format: "%.2f Å³", $0) } ?? "—")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("Density").font(.caption).foregroundColor(.secondary)
+                            Text(summary.density.map { String(format: "%.3f g/cm³", $0) } ?? "—")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("Space group").font(.caption).foregroundColor(.secondary)
+                            Text(spaceGroupText)
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        GridRow {
+                            Text("Crystal system").font(.caption).foregroundColor(.secondary)
+                            Text(summary.crystalSystem ?? "—")
+                        }
+                        GridRow {
+                            Text("Bravais lattice").font(.caption).foregroundColor(.secondary)
+                            Text(summary.bravaisLattice ?? "—")
+                        }
+                        GridRow {
+                            Text("Point group").font(.caption).foregroundColor(.secondary)
+                            Text(summary.pointGroup ?? "—")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var spaceGroupText: String {
+        if let n = summary.spaceGroupNumber, let s = summary.spaceGroupSymbol {
+            return "\(n) \(s)"
+        }
+        if let n = summary.spaceGroupNumber { return "\(n)" }
+        if let s = summary.spaceGroupSymbol { return s }
+        return "—"
     }
 }
 

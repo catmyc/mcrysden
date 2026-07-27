@@ -218,9 +218,6 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onChange = saved
         stopPlayback()
         // The readout stays hidden until the user selects an atom.
-        // Populate the Forces sidebar readout (incl. the non-@Published summary) for THIS
-        // scene on load, so a force-bearing file shows its arrows/energy immediately without
-        // waiting for a later UI interaction to trigger setNeedsRender().
         setNeedsRender()
     }
 
@@ -1048,6 +1045,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.hasForceSet = (next.forceSet != nil)
         state.isCrystal = next.isCrystal
         state.crystalSymmetry = next.crystalSymmetry
+        state.structureSummary = StructureSummary(next, symmetry: next.crystalSymmetry)
         // The route can have been regenerated (generated provenance) or
         // reciprocal-basis-remapped (user provenance). Mirror BOTH pieces while
         // the synchronous @Published callbacks are fenced; otherwise a later

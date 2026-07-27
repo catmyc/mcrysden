@@ -234,6 +234,22 @@ final class AppSafetyTests: XCTestCase {
     }
 
     @MainActor
+    func testStructureSummaryPopulatedAfterLoadAndClearedForEmptyViewer() throws {
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        XCTAssertNil(controller.state.structureSummary)
+
+        let fixture = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si110.xsf")
+        controller.loadFile(Scene(loaded: try Parser.load(fixture)), from: fixture, frameIndex: 0)
+
+        let summary = controller.state.structureSummary
+        XCTAssertNotNil(summary)
+        XCTAssertEqual(summary?.atomCount, controller.scene.atoms.count)
+        XCTAssertTrue(summary?.isCrystal ?? false)
+        XCTAssertFalse(summary?.formula.isEmpty ?? true)
+    }
+
+    @MainActor
     func testControllerSaveStateWritesFile() throws {
         let fixture = URL(fileURLWithPath: #file).deletingLastPathComponent()
             .appendingPathComponent("Fixtures/si110.xsf")
