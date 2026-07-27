@@ -264,7 +264,7 @@ extension KPath {
 enum CubicLattice { case fcc, bcc, sc }
 
 /// k-path export formats offered in the UI k-path editor.
-enum KPathExportFormat: String { case qe = "qe", kpf = "kpf" }
+enum KPathExportFormat: String { case qe = "qe", kpf = "kpf", vasp = "vasp" }
 
 extension KPath {
     /// Detect the cubic Bravais type from the conventional cell + its atomic
@@ -328,11 +328,14 @@ private func length(_ v: SIMD3<Float>) -> Float { sqrt(dot(v, v)) }
 enum KPathExport {
     enum ExportError: Error, LocalizedError {
         case disconnectedKPF
+        case noConnectedEdge
 
         var errorDescription: String? {
             switch self {
             case .disconnectedKPF:
                 return "KPF export requires a fully connected path (no breaks). Use QE format for disconnected paths."
+            case .noConnectedEdge:
+                return "VASP export requires at least one connected pair of k-points."
             }
         }
     }
@@ -346,6 +349,13 @@ enum KPathExport {
             return !path.points.isEmpty
         case .kpf:
             return path.points.count >= 2 && !path.hasDisconnectedSegments
+        case .vasp:
+            // VASP line-mode requires at least one connected pair (two points
+            // with no break between them) and no orphan singleton components.
+            let segs = path.segments()
+            let hasPair = segs.contains(where: { $0.count >= 2 })
+            let hasSingleton = segs.contains(where: { $0.count < 2 })
+            return path.points.count >= 2 && hasPair && !hasSingleton
         }
     }
 
@@ -361,7 +371,59 @@ enum KPathExport {
             return "KPF export requires a fully connected path (no breaks). Use QE format for disconnected paths."
         case .kpf:
             return "Export as XCrySDen k-path file"
+        case .vasp where path.points.count < 2:
+            return "VASP line-mode requires at least two k-points (one segment)."
+        case .vasp where path.segments().allSatisfy({ $0.count < 2 }):
+            return "VASP line-mode requires at least one connected pair of k-points."
+        case .vasp where path.segments().contains(where: { $0.count < 2 }):
+            return "VASP line-mode requires a fully connected path (no orphan singleton nodes)."
+        case .vasp:
+            return "Export VASP line-mode KPOINTS file"
         }
+    }
+
+    /// VASP line-mode KPOINTS file for a band-structure route. Format:
+    ///   k-points for band structure       ! comment
+    ///   N                                 ! points per segment (for VASP interpolation)
+    ///   Line-mode
+    ///   Reciprocal
+    /// followed by endpoint PAIRS. Each pair defines one segment: VASP
+    /// interpolates between its two points. Consecutive pairs within a
+    /// connected component duplicate the shared endpoint. A blank line
+    /// separates pairs. Singleton components are skipped.
+    ///
+    /// Uses reciprocal fractional coordinates and POSIX locale.
+    static func vaspKPoints(_ path: KPath) throws -> String {
+        let posixLocale = Locale(identifier: "en_US_POSIX")
+        func fmt(_ kp: KPoint) -> String {
+            String(format: "%.6f %.6f %.6f ! %@", locale: posixLocale,
+                   arguments: [kp.frac.x, kp.frac.y, kp.frac.z, kp.label])
+        }
+        let segs = path.segments()
+        if segs.contains(where: { $0.count < 2 }) {
+            throw ExportError.noConnectedEdge
+        }
+        var pairs: [[String]] = []
+        for range in segs {
+            for i in range.lowerBound..<(range.upperBound - 1) {
+                pairs.append([fmt(path.points[i]), fmt(path.points[i + 1])])
+            }
+        }
+        guard !pairs.isEmpty else {
+            throw ExportError.noConnectedEdge
+        }
+        var lines: [String] = [
+            "k-points for band structure",
+            "\(path.pointsPerSegment)",
+            "Line-mode",
+            "Reciprocal",
+        ]
+        for (idx, pair) in pairs.enumerated() {
+            if idx > 0 { lines.append("") }
+            lines.append(contentsOf: pair)
+        }
+        lines.append("")
+        return lines.joined(separator: "\n")
     }
 
     /// QE `K_POINTS crystal` card: a count line followed by `kx ky kz w` lines
@@ -380,13 +442,14 @@ enum KPathExport {
     }
 
     /// Export text for the given UI format: `.qe` => QE K_POINTS crystal,
-    /// `.kpf` => XCrySDen native k-path file.
+    /// `.kpf` => XCrySDen native k-path file, `.vasp` => VASP line-mode KPOINTS.
     /// KPF export throws if the path has breaks, since the format cannot
     /// represent disconnected segments unambiguously.
     static func export(_ path: KPath, as format: KPathExportFormat) throws -> String {
         switch format {
         case .qe: return qeKPointsCrystal(path)
         case .kpf: return try xcrysdnenKPF(path)
+        case .vasp: return try vaspKPoints(path)
         }
     }
 

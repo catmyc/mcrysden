@@ -26,6 +26,24 @@ All notable changes to mcrysden will be documented in this file. The format is b
 - Expanded the macOS suite to 590 tests, including coordinate-editing, provenance-undo, atomic route-publication, and selection-lifecycle regressions.
 - Expanded the macOS suite to 545 tests, including exact SeekPath-oracle coverage for all 29 HPKOT variants, rotated-cell and lifecycle regressions, disconnected-route rendering/export cases, and strict state validation.
 
+## [1.1.19] — 2026-07-27
+
+### Added
+- Added user-configurable per-segment k-path sampling density (2…200) with a sidebar stepper, persistence in `.molvis-state`, and load-time clamping.
+
+## [1.1.18] — 2026-07-27
+
+### Added
+- Added a collapsible Structure Summary panel to the sidebar showing lattice lengths, angles, volume, Hill-sorted formula, density, atom counts, and symmetry data for both molecular and crystal scenes.
+- Added IUPAC conventional atomic masses for density calculation.
+
+## [1.1.17] — 2026-07-27
+
+### Added
+- Added GUI File > Save State As and File > Export actions with constrained output types, source-alias protection, sheet-based error reporting, and atomic writes.
+- Added visible-layer-aware canvas export that includes element labels and BZ landmark overlays.
+- Added `showColorPlane` persistence in `.molvis-state` files with backward-compatible defaults and animation-frame-preserving lifecycle propagation.
+
 ## [1.1.16] — 2026-07-26
 
 ### Added

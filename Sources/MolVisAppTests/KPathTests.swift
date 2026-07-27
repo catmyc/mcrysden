@@ -35,6 +35,89 @@ final class KPathTests: XCTestCase {
         XCTAssertEqual(pts.last, SIMD3(0.5,0.5,0))
     }
 
+    func testExportVASPFormat() throws {
+        // Gamma -> X -> M, three points, two edges. Endpoints repeat shared nodes
+        // in pairs; a blank line separates each pair.
+        let path = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
+                                  KPoint(SIMD3(0.5,0,0), "X"),
+                                  KPoint(SIMD3(0.5,0.5,0), "M")],
+                          pointsPerSegment: 20)
+        let out = try KPathExport.vaspKPoints(path)
+        let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map { String($0) }
+        XCTAssertEqual(lines[0], "k-points for band structure")
+        XCTAssertEqual(lines[1], "20", "pointsPerSegment in header")
+        XCTAssertEqual(lines[2], "Line-mode")
+        XCTAssertEqual(lines[3], "Reciprocal")
+        // Pair 1: G, X
+        XCTAssertEqual(lines[4], "0.000000 0.000000 0.000000 ! G")
+        XCTAssertEqual(lines[5], "0.500000 0.000000 0.000000 ! X")
+        // Blank separator
+        XCTAssertEqual(lines[6], "")
+        // Pair 2: X, M (shared X repeated)
+        XCTAssertEqual(lines[7], "0.500000 0.000000 0.000000 ! X")
+        XCTAssertEqual(lines[8], "0.500000 0.500000 0.000000 ! M")
+        XCTAssertEqual(lines[9], "", "trailing blank")
+        XCTAssertEqual(lines.count, 10)
+    }
+
+    func testExportVASPDisconnected() throws {
+        // G -> X | M -> G (break at index 1). Two single-edge components.
+        let path = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
+                                  KPoint(SIMD3(0.5,0,0), "X"),
+                                  KPoint(SIMD3(0.5,0.5,0), "M"),
+                                  KPoint(SIMD3(0,0,0), "G")],
+                          pointsPerSegment: 10, breaks: [1])
+        let out = try KPathExport.vaspKPoints(path)
+        let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map { String($0) }
+        XCTAssertEqual(lines[0], "k-points for band structure")
+        XCTAssertEqual(lines[1], "10")
+        // Pair 1: G, X — blank — Pair 2: M, G
+        XCTAssertEqual(lines[4], "0.000000 0.000000 0.000000 ! G")
+        XCTAssertEqual(lines[5], "0.500000 0.000000 0.000000 ! X")
+        XCTAssertEqual(lines[6], "")
+        XCTAssertEqual(lines[7], "0.500000 0.500000 0.000000 ! M")
+        XCTAssertEqual(lines[8], "0.000000 0.000000 0.000000 ! G")
+    }
+
+    func testExportVASPAvailability() throws {
+        // VASP line-mode needs at least one connected pair.
+        let one = KPath(points: [KPoint(SIMD3(0,0,0), "G")])
+        XCTAssertFalse(KPathExport.isEnabledInEditor(one, as: .vasp))
+        // Two points connected — one pair.
+        let two = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
+                                  KPoint(SIMD3(0.5,0,0), "X")])
+        XCTAssertTrue(KPathExport.isEnabledInEditor(two, as: .vasp))
+        // Two points with a break = two singletons, no connected edge.
+        let singletons = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
+                                         KPoint(SIMD3(0.5,0,0), "X")], breaks: [0])
+        XCTAssertFalse(KPathExport.isEnabledInEditor(singletons, as: .vasp))
+        // Single-pair route with an orphan singleton (G-X|M) — rejected.
+        let withSingleton = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
+                                            KPoint(SIMD3(0.5,0,0), "X"),
+                                            KPoint(SIMD3(0.5,0.5,0), "M")], breaks: [1])
+        XCTAssertFalse(KPathExport.isEnabledInEditor(withSingleton, as: .vasp))
+        XCTAssertThrowsError(try KPathExport.export(withSingleton, as: .vasp))
+        // Four-point disconnected but fully paired: G-X | M-G (both edges).
+        let paired = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
+                                     KPoint(SIMD3(0.5,0,0), "X"),
+                                     KPoint(SIMD3(0.5,0.5,0), "M"),
+                                     KPoint(SIMD3(0,0,0), "G")], breaks: [1])
+        XCTAssertTrue(KPathExport.isEnabledInEditor(paired, as: .vasp))
+        // All-broken route throws from export().
+        XCTAssertThrowsError(try KPathExport.export(singletons, as: .vasp))
+        // Help text.
+        XCTAssertTrue(KPathExport.editorHelp(one, as: .vasp).contains("at least two"))
+        XCTAssertEqual(KPathExport.editorHelp(two, as: .vasp),
+                       "Export VASP line-mode KPOINTS file")
+    }
+
+    func testExportVASPRoundTripThroughExportSwitch() throws {
+        let path = KPath(points: [KPoint(SIMD3(0,0,0), "G"),
+                                  KPoint(SIMD3(0.5,0,0), "X")])
+        let out = try KPathExport.export(path, as: .vasp)
+        XCTAssertTrue(out.hasPrefix("k-points for band structure\n20\nLine-mode\nReciprocal\n"))
+    }
+
     func testExportKPF() {
         // ISS multiplier clears the .5 denominators -> 2.
         let path = KPath(points: [KPoint(SIMD3(0,0,0), "G"),

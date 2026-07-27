@@ -203,9 +203,12 @@ struct SideBar: View {
                         Button("kpf") { state.onExportKPath?(route, .kpf) }
                             .disabled(!KPathExport.isEnabledInEditor(route, as: .kpf))
                             .help(KPathExport.editorHelp(route, as: .kpf))
+                        Button("VASP") { state.onExportKPath?(route, .vasp) }
+                            .disabled(!KPathExport.isEnabledInEditor(route, as: .vasp))
+                            .help(KPathExport.editorHelp(route, as: .vasp))
                     }
                     .buttonStyle(.bordered).font(.caption)
-                    Stepper("QE samples per segment \(state.kPathSampling)",
+                    Stepper("Samples per segment \(state.kPathSampling)",
                             value: $state.kPathSampling, in: 2...200)
                 }
             }

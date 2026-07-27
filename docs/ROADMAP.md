@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-27 (v1.1.17 direct k-path coordinate editing implemented)**.
+Last updated: **2026-07-27 (v1.1.19 per-segment k-path sampling implemented)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -69,18 +69,27 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Keep analysis deterministic at one explicit tolerance, bounded to 4,096 base atoms, and unavailable for malformed, non-3D, or known-incomplete asymmetric-unit inputs.
 - [x] Verify all 29 variants against exact SeekPath-derived oracle fixtures; 545 tests pass in the full macOS suite.
 
+## v1.1.17–v1.1.19 (2026-07-27 session)
+
+- [x] GUI Save State As and Export menu actions with constrained output types, source-alias protection, sheet-based error reporting, atomic writes, and visible-layer-aware canvas export including element labels and BZ landmarks.
+- [x] Direct fractional-coordinate k-path editing with Apply/focus-loss commits, round-trip-safe coordinate drafts, provenance-aware undo, atomic route publication, and Sidebar-to-BZ selected-node highlighting.
+- [x] Structure summary panel with lattice lengths/angles, volume, Hill-sorted formula, density, atom counts, and symmetry data; uses base atoms/cell for periodic crystals and marks incomplete asymmetric-unit inputs.
+- [x] User-configurable per-segment k-path sampling with a 2…200 sidebar stepper, persistence in `.molvis-state`, and load-time clamping.
+
 ## Proposed function backlog
 
 ### Workflow and application integration
-- [ ] GUI Save State, Save State As, Revert, recent files, reopen last file, drag-and-drop, file watching, and multiple structure windows.
-- [ ] File-menu export, configurable image dimensions/background/transparency/anti-aliasing, and copy-current-view to clipboard.
+- [x] GUI Save State As and File-menu Export (v1.1.17).
+- [ ] Revert, recent files, reopen last file, drag-and-drop, file watching, and multiple structure windows.
+- [ ] Configurable image dimensions/background/transparency/anti-aliasing, and copy-current-view to clipboard.
 - [ ] Standard Edit menu with undo/redo, collapsible remembered sidebar sections, and a command palette.
 
 ### Reciprocal space and k-paths
-- [x] Per-component sampling budgets and disconnected path components, including singleton components, route rendering, strict persistence, and QE export.
+- [x] Per-component sampling budgets and disconnected path components.
 - [x] Direct fractional-coordinate editing with undo/provenance preservation and selected-node highlighting between sidebar and BZ.
-- [ ] User-configurable per-segment sampling and cumulative reciprocal distance.
-- [ ] Candidate hover tooltips, viewport node labels, automatic BZ framing, and imports from QE, VASP, Wannier90, and KPF.
+- [x] User-configurable per-segment k-path sampling for QE export.
+- [ ] Cumulative reciprocal distance display, candidate hover tooltips, viewport node labels, and automatic BZ framing.
+- [ ] Import k-paths from QE, VASP, Wannier90, and KPF.
 - [ ] Export VASP `KPOINTS`, Wannier90 `kpoint_path`, and additional QE band-path forms.
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
 
@@ -88,7 +97,8 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [ ] Expand CIF and CRYSCAL asymmetric-unit inputs through declared symmetry operations, with periodic-site deduplication and preserved species/index mappings, so they can use symmetry analysis and generated canonical k-paths.
 
 ### Structure information and analysis
-- [ ] Structure summary with lattice lengths/angles, volume, density, composition, formula, symmetry, atom table, fractional/Cartesian coordinates, and coordination numbers.
+- [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
+- [ ] Atom table with fractional/Cartesian coordinates, and coordination numbers.
 - [ ] Coordination shells, coordination coloring, nearest-neighbor tables, bond/angle distributions, radial distribution functions, and minimum-image periodic measurements.
 - [ ] Polyhedron volume/distortion metrics and two-structure comparison with displacement vectors and RMS displacement.
 - [ ] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels.
@@ -113,43 +123,17 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [ ] Batch conversion/rendering and external-code converters such as `pwi2xsf`, `pwo2xsf`, and `struct2xsf`.
 - [ ] Embedded scripting, parser/analysis plugins, and project/session files combining structures, bands, DOS, and volumetric datasets.
 
-## Half-done (mechanism exists, UI missing)
-- [~] **Save-state menu item** — `StateStore.save` writer is implemented and load is wired to the CLI and headless export, but there is **no menu item or button** to trigger a save from the GUI. A one-line UI hook onto the existing writer.
-- [~] **`--pwo` / `--out` to AXSF conversion reuse** — `.pwo` already produces animation frames; could back a `pwo2xsf`-style command.
-
 ## Tier A — implementation status
 
-### Done in v1.1.3
+All 10 Tier A items complete. `[x]`
 
-| # | Feature | Test fixtures verified on |
-|---|---------|---------------------------|
-| 1 | **Volumetric isosurface engine** (`DATAGRID_3D`/`2D` in XSF and `.xsf.gz`; marching cubes; iso-value slider; inverse-transpose world-space gradient normals; positive/negative shells) | `Assets/volumetric_grid.xsf` (rendered, frame-spanning), compressed-XSF dispatch regression, `Si datagrid` render test |
-| 2 | **Gaussian `.cube` / `.g98` reader** (z-fastest cube layout; voxel-interleaved multi-orbital fields; GUI orbital selector + saved selection) | `N2O.cube` (19×19×31 grid, 3 atoms, Bohr→Å), exact synthetic multi-orbital ordering test |
-| 3 | **Fermi-surface reader** (BXSF, multi-band shell at the Fermi level; `.gz` peeling) | `MgB2.bxsf` (3 bands, Fermi 0.523), `RhBulkFcc.bxsf` (negative vectors); PNG + PDF/SVG/EPS/PS export |
-| 6 | **WIEN2k `.struct` reader** | 24 files (Bohr→Å, fractional atoms, multi-position sites + rotation matrices) |
-| 7 | **CRYSTAL `.r1` reader** | 16 files (all crystal systems via space group → lattice params + angles; trigonal/hexagonal/monoclinic) |
-| 8 | **Orca `.out` reader** | `pbe.accOpt.AsF2-C2C2.out` via header sniff (ORCA banner; checked AFTER PWSCF marker) |
-| 9 | **FHI-aims / FHI98MD reader** | `GaAsSurface_coord.out` (lattice + species blocks; Bohr→Å) plus standard `geometry.in` (`lattice_vector`, `atom`, `atom_frac`) with automatic filename dispatch |
-| 5 | **Band-structure extraction** (QE `bands (ev):` k-point + eigenvalue blocks → line graph) | `CH3Rh111.out` (56 k-points × 69 bands via `--bands`); 2D Grapher (Fermi line, k-path, energy axes) swaps in for the 3D canvas |
-| 4 | **Color-plane / 2D-contour rendering** (DATAGRID_2D → viridis colormap + marching-squares contours; anisotropic dims; GUI toggle swaps canvas) | `mol-urea2D.xsf` (41×42 charge-density-difference plane); rendered to 56994 non-white px / 176 distinct hues |
-
-### Done in v1.1.10
-
-| # | Feature | Test fixtures verified on |
-|---|---------|---------------------------|
-| 10 | **Force / stress / energy readouts + force arrows** | `CH3Rh111.out`, `si_relax.out`; `ForceParser` (per-atom forces, Total force, stress tensor, energy auto-fill); `Renderer.drawForceArrows` (shaft + barb overlay); SideBar toggle/scale + readout (`showForces`, `forceScale`, `buildForceSummary`); `StateStore` persistence. |
-
-### Remaining Tier A (still TODO)
-
-None — all 10 Tier A items complete.
-
-### Tier B — done
+## Tier B — done
 
 | # | Feature | Scope |
 |---|---------|---------|
 | 11 | **Density of states (DOS)** plot (total + projected) | QE `dos.x`/`projwfc.x` tables via `.dos`, `.pdos`, standard `.pdos_*` names, or `--dos`; total/projected series render in `DOSGrapherView` and export to PNG/PDF/SVG/EPS/PS. |
 
-### Tier C — validated by interaction, not files
+## Tier C — validated by interaction, not files
 
 - [ ] **Structure editing**: cut cluster/molecule; substitute/remove/insert/displace atoms; elastic cell deformation; multi-slab; undo-redo stack.
 - [ ] **On-screen bond distance labels** — live distance text above each bond.
