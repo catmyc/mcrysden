@@ -154,6 +154,37 @@ final class StateStoreTests: XCTestCase {
         XCTAssertTrue(scene.showColorPlane)
     }
 
+    /// The per-segment k-path sampling preference must round-trip through the flat
+    /// state file: save with a value, load it back.
+    func testKPathSamplingRoundTrip() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
+        let s = Scene(loaded: try Parser.load(url))
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("kpsample.mvis-state")
+        try StateStore.save(s, camera: nil, sourceURL: url, to: tmp, kPathSampling: 42)
+
+        var s2 = Scene(loaded: try Parser.load(url))
+        var c2: Camera? = nil
+        let sampling = try StateStore.load(into: &s2, camera: &c2, from: tmp)
+        XCTAssertEqual(sampling, 42)
+        // And it is actually written to the flat file.
+        let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: tmp)) as? [String: Any]
+        XCTAssertEqual(obj?["kPathSampling"] as? Int, 42)
+    }
+
+    /// Old state files lack the kPathSampling key; the load must fall back to the
+    /// KPath default of 20 rather than trapping.
+    func testKPathSamplingBackwardsCompat() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("kpsample_old.mvis-state")
+        let payload: [String: Any] = ["version": 1, "displayMode": "ballStick", "supercell": [1,1,1],
+                                      "atomScale": 0.35, "bondRadius": 0.1]
+        try JSONSerialization.data(withJSONObject: payload, options: []).write(to: tmp)
+        var s = Scene()
+        var c: Camera? = nil
+        let sampling = try StateStore.load(into: &s, camera: &c, from: tmp)
+        XCTAssertEqual(sampling, 20)
+    }
+
     func testStateRejectsFutureVersion() throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("t3.mvis-state")
         let payload: [String: Any] = ["version": 99, "scene": try JSONSerialization.jsonObject(with: JSONEncoder().encode(Scene()))]

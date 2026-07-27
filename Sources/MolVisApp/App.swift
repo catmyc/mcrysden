@@ -179,7 +179,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     /// re-apply the structural transforms. Without this, the saved currentFrame
     /// would be metadata-only and the saved frame's geometry would never show.
     private static func loadScene(from url: URL, format: ParseFormat?, cliFrame: Int,
-                                  stateURL: URL?) throws -> (scene: Scene, camera: Camera?) {
+                                  stateURL: URL?, kPathSampling: inout Int) throws -> (scene: Scene, camera: Camera?) {
         if let stateURL, sameFile(url, stateURL) {
             throw CLIError.invalid("input and state alias the same file: \(url.path)")
         }
@@ -196,7 +196,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         scene.currentFrame = loadedFrame
         var camera: Camera? = nil
         if let stateURL {
-            try StateStore.load(into: &scene, camera: &camera, from: stateURL)
+            kPathSampling = try StateStore.load(into: &scene, camera: &camera, from: stateURL)
         }
         // Resolve the displayed frame (clamp a saved frame + reparse it) via the shared
         // helper so the GUI path and the frame-state tests run IDENTICAL logic.
@@ -310,8 +310,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
         if let outURL = options.exportURL, let inURL = options.inputURL {
             do {
                 try Self.validateExportDestination(outURL, input: inURL, state: options.stateURL)
+                var kPathSampling = 20
                 let (scene, camera) = try Self.loadScene(from: inURL, format: options.format,
-                                                         cliFrame: options.frame, stateURL: options.stateURL)
+                                                         cliFrame: options.frame, stateURL: options.stateURL,
+                                                         kPathSampling: &kPathSampling)
                 let exportSize = CGSize(width: 800, height: 800)
                 try Self.exportScene(scene, camera: camera, to: outURL, size: exportSize)
             } catch {
@@ -326,16 +328,21 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
             do {
                 // loadScene honors a saved animation frame by re-parsing it (the
                 // saved frame becomes geometry, not just metadata).
+                var kPathSampling = 20
                 let (scene, camera) = try Self.loadScene(from: inURL, format: options.format,
-                                                         cliFrame: options.frame, stateURL: options.stateURL)
+                                                         cliFrame: options.frame, stateURL: options.stateURL,
+                                                         kPathSampling: &kPathSampling)
                 let wc = MainWindowController(scene: Scene())
                 mainWC = wc
                 // Pass the RESOLVED frame (clFrame, or the restored frame if the
-                // state encoded one) so the scrubber opens where the user left off.
+                // state encodes one) so the scrubber opens where the user left off.
                 // The scene's currentFrame is now accurate (>= 0) whether it came from
                 // the CLI --frame, a saved state, or the default-open frame 0 -- so the
                 // scrubber initializes in sync with what's actually displayed.
                 wc.loadFile(scene, from: inURL, format: options.format, frameIndex: scene.currentFrame)
+                // kPathSampling is a UI-only preference, not a scene field, so it is not
+                // restored by syncFromScene; apply the value decoded from state here.
+                wc.state.kPathSampling = kPathSampling
                 if let camera {
                     wc.camera = camera
                     // Sync the orthographic toggle from the RESTORED camera (not the
@@ -636,7 +643,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.18"
+    static let appVersion = "1.1.19"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

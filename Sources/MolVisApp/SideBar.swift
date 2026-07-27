@@ -24,10 +24,53 @@ struct SideBar: View {
 
     var body: some View {
         Form {
-            Section {
-                Button("Reset View") { state.onResetView?() }
-                    .buttonStyle(.borderedProminent)
+            formContent
+        }
+        .formStyle(.grouped)
+        .padding()
+        .frame(minWidth: 200)
+        // Reload the editor fields when the selected index changes. Without this,
+        // selecting a different node would leave stale text in the bound fields.
+        .onChange(of: selectedKPointIndex) { _, _ in loadEditorFields() }
+        .onChange(of: state.routeGeneration) { _, _ in
+            // Whole-route replacement (Default/undo/clear/reset): drop the local
+            // selection and cancel any draft, even if the selected index is still
+            // valid — the route content changed under us.
+            selectedKPointIndex = nil
+            state.onSelectKPathNode?(nil)
+            editKx = ""; editKy = ""; editKz = ""; editLabel = ""
+        }
+        .onChange(of: state.viewResetGeneration) { _, _ in
+            // View reset: clear the local selection/editor to match the renderer
+            // highlight the controller just dropped. The route is unchanged.
+            selectedKPointIndex = nil
+            state.onSelectKPathNode?(nil)
+            editKx = ""; editKy = ""; editKz = ""; editLabel = ""
+        }
+        .onChange(of: state.kPathPoints) { _, _ in
+            if let i = selectedKPointIndex, !state.kPathPoints.indices.contains(i) {
+                selectedKPointIndex = nil
+                state.onSelectKPathNode?(nil)
             }
+            if !editorFocused {
+                loadEditorFields()
+            }
+        }
+        // Commit the draft once when every editor field loses focus (the user tabs
+        // away or clicks elsewhere). No keystroke commits on its own.
+        .onChange(of: editorFocused) { _, focused in
+            if !focused { commitEdits() }
+        }
+    }
+
+    // The full Form body is extracted to keep each builder below the type-checker's
+    // complexity threshold.
+    @ViewBuilder
+    private var formContent: some View {
+        Section {
+            Button("Reset View") { state.onResetView?() }
+                .buttonStyle(.borderedProminent)
+        }
             Section("Display") {
                 Picker("Mode", selection: $state.displayMode) {
                     ForEach(DisplayMode.allCases, id: \.self) { Text($0.label).tag($0) }
@@ -139,105 +182,7 @@ struct SideBar: View {
                         Text("Click a white landmark to append it. Drag to orbit.")
                             .font(.caption).foregroundColor(.secondary)
                     }
-                    ForEach(Array(state.kPathPoints.enumerated()), id: \.offset) { i, kp in
-                        // Two-line row: keeps each route item narrow enough for the ~20%
-                        // sidebar (a single line of label + 3 controls + coordinates overflows).
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 4) {
-                                // Selection control: tapping it toggles the per-node
-                                // coordinate editor open for this point.
-                                Button(action: { toggleSelection(i) }) {
-                                    Image(systemName: selectedKPointIndex == i ? "chevron.down" : "chevron.right")
-                                        .font(.caption)
-                                        .foregroundColor(selectedKPointIndex == i ? .accentColor : .secondary)
-                                }
-                                .buttonStyle(.borderless)
-                                .accessibilityLabel("Edit coordinates of point \(i + 1)")
-                                Text("\(i + 1).")
-                                    .font(.caption).foregroundColor(.secondary)
-                                TextField("", text: Binding(
-                                    // Bounds-safe: a row closure can outlive a deletion/reorder.
-                                    get: { state.kPathPoints.indices.contains(i) ? state.kPathPoints[i].label : "" },
-                                    set: { state.updateLabel(at: i, to: $0) }
-                                ))
-                                .frame(maxWidth: 40)
-                                Text(String(format: "(%.2f,%.2f,%.2f)", kp.frac.x, kp.frac.y, kp.frac.z))
-                                    .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
-                            }
-                            // Selected-node coordinate editor. Text fields are bound to local
-                            // state so a partial edit (e.g. "0.") never commits an invalid
-                            // float. Drafts are committed ONCE on focus loss or via the
-                            // explicit Apply button — not on every keystroke, which would
-                            // clobber the field with a state reload mid-edit.
-                            if selectedKPointIndex == i {
-                                Grid(alignment: .leading, horizontalSpacing: 4, verticalSpacing: 2) {
-                                    GridRow {
-                                        Text("kx").font(.caption)
-                                        TextField("kx", text: $editKx)
-                                            .textFieldStyle(.roundedBorder)
-                                            .focused($editorFocused)
-                                            .onSubmit { commitEdits() }
-                                    }
-                                    GridRow {
-                                        Text("ky").font(.caption)
-                                        TextField("ky", text: $editKy)
-                                            .textFieldStyle(.roundedBorder)
-                                            .focused($editorFocused)
-                                            .onSubmit { commitEdits() }
-                                    }
-                                    GridRow {
-                                        Text("kz").font(.caption)
-                                        TextField("kz", text: $editKz)
-                                            .textFieldStyle(.roundedBorder)
-                                            .focused($editorFocused)
-                                            .onSubmit { commitEdits() }
-                                    }
-                                    GridRow {
-                                        Text("Label").font(.caption)
-                                        TextField("label", text: $editLabel)
-                                            .textFieldStyle(.roundedBorder)
-                                            .focused($editorFocused)
-                                            .onSubmit { commitEdits() }
-                                    }
-                                    GridRow {
-                                        EmptyView()
-                                        Button("Apply") { commitEdits() }
-                                            .buttonStyle(.bordered).font(.caption)
-                                    }
-                                }
-                            }
-                            HStack(spacing: 2) {
-                                Spacer()
-                                Button(action: { commitEdits(); state.moveUp(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
-                                    Image(systemName: "arrow.up")
-                                }
-                                .buttonStyle(.borderless).disabled(i == 0)
-                                Button(action: { commitEdits(); state.moveDown(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
-                                    Image(systemName: "arrow.down")
-                                }
-                                .buttonStyle(.borderless).disabled(i == state.kPathPoints.count - 1)
-                                Button(action: { commitEdits(); state.remove(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
-                                    Image(systemName: "trash")
-                                }
-                                .buttonStyle(.borderless)
-                            }
-                        }
-                        // Break toggle between this point and the next.
-                        if i < state.kPathPoints.count - 1 {
-                            HStack {
-                                Spacer()
-                                let isBroken = state.kPathBreaks.contains(i)
-                                Button(action: { state.toggleBreak(at: i) }) {
-                                    Image(systemName: isBroken ? "line.diagonal" : "line.horizontal")
-                                        .foregroundColor(isBroken ? .red : .green)
-                                }
-                                .buttonStyle(.borderless)
-                                .accessibilityLabel(isBroken ? "Break between \(state.kPathPoints[i].label) and \(state.kPathPoints[i+1].label)" : "Connection between \(state.kPathPoints[i].label) and \(state.kPathPoints[i+1].label)")
-                                .accessibilityHint(isBroken ? "Double tap to connect" : "Double tap to break")
-                                .help(isBroken ? "Break: no segment joins these points — click to connect" : "Connected: segment joins these points — click to break")
-                            }
-                        }
-                    }
+                    kPathRows
                     HStack {
                         // Undo stays enabled after a Clear (the pre-clear route is restorable);
                         // it is gated on undo availability, not on whether the route is empty.
@@ -260,6 +205,8 @@ struct SideBar: View {
                             .help(KPathExport.editorHelp(route, as: .kpf))
                     }
                     .buttonStyle(.bordered).font(.caption)
+                    Stepper("QE samples per segment \(state.kPathSampling)",
+                            value: $state.kPathSampling, in: 2...200)
                 }
             }
             Section("Supercell") {
@@ -301,42 +248,6 @@ struct SideBar: View {
                     }
                 }
             }
-        }
-        .formStyle(.grouped)
-        .padding()
-        .frame(minWidth: 200)
-        // Reload the editor fields when the selected index changes. Without this,
-        // selecting a different node would leave stale text in the bound fields.
-        .onChange(of: selectedKPointIndex) { _, _ in loadEditorFields() }
-        .onChange(of: state.routeGeneration) { _, _ in
-            // Whole-route replacement (Default/undo/clear/reset): drop the local
-            // selection and cancel any draft, even if the selected index is still
-            // valid — the route content changed under us.
-            selectedKPointIndex = nil
-            state.onSelectKPathNode?(nil)
-            editKx = ""; editKy = ""; editKz = ""; editLabel = ""
-        }
-        .onChange(of: state.viewResetGeneration) { _, _ in
-            // View reset: clear the local selection/editor to match the renderer
-            // highlight the controller just dropped. The route is unchanged.
-            selectedKPointIndex = nil
-            state.onSelectKPathNode?(nil)
-            editKx = ""; editKy = ""; editKz = ""; editLabel = ""
-        }
-        .onChange(of: state.kPathPoints) { _, _ in
-            if let i = selectedKPointIndex, !state.kPathPoints.indices.contains(i) {
-                selectedKPointIndex = nil
-                state.onSelectKPathNode?(nil)
-            }
-            if !editorFocused {
-                loadEditorFields()
-            }
-        }
-        // Commit the draft once when every editor field loses focus (the user tabs
-        // away or clicks elsewhere). No keystroke commits on its own.
-        .onChange(of: editorFocused) { _, focused in
-            if !focused { commitEdits() }
-        }
     }
 
     // MARK: - k-path coordinate editor helpers
@@ -390,6 +301,110 @@ struct SideBar: View {
     /// or flip its provenance.
     private func formatCoord(_ v: Float) -> String {
         String(v)
+    }
+
+    // Per-k-path-point rows: extracted to keep the Section builder below the
+    // type-checker's complexity threshold.
+    private var kPathRows: some View {
+        ForEach(Array(state.kPathPoints.enumerated()), id: \.offset) { i, kp in
+            // Two-line row: keeps each route item narrow enough for the ~20%
+            // sidebar (a single line of label + 3 controls + coordinates overflows).
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    // Selection control: tapping it toggles the per-node
+                    // coordinate editor open for this point.
+                    Button(action: { toggleSelection(i) }) {
+                        Image(systemName: selectedKPointIndex == i ? "chevron.down" : "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(selectedKPointIndex == i ? .accentColor : .secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Edit coordinates of point \(i + 1)")
+                    Text("\(i + 1).")
+                        .font(.caption).foregroundColor(.secondary)
+                    TextField("", text: Binding(
+                        // Bounds-safe: a row closure can outlive a deletion/reorder.
+                        get: { state.kPathPoints.indices.contains(i) ? state.kPathPoints[i].label : "" },
+                        set: { state.updateLabel(at: i, to: $0) }
+                    ))
+                    .frame(maxWidth: 40)
+                    Text(String(format: "(%.2f,%.2f,%.2f)", kp.frac.x, kp.frac.y, kp.frac.z))
+                        .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                }
+                // Selected-node coordinate editor. Text fields are bound to local
+                // state so a partial edit (e.g. "0.") never commits an invalid
+                // float. Drafts are committed ONCE on focus loss or via the
+                // explicit Apply button — not on every keystroke, which would
+                // clobber the field with a state reload mid-edit.
+                if selectedKPointIndex == i {
+                    Grid(alignment: .leading, horizontalSpacing: 4, verticalSpacing: 2) {
+                        GridRow {
+                            Text("kx").font(.caption)
+                            TextField("kx", text: $editKx)
+                                .textFieldStyle(.roundedBorder)
+                                .focused($editorFocused)
+                                .onSubmit { commitEdits() }
+                        }
+                        GridRow {
+                            Text("ky").font(.caption)
+                            TextField("ky", text: $editKy)
+                                .textFieldStyle(.roundedBorder)
+                                .focused($editorFocused)
+                                .onSubmit { commitEdits() }
+                        }
+                        GridRow {
+                            Text("kz").font(.caption)
+                            TextField("kz", text: $editKz)
+                                .textFieldStyle(.roundedBorder)
+                                .focused($editorFocused)
+                                .onSubmit { commitEdits() }
+                        }
+                        GridRow {
+                            Text("Label").font(.caption)
+                            TextField("label", text: $editLabel)
+                                .textFieldStyle(.roundedBorder)
+                                .focused($editorFocused)
+                                .onSubmit { commitEdits() }
+                        }
+                        GridRow {
+                            EmptyView()
+                            Button("Apply") { commitEdits() }
+                                .buttonStyle(.bordered).font(.caption)
+                        }
+                    }
+                }
+                HStack(spacing: 2) {
+                    Spacer()
+                    Button(action: { commitEdits(); state.moveUp(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
+                        Image(systemName: "arrow.up")
+                    }
+                    .buttonStyle(.borderless).disabled(i == 0)
+                    Button(action: { commitEdits(); state.moveDown(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
+                        Image(systemName: "arrow.down")
+                    }
+                    .buttonStyle(.borderless).disabled(i == state.kPathPoints.count - 1)
+                    Button(action: { commitEdits(); state.remove(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            // Break toggle between this point and the next.
+            if i < state.kPathPoints.count - 1 {
+                HStack {
+                    Spacer()
+                    let isBroken = state.kPathBreaks.contains(i)
+                    Button(action: { state.toggleBreak(at: i) }) {
+                        Image(systemName: isBroken ? "line.diagonal" : "line.horizontal")
+                            .foregroundColor(isBroken ? .red : .green)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(isBroken ? "Break between \(state.kPathPoints[i].label) and \(state.kPathPoints[i+1].label)" : "Connection between \(state.kPathPoints[i].label) and \(state.kPathPoints[i+1].label)")
+                    .accessibilityHint(isBroken ? "Double tap to connect" : "Double tap to break")
+                    .help(isBroken ? "Break: no segment joins these points — click to connect" : "Connected: segment joins these points — click to break")
+                }
+            }
+        }
     }
 }
 

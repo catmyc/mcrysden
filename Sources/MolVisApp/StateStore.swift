@@ -14,7 +14,7 @@ enum StateStore {
     /// Persist the view-state. `sourceURL` is the loaded structure file (saved as
     /// `source`); pass nil only if the scene has no source (e.g. an empty
     /// viewer) — on reload the structure would need to be re-opened manually.
-    static func save(_ scene: Scene, camera: Camera?, sourceURL: URL?, to url: URL) throws {
+    static func save(_ scene: Scene, camera: Camera?, sourceURL: URL?, to url: URL, kPathSampling: Int = 20) throws {
         var payload: [String: Any] = ["version": 1]
         if let src = sourceURL { payload["source"] = src.path }
         payload["displayMode"] = scene.displayMode.rawValue
@@ -48,6 +48,10 @@ enum StateStore {
             "azimuth": scene.lighting.azimuth, "elevation": scene.lighting.elevation,
         ]
         payload["currentFrame"] = scene.currentFrame
+        // Per-segment k-path sampling density (UI-only preference). Persisted so a
+        // saved session restores the user's export sampling choice; falls back to
+        // 20 (the KPath default) for old state files that lack the key.
+        payload["kPathSampling"] = kPathSampling
         // k-path: persist each point's fractional coords + label, the break set
         // (disconnected segment indices), and the provenance. Capped at load
         // time; here we just serialize what the scene holds (already bounded by
@@ -89,7 +93,8 @@ enum StateStore {
     /// come from re-parsing `source`; this only restores the appearance/controls)
     /// and decode the optional `camera`. Malformed state throws a path-bearing
     /// ParseError and leaves both scene and camera unchanged.
-    static func load(into scene: inout Scene, camera: inout Camera?, from url: URL) throws {
+    @discardableResult
+    static func load(into scene: inout Scene, camera: inout Camera?, from url: URL) throws -> Int {
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -336,6 +341,11 @@ enum StateStore {
         }
         scene = candidate
         camera = candidateCamera
+        // Per-segment k-path sampling density. Old state files lack the key and
+        // fall back to the KPath default of 20. Clamp to UI bounds 2...200 so a
+        // malformed or extreme saved value cannot steer the stepper or export.
+        let raw = obj["kPathSampling"] as? Int
+        return raw.map { min(200, max(2, $0)) } ?? 20
     }
 
     private static func parseKPathPoints(_ value: Any, url: URL) throws -> [KPoint] {

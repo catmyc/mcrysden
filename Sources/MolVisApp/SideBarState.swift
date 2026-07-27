@@ -68,6 +68,10 @@ final class SideBarState: ObservableObject {
     /// Forces Brillouin-zone visibility on (handled in syncFromState). Exiting
     /// this mode does not itself change the route.
     @Published var editKPathOnBZ: Bool = false { didSet { onChange?() } }
+    /// Per-segment k-path sampling density used when building the KPath for export.
+    /// UI-only preference (not a scene field); the controller stamps it onto the
+    /// route before exporting. Defaults to the KPath default of 20.
+    @Published var kPathSampling: Int = 20
     /// Route provenance, mirrored from the scene. This is the source of truth for
     /// the route's identity: user-edit mutations set it to `.userEdited` (and clear
     /// the signature), `resetToDefault` / the controller set it to `.generated`,

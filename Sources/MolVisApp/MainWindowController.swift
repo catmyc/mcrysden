@@ -142,7 +142,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         window.delegate = self
         state.onChange = { [weak self] in self?.syncFromState() }
         state.onResetView = { [weak self] in self?.resetView() }
-        state.onExportKPath = { [weak self] path, format in self?.exportKPath(path, format) }
+        state.onExportKPath = { [weak self] path, format in
+            guard let self else { return }
+            self.exportKPath(self.kPathForExport(path), format)
+        }
         state.onResetKPath = { [weak self] in self?.resetKPathDefault() }
         state.onSelectKPathNode = { [weak self] index in self?.selectKPathNode(index) }
         // syncFromScene (above) installed the initial route via replaceKPath, bumping
@@ -869,6 +872,15 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
     }
 
+    /// Stamp the sidebar's current per-segment sampling onto a route before export.
+    /// The route arrives from the SideBar built with the KPath default; this applies
+    /// the user's preference so the exported point density matches the UI choice.
+    func kPathForExport(_ path: KPath) -> KPath {
+        var path = path
+        path.pointsPerSegment = state.kPathSampling
+        return path
+    }
+
     /// Present an export-failure alert as a sheet on the main window.
     private func presentExportError(_ error: Error) {
         let alert = NSAlert()
@@ -884,7 +896,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// view-state to `url` via StateStore. Wired to AppDelegate save actions.
     @MainActor
     internal func saveState(to url: URL) throws {
-        try StateStore.save(scene, camera: camera, sourceURL: sourceURL, to: url)
+        try StateStore.save(scene, camera: camera, sourceURL: sourceURL, to: url, kPathSampling: state.kPathSampling)
     }
 
     /// The loaded source is needed by file actions to protect it from overwrite.

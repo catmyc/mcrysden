@@ -1145,6 +1145,29 @@ final class KPathEditorTests: XCTestCase {
         XCTAssertTrue(s.kPathPoints.isEmpty)
     }
 
+    /// The per-segment k-path sampling preference defaults to the KPath default (20).
+    func testKPathSamplingDefaultsTo20() {
+        let s = SideBarState()
+        XCTAssertEqual(s.kPathSampling, 20)
+    }
+
+    /// The export path must stamp the sidebar's current sampling onto the route, so
+    /// the exported point density reflects the user's preference rather than the default.
+    func testExportUsesSidebarKPathSampling() throws {
+        let c = makeController(try crystalScene())
+        c.state.replaceKPath(
+            points: [KPoint(SIMD3(0, 0, 0), "G"), KPoint(SIMD3(0.5, 0, 0), "X")],
+            breaks: [], provenance: .userEdited, signature: nil)
+        c.state.kPathSampling = 10
+        // The route arrives from the SideBar built with the KPath default (20); the
+        // controller's export hook must overwrite it with the sidebar's preference.
+        let route = KPath(points: c.state.kPathPoints, breaks: c.state.kPathBreaks)
+        XCTAssertEqual(route.pointsPerSegment, 20)
+        let stamped = c.kPathForExport(route)
+        XCTAssertEqual(stamped.pointsPerSegment, 10)
+        XCTAssertNotEqual(stamped.interpolated().count, 0)
+    }
+
     func testEditorExportAvailabilityMatchesFormatSemantics() {
         let empty = KPath(points: [])
         XCTAssertFalse(KPathExport.isEnabledInEditor(empty, as: .qe))
