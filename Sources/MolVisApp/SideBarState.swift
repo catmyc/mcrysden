@@ -1,6 +1,15 @@
 import Foundation
 import Combine
 
+/// A point-in-time snapshot of the full k-path identity captured before a mutation,
+/// so the "Undo" control can restore geometry AND provenance/signature exactly.
+private struct KPathUndoSnapshot {
+    let points: [KPoint]
+    let breaks: Set<Int>
+    let provenance: KPathProvenance
+    let signature: String?
+}
+
 final class SideBarState: ObservableObject {
     @Published var displayMode: DisplayMode = .ballStick { didSet { onChange?() } }
     @Published var atomScale: Float = 0.35 { didSet { onChange?() } }
@@ -55,15 +64,36 @@ final class SideBarState: ObservableObject {
     /// Forces Brillouin-zone visibility on (handled in syncFromState). Exiting
     /// this mode does not itself change the route.
     @Published var editKPathOnBZ: Bool = false { didSet { onChange?() } }
+    /// Route provenance, mirrored from the scene. This is the source of truth for
+    /// the route's identity: user-edit mutations set it to `.userEdited` (and clear
+    /// the signature), `resetToDefault` / the controller set it to `.generated`,
+    /// and undo restores the value captured beforehand. The controller's
+    /// syncFromState copies it through to the scene; it is intentionally not
+    /// @Published because it never drives a view directly.
+    var kPathProvenance: KPathProvenance = .generated
+    /// Structure signature for generated routes; nil when user-edited. Mirrored
+    /// from the scene and restored by undo exactly like kPathProvenance.
+    var kPathSignature: String? = nil
     /// UI-only undo stack of prior routes (snapshots before each mutation), so the
     /// "Undo" control can step back. Bounded to 1024 entries. Each entry captures
-    /// both the points and the break set.
-    private var kPathUndo: [([KPoint], Set<Int>)] = []
+    /// the points, break set, provenance, and signature so undo can restore the
+    /// route's full identity, not just its geometry.
+    private var kPathUndo: [KPathUndoSnapshot] = []
     /// `kPathPoints` and `kPathBreaks` must reach the controller as one route
     /// snapshot. Their `didSet`s synchronously invoke `onChange`, so compound
     /// editor operations batch the notification until both values agree.
     private var kPathMutationDepth = 0
     private var pendingKPathChange = false
+    /// Bumped once per whole-route replacement (replaceKPath) so the controller can
+    /// clear a stale node selection and the SideBar can drop its local editor draft.
+    /// Single-node edits (updateLabel, updateKPathPoint, move, remove, append, ...)
+    /// leave it untouched, so editing a selected node keeps its highlight. @Published
+    /// so SwiftUI can observe it.
+     @Published private(set) var routeGeneration = 0
+     /// Bumped once per view reset so the SideBar clears its local selected node/editor
+     /// (a view reset is a natural clearing point for the transient highlight, but it
+     /// does NOT replace the route, so routeGeneration must stay untouched).
+     @Published private(set) var viewResetGeneration = 0
     /// Whether an undo is available. Drives the "Undo" control's disabled state so it
     /// stays enabled after a Clear (the pre-clear route is restorable) and is cleared
     /// whenever the route is reset/loaded.
@@ -120,6 +150,11 @@ final class SideBarState: ObservableObject {
     /// install it (the "Default" control). The controller owns the scene, so it
     /// wires this to recompute `makeDefaultKPath`.
     var onResetKPath: (() -> Void)?
+    /// Select (or deselect, nil) the route node at `index` in the BZ viewport. The
+    /// sidebar route list invokes this on tap; the controller wires it to highlight
+    /// the node. Whole-route replacements clear the selection on their own, so this
+    /// callback only needs to forward the index.
+    var onSelectKPathNode: ((Int?) -> Void)?
 
     /// Reflect a loaded scene's controls into the sidebar WITHOUT triggering
     /// onChange (so we don't immediately re-mutate the scene we just loaded).
@@ -138,7 +173,10 @@ final class SideBarState: ObservableObject {
         // Mirror the scene's route: for a freshly-loaded crystal this is the
         // generated high-symmetry default; once the user edits it, the edited
         // route lives in the scene and must be copied back, never regenerated.
-        replaceKPath(points: scene.kPathPoints, breaks: scene.kPathBreaks)
+        // Provenance and signature travel with the geometry so the sidebar's idea
+        // of the route's identity matches the scene's exactly.
+        replaceKPath(points: scene.kPathPoints, breaks: scene.kPathBreaks,
+                     provenance: scene.kPathProvenance, signature: scene.kPathSignature)
         editKPathOnBZ = false   // loading a new scene exits edit mode
         kPathUndo = []          // drop stale undo history from the previous scene
         measurementMode = scene.measurementMode
@@ -189,11 +227,22 @@ final class SideBarState: ObservableObject {
 
     // MARK: - k-path editing (UI-only mutations; each fires onChange → sync)
 
-    /// Record the current route on the undo stack before mutating it. Bounded so a
+    /// Record the current route on the undo stack before mutating it. The snapshot
+    /// captures the full identity — points, breaks, provenance, and signature — so
+    /// undo restores exactly what the route was, not just its geometry. Bounded so a
     /// long editing session cannot grow the stack without limit.
     private func pushUndo() {
         if kPathUndo.count >= 1024 { kPathUndo.removeFirst() }
-        kPathUndo.append((kPathPoints, kPathBreaks))
+        kPathUndo.append(KPathUndoSnapshot(points: kPathPoints, breaks: kPathBreaks,
+                                           provenance: kPathProvenance, signature: kPathSignature))
+    }
+
+    /// Mark the route as user-edited, clearing any generated signature. Every
+    /// user-initiated mutation calls this after pushUndo() so the edit is recorded
+    /// as deliberate and never mistaken for the canonical generated path.
+    private func markUserEdited() {
+        kPathProvenance = .userEdited
+        kPathSignature = nil
     }
 
     /// Run a compound k-path change while deferring its synchronous state
@@ -219,12 +268,20 @@ final class SideBarState: ObservableObject {
     }
 
     /// Replace the whole route atomically from the controller (for example when
-    /// restoring or regenerating the canonical path). Its one notification never
-    /// exposes a new point list paired with old break indices.
-    func replaceKPath(points: [KPoint], breaks: Set<Int>) {
+    /// restoring or regenerating the canonical path). Restores the full route
+    /// identity — points, breaks, provenance, and signature — so a wholesale
+    /// replacement never desyncs geometry from its provenance. Its one notification
+    /// never exposes a new point list paired with old break indices.
+    func replaceKPath(points: [KPoint], breaks: Set<Int>, provenance: KPathProvenance, signature: String?) {
         mutateKPath {
+            kPathProvenance = provenance
+            kPathSignature = signature
             kPathPoints = points
             kPathBreaks = breaks
+            // Bump inside the mutation so the generation is advanced before
+            // mutateKPath's deferred onChange -> syncFromState runs; otherwise the
+            // controller would observe the pre-bump value and not clear the selection.
+            routeGeneration += 1
         }
     }
 
@@ -235,7 +292,27 @@ final class SideBarState: ObservableObject {
         let bounded = String(label.prefix(64))
         guard kPathPoints[index].label != bounded else { return }
         pushUndo()
+        markUserEdited()
         kPathPoints[index].label = bounded
+    }
+
+    /// Update a single node's fractional coordinate and label. No-op for an
+    /// out-of-range index, a non-finite coordinate, or when both values are
+    /// unchanged (no undo entry pushed in that case). Records exactly one undo
+    /// snapshot and emits one state change transactionally.
+    func updateKPathPoint(at index: Int, fractionalCoordinate: SIMD3<Float>, label: String) {
+        guard kPathPoints.indices.contains(index) else { return }
+        guard fractionalCoordinate.x.isFinite && fractionalCoordinate.y.isFinite && fractionalCoordinate.z.isFinite else { return }
+        let bounded = String(label.prefix(64))
+        guard kPathPoints[index].frac != fractionalCoordinate || kPathPoints[index].label != bounded else { return }
+        pushUndo()
+        markUserEdited()
+        // Assign a whole new KPoint in one shot so @Published fires objectWillChange
+        // exactly once: an in-place frac-then-label update would otherwise publish an
+        // intermediate (new-coordinate, old-label) value to Combine subscribers.
+        mutateKPath {
+            kPathPoints[index] = KPoint(fractionalCoordinate, bounded)
+        }
     }
 
     /// Swap a node with its predecessor. No-op at the top or out of range.
@@ -244,6 +321,7 @@ final class SideBarState: ObservableObject {
     func moveUp(at index: Int) {
         guard index > 0, index < kPathPoints.count else { return }
         pushUndo()
+        markUserEdited()
         kPathPoints.swapAt(index, index - 1)
     }
 
@@ -253,6 +331,7 @@ final class SideBarState: ObservableObject {
     func moveDown(at index: Int) {
         guard index >= 0, index < kPathPoints.count - 1 else { return }
         pushUndo()
+        markUserEdited()
         kPathPoints.swapAt(index, index + 1)
     }
 
@@ -263,6 +342,7 @@ final class SideBarState: ObservableObject {
     func remove(at index: Int) {
         guard kPathPoints.indices.contains(index) else { return }
         pushUndo()
+        markUserEdited()
         let oldBreaks = kPathBreaks
         mutateKPath {
             kPathPoints.remove(at: index)
@@ -301,15 +381,17 @@ final class SideBarState: ObservableObject {
     /// Undo the last mutation, restoring the route snapshot taken beforehand.
     /// No-op when there is nothing to undo.
     func undoLast() {
-        guard let (points, breaks) = kPathUndo.popLast() else { return }
-        replaceKPath(points: points, breaks: breaks)
+        guard let snap = kPathUndo.popLast() else { return }
+        replaceKPath(points: snap.points, breaks: snap.breaks,
+                     provenance: snap.provenance, signature: snap.signature)
     }
 
     /// Clear the whole route. No-op (no undo entry) when already empty.
     func clear() {
         guard !kPathPoints.isEmpty else { return }
         pushUndo()
-        replaceKPath(points: [], breaks: [])
+        markUserEdited()
+        replaceKPath(points: [], breaks: [], provenance: .userEdited, signature: nil)
     }
 
     /// Toggle a break at the given index. A break at i means no segment joins
@@ -319,6 +401,7 @@ final class SideBarState: ObservableObject {
     func toggleBreak(at index: Int) {
         guard index >= 0, index < kPathPoints.count - 1 else { return }
         pushUndo()
+        markUserEdited()
         if kPathBreaks.contains(index) {
             kPathBreaks.remove(index)
         } else {
@@ -331,6 +414,7 @@ final class SideBarState: ObservableObject {
         guard index >= 0, index < kPathPoints.count - 1 else { return }
         guard !kPathBreaks.contains(index) else { return }
         pushUndo()
+        markUserEdited()
         kPathBreaks.insert(index)
     }
 
@@ -338,6 +422,7 @@ final class SideBarState: ObservableObject {
     func removeBreak(at index: Int) {
         guard kPathBreaks.contains(index) else { return }
         pushUndo()
+        markUserEdited()
         kPathBreaks.remove(index)
     }
 
@@ -350,6 +435,13 @@ final class SideBarState: ObservableObject {
         onResetKPath?()
     }
 
+    /// Bump `viewResetGeneration` so the SideBar clears its local selected
+    /// node/editor and the controller clears the renderer highlight. A view reset
+    /// does not replace the route, so `routeGeneration` is intentionally untouched.
+    func notifyViewReset() {
+        viewResetGeneration += 1
+    }
+
     /// Append a picked BZ landmark, capping the route at 1024 nodes and suppressing
     /// an exact fractional-coordinate repeat of the current last node (renaming a node
     /// must not defeat the duplicate check). Non-consecutive repeats (Gamma-X-Gamma)
@@ -358,6 +450,7 @@ final class SideBarState: ObservableObject {
         if let last = kPathPoints.last, last.frac == point.frac { return }
         guard kPathPoints.count < 1024 else { return }
         pushUndo()
+        markUserEdited()
         kPathPoints.append(point)
     }
 }

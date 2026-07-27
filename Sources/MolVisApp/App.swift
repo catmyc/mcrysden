@@ -636,7 +636,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate {
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.16"
+    static let appVersion = "1.1.17"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

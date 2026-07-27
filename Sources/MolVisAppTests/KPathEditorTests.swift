@@ -961,6 +961,11 @@ final class KPathEditorTests: XCTestCase {
                    from: url, format: nil, frameIndex: 0)
         let route = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.25, 0.25, 0.25), "P"),
                      KPoint(SIMD3(0.5, 0, 0), "X")]
+        // Adopt the new ownership model: provenance is set on the state (source of
+        // truth) BEFORE the geometry so the synchronous onChange -> syncFromState
+        // copies .userEdited through to the scene rather than the default .generated.
+        c.state.kPathProvenance = .userEdited
+        c.state.kPathSignature = nil
         c.state.kPathPoints = route
         c.state.kPathBreaks = [1]
         XCTAssertEqual(c.scene.kPathPoints, route)
@@ -1024,6 +1029,85 @@ final class KPathEditorTests: XCTestCase {
         XCTAssertTrue(s.kPathPoints.isEmpty)
         s.undoLast()
         XCTAssertFalse(s.kPathPoints.isEmpty)
+    }
+
+    // MARK: updateKPathPoint (direct fractional coordinate editing)
+
+    func testUpdateKPathPointSuccess() {
+        let s = SideBarState()
+        s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.5, 0, 0), "X")]
+        s.kPathBreaks = [0]
+        var changes = 0
+        s.onChange = { changes += 1 }
+
+        s.updateKPathPoint(at: 1, fractionalCoordinate: SIMD3(0.25, 0.25, 0.25), label: "W")
+
+        XCTAssertEqual(s.kPathPoints[1].frac, SIMD3(0.25, 0.25, 0.25))
+        XCTAssertEqual(s.kPathPoints[1].label, "W")
+        XCTAssertEqual(s.kPathBreaks, [0], "breaks must be preserved")
+        XCTAssertEqual(changes, 1, "exactly one state change must fire")
+        XCTAssertTrue(s.canUndo)
+    }
+
+    func testUpdateKPathPointBoundsLabel() {
+        let s = SideBarState()
+        s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ")]
+        let long = String(repeating: "A", count: 100)
+        s.updateKPathPoint(at: 0, fractionalCoordinate: SIMD3(0.1, 0.2, 0.3), label: long)
+        XCTAssertEqual(s.kPathPoints[0].label.count, 64)
+    }
+
+    func testUpdateKPathPointNoOpWhenUnchanged() {
+        let s = SideBarState()
+        s.kPathPoints = [KPoint(SIMD3(0.5, 0, 0), "X")]
+        s.updateKPathPoint(at: 0, fractionalCoordinate: SIMD3(0.5, 0, 0), label: "X")
+        XCTAssertFalse(s.canUndo, "no-op must not push undo")
+    }
+
+    func testUpdateKPathPointRejectsInvalidIndex() {
+        let s = SideBarState()
+        s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ")]
+        s.updateKPathPoint(at: 5, fractionalCoordinate: SIMD3(0.5, 0, 0), label: "X")
+        XCTAssertEqual(s.kPathPoints.count, 1)
+        XCTAssertEqual(s.kPathPoints[0].frac, SIMD3(0, 0, 0))
+        XCTAssertFalse(s.canUndo)
+    }
+
+    func testUpdateKPathPointRejectsNonFinite() {
+        let s = SideBarState()
+        s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.5, 0, 0), "X")]
+        s.updateKPathPoint(at: 0, fractionalCoordinate: SIMD3(Float.nan, 0, 0), label: "bad")
+        XCTAssertEqual(s.kPathPoints[0].frac, SIMD3(0, 0, 0), "NaN coord must be rejected")
+        s.updateKPathPoint(at: 0, fractionalCoordinate: SIMD3(0, Float.infinity, 0), label: "bad")
+        XCTAssertEqual(s.kPathPoints[0].frac, SIMD3(0, 0, 0), "Inf coord must be rejected")
+        XCTAssertFalse(s.canUndo)
+    }
+
+    func testUpdateKPathPointUndo() {
+        let s = SideBarState()
+        s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.5, 0, 0), "X")]
+        s.kPathBreaks = [0]
+        s.updateKPathPoint(at: 1, fractionalCoordinate: SIMD3(0.25, 0.25, 0.25), label: "W")
+        XCTAssertEqual(s.kPathPoints[1].frac, SIMD3(0.25, 0.25, 0.25))
+        s.undoLast()
+        XCTAssertEqual(s.kPathPoints[1].frac, SIMD3(0.5, 0, 0))
+        XCTAssertEqual(s.kPathPoints[1].label, "X")
+        XCTAssertEqual(s.kPathBreaks, [0], "breaks must survive undo")
+    }
+
+    func testUpdateKPathPointSetsProvenanceThroughSync() throws {
+        let c = makeController(try crystalScene())
+        let s = c.state
+        s.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.5, 0, 0), "X")]
+        c.scene.kPathPoints = s.kPathPoints
+        c.scene.kPathBreaks = s.kPathBreaks
+        c.scene.kPathProvenance = .generated
+
+        s.updateKPathPoint(at: 1, fractionalCoordinate: SIMD3(0.25, 0.25, 0.25), label: "W")
+        // onChange -> syncFromState: route changed, provenance flips to userEdited.
+        XCTAssertEqual(c.scene.kPathPoints[1].frac, SIMD3(0.25, 0.25, 0.25))
+        XCTAssertEqual(c.scene.kPathProvenance, .userEdited)
+        XCTAssertNil(c.scene.kPathSignature)
     }
 
     func testAppendCapsAndSuppressesConsecutiveDup() {

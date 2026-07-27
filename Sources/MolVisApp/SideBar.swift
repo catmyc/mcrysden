@@ -1,4 +1,5 @@
 import SwiftUI
+import simd
 
 struct SideBar: View {
     @ObservedObject var state: SideBarState
@@ -6,6 +7,20 @@ struct SideBar: View {
     // Light-direction steppers work in whole degrees; the slider reads/writes
     // the same Lighting.azimuth/elevation the shader consumes.
     private let degRange: ClosedRange<Float> = 0...360
+
+    // Selected-node coordinate editor state. Selection is view-local; the
+    // editor text fields are local so a partial edit (e.g. "0.") is never
+    // committed as an invalid float. Edits are committed through the
+    // SideBarState `updateKPathPoint(at:fractionalCoordinate:label:)` mutation.
+    @State private var selectedKPointIndex: Int? = nil
+    @State private var editKx: String = ""
+    @State private var editKy: String = ""
+    @State private var editKz: String = ""
+    @State private var editLabel: String = ""
+    // Tracks whether any per-node editor field holds keyboard focus. Used to commit
+    // the draft once on focus loss (instead of every keystroke) and to keep an
+    // external route mutation from clobbering a draft in progress while focused.
+    @FocusState private var editorFocused: Bool
 
     var body: some View {
         Form {
@@ -123,6 +138,15 @@ struct SideBar: View {
                         // sidebar (a single line of label + 3 controls + coordinates overflows).
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 4) {
+                                // Selection control: tapping it toggles the per-node
+                                // coordinate editor open for this point.
+                                Button(action: { toggleSelection(i) }) {
+                                    Image(systemName: selectedKPointIndex == i ? "chevron.down" : "chevron.right")
+                                        .font(.caption)
+                                        .foregroundColor(selectedKPointIndex == i ? .accentColor : .secondary)
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("Edit coordinates of point \(i + 1)")
                                 Text("\(i + 1).")
                                     .font(.caption).foregroundColor(.secondary)
                                 TextField("", text: Binding(
@@ -134,17 +158,59 @@ struct SideBar: View {
                                 Text(String(format: "(%.2f,%.2f,%.2f)", kp.frac.x, kp.frac.y, kp.frac.z))
                                     .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
                             }
+                            // Selected-node coordinate editor. Text fields are bound to local
+                            // state so a partial edit (e.g. "0.") never commits an invalid
+                            // float. Drafts are committed ONCE on focus loss or via the
+                            // explicit Apply button — not on every keystroke, which would
+                            // clobber the field with a state reload mid-edit.
+                            if selectedKPointIndex == i {
+                                Grid(alignment: .leading, horizontalSpacing: 4, verticalSpacing: 2) {
+                                    GridRow {
+                                        Text("kx").font(.caption)
+                                        TextField("kx", text: $editKx)
+                                            .textFieldStyle(.roundedBorder)
+                                            .focused($editorFocused)
+                                            .onSubmit { commitEdits() }
+                                    }
+                                    GridRow {
+                                        Text("ky").font(.caption)
+                                        TextField("ky", text: $editKy)
+                                            .textFieldStyle(.roundedBorder)
+                                            .focused($editorFocused)
+                                            .onSubmit { commitEdits() }
+                                    }
+                                    GridRow {
+                                        Text("kz").font(.caption)
+                                        TextField("kz", text: $editKz)
+                                            .textFieldStyle(.roundedBorder)
+                                            .focused($editorFocused)
+                                            .onSubmit { commitEdits() }
+                                    }
+                                    GridRow {
+                                        Text("Label").font(.caption)
+                                        TextField("label", text: $editLabel)
+                                            .textFieldStyle(.roundedBorder)
+                                            .focused($editorFocused)
+                                            .onSubmit { commitEdits() }
+                                    }
+                                    GridRow {
+                                        EmptyView()
+                                        Button("Apply") { commitEdits() }
+                                            .buttonStyle(.bordered).font(.caption)
+                                    }
+                                }
+                            }
                             HStack(spacing: 2) {
                                 Spacer()
-                                Button(action: { state.moveUp(at: i) }) {
+                                Button(action: { commitEdits(); state.moveUp(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
                                     Image(systemName: "arrow.up")
                                 }
                                 .buttonStyle(.borderless).disabled(i == 0)
-                                Button(action: { state.moveDown(at: i) }) {
+                                Button(action: { commitEdits(); state.moveDown(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
                                     Image(systemName: "arrow.down")
                                 }
                                 .buttonStyle(.borderless).disabled(i == state.kPathPoints.count - 1)
-                                Button(action: { state.remove(at: i) }) {
+                                Button(action: { commitEdits(); state.remove(at: i); selectedKPointIndex = nil; state.onSelectKPathNode?(nil) }) {
                                     Image(systemName: "trash")
                                 }
                                 .buttonStyle(.borderless)
@@ -233,6 +299,91 @@ struct SideBar: View {
         .formStyle(.grouped)
         .padding()
         .frame(minWidth: 200)
+        // Reload the editor fields when the selected index changes. Without this,
+        // selecting a different node would leave stale text in the bound fields.
+        .onChange(of: selectedKPointIndex) { _, _ in loadEditorFields() }
+        .onChange(of: state.routeGeneration) { _, _ in
+            // Whole-route replacement (Default/undo/clear/reset): drop the local
+            // selection and cancel any draft, even if the selected index is still
+            // valid — the route content changed under us.
+            selectedKPointIndex = nil
+            state.onSelectKPathNode?(nil)
+            editKx = ""; editKy = ""; editKz = ""; editLabel = ""
+        }
+        .onChange(of: state.viewResetGeneration) { _, _ in
+            // View reset: clear the local selection/editor to match the renderer
+            // highlight the controller just dropped. The route is unchanged.
+            selectedKPointIndex = nil
+            state.onSelectKPathNode?(nil)
+            editKx = ""; editKy = ""; editKz = ""; editLabel = ""
+        }
+        .onChange(of: state.kPathPoints) { _, _ in
+            if let i = selectedKPointIndex, !state.kPathPoints.indices.contains(i) {
+                selectedKPointIndex = nil
+                state.onSelectKPathNode?(nil)
+            }
+            if !editorFocused {
+                loadEditorFields()
+            }
+        }
+        // Commit the draft once when every editor field loses focus (the user tabs
+        // away or clicks elsewhere). No keystroke commits on its own.
+        .onChange(of: editorFocused) { _, focused in
+            if !focused { commitEdits() }
+        }
+    }
+
+    // MARK: - k-path coordinate editor helpers
+
+    /// Toggle selection of the node at `i`. Selecting loads its values into the
+    /// local editor fields; deselecting commits any pending valid edits first.
+    private func toggleSelection(_ i: Int) {
+        if selectedKPointIndex == i {
+            commitEdits()
+            selectedKPointIndex = nil
+            state.onSelectKPathNode?(nil)
+        } else {
+            commitEdits()
+            selectedKPointIndex = i
+            state.onSelectKPathNode?(i)
+            loadEditorFields()
+        }
+    }
+
+    /// Copy the selected node's values into the local editor text fields. No-op
+    /// when nothing is selected or the index is out of range.
+    private func loadEditorFields() {
+        guard let i = selectedKPointIndex, state.kPathPoints.indices.contains(i) else { return }
+        let kp = state.kPathPoints[i]
+        editKx = formatCoord(kp.frac.x)
+        editKy = formatCoord(kp.frac.y)
+        editKz = formatCoord(kp.frac.z)
+        editLabel = kp.label
+    }
+
+    /// Commit the local editor fields back to state, but only when every
+    /// coordinate field parses to a finite float. A partial edit like "0." or
+    /// an empty field leaves the stored value untouched instead of corrupting it.
+    private func commitEdits() {
+        guard let i = selectedKPointIndex, state.kPathPoints.indices.contains(i) else { return }
+        guard let kx = Float(editKx), kx.isFinite,
+              let ky = Float(editKy), ky.isFinite,
+              let kz = Float(editKz), kz.isFinite else { return }
+        let frac = SIMD3<Float>(kx, ky, kz)
+        let label = String(editLabel.prefix(64))
+        let current = state.kPathPoints[i]
+        // Skip the write when nothing actually changed — avoids pushing a spurious
+        // undo entry and prevents a feedback loop through `state.kPathPoints`.
+        guard current.frac != frac || current.label != label else { return }
+        state.updateKPathPoint(at: i, fractionalCoordinate: frac, label: label)
+    }
+
+    /// Format a fractional coordinate for editing. Swift's default Float->String is
+    /// the shortest representation that round-trips exactly (Float(String(v)) == v),
+    /// so merely opening/closing the editor can never change a stored coordinate
+    /// or flip its provenance.
+    private func formatCoord(_ v: Float) -> String {
+        String(v)
     }
 }
 

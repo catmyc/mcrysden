@@ -1524,7 +1524,10 @@ final class KPathLifecycleTests: XCTestCase {
             [0, 0, 4],
         ], atoms: [(14, SIMD3(0, 0, 0))])
         let controller = MainWindowController(scene: s, showWindow: false)
-        // User edits the path.
+        // User edits the path. Provenance is the source of truth on the state, so
+        // mark the edit before the geometry; syncFromState() copies it through.
+        controller.state.kPathProvenance = .userEdited
+        controller.state.kPathSignature = nil
         controller.state.kPathPoints = [KPoint(SIMD3(0.1, 0.2, 0.3), "custom")]
         controller.state.kPathBreaks = []
         controller.syncFromState()

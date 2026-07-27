@@ -144,6 +144,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onResetView = { [weak self] in self?.resetView() }
         state.onExportKPath = { [weak self] path, format in self?.exportKPath(path, format) }
         state.onResetKPath = { [weak self] in self?.resetKPathDefault() }
+        state.onSelectKPathNode = { [weak self] index in self?.selectKPathNode(index) }
+        // syncFromScene (above) installed the initial route via replaceKPath, bumping
+        // routeGeneration; mirror that so the first real syncFromState does not treat
+        // the initial route as a wholesale replacement and clear a nil selection.
+        lastRouteGeneration = state.routeGeneration
         canvas.delegate = renderer
         canvas.world = self
         renderer?.currentCamera = camera
@@ -172,6 +177,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // syncFromScene exits edit mode (editKPathOnBZ -> false); mirror that into the
         // renderer so a freshly-loaded scene can't leave stale landmark crosses drawn.
         renderer?.showBZLandmarks = state.editKPathOnBZ
+        // A freshly-loaded scene has its own route; clear any stale node highlight
+        // left over from the previous scene (its index may now be out of range).
+        // syncFromScene installed that route via replaceKPath (bumping routeGeneration);
+        // resync the token so the next syncFromState does not treat the fresh route as
+        // a wholesale replacement and clear a newly-set selection.
+        renderer?.selectedKPathNode = nil
+        lastRouteGeneration = state.routeGeneration
         applyCameraForNewSceneIfNeeded()
         // Graph data replaces the Metal canvas. DOS takes precedence if a loaded
         // scene ever contains both DOS and band data.
@@ -428,6 +440,16 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         return true
     }
 
+    /// Highlight the route node at `index` in the BZ viewport, linking the
+    /// sidebar route list's selection to the rendered k-path overlay. Pass nil
+    /// to clear. The renderer draws the selected node as a larger green cross;
+    /// out-of-range indices are a safe no-op there. This is the hook the
+    /// SidebarState/UI invokes on selection (it sets this from a callback).
+    func selectKPathNode(_ index: Int?) {
+        renderer?.selectedKPathNode = index
+        setNeedsRender()
+    }
+
     /// Toggle selection of `index`.  While a measurement result is locked the
     /// selection is frozen.  Otherwise clicking an atom toggles it; when the
     /// selection reaches the active mode's atom cap the measurement is computed
@@ -601,6 +623,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// appearance state. Reset lighting/background separately via the sidebar.
     func resetView() {
         camera.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        // A view reset is a natural clearing point for the transient node highlight;
+        // the route is unchanged, so this only drops the render toggle, not appearance.
+        // Bumping viewResetGeneration signals the SideBar to clear its local selected
+        // node/editor too, keeping the sidebar selection in sync with the renderer.
+        state.notifyViewReset()
+        renderer?.selectedKPathNode = nil
         applyCameraForNewSceneIfNeeded()
         // applyCameraForNewSceneIfNeeded() replaces the camera with
         // scene.defaultCamera(), whose projection defaults to orthographic — restore
@@ -722,17 +750,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.isCrystal = scene.isCrystal
         // k-path: the edited route lives in the sidebar state; push it into the
         // scene (never regenerate, or a sidebar sync would clobber user edits).
-        // The first user edit flips provenance from .generated to .userEdited
-        // so subsequent structure changes don't silently destroy the route.
-        if state.kPathPoints != scene.kPathPoints || state.kPathBreaks != scene.kPathBreaks {
-            scene.kPathProvenance = .userEdited
-            // Signatures identify canonical generated routes only. Clearing it at
-            // the first edit prevents a stale generated signature from leaking
-            // into persistence or later lifecycle decisions.
-            scene.kPathSignature = nil
-        }
+        // Provenance and signature are owned by the sidebar state (user-edit
+        // mutations set them; undo/reset/restore replace them wholesale), so copy
+        // them through verbatim instead of recomputing from the geometry diff —
+        // recomputing here would wrongly re-flag an undo-restored generated route
+        // as user-edited.
+        scene.kPathProvenance = state.kPathProvenance
+        scene.kPathSignature = state.kPathSignature
         scene.kPathPoints = state.kPathPoints
         scene.kPathBreaks = state.kPathBreaks
+        // A whole-route replacement (Default/undo/clear) bumps routeGeneration;
+        // clear any stale node selection so an out-of-range index can't linger.
+        // Single-node edits leave the generation untouched, so editing a selected
+        // node keeps its highlight.
+        if state.routeGeneration != lastRouteGeneration {
+            lastRouteGeneration = state.routeGeneration
+            renderer?.selectedKPathNode = nil
+        }
         // lighting + background — the renderer currently uses a fixed shader and
         // solid clear color (the richer shader is owned by another agent); we
         // mirror state into the scene here so the values persist via StateStore
@@ -806,7 +840,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.kPathBreaks = path.breaks
         scene.kPathProvenance = .generated
         scene.kPathSignature = CanonicalPathGenerator.structureSignature(for: scene.crystalSymmetry?.symmetry)
-        state.replaceKPath(points: path.points, breaks: path.breaks)
+        let signature = scene.kPathSignature
+        state.replaceKPath(points: path.points, breaks: path.breaks, provenance: .generated, signature: signature)
     }
 
     /// Install the canonical path from the scene's symmetry analysis into the
@@ -890,6 +925,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// state.frameIndex (which would otherwise fire onChange and re-enter).
     private var isReloadingFrame = false
     private var isSyncingState = false
+    /// Last-seen value of `state.routeGeneration`. A whole-route replacement bumps
+    /// that counter; when it changes we clear any stale node selection. Single-node
+    /// edits leave the counter untouched, so editing a selected node keeps its
+    /// highlight. Initialized in init/syncFromState from the current state.
+    private var lastRouteGeneration = -1
 
     /// Decode AXSF frame `index` and swap it into the current scene, preserving
     /// the camera and all UI-controllable state (display mode, scales, lighting,
@@ -1013,7 +1053,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // the synchronous @Published callbacks are fenced; otherwise a later
         // unrelated sidebar change would push the old fractional coordinates
         // back into the newly installed frame and misclassify its provenance.
-        state.replaceKPath(points: next.kPathPoints, breaks: next.kPathBreaks)
+        state.replaceKPath(points: next.kPathPoints, breaks: next.kPathBreaks,
+                           provenance: next.kPathProvenance, signature: next.kPathSignature)
+        // The frame's route replaced the previous one wholesale; clear any stale
+        // node highlight (the held isSyncingState guard fences syncFromState from
+        // detecting the generation bump here, so clear directly and resync the token).
+        renderer?.selectedKPathNode = nil
+        lastRouteGeneration = state.routeGeneration
         // Orbital picker: mirror the preserved & validated scene selection exactly
         // (applySelectedOrbitalAndClampIso already clamped + bounded it) so the
         // sidebar always agrees with the rendered frame, even for negative injected

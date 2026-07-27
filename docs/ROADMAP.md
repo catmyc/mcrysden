@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-27 (post-v1.1.16 symmetry and standard-path work implemented)**.
+Last updated: **2026-07-27 (v1.1.17 direct k-path coordinate editing implemented)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -78,7 +78,8 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 
 ### Reciprocal space and k-paths
 - [x] Per-component sampling budgets and disconnected path components, including singleton components, route rendering, strict persistence, and QE export.
-- [ ] Direct fractional-coordinate editing, user-configurable per-segment sampling, cumulative reciprocal distance, and selected-node highlighting between sidebar and BZ.
+- [x] Direct fractional-coordinate editing with undo/provenance preservation and selected-node highlighting between sidebar and BZ.
+- [ ] User-configurable per-segment sampling and cumulative reciprocal distance.
 - [ ] Candidate hover tooltips, viewport node labels, automatic BZ framing, and imports from QE, VASP, Wannier90, and KPF.
 - [ ] Export VASP `KPOINTS`, Wannier90 `kpoint_path`, and additional QE band-path forms.
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.

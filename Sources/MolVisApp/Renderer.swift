@@ -92,6 +92,12 @@ final class Renderer: NSObject {
     // SideBarState.editKPathOnBZ by MainWindowController.syncFromState). Non-persisted:
     // a pure render toggle, not part of Scene. Defaults off.
     var showBZLandmarks = false
+    /// Index of the route node to highlight in the BZ viewport (mirrors the
+    /// sidebar's selected route node), or nil for no highlight. Non-persisted:
+    /// a pure render toggle kept in sync by MainWindowController, like
+    /// `showBZLandmarks`. Compared against the per-frame node index in
+    /// `drawKPathRoute`, so an out-of-range value is simply not drawn.
+    var selectedKPathNode: Int? = nil
     private func invalidateBrillouinZoneCache() {
         cachedBZ = nil; bzBuilt = false
         cachedCandidates = nil
@@ -1181,13 +1187,29 @@ final class Renderer: NSObject {
         let amber = SIMD3<Float>(1.0, 0.55, 0.1)
         let segOK = segVerts.isEmpty ? true : drawLineBuffer(segVerts, color: amber, enc: enc, frameBuffer: frameBuffer)
 
+        // Defense in depth against a stale controller index: validate against the
+        // rendered node count and treat an out-of-range value as "no selection".
+        // The controller clears the index on every wholesale route replacement, load,
+        // reset, and frame change, but this guard ensures a missed clear can never
+        // highlight the wrong node (an out-of-range index simply draws nothing).
+        let sel = selectedKPathNode.flatMap { (0..<mapped.count).contains($0) ? $0 : nil }
         var nodeVerts: [SIMD3<Float>] = []
+        var highlightVerts: [SIMD3<Float>] = []
         for i in 0..<mapped.count where valid[i] {
-            nodeVerts.append(contentsOf: Renderer.crossLineSegments(mapped[i], half: routeNodeHalf))
+            if let sel, i == sel {
+                // Highlighted (sidebar-selected) node: larger cross in a vivid
+                // green so it reads against the cyan nodes, amber segments, and
+                // purple BZ faces.
+                highlightVerts.append(contentsOf: Renderer.crossLineSegments(mapped[i], half: routeNodeHalf * 1.5))
+            } else {
+                nodeVerts.append(contentsOf: Renderer.crossLineSegments(mapped[i], half: routeNodeHalf))
+            }
         }
         let cyan = SIMD3<Float>(0.2, 0.8, 1.0)
         let nodeOK = nodeVerts.isEmpty ? true : drawLineBuffer(nodeVerts, color: cyan, enc: enc, frameBuffer: frameBuffer)
-        return segOK && nodeOK
+        let highlight = SIMD3<Float>(0.2, 1.0, 0.3)
+        let highlightOK = highlightVerts.isEmpty ? true : drawLineBuffer(highlightVerts, color: highlight, enc: enc, frameBuffer: frameBuffer)
+        return segOK && nodeOK && highlightOK
     }
 
     // MARK: - Isosurface

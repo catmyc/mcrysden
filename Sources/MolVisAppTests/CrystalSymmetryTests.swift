@@ -557,6 +557,11 @@ final class CrystalSymmetryTests: XCTestCase {
         let controller = MainWindowController(scene: Scene(), showWindow: false)
         controller.loadFile(frame0, from: url, frameIndex: 0)
         let edited = [KPoint(SIMD3<Float>(0, 0, 0), "edited")]
+        // Provenance is the source of truth on the state; set it before the geometry
+        // so the synchronous onChange -> syncFromState adopts .userEdited and the
+        // frame reload transfers (rather than regenerates) the route.
+        controller.state.kPathProvenance = .userEdited
+        controller.state.kPathSignature = nil
         controller.state.kPathPoints = edited
         XCTAssertEqual(controller.scene.kPathPoints, edited)
         controller.state.frameIndex = 1
