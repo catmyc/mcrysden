@@ -536,6 +536,84 @@ final class AppSafetyTests: XCTestCase {
         let names = windowSub.items.map { $0.title }
         XCTAssertTrue(names.contains("Structure A"), "Window menu should list the open window")
     }
-}
 
+    // MARK: - Analysis checkmark sync
+
+    @MainActor
+    private func analysisMenu(_ app: App) -> NSMenu {
+        let menu = app.buildMenu()
+        // The Analysis item itself has no title; match by its submenu's title.
+        guard let analysis = menu.items.first(where: { $0.submenu?.title == "Analysis" })?.submenu else {
+            XCTFail("Analysis menu missing")
+            return NSMenu()
+        }
+        XCTAssertTrue(analysis.delegate === app)
+        return analysis
+    }
+
+    @MainActor
+    func testAnalysisCheckmarksReflectActiveViewerMode() {
+        let app = App()
+        let analysis = analysisMenu(app)
+        let wc = MainWindowController(scene: Scene(), showWindow: false)
+        wc.state.measurementMode = .distance
+        app.testAddWindow(wc)
+        app.menuWillOpen(analysis)
+        let onItems = analysis.items.filter { $0.state == .on }
+        XCTAssertEqual(onItems.count, 1, "exactly one mode should be checked")
+        XCTAssertEqual(onItems.first?.tag, 2, "Distance (tag 2) should be checked")
+    }
+
+    @MainActor
+    func testAnalysisCheckmarksClearWhenNoActiveViewer() {
+        let app = App()
+        let analysis = analysisMenu(app)
+        // Seed a stale checkmark, then open the menu with no windows registered.
+        analysis.items.first?.state = .on
+        app.menuWillOpen(analysis)
+        let onItems = analysis.items.filter { $0.state == .on }
+        XCTAssertEqual(onItems.count, 0, "stale checkmarks must be cleared with no active viewer")
+    }
+
+    @MainActor
+    func testAnalysisCheckmarksUpdateOnWindowSwitch() {
+        let app = App()
+        let analysis = analysisMenu(app)
+        let wc1 = MainWindowController(scene: Scene(), showWindow: false)
+        wc1.state.measurementMode = .distance
+        let wc2 = MainWindowController(scene: Scene(), showWindow: false)
+        wc2.state.measurementMode = .angle
+        app.testAddWindow(wc1)
+        app.testAddWindow(wc2)
+        // Last added is active: wc2 (angle).
+        app.menuWillOpen(analysis)
+        XCTAssertEqual(analysis.items.first { $0.tag == 3 }?.state, .on)
+        // Simulate wc1 becoming key.
+        let note = Notification(name: NSWindow.didBecomeKeyNotification, object: wc1.window)
+        app.windowDidBecomeKey(note)
+        XCTAssertEqual(analysis.items.first { $0.tag == 2 }?.state, .on)
+        XCTAssertEqual(analysis.items.first { $0.tag == 3 }?.state, .off)
+    }
+
+    @MainActor
+    func testAnalysisCheckmarksUpdateOnWindowClose() {
+        let app = App()
+        let analysis = analysisMenu(app)
+        let wc1 = MainWindowController(scene: Scene(), showWindow: false)
+        wc1.state.measurementMode = .distance
+        let wc2 = MainWindowController(scene: Scene(), showWindow: false)
+        wc2.state.measurementMode = .angle
+        app.testAddWindow(wc1)
+        app.testAddWindow(wc2)
+        // Close the active window (wc2); fallback to wc1.
+        let note = Notification(name: NSWindow.willCloseNotification, object: wc2.window)
+        app.windowWillClose(note)
+        XCTAssertEqual(analysis.items.first { $0.tag == 2 }?.state, .on)
+        XCTAssertEqual(analysis.items.first { $0.tag == 3 }?.state, .off)
+    }
+
+    func testAppVersionIs120() {
+        XCTAssertEqual(App.appVersion, "1.2.0")
+    }
+}
 

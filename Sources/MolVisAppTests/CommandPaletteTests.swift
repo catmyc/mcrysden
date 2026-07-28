@@ -1,8 +1,18 @@
+import AppKit
 import XCTest
 @testable import MolVisApp
 
 @MainActor
 final class CommandPaletteTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // Materialize the shared application so NSApp is non-nil and
+        // sendAction delivers synchronously. No window is presented.
+        _ = NSApplication.shared
+        // Reset the routing hook so a crashed test can't leak a spy into the next.
+        CommandPaletteView.routeTextEdit = CommandPaletteView.defaultRouteTextEdit
+    }
+
     private let sections: [CommandPaletteSection] = [
         CommandPaletteSection(title: "File", items: [
             CommandPaletteItem(title: "Open\u{2026}", keyEquivalent: "⌘O", section: "File", action: {}),
@@ -166,5 +176,123 @@ final class CommandPaletteTests: XCTestCase {
         }
         let open = file.items.first { $0.title.hasPrefix("Open") }
         XCTAssertEqual(open?.keyEquivalent, "⌘O")
+    }
+
+    // MARK: - Text-edit command routing
+
+    // Standard NSTextView does not implement undo:/redo: directly; those reach
+    // the undo manager via the responder chain. The palette therefore restores
+    // the originating window/responder and dispatches with a nil target so the
+    // normal chain resolves the action. These tests verify that wiring without
+    // presenting a real window (which is required to exercise the chain end-to-end).
+
+    /// Records window-routing calls. Never ordered front and never closed, so it
+    /// can be instantiated in XCTest without the teardown crashes that afflict
+    /// presented windows.
+    private final class MockWindow: NSWindow {
+        var didMakeKeyAndOrderFront = false
+        var didMakeFirstResponder: NSResponder?
+        var firstResponderToReturn: NSResponder?
+        var isVisibleOverride: Bool
+        override var isVisible: Bool { isVisibleOverride }
+        override var firstResponder: NSResponder? { firstResponderToReturn }
+
+        init(isVisible: Bool = true) {
+            self.isVisibleOverride = isVisible
+            super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
+        }
+
+        override func makeKeyAndOrderFront(_ sender: Any?) {
+            didMakeKeyAndOrderFront = true
+        }
+
+        override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
+            didMakeFirstResponder = responder
+            firstResponderToReturn = responder
+            return true
+        }
+    }
+
+    func testDefaultRouteRestoresWindowAndFirstResponder() {
+        let window = MockWindow()
+        let responder = NSResponder()
+        let ctx = CommandPaletteView.PriorContext(window: window, responder: responder)
+        CommandPaletteView.defaultRouteTextEdit(NSSelectorFromString("undo:"), ctx)
+        XCTAssertTrue(window.didMakeKeyAndOrderFront)
+        XCTAssertTrue(window.didMakeFirstResponder === responder)
+    }
+
+    func testDefaultRouteIsNoOpWhenWindowNotVisible() {
+        let window = MockWindow(isVisible: false)
+        let responder = NSResponder()
+        let ctx = CommandPaletteView.PriorContext(window: window, responder: responder)
+        CommandPaletteView.defaultRouteTextEdit(NSSelectorFromString("undo:"), ctx)
+        XCTAssertFalse(window.didMakeKeyAndOrderFront)
+        XCTAssertNil(window.didMakeFirstResponder)
+    }
+
+    func testDefaultRouteSkipsRestoreWhenContextNil() {
+        // No origin means there is no safe responder chain to dispatch through.
+        CommandPaletteView.defaultRouteTextEdit(NSSelectorFromString("undo:"), nil)
+    }
+
+    func testRetargetedActionReadsContextAtInvocation() {
+        let responder = NSResponder()
+        CommandPaletteView.testSetPriorContext(window: nil, responder: responder)
+        var captured: NSResponder?
+        CommandPaletteView.routeTextEdit = { _, ctx in
+            captured = ctx?.responder
+        }
+        defer { CommandPaletteView.routeTextEdit = CommandPaletteView.defaultRouteTextEdit }
+        let action = CommandPaletteView.retargeted("undo:")
+        action()
+        XCTAssertTrue(captured === responder)
+    }
+
+    func testRetargetedActionWithNilContextIsNoOp() {
+        CommandPaletteView.testSetPriorContext(window: nil, responder: nil)
+        let action = CommandPaletteView.retargeted("undo:")
+        action()  // must not trap
+    }
+
+    func testStandardEditItemsRouteThroughHook() {
+        var dispatched: [String] = []
+        CommandPaletteView.routeTextEdit = { sel, _ in
+            dispatched.append(NSStringFromSelector(sel))
+        }
+        defer { CommandPaletteView.routeTextEdit = CommandPaletteView.defaultRouteTextEdit }
+
+        let std = CommandPaletteSection.standardSections
+        guard let edit = std.first(where: { $0.title == "Edit" }) else {
+            return XCTFail("Edit section missing")
+        }
+        for item in edit.items {
+            item.action()
+        }
+        // The six standard text-edit items route through the responder-chain hook;
+        // "Copy Current View" uses a separate app-targeted dispatch.
+        XCTAssertEqual(dispatched, ["undo:", "redo:", "cut:", "copy:", "paste:", "selectAll:"])
+    }
+
+    func testInvokeSelectedRoutesTextEditCommand() {
+        var dispatched: [String] = []
+        CommandPaletteView.routeTextEdit = { sel, _ in
+            dispatched.append(NSStringFromSelector(sel))
+        }
+        defer { CommandPaletteView.routeTextEdit = CommandPaletteView.defaultRouteTextEdit }
+
+        let std = CommandPaletteSection.standardSections
+        guard let edit = std.first(where: { $0.title == "Edit" }),
+              let undo = edit.items.first(where: { $0.title == "Undo" }) else {
+            return XCTFail("Undo item missing")
+        }
+        let model = CommandPaletteModel(sections: std)
+        // Select the Undo row and invoke it, mirroring the keyboard-Return and
+        // mouse-click paths, which both funnel through invokeSelected().
+        if let idx = model.filteredItems.firstIndex(where: { $0.id == undo.id }) {
+            model.selectedIndex = idx
+        }
+        model.invokeSelected()
+        XCTAssertEqual(dispatched, ["undo:"])
     }
 }

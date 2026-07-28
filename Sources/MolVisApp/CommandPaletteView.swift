@@ -49,12 +49,12 @@ struct CommandPaletteSection: Identifiable {
                 CommandPaletteItem(title: "New Window", keyEquivalent: formatKey("n", [.command, .shift]), section: "File", action: dispatch("newDocument:", appTargeted: true)),
             ]),
             CommandPaletteSection(title: "Edit", items: [
-                CommandPaletteItem(title: "Undo", keyEquivalent: formatKey("z", [.command]), section: "Edit", action: dispatch("undo:")),
-                CommandPaletteItem(title: "Redo", keyEquivalent: formatKey("z", [.command, .shift]), section: "Edit", action: dispatch("redo:")),
-                CommandPaletteItem(title: "Cut", keyEquivalent: formatKey("x", [.command]), section: "Edit", action: dispatch("cut:")),
-                CommandPaletteItem(title: "Copy", keyEquivalent: formatKey("c", [.command]), section: "Edit", action: dispatch("copy:")),
-                CommandPaletteItem(title: "Paste", keyEquivalent: formatKey("v", [.command]), section: "Edit", action: dispatch("paste:")),
-                CommandPaletteItem(title: "Select All", keyEquivalent: formatKey("a", [.command]), section: "Edit", action: dispatch("selectAll:")),
+                CommandPaletteItem(title: "Undo", keyEquivalent: formatKey("z", [.command]), section: "Edit", action: CommandPaletteView.retargeted("undo:")),
+                CommandPaletteItem(title: "Redo", keyEquivalent: formatKey("z", [.command, .shift]), section: "Edit", action: CommandPaletteView.retargeted("redo:")),
+                CommandPaletteItem(title: "Cut", keyEquivalent: formatKey("x", [.command]), section: "Edit", action: CommandPaletteView.retargeted("cut:")),
+                CommandPaletteItem(title: "Copy", keyEquivalent: formatKey("c", [.command]), section: "Edit", action: CommandPaletteView.retargeted("copy:")),
+                CommandPaletteItem(title: "Paste", keyEquivalent: formatKey("v", [.command]), section: "Edit", action: CommandPaletteView.retargeted("paste:")),
+                CommandPaletteItem(title: "Select All", keyEquivalent: formatKey("a", [.command]), section: "Edit", action: CommandPaletteView.retargeted("selectAll:")),
                 CommandPaletteItem(title: "Copy Current View", keyEquivalent: formatKey("c", [.command, .shift]), section: "Edit", action: dispatch("copyCurrentView:", appTargeted: true)),
             ]),
             CommandPaletteSection(title: "View", items: [
@@ -112,15 +112,6 @@ final class CommandPaletteModel: ObservableObject {
         selectedIndex = min(filteredItems.count - 1, selectedIndex + 1)
     }
 
-    /// Whether the currently selected command is a text-editing action that
-    /// should be retargeted to the pre-palette responder.
-    var selectedItemIsTextEditCommand: Bool {
-        let items = filteredItems
-        guard items.indices.contains(selectedIndex) else { return false }
-        let title = items[selectedIndex].title
-        return ["Undo", "Redo", "Cut", "Copy", "Paste", "Select All"].contains(title)
-    }
-
     func invokeSelected() {
         let items = filteredItems
         guard items.indices.contains(selectedIndex) else { return }
@@ -157,12 +148,6 @@ struct CommandPaletteView: View {
         .onKeyPress(.upArrow) { model.moveUp(); return .handled }
         .onKeyPress(.downArrow) { model.moveDown(); return .handled }
         .onKeyPress(.return) {
-            // Retarget text-editing commands to the pre-palette responder so
-            // undo/redo/cut/copy/paste operate on the underlying editor.
-            let prior = CommandPaletteView.priorResponder
-            if let prior, model.selectedItemIsTextEditCommand {
-                NSApp?.keyWindow?.makeFirstResponder(prior)
-            }
             model.invokeSelected()
             onDismiss()
             return .handled
@@ -279,17 +264,57 @@ extension CommandPaletteView {
         override var canBecomeKey: Bool { true }
     }
 
-    /// The responder that was first responder before the palette opened, so
-    /// text commands (undo/redo/cut/copy/paste) can be retargeted to it.
-    private static weak var priorResponder: NSResponder?
+    /// The window and first responder that were active before the palette
+    /// opened. Text commands are routed back through the originating window's
+    /// responder chain (the only way NSTextView's undo:/redo: reach the undo
+    /// manager), not targeted at the responder directly.
+    struct PriorContext {
+        weak var window: NSWindow?
+        weak var responder: NSResponder?
+    }
+
+    private static var priorContext: PriorContext?
+
+    /// Default routing for a text-edit command: restores the originating
+    /// window as key and its first responder, then dispatches with a nil target
+    /// so the normal responder/undo-manager chain resolves it.
+    static let defaultRouteTextEdit: (Selector, PriorContext?) -> Void = { sel, ctx in
+        guard let window = ctx?.window, window.isVisible else { return }
+        window.makeKeyAndOrderFront(nil)
+        if let responder = ctx?.responder, window.firstResponder !== responder {
+            guard window.makeFirstResponder(responder) else { return }
+        }
+        _ = NSApp?.sendAction(sel, to: nil, from: nil)
+    }
+
+    /// Overridable routing hook. Mirrors `defaultRouteTextEdit`; tests replace
+    /// this to observe routing without presenting a real window.
+    static var routeTextEdit: (Selector, PriorContext?) -> Void = defaultRouteTextEdit
+
+    /// Action factory for text-editing commands: routes through the originating
+    /// window's responder chain via `routeTextEdit`, reading context at
+    /// invocation time. Shared by both the Return key and mouse-click paths.
+    static func retargeted(_ selector: String) -> () -> Void {
+        return {
+            let sel = NSSelectorFromString(selector)
+            routeTextEdit(sel, priorContext)
+        }
+    }
+
+    /// Test seam: set the context that `retargeted` actions route through. Avoids
+    /// presenting a real palette window in XCTest.
+    static func testSetPriorContext(window: NSWindow?, responder: NSResponder?) {
+        priorContext = PriorContext(window: window, responder: responder)
+    }
 
     static func show(sections: [CommandPaletteSection] = CommandPaletteSection.standardSections) {
         currentPanel?.close()
-        priorResponder = NSApp?.keyWindow?.firstResponder
+        let keyWindow = NSApp?.keyWindow
+        priorContext = PriorContext(window: keyWindow, responder: keyWindow?.firstResponder)
 
         // Capture the active window's screen (not necessarily main) so the palette
         // opens on the same display as the viewer that invoked it.
-        guard NSApp != nil, let screen = NSApp?.keyWindow?.screen ?? NSScreen.main else { return }
+        guard NSApp != nil, let screen = keyWindow?.screen ?? NSScreen.main else { return }
         let model = CommandPaletteModel(sections: sections)
 
         let panel = KeyablePanel(

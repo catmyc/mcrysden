@@ -59,6 +59,17 @@ final class ExportOptionsTests: XCTestCase {
         XCTAssertEqual(c.a, 1.0, accuracy: 0.001)
     }
 
+    func testClearColorOpaqueForcesAlphaOne() {
+        let opts = ExportOptions()
+        opts.backgroundColor = NSColor(deviceRed: 0.5, green: 0.25, blue: 0.75, alpha: 0.3)
+        opts.isTransparent = false
+        let c = opts.clearColor
+        XCTAssertEqual(c.r, 0.5, accuracy: 0.001)
+        XCTAssertEqual(c.g, 0.25, accuracy: 0.001)
+        XCTAssertEqual(c.b, 0.75, accuracy: 0.001)
+        XCTAssertEqual(c.a, 1.0, accuracy: 0.001)
+    }
+
     func testClearColorTransparent() {
         let opts = ExportOptions()
         opts.backgroundColor = NSColor.white

@@ -37,6 +37,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     /// whether a file is loaded; Open Recent is rebuilt from NSDocumentController.
     private weak var revertItem: NSMenuItem?
     private weak var recentItem: NSMenuItem?
+    /// Analysis submenu reference so checkmark refresh does not depend on NSApp.
+    private weak var analysisMenu: NSMenu?
 
     /// Pending timer that resets the Copy Current View menu title after a flash.
     /// Cancelled before scheduling a new one so rapid copies don't race.
@@ -380,12 +382,14 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     @objc func windowWillClose(_ note: Notification) {
         if let wc = (note.object as? NSWindow)?.delegate as? MainWindowController {
             windowRegistry.remove(wc)
+            updateAnalysisCheckmarks()
         }
     }
 
     @objc func windowDidBecomeKey(_ note: Notification) {
         if let wc = (note.object as? NSWindow)?.delegate as? MainWindowController {
             windowRegistry.makeActive(wc)
+            updateAnalysisCheckmarks()
         }
     }
 
@@ -562,7 +566,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         // Analysis
         let analysisItem = NSMenuItem(); main.addItem(analysisItem)
         let analysis = NSMenu(title: "Analysis")
+        analysis.delegate = self
         analysisItem.submenu = analysis
+        self.analysisMenu = analysis
         // Build the menu with a stable tag per item (1..4) so we can update
         // the checkmark without matching titles.
         let modeList: [(String, Int)] = [
@@ -694,9 +700,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     // MARK: - NSMenuDelegate
 
     /// Enable/disable Revert and rebuild Open Recent each time the File menu opens.
-    /// Also rebuilds the per-window list in the Window menu.
+    /// Also rebuilds the per-window list in the Window menu and refreshes the
+    /// Analysis checkmarks so they always reflect the active viewer's mode.
     @MainActor
     func menuWillOpen(_ menu: NSMenu) {
+        if menu.title == "Analysis" {
+            updateAnalysisCheckmarks()
+        }
         if menu.title == "File" {
         revertItem?.isEnabled = (mainWC?.currentSourceURL != nil)
         guard let recentItem else { return }
@@ -957,11 +967,15 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Reflect the active measurement mode with a checkmark in the Analysis menu.
+    /// Clears all checkmarks when there is no active viewer.
     private func updateAnalysisCheckmarks() {
         // Read from `state` — the canonical source — so the checkmark reflects
         // the mode the menu just set, without depending on a pending sync.
-        guard let analysis = NSApp.mainMenu?.item(withTitle: "Analysis")?.submenu,
-              let mode = mainWC?.state.measurementMode else { return }
+        guard let analysis = analysisMenu else { return }
+        guard let mode = mainWC?.state.measurementMode else {
+            for item in analysis.items { item.state = .off }
+            return
+        }
         let activeTag: Int = { switch mode {
             case .none: return 1; case .distance: return 2; case .angle: return 3; case .dihedral: return 4
         } }()
@@ -969,7 +983,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.3.0"
+    static let appVersion = "1.2.0"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

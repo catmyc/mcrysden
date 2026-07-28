@@ -63,7 +63,7 @@ final class ExportOptions: ObservableObject {
     var clearColor: (r: Double, g: Double, b: Double, a: Double) {
         if isTransparent { return (0, 0, 0, 0) }
         let c = backgroundColor.usingColorSpace(.deviceRGB) ?? backgroundColor
-        return (c.redComponent, c.greenComponent, c.blueComponent, c.alphaComponent)
+        return (c.redComponent, c.greenComponent, c.blueComponent, 1.0)
     }
 }
 
