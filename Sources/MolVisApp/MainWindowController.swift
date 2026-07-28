@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Metal
 import MetalKit
 import simd
@@ -51,6 +52,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Test-only count of actual editor BZ builds (cache misses). Lets tests confirm
     /// at-most-once-per-scene construction and invalidation on file/frame install.
     internal var bzBuildCount = 0
+    /// Test-only seam: true while an active file watcher is installed for the
+    /// loaded source. Lets tests assert watching starts/loads without a real fs event.
+    internal var isWatchingFile: Bool { fileWatchSource != nil }
+    /// Test-only seam: true while the reload prompt is visible. Lets tests assert
+    /// the prompt is shown after a debounced change without a real fs event.
+    internal var isReloadPromptVisible: Bool { reloadPromptWindow != nil }
     /// Monotonic generation counter so out-of-order background drop loads never
     /// overwrite a later-scrubbed or more recent load. Incremented at each
     /// loadFile / loadDroppedFile entry; the capture before async work gates install.
@@ -58,6 +65,26 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Repeating timer driving AXSF playback. Held weakly by the runloop; we
     /// recreate it on Play and invalidate on Pause/stop in `syncFromState`.
     private var playTimer: Timer?
+
+    // MARK: - File watching
+
+    /// Dispatch source monitoring the loaded source file for disk changes. nil when
+    /// no file is loaded or watching was cancelled (e.g. on close / new load).
+    private var fileWatchSource: DispatchSourceFileSystemObject?
+    /// POSIX descriptor backing `fileWatchSource`, tracked so the cancel handler
+    /// closes it exactly once (double-close is undefined).
+    private var fileWatchDescriptor: Int32 = -1
+    /// Debounce timer coalescing rapid fs events into a single reload prompt.
+    private var fileWatchDebounce: Timer?
+    /// Floating reload-prompt panel shown over the viewport; nil when hidden.
+    private var reloadPromptWindow: NSPanel?
+    /// Tracks whether the prompt is for a delete (vs. modify) so the message differs.
+    private var reloadPromptIsDelete = false
+    /// Monotonic token so a stale debounce can't prompt after a reload/close.
+    private var fileWatchToken = 0
+    /// Last-seen inode of the watched file; a change means the file was replaced
+    /// (atomic write) and we must re-open the descriptor on the new inode.
+    private var fileWatchInode: UInt64 = 0
 
     init(scene: Scene, showWindow: Bool = true) {
         self.scene = scene
@@ -185,6 +212,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             // the file can be reopened on the next launch when no CLI input is given.
             NSDocumentController.shared.noteNewRecentDocumentURL(url)
             UserDefaults.standard.set(url.path, forKey: App.lastOpenedURLKey)
+            startFileWatching(url)
         }
         bzEpoch += 1   // new scene: cell/baseAtoms may differ, rebuild the editor BZ
         state.syncFromScene(scene)
@@ -365,6 +393,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Closing the main window must end the program: hide the docked readout
     // first so the app terminates cleanly instead of leaving it orphaned.
     func windowWillClose(_ notification: Notification) {
+        stopFileWatching()
         stopPlayback()
         state.isPlaying = false
         infoWindow.orderOut(nil)
@@ -956,7 +985,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// payloads hidden by the view state must not supersede the Metal canvas.
     @MainActor
     @discardableResult
-    internal func exportCurrentView(to url: URL, size: CGSize) throws -> CGImage {
+    internal func exportCurrentView(to url: URL, size: CGSize, options: ExportOptions? = nil) throws -> CGImage {
         // The export size is the current logical viewport size; reproject labels
         // after a resize before copying the live overlay.
         updateLabels()
@@ -964,9 +993,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if dosGrapher.isHidden { visibleScene.densityOfStates = nil }
         if bandGrapher.isHidden { visibleScene.bandStructure = nil }
         if colorPlane.isHidden { visibleScene.grid2D = nil }
-        let options = RenderExportOptions(labels: canvas.isHidden ? [] : labelOverlay.labels,
-                                          showBZLandmarks: !canvas.isHidden && state.editKPathOnBZ && scene.isCrystal)
-        return try App.exportScene(visibleScene, camera: camera, to: url, size: size, options: options)
+        // Apply export options: if the caller passes explicit options, use them;
+        // otherwise render with the scene's own background (preserving gradients).
+        let renderOptions = RenderExportOptions(labels: canvas.isHidden ? [] : labelOverlay.labels,
+                                                showBZLandmarks: !canvas.isHidden && state.editKPathOnBZ && scene.isCrystal)
+        if let options {
+            // Apply background override to the scene copy for ALL export paths
+            // (graph, vector, and Metal) so background/transparency settings are
+            // honored uniformly.
+            if !options.isTransparent {
+                visibleScene.background = options.backgroundHex
+                visibleScene.backgroundType = .solid
+            }
+            return try App.exportScene(visibleScene, camera: camera, to: url, size: size,
+                                       options: renderOptions, exportOptions: options)
+        }
+        return try App.exportScene(visibleScene, camera: camera, to: url, size: size,
+                                   options: renderOptions)
     }
 
     /// Pick a small set of iso-contour levels spanning the grid's value range,
@@ -1190,6 +1233,152 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private func stopPlayback() {
         playTimer?.invalidate()
         playTimer = nil
+    }
+
+    // MARK: - File watching
+
+    /// Begin (or restart) watching `url` for disk changes. Idempotent: any prior
+    /// watcher is cancelled first. No-op when the file can't be opened (e.g. gone).
+    func startFileWatching(_ url: URL) {
+        stopFileWatching()
+        let fd = open(url.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        fileWatchDescriptor = fd
+        fileWatchInode = Self.inodeOf(url) ?? 0
+        fileWatchToken += 1
+        let token = fileWatchToken
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .delete, .rename, .revoke],
+            queue: .main)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.handleWatchEvent(source.data, url: url, token: token)
+        }
+        source.setCancelHandler {
+            // Unconditionally close our captured descriptor exactly once, even if
+            // the controller has been released before the async handler runs.
+            close(fd)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.fileWatchDescriptor == fd else { return }
+                self.fileWatchDescriptor = -1
+            }
+        }
+        source.resume()
+        fileWatchDescriptor = fd
+        fileWatchSource = source
+    }
+
+    /// Cancel any active file watcher and dismiss the reload prompt.
+    func stopFileWatching() {
+        fileWatchDebounce?.invalidate()
+        fileWatchDebounce = nil
+        fileWatchToken += 1
+        dismissReloadPrompt()
+        if let source = fileWatchSource {
+            source.cancel()
+            fileWatchSource = nil
+        }
+    }
+
+    private func handleWatchEvent(_ event: DispatchSource.FileSystemEvent, url: URL, token: Int) {
+        guard token == fileWatchToken else { return }
+        // Delete/rename/revoke: the inode we opened is gone.
+        if event.contains(.delete) || event.contains(.rename) || event.contains(.revoke) {
+            // A delete/rename is often an atomic replace (write temp + rename, or
+            // truncate + rewrite). If a new file now lives at the same path with a
+            // different inode, re-open on the new inode and prompt for reload.
+            if let inode = Self.inodeOf(url), inode != 0, inode != fileWatchInode {
+                fileWatchSource?.cancel()
+                fileWatchSource = nil
+                fileWatchDebounce?.invalidate()
+                startFileWatching(url)
+                scheduleReloadPrompt(url: url, isDelete: false, token: fileWatchToken)
+                return
+            }
+            fileWatchSource?.cancel()
+            fileWatchSource = nil
+            scheduleReloadPrompt(url: url, isDelete: true, token: token)
+            return
+        }
+        // Write/extend: content changed.
+        scheduleReloadPrompt(url: url, isDelete: false, token: token)
+    }
+
+    private func scheduleReloadPrompt(url: URL, isDelete: Bool, token: Int) {
+        fileWatchDebounce?.invalidate()
+        fileWatchDebounce = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: false) { [weak self] _ in
+            guard let self, self.fileWatchToken == token else { return }
+            self.showReloadPrompt(url: url, isDelete: isDelete)
+        }
+    }
+
+    private func showReloadPrompt(url: URL, isDelete: Bool) {
+        dismissReloadPrompt()
+        reloadPromptIsDelete = isDelete
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 44),
+                            styleMask: [.nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.isReleasedWhenClosed = false
+        panel.backgroundColor = NSColor.windowBackgroundColor
+        panel.level = .floating
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 44))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(labelWithString: isDelete
+            ? "\(url.lastPathComponent) was deleted or moved."
+            : "\(url.lastPathComponent) changed on disk.")
+        label.font = .systemFont(ofSize: 12)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        let button = NSButton(title: isDelete ? "OK" : "Reload", target: nil, action: nil)
+        button.bezelStyle = .rounded
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.target = self
+        button.action = isDelete ? #selector(dismissReloadPromptObjC) : #selector(confirmReloadFromPrompt)
+        container.addSubview(button)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            button.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            button.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            button.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 12),
+        ])
+        panel.contentView = container
+        reloadPromptWindow = panel
+        window.addChildWindow(panel, ordered: .above)
+        positionReloadPrompt()
+    }
+
+    private func positionReloadPrompt() {
+        guard let panel = reloadPromptWindow else { return }
+        let wf = window.frame
+        let size = panel.frame.size
+        panel.setFrame(NSRect(x: wf.origin.x + wf.width - size.width - 12,
+                              y: wf.origin.y + wf.height - size.height - 36,
+                              width: size.width, height: size.height), display: false)
+    }
+
+    @objc private func confirmReloadFromPrompt(_ sender: Any?) {
+        dismissReloadPrompt()
+        revertToSource()
+    }
+
+    @objc private func dismissReloadPromptObjC(_ sender: Any?) {
+        dismissReloadPrompt()
+    }
+
+    private func dismissReloadPrompt() {
+        reloadPromptWindow?.parent?.removeChildWindow(reloadPromptWindow!)
+        reloadPromptWindow?.orderOut(nil)
+        reloadPromptWindow = nil
+    }
+
+    private static func inodeOf(_ url: URL) -> UInt64? {
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+              let inode = attrs[.systemFileNumber] as? NSNumber else { return nil }
+        return inode.uint64Value
     }
 
     /// Select exactly one viewport layer. Keeping the graph views as siblings of

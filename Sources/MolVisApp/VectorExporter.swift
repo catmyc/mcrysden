@@ -35,7 +35,8 @@ enum RasterExporter {
     // the export tests) across all formats — not just the written file's byte size.
     @discardableResult
     static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize,
-                       options: RenderExportOptions = RenderExportOptions()) throws -> CGImage {
+                       options: RenderExportOptions = RenderExportOptions(),
+                       background: (r: Double, g: Double, b: Double, a: Double)? = nil) throws -> CGImage {
         // Validate representability before Int conversion (mirrors PngExporter) so an
         // absurd size throws instead of trapping on the Int cast.
         let rw = size.width.rounded(), rh = size.height.rounded()
@@ -47,7 +48,7 @@ enum RasterExporter {
         let w = Int(rw), h = Int(rh)
         let total = w.multipliedReportingOverflow(by: h)
         guard !total.overflow, total.partialValue <= 16_000_000 else { throw RasterExportError.noTex }
-        let cg = try render(scene: scene, camera: camera, w: w, h: h, options: options)
+        let cg = try render(scene: scene, camera: camera, w: w, h: h, options: options, background: background)
         try write(cgImage: cg, to: url, size: CGSize(width: w, height: h))
         return cg
     }
@@ -78,12 +79,16 @@ enum RasterExporter {
     // MARK: Metal → CGImage (mirrors PngExporter, reused for all formats)
 
     private static func render(scene: Scene, camera: Camera?, w: Int, h: Int,
-                               options: RenderExportOptions) throws -> CGImage {
+                               options: RenderExportOptions,
+                               background: (r: Double, g: Double, b: Double, a: Double)? = nil) throws -> CGImage {
         guard w > 0, h > 0 else { throw RasterExportError.noTex }
         guard let device = MTLCreateSystemDefaultDevice() else { throw RasterExportError.noGPU }
         let renderer = try Renderer(device: device)
         renderer.scene = scene
         renderer.showBZLandmarks = options.showBZLandmarks
+        if let bg = background {
+            renderer.clearColorOverride = MTLClearColorMake(bg.r, bg.g, bg.b, bg.a)
+        }
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm
         desc.width = w; desc.height = h

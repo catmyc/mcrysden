@@ -121,6 +121,9 @@ final class Renderer: NSObject {
         var generation: UInt64
     }
     var background: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)
+    /// Optional clear-color override for exports; when set, encode uses it instead
+    /// of deriving the clear color from the scene background. Reset to nil after use.
+    var clearColorOverride: MTLClearColor?
 
     /// Renderer-owned token for the current scalar field. Bumped in
     /// `invalidateCaches` exactly when the iso field's content, geometry, or iso
@@ -478,11 +481,16 @@ final class Renderer: NSObject {
         guard let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
         guard ensureDepthTexture(width: w, height: h) else { return false }
 
-        // Clear color reflects the CURRENT background type + hex, recomputed every
-        // frame so sidebar edits apply immediately (previously frozen at init).
-        let clearColor = scene.backgroundType == .gradient_top
-            ? Renderer.MTLClearColorFromString(scene.backgroundBottom)
-            : Renderer.MTLClearColorFromString(scene.background)
+        // Clear color: explicit override (for exports) takes priority, else derive
+        // from the current background type + hex so sidebar edits apply immediately.
+        let clearColor: MTLClearColor
+        if let override = clearColorOverride {
+            clearColor = override
+        } else {
+            clearColor = scene.backgroundType == .gradient_top
+                ? Renderer.MTLClearColorFromString(scene.backgroundBottom)
+                : Renderer.MTLClearColorFromString(scene.background)
+        }
 
         let desc = MTLRenderPassDescriptor()
         desc.colorAttachments[0].texture = target
@@ -507,10 +515,9 @@ final class Renderer: NSObject {
         guard let depthStencilState else { enc.endEncoding(); return false }
         enc.setDepthStencilState(depthStencilState)
 
-        // Vertical-gradient backdrop: a fullscreen quad at the far plane, drawn
-        // with the always-pass / never-write overlay depth state so the scene
-        // (depth < 1.0) paints over it. Reuses the gizmo's overlay depth state.
-        if scene.backgroundType == .gradient_top {
+        // Vertical-gradient backdrop. Suppressed during exports with an explicit
+        // clearColorOverride so transparent/custom backgrounds render as configured.
+        if scene.backgroundType == .gradient_top && clearColorOverride == nil {
             drawGradient(enc)
         }
 

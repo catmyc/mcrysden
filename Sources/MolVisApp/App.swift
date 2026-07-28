@@ -1,9 +1,37 @@
 import AppKit
 import Darwin
+import SwiftUI
 import UniformTypeIdentifiers
 
-final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMenuDelegate {
-    var mainWC: MainWindowController?
+final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMenuDelegate, NSWindowDelegate {
+    var mainWC: MainWindowController? { get { windowRegistry.active } }
+    private let exportOptions = ExportOptions()
+
+    /// Present the command palette overlay.
+    @MainActor
+    @objc private func showCommandPalette(_ sender: Any?) {
+        CommandPaletteView.show()
+    }
+
+    private var exportOptionsPanel: NSPanel?
+
+    /// Present the export options panel as a modeless floating panel.
+    @MainActor
+    @objc private func showExportOptions(_ sender: Any?) {
+        if let existing = exportOptionsPanel {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 360),
+                             styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        panel.title = "Export Options"
+        panel.contentView = NSHostingView(rootView: ExportOptionsView(options: exportOptions))
+        panel.isFloatingPanel = true
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        exportOptionsPanel = panel
+        panel.makeKeyAndOrderFront(nil)
+    }
 
     /// File-menu items the menu delegate (self) updates on open: Revert reflects
     /// whether a file is loaded; Open Recent is rebuilt from NSDocumentController.
@@ -40,6 +68,33 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
 
     /// Quit automatically when the user closes the last window (issue 1).
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
+
+    // MARK: - Window controller registry
+
+    /// Tracks live viewer windows so menu actions can route to the active window
+    /// and the Window menu can list them. Windows are added on creation, removed
+    /// on close, and tracked for activation via didBecomeKey notifications — so
+    /// `active` never depends on NSApp (which is nil in tests / before launch).
+    private final class WindowRegistry {
+        private var controllers: [MainWindowController] = []
+        private var activeController: MainWindowController?
+        func add(_ wc: MainWindowController) {
+            if !controllers.contains(where: { $0 === wc }) {
+                controllers.append(wc)
+                activeController = wc
+            }
+        }
+        func remove(_ wc: MainWindowController) {
+            controllers.removeAll { $0 === wc }
+            if activeController === wc { activeController = controllers.last }
+        }
+        func makeActive(_ wc: MainWindowController) {
+            if controllers.contains(where: { $0 === wc }) { activeController = wc }
+        }
+        var active: MainWindowController? { activeController ?? controllers.last }
+        var windows: [NSWindow] { controllers.map { $0.window } }
+    }
+    private let windowRegistry = WindowRegistry()
 
     /// A single source of truth for every supported format: its force-flag, the file
     /// extensions (primary first) the Open panel offers, and the parser to use.
@@ -322,10 +377,26 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         return (URL(fileURLWithPath: path), true)
     }
 
+    @objc func windowWillClose(_ note: Notification) {
+        if let wc = (note.object as? NSWindow)?.delegate as? MainWindowController {
+            windowRegistry.remove(wc)
+        }
+    }
+
+    @objc func windowDidBecomeKey(_ note: Notification) {
+        if let wc = (note.object as? NSWindow)?.delegate as? MainWindowController {
+            windowRegistry.makeActive(wc)
+        }
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.mainMenu = buildMenu()
         NSApp.activate(ignoringOtherApps: true)         // bring to front so menu bar changes
         updateAnalysisCheckmarks()
+        NotificationCenter.default.addObserver(self, selector: #selector(windowWillClose(_:)),
+                                               name: NSWindow.willCloseNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeKey(_:)),
+                                               name: NSWindow.didBecomeKeyNotification, object: nil)
         let args = Array(CommandLine.arguments.dropFirst())
         let options: LaunchOptions
         do {
@@ -366,12 +437,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                                                          cliFrame: options.frame, stateURL: options.stateURL,
                                                          kPathSampling: &kPathSampling)
                 let wc = MainWindowController(scene: Scene())
-                mainWC = wc
-                // Pass the RESOLVED frame (clFrame, or the restored frame if the
-                // state encodes one) so the scrubber opens where the user left off.
-                // The scene's currentFrame is now accurate (>= 0) whether it came from
-                // the CLI --frame, a saved state, or the default-open frame 0 -- so the
-                // scrubber initializes in sync with what's actually displayed.
+                windowRegistry.add(wc)
                 wc.loadFile(scene, from: inURL, format: options.format, frameIndex: scene.currentFrame)
                 // kPathSampling is a UI-only preference, not a scene field, so it is not
                 // restored by syncFromScene; apply the value decoded from state here.
@@ -391,15 +457,36 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     // the app. Drop the broken key and open an empty viewer so the
                     // user can continue instead of getting a blank launch on every run.
                     UserDefaults.standard.removeObject(forKey: Self.lastOpenedURLKey)
-                    mainWC = MainWindowController(scene: Scene())
+                    windowRegistry.add(MainWindowController(scene: Scene()))
                 } else {
                     // Explicit CLI input the user asked for: report and exit.
                     exit(EXIT_FAILURE)
                 }
             }
         } else {
-            mainWC = MainWindowController(scene: Scene())
+            windowRegistry.add(MainWindowController(scene: Scene()))
         }
+    }
+
+    /// Test-only seam: add a window to the registry without going through the
+    /// full menu action. Lets controller tests assert Window-menu contents.
+    internal func testAddWindow(_ wc: MainWindowController) {
+        windowRegistry.add(wc)
+    }
+
+    /// File > New Window: open a fresh viewer window with an empty scene. Each
+    /// window owns its own MainWindowController + scene.
+    @objc func newDocument(_ sender: Any?) {
+        let base = NSApp.keyWindow
+        let wc = MainWindowController(scene: Scene())
+        windowRegistry.add(wc)
+        // Cascade new windows off the key window so they don't perfectly overlap.
+        if let base {
+            let f = base.frame
+            wc.window.setFrame(NSRect(x: f.origin.x + 24, y: f.origin.y - 24,
+                                      width: f.width, height: f.height), display: false)
+        }
+        wc.window.makeKeyAndOrderFront(nil)
     }
 
     // MARK: - Menu bar
@@ -430,6 +517,11 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         saveStateAsItem.target = self
         let exportItem = file.addItem(withTitle: "Export\u{2026}", action: #selector(exportDocument), keyEquivalent: "e")
         exportItem.target = self
+        let exportOptionsItem = file.addItem(withTitle: "Export Options\u{2026}", action: #selector(showExportOptions), keyEquivalent: "")
+        exportOptionsItem.target = self
+        let newWindowItem = file.addItem(withTitle: "New Window", action: #selector(newDocument), keyEquivalent: "N")
+        newWindowItem.keyEquivalentModifierMask = [.command, .shift]
+        newWindowItem.target = self
         // Edit — must precede View in the standard macOS menu ordering.
         let editItem = NSMenuItem(); main.addItem(editItem)
         let edit = NSMenu(title: "Edit")
@@ -446,12 +538,27 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         let sep2 = NSMenuItem.separator(); edit.addItem(sep2)
         let copyViewItem = edit.addItem(withTitle: "Copy Current View", action: #selector(copyCurrentView), keyEquivalent: "C")
         copyViewItem.target = self
+        // Command palette
+        let paletteItem = edit.addItem(withTitle: "Command Palette", action: #selector(showCommandPalette), keyEquivalent: "P")
+        paletteItem.target = self
         // View
         let viewItem = NSMenuItem(); main.addItem(viewItem)
         let view = NSMenu(title: "View")
         viewItem.submenu = view
         let lbl = view.addItem(withTitle: "Toggle Element Labels", action: #selector(toggleLabelsFromMenu), keyEquivalent: "l")
         lbl.target = self
+        // Window
+        let windowItem = NSMenuItem(); main.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.delegate = self
+        windowItem.submenu = windowMenu
+        let minimizeItem = windowMenu.addItem(withTitle: "Minimize", action: Selector(("miniaturize:")), keyEquivalent: "m")
+        minimizeItem.target = nil   // route to first responder
+        let zoomItem = windowMenu.addItem(withTitle: "Zoom", action: Selector(("zoom:")), keyEquivalent: "")
+        zoomItem.target = nil
+        windowMenu.addItem(NSMenuItem.separator())
+        let bringAllItem = windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApp.arrangeInFront(_:)), keyEquivalent: "")
+        bringAllItem.target = NSApp
         // Analysis
         let analysisItem = NSMenuItem(); main.addItem(analysisItem)
         let analysis = NSMenu(title: "Analysis")
@@ -503,12 +610,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         panel.allowedContentTypes = Self.exportContentTypes
         panel.beginSheetModal(for: wc.window) { result in
             guard result == .OK, let url = panel.url else { return }
-            // Graph renderers operate in AppKit points. Export at the visible logical
-            // size so graph typography and margins match the viewport on Retina displays.
-            let size = Self.exportSizeForViewport(wc.viewport.bounds.size)
+            let size = CGSize(width: self.exportOptions.width, height: self.exportOptions.height)
             do {
+                try self.exportOptions.validate()
+                try Self.validatedExportSize(size)
                 try Self.validateGUIWriteDestination(url, source: wc.currentSourceURL)
-                try wc.exportCurrentView(to: url, size: size)
+                try wc.exportCurrentView(to: url, size: size, options: self.exportOptions)
             } catch {
                 print("[mcrysden] export failed: \(error)")
                 self.presentFileOperationError(error, title: "export failed", for: wc)
@@ -531,6 +638,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     /// configurable-dimensions workflow rather than silently changing typography.
     static func exportSizeForViewport(_ viewportSize: CGSize) -> CGSize { viewportSize }
 
+    /// Build an NSColor from a clear-color tuple. Returns nil for transparent (alpha 0).
+    static func color(from clearColor: (r: Double, g: Double, b: Double, a: Double)?) -> NSColor? {
+        guard let c = clearColor, c.a > 0 else { return nil }
+        return NSColor(deviceRed: c.r, green: c.g, blue: c.b, alpha: c.a)
+    }
+
     /// File > Open...
     @objc private func openDocument(_ sender: Any?) {
         guard let wc = mainWC else { return }
@@ -542,15 +655,15 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         panel.delegate = self
         panel.beginSheetModal(for: wc.window) { result in
             guard result == .OK, let url = panel.url else { return }
-            self.openFile(url)
+            self.openFile(url, into: wc)
         }
     }
 
     /// Shared Open path used by Open..., Open Recent, and drag-and-drop: parse
-    /// `url` and load it into the live window. Mirrors the Open panel's error
-    /// handling (non-fatal console error on failure).
-    private func openFile(_ url: URL) {
-        guard let wc = mainWC else { return }
+    /// `url` and load it into `wc`. Mirrors the Open panel's error handling.
+    private func openFile(_ url: URL, into wc: MainWindowController? = nil) {
+        let wc = wc ?? mainWC
+        guard let wc else { return }
         do {
             let scene = Scene(loaded: try Parser.load(url))
             wc.loadFile(scene, from: url, format: nil, frameIndex: 0)
@@ -581,9 +694,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     // MARK: - NSMenuDelegate
 
     /// Enable/disable Revert and rebuild Open Recent each time the File menu opens.
+    /// Also rebuilds the per-window list in the Window menu.
     @MainActor
     func menuWillOpen(_ menu: NSMenu) {
-        guard menu.title == "File" else { return }
+        if menu.title == "File" {
         revertItem?.isEnabled = (mainWC?.currentSourceURL != nil)
         guard let recentItem else { return }
         let submenu = NSMenu(title: "Open Recent")
@@ -598,6 +712,27 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         let clearItem = submenu.addItem(withTitle: "Clear Menu", action: #selector(clearRecentDocuments(_:)), keyEquivalent: "")
         clearItem.target = self
         recentItem.submenu = submenu
+        }
+        if menu.title == "Window" {
+            // Remove the per-window items (everything after the 4 standard items).
+            while menu.items.count > 4 { menu.removeItem(at: menu.items.count - 1) }
+            let windows = windowRegistry.windows
+            if windows.count > 1 { menu.addItem(NSMenuItem.separator()) }
+            for w in windows {
+                var name = w.title
+                if let url = (w.delegate as? MainWindowController)?.currentSourceURL, !url.lastPathComponent.isEmpty {
+                    name = url.lastPathComponent
+                }
+                let item = menu.addItem(withTitle: name, action: #selector(selectWindowFromMenu(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = w
+                if w === (windowRegistry.active?.window) { item.state = .on }
+            }
+        }
+    }
+
+    @objc private func selectWindowFromMenu(_ sender: NSMenuItem) {
+        (sender.representedObject as? NSWindow)?.makeKeyAndOrderFront(nil)
     }
 
     static func supportsOpenURL(_ url: URL) -> Bool {
@@ -645,7 +780,15 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     @MainActor
     @discardableResult
     static func exportScene(_ scene: Scene, camera: Camera?, to url: URL, size: CGSize,
-                            options: RenderExportOptions = RenderExportOptions()) throws -> CGImage {
+                            options: RenderExportOptions = RenderExportOptions(),
+                            exportOptions: ExportOptions? = nil) throws -> CGImage {
+        // Compute the effective clear color: explicit export option wins, else derive
+        // from the scene background so callers without options preserve gradients.
+        // Only pass an explicit background override when export options were
+        // supplied. Otherwise leave it nil so the scene's own background
+        // (including gradients) is preserved for CLI/headless/clipboard exports.
+        let effectiveBackground: (r: Double, g: Double, b: Double, a: Double)? =
+            exportOptions?.clearColor
         guard supportedExportExtensions.contains(url.pathExtension.lowercased()) else {
             throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
@@ -653,12 +796,25 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         // below never trap on an Int cast or allocate an absurd buffer; any
         // non-finite/non-positive/oversized/overflowing size throws here first.
         let _ = try validatedExportSize(size)
+        // Graph/color-plane exports: EPS/PS have no alpha support.
+        if exportOptions?.isTransparent == true && ["eps", "ps"].contains(url.pathExtension.lowercased()) {
+            throw CLIError.invalid("transparent export is not supported for \(url.pathExtension.uppercased()); use PNG or PDF instead")
+        }
+        let isTransparent = exportOptions?.isTransparent ?? false
+        let graphBackground = Self.color(from: effectiveBackground)
         if let dos = scene.densityOfStates {
-            return try DOSExporter.export(dos, to: url, size: size)
+            return try exportGraph(DOSGrapherView(frame: NSRect(origin: .zero, size: size)), configure: {
+                $0.densityOfStates = dos
+                $0.exportBackground = graphBackground
+                $0.isExportTransparent = isTransparent
+            }, to: url, size: size)
         }
         if let bands = scene.bandStructure {
-            return try exportGraph(BandGrapherView(frame: NSRect(origin: .zero, size: size)),
-                                   configure: { $0.bandStructure = bands }, to: url, size: size)
+            return try exportGraph(BandGrapherView(frame: NSRect(origin: .zero, size: size)), configure: {
+                $0.bandStructure = bands
+                $0.exportBackground = graphBackground
+                $0.isExportTransparent = isTransparent
+            }, to: url, size: size)
         }
         if scene.showColorPlane, let grid = scene.grid2D {
             return try exportGraph(ColorPlaneView(frame: NSRect(origin: .zero, size: size)), configure: {
@@ -670,13 +826,25 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                         grid.minValue + (grid.maxValue - grid.minValue) * Float($0) / 6
                     }
                 }
+                $0.exportBackground = graphBackground
+                $0.isExportTransparent = isTransparent
             }, to: url, size: size)
         }
         switch url.pathExtension.lowercased() {
-        case "pdf", "svg", "eps", "ps":
-            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: options)
+        case "pdf", "svg":
+            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: options,
+                                              background: effectiveBackground)
+        case "eps", "ps":
+            // EPS/PS have no alpha support: reject transparency and flatten.
+            if exportOptions?.isTransparent == true {
+                throw CLIError.invalid("transparent export is not supported for \(url.pathExtension.uppercased()); use PNG or PDF instead")
+            }
+            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: options,
+                                              background: effectiveBackground)
         case "png":
-            return try PngExporter.export(scene: scene, camera: camera, to: url, size: size, options: options)
+            return try PngExporter.export(scene: scene, camera: camera, to: url, size: size, options: options,
+                                           background: Self.color(from: effectiveBackground),
+                                           transparent: exportOptions?.isTransparent ?? false)
         default:
             throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
@@ -684,7 +852,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
 
     @MainActor
     static func exportGraph<View: NSView>(_ view: View, configure: (View) -> Void,
-                                           to url: URL, size: CGSize) throws -> CGImage {
+                                           to url: URL, size: CGSize,
+                                           background: (r: Double, g: Double, b: Double, a: Double)? = nil) throws -> CGImage {
         let (width, height) = try validatedExportSize(size)
         guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
@@ -698,6 +867,11 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         context.cgContext.translateBy(x: 0, y: CGFloat(height))
         context.cgContext.scaleBy(x: 1, y: -1)
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context.cgContext, flipped: true)
+        // Apply custom background if provided (opaque only); otherwise leave transparent.
+        if let bg = background, bg.a > 0 {
+            context.cgContext.setFillColor(red: bg.r, green: bg.g, blue: bg.b, alpha: bg.a)
+            context.cgContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        }
         view.draw(view.bounds)
         context.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()
@@ -795,7 +969,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.0"
+    static let appVersion = "1.3.0"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

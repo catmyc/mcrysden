@@ -168,8 +168,6 @@ final class AppExportTests: XCTestCase {
         let app = App()
         let item = NSMenuItem(title: "Copy Current View", action: #selector(NSObject.init), keyEquivalent: "")
 
-        let exp = expectation(description: "title restored after last copy")
-
         // First copy: title → "Copied View", reset scheduled at +1.0s.
         app.flashCopyResult(item, success: true)
         XCTAssertEqual(item.title, "Copied View")
@@ -186,12 +184,12 @@ final class AppExportTests: XCTestCase {
             XCTAssertEqual(item.title, "Copied View")
         }
 
-        // After ~2.0s total the second timer has fired and the title is restored.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            XCTAssertEqual(item.title, "Copy Current View")
-            exp.fulfill()
-        }
-
-        wait(for: [exp], timeout: 5.0)
+        // After the second timer fires, the title must be restored. Poll with a
+        // predicate expectation to avoid depending on exact async-after timing
+        // under full-suite load.
+        let restore = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "title == %@", "Copy Current View"),
+            object: item)
+        wait(for: [restore], timeout: 4.0)
     }
 }

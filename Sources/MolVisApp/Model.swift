@@ -145,6 +145,17 @@ struct Scene: Codable {
     var backgroundType: BackgroundType = .solid
     var background: String = "#101014"
     var backgroundBottom: String = "#000000"   // gradient end color
+    /// The effective clear color derived from the background settings. Used as a
+    /// fallback when no explicit export background override is supplied.
+    var clearColor: (r: Double, g: Double, b: Double, a: Double) {
+        let hex = backgroundType == .gradient_top ? backgroundBottom : background
+        var s = hex.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let v = UInt32(s, radix: 16) else { return (0, 0, 0, 1) }
+        return (Double((v >> 16) & 0xFF) / 255.0,
+                Double((v >> 8) & 0xFF) / 255.0,
+                Double(v & 0xFF) / 255.0, 1)
+    }
     var lighting: Lighting = Lighting()
     var showCellFrame: Bool = true
     var showAxes: Bool = true

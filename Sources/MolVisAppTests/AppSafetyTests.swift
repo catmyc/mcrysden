@@ -443,6 +443,99 @@ final class AppSafetyTests: XCTestCase {
         XCTAssertTrue(controller.scene.atoms.isEmpty)
         XCTAssertNil(UserDefaults.standard.string(forKey: App.lastOpenedURLKey))
     }
+
+    // MARK: - File watching
+
+    @MainActor
+    func testFileWatcherStartsOnLoadAndStopsOnClose() throws {
+        let fixture = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si110.xsf")
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        XCTAssertFalse(controller.isWatchingFile)
+        controller.loadFile(Scene(loaded: try Parser.load(fixture)), from: fixture, frameIndex: 0)
+        XCTAssertTrue(controller.isWatchingFile, "loading a file must start a watcher")
+        XCTAssertFalse(controller.isReloadPromptVisible)
+        controller.stopFileWatching()
+        XCTAssertFalse(controller.isWatchingFile)
+    }
+
+    @MainActor
+    func testFileWatcherRestartsWhenNewFileLoaded() throws {
+        let fixture = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si110.xsf")
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mcrysden-fw-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let first = dir.appendingPathComponent("first.xsf")
+        let second = dir.appendingPathComponent("second.xsf")
+        try FileManager.default.copyItem(at: fixture, to: first)
+        try FileManager.default.copyItem(at: fixture, to: second)
+
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(Scene(loaded: try Parser.load(first)), from: first, frameIndex: 0)
+        XCTAssertTrue(controller.isWatchingFile)
+        let firstURL = controller.currentSourceURL
+        controller.loadFile(Scene(loaded: try Parser.load(second)), from: second, frameIndex: 0)
+        XCTAssertTrue(controller.isWatchingFile)
+        XCTAssertEqual(controller.currentSourceURL, second)
+        XCTAssertNotEqual(firstURL, controller.currentSourceURL)
+    }
+
+    @MainActor
+    func testFileWatcherNoOpForEmptyViewer() {
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        XCTAssertFalse(controller.isWatchingFile)
+        // Closing an empty viewer must not trap.
+        controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        XCTAssertFalse(controller.isWatchingFile)
+    }
+
+    // MARK: - Multiple windows
+
+    @MainActor
+    func testNewWindowMenuItemExistsWithShortcut() {
+        let app = App()
+        let menu = app.buildMenu()
+        guard let fileMenu = menu.items.first(where: { $0.title == "File" })?.submenu else {
+            return XCTFail("File menu missing")
+        }
+        guard let newWindow = fileMenu.items.first(where: { $0.title == "New Window" }) else {
+            return XCTFail("'New Window' menu item missing")
+        }
+        XCTAssertEqual(newWindow.action, Selector(("newDocument:")))
+        XCTAssertEqual(newWindow.keyEquivalent, "N")
+        XCTAssertEqual(newWindow.keyEquivalentModifierMask, [.command, .shift])
+        XCTAssertEqual(newWindow.target as? App, app)
+    }
+
+    @MainActor
+    func testWindowMenuHasStandardItems() {
+        let app = App()
+        let menu = app.buildMenu()
+        guard let windowSub = menu.items.first(where: { $0.submenu?.title == "Window" })?.submenu else {
+            return XCTFail("Window menu missing")
+        }
+        let titles = windowSub.items.map { $0.title }
+        XCTAssertTrue(titles.contains("Minimize"))
+        XCTAssertTrue(titles.contains("Zoom"))
+        XCTAssertTrue(titles.contains("Bring All to Front"))
+    }
+
+    @MainActor
+    func testWindowMenuListsOpenWindows() {
+        let app = App()
+        let menu = app.buildMenu()
+        guard let windowSub = menu.items.first(where: { $0.submenu?.title == "Window" })?.submenu else {
+            return XCTFail("Window menu missing")
+        }
+        // Simulate a registered window via the test seam.
+        let wc1 = MainWindowController(scene: Scene(), showWindow: false)
+        wc1.window.title = "Structure A"
+        app.testAddWindow(wc1)
+        app.menuWillOpen(windowSub)
+        let names = windowSub.items.map { $0.title }
+        XCTAssertTrue(names.contains("Structure A"), "Window menu should list the open window")
+    }
 }
 
 

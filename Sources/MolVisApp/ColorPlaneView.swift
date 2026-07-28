@@ -20,14 +20,25 @@ final class ColorPlaneView: NSView {
     /// Optional iso-contour levels to trace over the colormap.
     var contourLevels: [Float] = []
     var zLabel: String = ""
+    /// When set, draw uses this background instead of white (used for export).
+    var exportBackground: NSColor?
+    /// When true, draw leaves the context empty for transparent export output.
+    var isExportTransparent: Bool = false
 
     override var isFlipped: Bool { true }
+
+    /// Returns the background to fill with, or nil for transparent export.
+    private var fillBackground: NSColor? {
+        if let bg = exportBackground { return bg }
+        if isExportTransparent { return nil }
+        return NSColor.white
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext, let grid, !grid.isEmpty,
               let firstRow = grid.first, !firstRow.isEmpty,
               grid.allSatisfy({ $0.allSatisfy { $0.isFinite } })
-        else { NSColor.white.setFill(); dirtyRect.fill(); drawEmpty(); return }
+        else { if let bg = fillBackground { bg.setFill(); dirtyRect.fill() }; drawEmpty(); return }
 
         let rows = grid.count
         let cols = firstRow.count
@@ -35,10 +46,17 @@ final class ColorPlaneView: NSView {
         // rather than crash (project principle: never crash on malformed input).
         // Mirror the non-finite guard above: clear to white then draw the diagnostic.
         guard grid.allSatisfy({ $0.count == cols }) else {
-            NSColor.white.setFill(); dirtyRect.fill(); drawEmpty(); return
+            if let bg = fillBackground { bg.setFill(); dirtyRect.fill() }; drawEmpty(); return
         }
         guard let cg = renderBitmap(grid, rows: rows, cols: cols) else {
-            NSColor.white.setFill(); dirtyRect.fill(); return
+            if let bg = fillBackground { bg.setFill(); dirtyRect.fill() }; return
+        }
+
+        // Fill the background before projecting the grid bitmap so margins show
+        // the configured color (or remain transparent for export).
+        if let bg = fillBackground {
+            ctx.setFillColor(bg.cgColor)
+            dirtyRect.fill()
         }
 
         // Projection from normalized grid coords (u in [0,1] across cols, v in

@@ -16,9 +16,18 @@ final class DOSGrapherView: NSView {
 
     override var isFlipped: Bool { true }
 
+    /// When set, draw fills with this color (used for export).
+    var exportBackground: NSColor?
+    /// When true, draw skips the white fill for transparent export output.
+    var isExportTransparent: Bool = false
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.white.setFill()
-        dirtyRect.fill()
+        if let bg = exportBackground {
+            bg.setFill()
+            dirtyRect.fill()
+        } else if !isExportTransparent {
+            NSColor.white.setFill()
+            dirtyRect.fill()
+        }
 
         guard let dos = densityOfStates else {
             drawEmpty("No density of states")
@@ -249,8 +258,9 @@ enum DOSExportError: Error { case invalidSize, noBitmap, noContext, noImage }
 enum DOSExporter {
     @MainActor
     @discardableResult
-    static func export(_ dos: DensityOfStates, to url: URL, size: CGSize) throws -> CGImage {
-        let image = try render(dos, size: size)
+    static func export(_ dos: DensityOfStates, to url: URL, size: CGSize,
+                        background: (r: Double, g: Double, b: Double, a: Double)? = nil) throws -> CGImage {
+        let image = try render(dos, size: size, background: background)
         switch url.pathExtension.lowercased() {
         case "pdf", "svg", "eps", "ps":
             try RasterExporter.write(cgImage: image, to: url, size: size)
@@ -265,7 +275,8 @@ enum DOSExporter {
     }
 
     @MainActor
-    static func render(_ dos: DensityOfStates, size: CGSize) throws -> CGImage {
+    static func render(_ dos: DensityOfStates, size: CGSize,
+                        background: (r: Double, g: Double, b: Double, a: Double)? = nil) throws -> CGImage {
         // Share the App-side size validator so a huge/NaN/infinite size throws a clear
         // error instead of trapping on the Int cast or hanging on a giant allocation.
         let (width, height) = try App.validatedExportSize(size)
@@ -284,6 +295,11 @@ enum DOSExporter {
         context.cgContext.translateBy(x: 0, y: CGFloat(height))
         context.cgContext.scaleBy(x: 1, y: -1)
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context.cgContext, flipped: true)
+        // Apply custom background if provided; otherwise leave transparent for the view's own fill.
+        if let bg = background, bg.a > 0 {
+            context.cgContext.setFillColor(red: bg.r, green: bg.g, blue: bg.b, alpha: bg.a)
+            context.cgContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        }
         view.draw(view.bounds)
         context.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()

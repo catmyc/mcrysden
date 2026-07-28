@@ -9,6 +9,8 @@ For multi-component features, dispatch independent **Longcat subagents** in para
 3. **Fix** — Dispatch the findings back to Longcat agents (group related findings into the same agent to minimize context). Apply trivial/mechanical fixes directly if faster.
 4. **Repeat** — Re-run review after each fix round until the reviewer responds exactly `no actionable findings`.
 5. **Verify** — Run `swift build`, `swift test`, and `zsh scripts/smoke.sh`. Commit with a version bump.
+6. **Record** - update documentation at the end of the completed work flow. 
+
 
 Key rules:
 - Never dispatch overlapping file scopes to parallel agents.

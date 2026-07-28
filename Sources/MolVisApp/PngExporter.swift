@@ -15,7 +15,8 @@ enum PngExporter {
     /// validate pixel content (used by the export tests) in addition to the written file.
     @discardableResult
     static func export(scene: Scene, camera: Camera?, to url: URL, size: CGSize,
-                       options: RenderExportOptions = RenderExportOptions()) throws -> CGImage {
+                       options: RenderExportOptions = RenderExportOptions(),
+                       background: NSColor? = nil, transparent: Bool = false) throws -> CGImage {
         // Validate the rounded dimensions are representable as Int BEFORE converting
         // (greatestFiniteMagnitude.rounded() still overflows Int → trap), then enforce
         // the per-axis Metal texture cap and an overflow-checked total-pixel cap.
@@ -40,7 +41,15 @@ enum PngExporter {
         guard let tex = device.makeTexture(descriptor: desc) else { throw PngExportError.noTex }
         guard let q = device.makeCommandQueue() else { throw PngExportError.noQueue }
         guard let cb = q.makeCommandBuffer() else { throw PngExportError.noCommandBuffer }
-        renderer.background = PngExporter.clearColor(scene.background)
+        // Only override the clear color when the caller explicitly requests a
+        // custom background or transparency; otherwise leave clearColorOverride
+        // nil so the scene's own background (including gradients) is preserved.
+        if transparent {
+            renderer.clearColorOverride = MTLClearColorMake(0, 0, 0, 0)
+        } else if let background {
+            renderer.clearColorOverride = PngExporter.clearColor(background)
+        }
+        defer { renderer.clearColorOverride = nil }
         // No camera supplied (headless export)? Fall back to the scene's canonical
         // default framing, which matches what the GUI shows.
         var cam = camera ?? scene.defaultCamera()
@@ -104,5 +113,10 @@ enum PngExporter {
         return MTLClearColorMake(Double((v >> 16) & 0xFF) / 255.0,
                                  Double((v >> 8) & 0xFF) / 255.0,
                                  Double(v & 0xFF) / 255.0, 1)
+    }
+    static func clearColor(_ color: NSColor) -> MTLClearColor {
+        let rgb = color.usingColorSpace(.deviceRGB) ?? color
+        return MTLClearColorMake(Double(rgb.redComponent), Double(rgb.greenComponent),
+                                 Double(rgb.blueComponent), Double(rgb.alphaComponent))
     }
 }

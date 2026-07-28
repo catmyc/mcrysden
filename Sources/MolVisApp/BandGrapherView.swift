@@ -10,6 +10,10 @@ final class BandGrapherView: NSView {
     }
     /// Indices (into kDistances) of high-symmetry points to mark with vertical gridlines.
     var highSymmetryIndices: [Int] = []
+    /// When set, draw fills with this color (used for export).
+    var exportBackground: NSColor?
+    /// When true, draw skips the white fill for transparent export output.
+    var isExportTransparent: Bool = false
 
     private let axisFont = NSFont.systemFont(ofSize: 11)
     private let titleFont = NSFont.boldSystemFont(ofSize: 13)
@@ -29,8 +33,15 @@ final class BandGrapherView: NSView {
               bs.fermiEnergy?.isFinite ?? true
         else { drawEmpty(dirtyRect); return }
 
-        NSColor.white.setFill()
-        dirtyRect.fill()
+        // Export path: fill with custom background if provided; transparent export
+        // leaves the context empty. On-screen: default white fill.
+        if let bg = exportBackground {
+            bg.setFill()
+            dirtyRect.fill()
+        } else if !isExportTransparent {
+            NSColor.white.setFill()
+            dirtyRect.fill()
+        }
 
         let plot = NSPoint(x: bounds.width - 20, y: bounds.height - topMargin)
         let origin = NSPoint(x: margin.x, y: bounds.height - margin.y)
