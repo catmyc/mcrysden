@@ -4,6 +4,21 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.23] — 2026-07-29
+
+### Added
+- Exact skew-cell-safe minimum-image displacement and distance for periodicDim 0…3; periodic-aware distance measurement uses the minimum image for both the readout and rendered line; a virtualized read-only atom table with Cartesian/fractional coordinates, element/label filtering, and linked multiple selection that can drive active distance measurement.
+
+### Changed
+- Reconciled the roadmap, release history, state-file extension, export descriptions, and symmetry/k-path documentation with the implemented application.
+
+### Fixed
+- Resolved a main-actor async test deadlock.
+- Made the periodic distance readout and rendered measurement line use the same minimum-image displacement, and connected atom-table selection to active distance measurement.
+
+### Tests
+- Added 90 tests: 28 PeriodicGeometryTests, 6 PeriodicMeasurementTests, 32 AtomTableViewTests, 19 AtomTableIntegrationTests, and 5 RendererTests regressions. Suite now at 858 tests.
+
 ## [1.1.22] — 2026-07-29
 
 ### Added

@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-29 (v1.1.22 CIF declared-operation symmetry expansion)**.
+Last updated: **2026-07-29 (v1.1.23 periodic minimum-image distance, read-only atom table, and 858 tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-## Implemented foundation (through v1.1.22)
+## Implemented foundation (through v1.1.23)
 
 ### File formats
 - [x] XSF (structure + `DATAGRID_3D`/`2D`, including `.xsf.gz`), AXSF animation
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 762 tracked tests as of v1.1.22: unit, snapshot (FNV-1a pixel hash vs. committed goldens), model-layer cache, parser-hardening, renderer-safety, export, state, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 858 tracked tests as of v1.1.23: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache, parser-hardening, renderer-safety, export, state, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
@@ -105,8 +105,8 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 
 ### Structure information and analysis
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
-- [ ] Atom table with fractional/Cartesian coordinates, and coordination numbers.
-- [ ] Coordination shells, coordination coloring, nearest-neighbor tables, bond/angle distributions, radial distribution functions, and minimum-image periodic measurements.
+- [~] Atom table with fractional/Cartesian coordinates, and coordination numbers. Read-only Cartesian/fractional table with element/label filtering and linked multiple selection implemented; coordination numbers and editing remain pending.
+- [~] Coordination shells, coordination coloring, nearest-neighbor tables, bond/angle distributions, radial distribution functions, and minimum-image periodic measurements. Periodic minimum-image distance measurement implemented; shells, coloring, neighbor tables, distributions, RDF, and broader periodic analysis remain pending.
 - [ ] Polyhedron volume/distortion metrics and two-structure comparison with displacement vectors and RMS displacement.
 - [ ] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels.
 

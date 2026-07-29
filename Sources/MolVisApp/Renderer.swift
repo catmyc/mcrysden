@@ -946,27 +946,87 @@ final class Renderer: NSObject {
     /// Draw measurement lines between selected atoms in 3D space.
     @discardableResult
     private func drawMeasurements(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
-        guard scene.measurementMode != .none else { return true }
-        let sel = scene.selectedAtoms
-        guard sel.count >= 2 else { return true }
-        let atoms = scene.atoms
-        var verts: [SIMD3<Float>] = []
-        verts.reserveCapacity(sel.count * 2)
-        for i in 0..<(sel.count - 1) {
-            let a = sel[i], b = sel[i+1]
-            // Skip a single bad pair rather than bailing and dropping the valid
-            // segments collected so far; guard negatives (sel holds Int, so a stale
-            // -1 passes an upper-bound check) as well as out-of-range indices.
-            guard a >= 0, b >= 0, a < atoms.count, b < atoms.count else { continue }
-            verts.append(atoms[a].coord)
-            verts.append(atoms[b].coord)
-        }
+        let verts = measurementLineVertices()
         // All pairs invalid: nothing to draw, but still a successful no-op.
         guard !verts.isEmpty else { return true }
         enc.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(lastW), height: Double(lastH),
                                     znear: 0, zfar: 1))
         enc.setDepthStencilState(overlayDepthState)
         return drawLineBuffer(verts, color: SIMD3<Float>(0.2, 0.6, 1), enc: enc, frameBuffer: frameBuffer)
+    }
+
+    /// Returns the world-space line vertices used for measurement overlays.
+    /// Distance measurements use the same minimum-image displacement as the
+    /// measurement readout; all other measurements retain their direct polyline.
+    static func measurementLineVertices(for scene: Scene) -> [SIMD3<Float>] {
+        guard scene.measurementMode != .none else { return [] }
+        let selected = scene.selectedAtoms
+        guard selected.count >= 2 else { return [] }
+        let atoms = scene.atoms
+
+        if scene.measurementMode == .distance {
+            return lockedDistanceLineVertices(for: scene) ?? []
+        }
+
+        var verts: [SIMD3<Float>] = []
+        verts.reserveCapacity(selected.count * 2)
+        for i in 0..<(selected.count - 1) {
+            let a = selected[i], b = selected[i + 1]
+            // Skip a single bad pair rather than dropping valid segments collected
+            // so far; guard stale negative and out-of-range indices as well.
+            guard a >= 0, b >= 0, a < atoms.count, b < atoms.count else { continue }
+            let from = atoms[a].coord, to = atoms[b].coord
+            guard from.isFinite, to.isFinite else { continue }
+            verts.append(from)
+            verts.append(to)
+        }
+        return verts
+    }
+
+    /// Resolve a distance line only from the locked result that belongs to the
+    /// current ordered selection. A missing or stale result is not permission to
+    /// run the periodic solver again: the readout and overlay must agree.
+    private static func lockedDistanceLineVertices(for scene: Scene) -> [SIMD3<Float>]? {
+        let selected = scene.selectedAtoms
+        guard scene.measurementMode == .distance,
+              selected.count == 2,
+              let result = scene.measurementResult,
+              result.mode == .distance,
+              result.atomIndices == selected,
+              result.value.isFinite else { return nil }
+
+        let atoms = scene.atoms
+        let sourceIndex = selected[0], targetIndex = selected[1]
+        guard sourceIndex >= 0, sourceIndex < atoms.count,
+              targetIndex >= 0, targetIndex < atoms.count else { return nil }
+        let source = atoms[sourceIndex].coord
+        let target = atoms[targetIndex].coord
+        guard source.isFinite, target.isFinite,
+              let displacement = PeriodicGeometry.minimumImageDisplacement(
+                  from: source, to: target, cell: scene.cell, periodicDim: scene.periodicDim
+              ) else { return nil }
+        let endpoint = source + displacement
+        guard endpoint.isFinite else { return nil }
+        return [source, endpoint]
+    }
+
+    /// Camera redraws do not change measurement geometry. Keep just one resolved
+    /// distance entry; the key is deliberately limited to the two selected atoms
+    /// and measurement inputs rather than the full atom array.
+    private func measurementLineVertices() -> [SIMD3<Float>] {
+        guard scene.measurementMode == .distance else {
+            return Renderer.measurementLineVertices(for: scene)
+        }
+        guard let key = Renderer.distanceLineCacheKey(for: scene) else { return [] }
+        if cachedDistanceLineKey == key {
+            return cachedDistanceLineVertices ?? []
+        }
+
+        distanceLineResolveCount += 1
+        let resolved = Renderer.lockedDistanceLineVertices(for: scene)
+        cachedDistanceLineKey = key
+        cachedDistanceLineVertices = resolved
+        return resolved ?? []
     }
 
     /// Screen-space orientation gizmo: a fixed-size triad of bold arrows pinned
@@ -1288,11 +1348,73 @@ final class Renderer: NSObject {
         return true
     }
 
+    private struct DistanceCellCacheKey: Equatable {
+        let a: SIMD3<UInt32>
+        let b: SIMD3<UInt32>
+        let c: SIMD3<UInt32>
+    }
+
+    private struct DistanceLineCacheKey: Equatable {
+        let mode: String
+        let selectedAtoms: [Int]
+        let source: SIMD3<UInt32>
+        let target: SIMD3<UInt32>
+        let cell: DistanceCellCacheKey?
+        let periodicDim: Int
+        let resultMode: String
+        let resultAtomIndices: [Int]
+        let resultValue: UInt32
+        let resultSummary: String
+    }
+
+    private static func distanceLineCacheKey(for scene: Scene) -> DistanceLineCacheKey? {
+        let selected = scene.selectedAtoms
+        guard scene.measurementMode == .distance,
+              selected.count == 2,
+              let result = scene.measurementResult,
+              result.mode == .distance,
+              result.atomIndices == selected,
+              result.value.isFinite else { return nil }
+
+        let atoms = scene.atoms
+        let sourceIndex = selected[0], targetIndex = selected[1]
+        guard sourceIndex >= 0, sourceIndex < atoms.count,
+              targetIndex >= 0, targetIndex < atoms.count else { return nil }
+        let source = atoms[sourceIndex].coord
+        let target = atoms[targetIndex].coord
+        let cell = scene.cell.map {
+            DistanceCellCacheKey(a: floatBits($0.a), b: floatBits($0.b), c: floatBits($0.c))
+        }
+        return DistanceLineCacheKey(
+            mode: scene.measurementMode.rawValue,
+            selectedAtoms: selected,
+            source: floatBits(source),
+            target: floatBits(target),
+            cell: cell,
+            periodicDim: scene.periodicDim,
+            resultMode: result.mode.rawValue,
+            resultAtomIndices: result.atomIndices,
+            resultValue: result.value.bitPattern,
+            resultSummary: result.summary
+        )
+    }
+
+    private static func floatBits(_ value: SIMD3<Float>) -> SIMD3<UInt32> {
+        SIMD3(value.x.bitPattern, value.y.bitPattern, value.z.bitPattern)
+    }
+
     // Per-shell isosurface cache (index 0 = outside/sign>0, 1 = inside/sign<0).
     // Polyhedral cache: reuses vertex buffer across camera-only frames.
     private var cachedPolyBuffer: MTLBuffer?
     private var cachedPolyVertexCount: Int = 0
     private var cachedPolyKey: (atoms: [Atom], bonds: [Bond], selected: [Int])?
+
+    // One-entry distance cache. An optional vertex array distinguishes a cached
+    // malformed-geometry failure from an uncached key, so failed periodic solves
+    // are not retried on every camera redraw.
+    private var cachedDistanceLineKey: DistanceLineCacheKey?
+    private var cachedDistanceLineVertices: [SIMD3<Float>]?
+    private(set) var distanceLineResolveCount = 0
 
     private var cachedIsoBuffers: [MTLBuffer?] = [nil, nil]
     private var cachedIsoKeys: [IsoCacheKey?] = [nil, nil]
@@ -1381,6 +1503,11 @@ final class Renderer: NSObject {
     /// appearance-only tweak (lighting, scales, background) rebuilds the BZ /
     /// iso / fermi caches every frame.
     private func invalidateCaches(old: Scene) {
+        if Renderer.distanceLineCacheKey(for: old) != Renderer.distanceLineCacheKey(for: scene) {
+            cachedDistanceLineKey = nil
+            cachedDistanceLineVertices = nil
+        }
+
         // Inputs each cache depends on; recomputed cheaply from the scene.
         let oldCell = old.cell
         let newCell = scene.cell

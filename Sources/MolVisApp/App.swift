@@ -380,10 +380,11 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     @objc func windowWillClose(_ note: Notification) {
-        if let wc = (note.object as? NSWindow)?.delegate as? MainWindowController {
-            windowRegistry.remove(wc)
-            updateAnalysisCheckmarks()
-        }
+        guard let window = note.object as? NSWindow,
+              let wc = window.delegate as? MainWindowController,
+              window === wc.window else { return }
+        windowRegistry.remove(wc)
+        updateAnalysisCheckmarks()
     }
 
     @objc func windowDidBecomeKey(_ note: Notification) {
@@ -983,7 +984,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.22"
+    static let appVersion = "1.1.23"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

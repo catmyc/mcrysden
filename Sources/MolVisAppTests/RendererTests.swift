@@ -393,11 +393,10 @@ final class RendererTests: XCTestCase {
         return (minC, maxC)
     }
 
-    // drawMeasurements must SKIP an invalid selection pair (negative or out-of-range
-    // index) instead of bailing and discarding the segments already collected. It must
-    // also remain a successful no-op when every pair is invalid (no crash, no false).
+    // Distance overlays require the locked result; stale or incomplete selections must
+    // not fall through to a newly-solved direct/periodic line.
     func testDrawMeasurementsSkipsInvalidPair() throws {
-        func scene(selected: [Int], mode: MeasurementMode) -> Scene {
+        func scene(selected: [Int], mode: MeasurementMode, lockDistance: Bool = false) -> Scene {
             var s = Scene()
             s.background = "#000000"
             s.showAxes = false; s.showCellFrame = false
@@ -405,27 +404,183 @@ final class RendererTests: XCTestCase {
                        Atom(coord: SIMD3( 3, 0, 0), atomicNumber: 6, label: "C")]
             s.selectedAtoms = selected
             s.measurementMode = mode
+            if lockDistance {
+                s.measurementResult = Scene.computeMeasurement(mode: .distance, atoms: s.atoms,
+                                                               selected: selected)
+            }
             return s
         }
-        // Baseline: a single valid pair draws the measurement line.
-        let validHash = pixelHash(try render(scene: scene(selected: [0, 1], mode: .distance), dist: 10))
-        // The same valid pair followed by a stale out-of-range index: the line must
-        // still draw (the invalid pair is skipped, not discarded with it).
+        // Keep the selected atoms in the baseline so atom highlighting does not mask
+        // whether the measurement line was emitted.
+        let baselineHash = pixelHash(try render(scene: scene(selected: [0, 1], mode: .none), dist: 10))
+        let validHash = pixelHash(try render(scene: scene(selected: [0, 1], mode: .distance,
+                                                         lockDistance: true), dist: 10))
+        // No result for the otherwise valid pair must not trigger a fresh solve.
+        let nilResultHash = pixelHash(try render(scene: scene(selected: [0, 1], mode: .distance), dist: 10))
+        XCTAssertEqual(nilResultHash, baselineHash, "nil distance result must draw no line")
+        // A stale out-of-range index has no matching locked result and therefore no line.
         let trailingInvalidHash = pixelHash(try render(scene: scene(selected: [0, 1, 99], mode: .distance), dist: 10))
-        XCTAssertEqual(trailingInvalidHash, validHash,
-                       "a trailing stale index must not discard the valid segment")
-        // A stale negative index on the leading pair is skipped while the valid pair
-        // that follows still draws.
+        XCTAssertEqual(trailingInvalidHash, baselineHash,
+                       "a trailing stale index must not fall through to a distance line")
+        // A stale negative index likewise has no matching locked result.
         let negativeHash = pixelHash(try render(scene: scene(selected: [-1, 0, 1], mode: .distance), dist: 10))
-        XCTAssertEqual(negativeHash, validHash,
-                       "a stale negative index must be skipped, not trap on atoms[-1]")
-        // All-invalid selection: a successful no-op that matches the no-line baseline.
-        let baselineHash = pixelHash(try render(scene: scene(selected: [], mode: .none), dist: 10))
+        XCTAssertEqual(negativeHash, baselineHash,
+                       "a stale negative index must not fall through to a distance line")
+        // All-invalid selection remains a successful no-op.
+        let emptyBaselineHash = pixelHash(try render(scene: scene(selected: [], mode: .none), dist: 10))
         let allInvalidHash = pixelHash(try render(scene: scene(selected: [-1, 99], mode: .distance), dist: 10))
-        XCTAssertEqual(allInvalidHash, baselineHash,
+        XCTAssertEqual(allInvalidHash, emptyBaselineHash,
                        "all-invalid selection must be a no-op that draws nothing extra")
         XCTAssertNotEqual(validHash, baselineHash,
                           "a valid measurement must actually draw a line over the baseline")
+    }
+
+    func testLockedPeriodicDistanceUsesMinimumImageLineEndpoint() {
+        let cell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10))
+        var scene = Scene()
+        scene.cell = cell
+        scene.periodicDim = 3
+        scene.measurementMode = .distance
+        scene.atoms = [
+            Atom(coord: SIMD3(0.5, 5, 5), atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3(9.5, 5, 5), atomicNumber: 1, label: "H"),
+        ]
+        scene.selectedAtoms = [0, 1]
+        scene.measurementResult = Scene.computeMeasurement(mode: .distance, atoms: scene.atoms,
+                                                           selected: scene.selectedAtoms,
+                                                           cell: cell, periodicDim: 3)
+
+        let vertices = Renderer.measurementLineVertices(for: scene)
+        XCTAssertEqual(vertices, [SIMD3(0.5, 5, 5), SIMD3(-0.5, 5, 5)])
+    }
+
+    func testDistanceSkipsLineWhenPeriodicGeometryIsInvalid() {
+        var scene = Scene()
+        scene.cell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 1))
+        scene.periodicDim = 3
+        scene.measurementMode = .distance
+        scene.atoms = [
+            Atom(coord: .zero, atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3(0.5, 0.5, 0), atomicNumber: 1, label: "H"),
+        ]
+        scene.selectedAtoms = [0, 1]
+        scene.measurementResult = MeasurementResult(mode: .distance, atomIndices: [0, 1],
+                                                    value: 0.707, summary: "locked")
+
+        XCTAssertTrue(Renderer.measurementLineVertices(for: scene).isEmpty)
+    }
+
+    func testDistanceRequiresMatchingLockedResult() {
+        var scene = Scene()
+        scene.measurementMode = .distance
+        scene.atoms = [
+            Atom(coord: .zero, atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3(2, 0, 0), atomicNumber: 1, label: "H"),
+        ]
+        scene.selectedAtoms = [0, 1]
+
+        XCTAssertTrue(Renderer.measurementLineVertices(for: scene).isEmpty,
+                      "distance mode without a result must not solve geometry")
+
+        scene.measurementResult = MeasurementResult(mode: .distance, atomIndices: [1, 0],
+                                                    value: 2, summary: "stale order")
+        XCTAssertTrue(Renderer.measurementLineVertices(for: scene).isEmpty,
+                      "a result for a different atom order must not draw a line")
+    }
+
+    func testDistanceLineCacheReusesAndInvalidates() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let renderer = try Renderer(device: device)
+        let texture = device.makeTexture(descriptor: wtx(64, 64))!
+        let queue = device.makeCommandQueue()!
+        let viewport = MTLViewport(originX: 0, originY: 0, width: 64, height: 64, znear: 0, zfar: 1)
+
+        func scene(cell: Cell, atoms: [Atom], selected: [Int]) -> Scene {
+            var s = Scene()
+            s.background = "#000000"
+            s.showStructure = false; s.showAxes = false; s.showCellFrame = false
+            s.cell = cell
+            s.periodicDim = 3
+            s.measurementMode = .distance
+            s.atoms = atoms
+            s.selectedAtoms = selected
+            s.measurementResult = Scene.computeMeasurement(mode: .distance, atoms: atoms,
+                                                            selected: selected, cell: cell,
+                                                            periodicDim: 3)
+            return s
+        }
+
+        func encodeOnce() {
+            let commandBuffer = queue.makeCommandBuffer()!
+            XCTAssertTrue(renderer.encode(to: commandBuffer, target: texture,
+                                           viewport: viewport, camera: renderer.currentCamera))
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+        }
+
+        let cell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10))
+        let atoms = [Atom(coord: SIMD3(0.5, 5, 5), atomicNumber: 1, label: "H"),
+                     Atom(coord: SIMD3(9.5, 5, 5), atomicNumber: 1, label: "H")]
+        renderer.scene = scene(cell: cell, atoms: atoms, selected: [0, 1])
+        encodeOnce()
+        XCTAssertEqual(renderer.distanceLineResolveCount, 1)
+
+        renderer.currentCamera.rotation = simd_quatf(angle: .pi / 3, axis: SIMD3(0, 1, 0))
+        encodeOnce()
+        XCTAssertEqual(renderer.distanceLineResolveCount, 1,
+                       "camera-only redraws must reuse the resolved distance line")
+
+        var geometryChanged = atoms
+        geometryChanged[1].coord = SIMD3(8.5, 5, 5)
+        renderer.scene = scene(cell: cell, atoms: geometryChanged, selected: [0, 1])
+        encodeOnce()
+        XCTAssertEqual(renderer.distanceLineResolveCount, 2,
+                       "changing a selected atom coordinate must invalidate the line")
+
+        let changedCell = Cell(a: SIMD3(12, 0, 0), b: cell.b, c: cell.c)
+        renderer.scene = scene(cell: changedCell, atoms: geometryChanged, selected: [0, 1])
+        encodeOnce()
+        XCTAssertEqual(renderer.distanceLineResolveCount, 3,
+                       "changing cell vectors must invalidate the line")
+
+        renderer.scene = scene(cell: changedCell, atoms: geometryChanged, selected: [1, 0])
+        encodeOnce()
+        XCTAssertEqual(renderer.distanceLineResolveCount, 4,
+                       "changing selected atom order must invalidate the line")
+
+        var malformed = renderer.scene
+        malformed.cell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 1))
+        malformed.measurementResult = MeasurementResult(mode: .distance, atomIndices: [1, 0],
+                                                         value: 1, summary: "locked")
+        renderer.scene = malformed
+        encodeOnce()
+        XCTAssertEqual(renderer.distanceLineResolveCount, 5)
+        encodeOnce()
+        XCTAssertEqual(renderer.distanceLineResolveCount, 5,
+                       "a malformed-geometry failure must be cached as a no-line result")
+    }
+
+    func testLockedAngleKeepsDirectPolyline() {
+        let cell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10))
+        var scene = Scene()
+        scene.cell = cell
+        scene.periodicDim = 3
+        scene.measurementMode = .angle
+        scene.atoms = [
+            Atom(coord: SIMD3(0.5, 5, 5), atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3(5, 5, 5), atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3(9.5, 6, 5), atomicNumber: 1, label: "H"),
+        ]
+        scene.selectedAtoms = [0, 1, 2]
+        scene.measurementResult = Scene.computeMeasurement(mode: .angle, atoms: scene.atoms,
+                                                           selected: scene.selectedAtoms,
+                                                           cell: cell, periodicDim: 3)
+
+        XCTAssertEqual(Renderer.measurementLineVertices(for: scene), [
+            SIMD3(0.5, 5, 5), SIMD3(5, 5, 5),
+            SIMD3(5, 5, 5), SIMD3(9.5, 6, 5),
+        ])
     }
 
     // Locks the Critical instancing fix: two distinct atoms must render as two

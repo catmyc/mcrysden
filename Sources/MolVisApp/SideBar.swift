@@ -99,6 +99,8 @@ struct SideBar: View {
             if let summary = state.structureSummary {
                 CollapsibleSection(title: "Structure Summary", isExpanded: $structureSummaryExpanded) {
                     structureSummaryGrid(summary)
+                    Button("Atom Table…") { state.onShowAtomTable?() }
+                        .buttonStyle(.bordered)
                 }
             }
             // --- Appearance: material + background ---------------------------------

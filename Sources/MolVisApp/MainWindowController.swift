@@ -17,6 +17,16 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let colorPlane: ColorPlaneView      // color-plane / 2D-contour overlay (shown when grid2D != nil and toggled)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
+    /// Standalone atom table (search field + virtualized table). Owned by the
+    /// controller but not installed in any window until `showAtomTable` lazily
+    /// creates the auxiliary panel.
+    let atomTable = AtomTableView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+    /// Lazily-created, reusable auxiliary window hosting `atomTable`. nil until the
+    /// first `showAtomTable`; repeated calls reuse this same window.
+    private(set) var atomTableWindow: NSWindow?
+    /// Last selection synced INTO the atom table — guards against redundant
+    /// `setSelectedAtomIndices` work and selection-callback recursion.
+    private var lastSyncedSelection: [Int] = []
     /// The main Metal renderer. `nil` only if Metal is unavailable (no GPU device or the
     /// shader library fails to compile) — exactly the case `try! Renderer(device:)` used
     /// to trap on. All other render touches guard on this, so the GUI still opens with
@@ -179,6 +189,37 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         state.onResetKPath = { [weak self] in self?.resetKPathDefault() }
         state.onSelectKPathNode = { [weak self] index in self?.selectKPathNode(index) }
+        state.onShowAtomTable = { [weak self] in self?.showAtomTable() }
+        atomTable.onSelectionChange = { [weak self] indices in
+            guard let self else { return }
+            // Map filtered rows back to original displayed indices; keep them
+            // sorted + unique and drop anything that isn't a valid atom index.
+            let valid = indices.filter { $0 >= 0 && $0 < self.scene.atoms.count }
+            let sortedUnique = Array(Set(valid)).sorted()
+            // Table rows are sorted, so they cannot represent the pick order required
+            // by angle/dihedral measurements. Keep the full linked selection instead
+            // of applying the viewport pick cap.
+            let selection = sortedUnique
+            self.scene.selectedAtoms = selection
+            self.scene.measurementResult = nil
+            // Distance is order-independent and can be computed from exactly two
+            // table-selected atoms. Other measurement modes remain viewport-only.
+            if self.scene.measurementMode == .distance, selection.count == 2 {
+                self.scene.measurementResult = Scene.computeMeasurement(
+                    mode: self.scene.measurementMode,
+                    atoms: self.scene.atoms,
+                    selected: selection,
+                    cell: self.scene.cell,
+                    periodicDim: self.scene.periodicDim
+                )
+            }
+            self.lastSyncedSelection = selection
+            if !selection.isEmpty {
+                self.positionInfoWindow()
+                self.showInfoWindow()
+            }
+            self.setNeedsRender()
+        }
         // syncFromScene (above) installed the initial route via replaceKPath, bumping
         // routeGeneration; mirror that so the first real syncFromState does not treat
         // the initial route as a wholesale replacement and clear a nil selection.
@@ -259,6 +300,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.isPlaying = false
         state.onChange = saved
         stopPlayback()
+        refreshAtomTable()
         // The readout stays hidden until the user selects an atom.
         setNeedsRender()
     }
@@ -330,6 +372,49 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         infoWindow.orderFront(nil)
     }
 
+    /// Lazily create (once) and show the auxiliary atom-table panel. Repeated
+    /// calls reuse the same window identity. The panel is non-modal and released
+    /// only on app termination (`isReleasedWhenClosed = false`).
+    func showAtomTable() {
+        if atomTableWindow == nil {
+            let win = NSWindow(contentRect: atomTable.frame,
+                                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                backing: .buffered, defer: false)
+            win.title = "Atom Table"
+            win.isReleasedWhenClosed = false
+            win.contentView = atomTable
+            atomTableWindow = win
+        }
+        // A hidden table intentionally stays stale. Catch it up immediately before
+        // presenting it again, while preserving the existing window and search text.
+        updateAtomTable()
+        atomTableWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Push the current scene's atoms/cell/selection into the table. O(atom-count)
+    /// due to fractional-coordinate computation, so only call on structure changes
+    /// (load/frame/supercell/slab), never on every render. Preserves search text.
+    func refreshAtomTable() {
+        guard let window = atomTableWindow, window.isVisible else { return }
+        updateAtomTable()
+    }
+
+    private func updateAtomTable() {
+        atomTable.update(atoms: scene.atoms, cell: scene.cell, selectedAtoms: scene.selectedAtoms)
+        lastSyncedSelection = scene.selectedAtoms
+    }
+
+    /// Synchronize the table's row selection to match `scene.selectedAtoms`, but
+    /// only when it actually changed — avoids redundant work and callback recursion.
+    /// Stale indices (not in the current filter) are ignored by the table view.
+    private func syncAtomTableSelection() {
+        guard let window = atomTableWindow, window.isVisible else { return }
+        if scene.selectedAtoms != lastSyncedSelection {
+            atomTable.setSelectedAtomIndices(scene.selectedAtoms)
+            lastSyncedSelection = scene.selectedAtoms
+        }
+    }
+
     private func refreshDelegate() {
         if scene.displayMode.is2D {
             canvas.delegate = renderer2D
@@ -349,6 +434,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if infoPanel.string != text { infoPanel.string = text }
         // Keep the sidebar Forces readout in sync with the scene's forceSet.
         if state.forceSummary != buildForceSummary() { state.forceSummary = buildForceSummary() }
+        // Reflect viewport selection into the atom table (only when changed).
+        syncAtomTableSelection()
         canvas.draw()
     }
 
@@ -392,7 +479,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     /// Closing the main window must end the program: hide the docked readout
     // first so the app terminates cleanly instead of leaving it orphaned.
+    /// Only the MAIN window closing tears down file watching / playback. The
+    /// auxiliary panel has no controller delegate and is a no-op here.
     func windowWillClose(_ notification: Notification) {
+        guard (notification.object as? NSWindow) == window else { return }
         stopFileWatching()
         stopPlayback()
         state.isPlaying = false
@@ -548,7 +638,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             && scene.selectedAtoms.count >= scene.measurementMode.selectionCap {
             scene.measurementResult = Scene.computeMeasurement(mode: scene.measurementMode,
                                                                 atoms: scene.atoms,
-                                                                selected: scene.selectedAtoms)
+                                                                selected: scene.selectedAtoms,
+                                                                cell: scene.cell,
+                                                                periodicDim: scene.periodicDim)
         }
         // Reveal + dock the readout the first time an atom is selected.
         if !infoWindow.isVisible { positionInfoWindow(); showInfoWindow() }
@@ -568,7 +660,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             return
         }
         scene.measurementResult = Scene.computeMeasurement(mode: scene.measurementMode,
-                                                            atoms: scene.atoms, selected: sel)
+                                                            atoms: scene.atoms, selected: sel,
+                                                            cell: scene.cell,
+                                                            periodicDim: scene.periodicDim)
         setNeedsRender()
     }
 
@@ -596,6 +690,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let slab = Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
                         planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
         scene = scene.applySlab(slab)
+        refreshAtomTable()
         setNeedsRender()
     }
 
@@ -873,8 +968,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             ? Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
                    planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
             : nil
+        let oldSlab = scene.slab
         if superCellChanged || scene.slab != slab {
             scene = scene.applySlab(slab)
+        }
+        if superCellChanged || scene.slab != oldSlab {
+            refreshAtomTable()
         }
         // Reframe when crossing the 2D↔3D boundary — after supercell/slab
         // mutations so the camera fits the final geometry.
@@ -1194,6 +1293,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             colorPlane.grid = nil
         }
         updateContentVisibility()
+        refreshAtomTable()
         setNeedsRender()
     }
 

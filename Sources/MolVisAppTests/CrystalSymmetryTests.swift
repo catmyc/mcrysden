@@ -603,7 +603,8 @@ final class CrystalSymmetryTests: XCTestCase {
         controller.loadFile(initial, from: url, frameIndex: 0)
         controller.state.isPlaying = true
         XCTAssertTrue(controller.state.isPlaying)
-        controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        controller.windowWillClose(Notification(name: NSWindow.willCloseNotification,
+                                                 object: controller.window))
         XCTAssertFalse(controller.state.isPlaying)
     }
 

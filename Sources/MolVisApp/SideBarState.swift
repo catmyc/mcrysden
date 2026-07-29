@@ -163,6 +163,9 @@ final class SideBarState: ObservableObject {
     /// the node. Whole-route replacements clear the selection on their own, so this
     /// callback only needs to forward the index.
     var onSelectKPathNode: ((Int?) -> Void)?
+    /// Present the atom table panel for the current scene. The controller owns the
+    /// AtomTableView and lazily creates the auxiliary window on first use.
+    var onShowAtomTable: (() -> Void)?
 
     /// Reflect a loaded scene's controls into the sidebar WITHOUT triggering
     /// onChange (so we don't immediately re-mutate the scene we just loaded).

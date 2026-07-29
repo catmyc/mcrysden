@@ -162,7 +162,7 @@ final class AppExportTests: XCTestCase {
     }
 
     @MainActor
-    func testRepeatedCopyCancelsPendingResetTimer() {
+    func testRepeatedCopyCancelsPendingResetTimer() async {
         // Two rapid copies must not let the first copy's reset timer fire and
         // revert the title while the second copy's flash is still showing.
         let app = App()
@@ -173,16 +173,14 @@ final class AppExportTests: XCTestCase {
         XCTAssertEqual(item.title, "Copied View")
 
         // Second copy at +0.1s: must cancel the first timer, schedule a fresh +1.0s.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            app.flashCopyResult(item, success: true)
-            XCTAssertEqual(item.title, "Copied View")
-        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        app.flashCopyResult(item, success: true)
+        XCTAssertEqual(item.title, "Copied View")
 
         // At +0.5s the title must still be "Copied View" — the first timer was
         // cancelled, so it cannot have reverted the title.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            XCTAssertEqual(item.title, "Copied View")
-        }
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(item.title, "Copied View")
 
         // After the second timer fires, the title must be restored. Poll with a
         // predicate expectation to avoid depending on exact async-after timing
@@ -190,6 +188,6 @@ final class AppExportTests: XCTestCase {
         let restore = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "title == %@", "Copy Current View"),
             object: item)
-        wait(for: [restore], timeout: 4.0)
+        await fulfillment(of: [restore], timeout: 4.0)
     }
 }

@@ -6,7 +6,8 @@ extension Scene {
     /// Compute a distance / angle / dihedral from selected atoms.
     /// pick order matters: angle uses the middle atom as vertex; dihedral is
     /// signed by the plane normals of (a,b,c) and (b,c,d).
-    static func computeMeasurement(mode: MeasurementMode, atoms: [Atom], selected: [Int]) -> MeasurementResult? {
+    static func computeMeasurement(mode: MeasurementMode, atoms: [Atom], selected: [Int],
+                                   cell: Cell? = nil, periodicDim: Int = 0) -> MeasurementResult? {
         guard mode != .none, selected.count == mode.selectionCap,
               selected.allSatisfy({ $0 >= 0 && $0 < atoms.count }) else { return nil }
         let sel = selected.map { atoms[$0].coord }
@@ -14,7 +15,13 @@ extension Scene {
         var value: Float = 0
         switch mode {
         case .distance:
-            value = length(sel[1] - sel[0])
+            if let cell = cell {
+                guard let d = PeriodicGeometry.minimumImageDistance(from: sel[0], to: sel[1],
+                                                                      cell: cell, periodicDim: periodicDim) else { return nil }
+                value = d
+            } else {
+                value = length(sel[1] - sel[0])
+            }
         case .angle:
             let d0 = sel[0] - sel[1], d2 = sel[2] - sel[1]
             guard length(d0) > 1e-8, length(d2) > 1e-8 else { return nil }
