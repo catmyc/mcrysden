@@ -227,7 +227,7 @@ Light direction fixed in view-space (top-left).
 
 ---
 
-## 8. State file (`.molvis-state`)
+## 8. State file (`.mvis-state`)
 
 JSON, human-readable and diffable.
 
@@ -316,7 +316,7 @@ Each step is independently demoable in the GUI before moving on. Note the **desi
 6. Sidebar (SwiftUI): display-mode picker, atom scale, bond radius, background, cell/axes toggles.
 7. Supercell + slab.
 8. 2D renderer swap.
-9. `StateStore` (save/load `.molvis-state`).
+9. `StateStore` (save/load `.mvis-state`).
 10. `PngExporter` — reuse `Renderer.encode` with an **owned** `MTLTexture` target (no MTKView), blit → `CGImage` → PNG — plus the `--export` CLI path in `MolVisApp` and `scripts/smoke.sh`.
 11. Snapshot tests + CI.
 12. Element-table polish, color schemes, polyhedral via ported `voronoi.c`.

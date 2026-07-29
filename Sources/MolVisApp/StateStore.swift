@@ -1,7 +1,7 @@
 import Foundation
 import CoreFoundation
 
-// .molvis-state persistence. Matches the documented contract
+// .mvis-state persistence. Matches the documented contract
 // (docs/superpowers/specs/2026-07-06-mcrysden-design.md §8): a FLAT top-level
 // object with the view-state fields the viewer needs to restore, plus the
 // source file path (optional) and an optional camera. Atoms/bonds/cell are NOT

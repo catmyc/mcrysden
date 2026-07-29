@@ -46,11 +46,11 @@ Routes have either `generated` or `userEdited` provenance:
 - Display-only supercell and slab operations do not replace the route.
 - A user-edited route is remapped from the old to the new input reciprocal basis through Cartesian reciprocal space. If either basis is unusable, the literal fractional coordinates are preserved as the non-destructive fallback.
 
-The flat `.molvis-state` format persists `kPathPoints`, `kPathBreaks`, `kPathProvenance`, optional generated `kPathSignature`, and `kPathInputCell`. Loading validates these fields transactionally. Older state files without the newer keys remain connected and use the legacy-compatible route policy.
+The flat `.mvis-state` format persists `kPathPoints`, `kPathBreaks`, `kPathProvenance`, optional generated `kPathSignature`, and `kPathInputCell`. Loading validates these fields transactionally. Older state files without the newer keys remain connected and use the legacy-compatible route policy.
 
 ## Export behavior
 
-Quantum Espresso `K_POINTS crystal` export can represent the interpolated points from disconnected components and preserves explicit singleton components. XCrySDen KPF has no syntax for a disconnected boundary, so the UI disables that export for disconnected routes and the exporter rejects a programmatic request with a clear error.
+Quantum Espresso `K_POINTS crystal` export can represent the interpolated points from disconnected components and preserves explicit singleton components. VASP line-mode `KPOINTS` export uses endpoint pairs and blank lines between segments; singleton components are rejected because line mode cannot represent them. XCrySDen KPF has no syntax for a disconnected boundary, so the UI disables that export for disconnected routes and the exporter rejects a programmatic request with a clear error.
 
 ## Verification
 
@@ -62,4 +62,4 @@ swift test
 zsh scripts/smoke.sh
 ```
 
-The current suite contains 611 tests. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.
+The tracked suite contains 762 tests as of v1.1.22. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.

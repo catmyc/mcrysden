@@ -70,7 +70,7 @@ Key rules:
 | `KPath.swift` | k-path interpolation, QE/KPF/VASP export |
 | `CrystalSymmetry.swift` | Spglib analysis: space group, Wyckoff, standardized cells |
 | `HPKOT.swift` | SeekPath 2.1 canonical paths for all 29 Bravais variants |
-| `StateStore.swift` | `.molvis-state` JSON serialization |
+| `StateStore.swift` | `.mvis-state` JSON serialization |
 | `StructureSummary.swift` | Lattice, composition, density, symmetry data model |
 | `ElementTable.swift` | CPK colors, covalent/vdw radii, atomic masses |
 
@@ -82,7 +82,7 @@ Key rules:
   MCRYSDEN_REGENERATE=1 swift test --filter SnapshotTests
   ```
   Review the changed hashes, then rerun snapshots without the environment variable.
-- The current suite contains 611 tests. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
+- The tracked suite contains 762 tests as of v1.1.22. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
 - Parser failures must become `ParseError` with a useful path/reason; malformed user files must not trap. C parsers report details through thread-local `molenv_last_error`.
 
 ## References

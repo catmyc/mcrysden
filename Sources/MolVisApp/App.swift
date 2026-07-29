@@ -1005,7 +1005,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
           \(flags)
         For animated files (AXSF ANIMSTEPS, QE .pwo ionic steps, Orca opt cycles),
         open a specific frame with --frame N (0-based frame index).
-        Export format is chosen by extension: .png (raster) or .pdf/.svg/.eps/.ps (vector).
+        Export format is chosen by extension: .png (raster) or .pdf/.svg/.eps/.ps (raster-backed containers).
         """)
     }
 }

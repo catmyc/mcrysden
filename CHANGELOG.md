@@ -7,23 +7,30 @@ All notable changes to mcrysden will be documented in this file. The format is b
 ## [1.1.22] — 2026-07-29
 
 ### Added
+- Added CIF declared symmetry-operation parsing, asymmetric-unit expansion with periodic deduplication, and completeness promotion enabling spglib analysis and canonical k-paths on expanded structures.
+
+### Fixed
+- Hardened CIF tokenization, numeric parsing, cell assembly, and group dispatch against malformed and non-finite input, with strict per-record validation and parse-local reentrant state.
+
+### Tests
+- Added focused tests for CIF symmetry expansion, periodic deduplication, completeness promotion, and strict token/numeric/cell safety. Suite now at 762 tests.
+
+## [1.1.21] — 2026-07-28
+
+### Added
 - Added File > Revert To Saved, File > Open Recent submenu (standard NSDocumentController recents with Clear), reopen-last-file on launch (UserDefaults-backed with empty-viewer fallback), and drag-and-drop file loading onto the viewer.
 - Added a standard Edit menu (Undo/Redo/Cut/Copy/Paste/Select All routed to first responder) with Copy Current View to clipboard.
 - Added collapsible, remembered sidebar sections across all 12 major sections (persisted independently in UserDefaults).
 - Added automatic source-file watching, multiple independent structure windows, and a dynamic Window menu.
 - Added configurable export dimensions, background color, and transparency with format-aware validation.
 - Added a searchable command palette with keyboard navigation and responder-chain routing for text-editing commands.
-- Added CIF declared symmetry-operation parsing, asymmetric-unit expansion with periodic deduplication, and completeness promotion enabling spglib analysis and canonical k-paths on expanded structures.
 
 ### Changed
 - Drag-and-drop parsing now runs off the main thread with generation-ordered install and directory rejection.
 - Edit menu follows standard macOS ordering (File, Edit, View).
 
-### Fixed
-- Hardened CIF tokenization, numeric parsing, cell assembly, and group dispatch against malformed, non-finite, and non-reentrant input with strict per-record validation and reentrant-state safety.
-
 ### Tests
-- Added focused tests for CIF symmetry expansion, periodic deduplication, completeness promotion, strict token/numeric/cell safety, workflow integration, multi-window state, file watching, export options, and command-palette routing. Suite now at 762 tests.
+- Added focused tests for workflow integration, multi-window state, file watching, export options, and command-palette routing. Suite now at 658 tests.
 
 ## [1.1.20] — 2026-07-27
 
@@ -38,7 +45,7 @@ All notable changes to mcrysden will be documented in this file. The format is b
 ## [1.1.19] — 2026-07-27
 
 ### Added
-- Added user-configurable per-segment k-path sampling density (2…200) with a sidebar stepper, persistence in `.molvis-state`, and load-time clamping.
+- Added user-configurable per-segment k-path sampling density (2…200) with a sidebar stepper, persistence in `.mvis-state`, and load-time clamping.
 
 ## [1.1.18] — 2026-07-27
 
@@ -51,14 +58,14 @@ All notable changes to mcrysden will be documented in this file. The format is b
 ### Added
 - Added GUI File > Save State As and File > Export actions with constrained output types, source-alias protection, sheet-based error reporting, and atomic writes.
 - Added visible-layer-aware canvas export that includes element labels and BZ landmark overlays.
-- Added `showColorPlane` persistence in `.molvis-state` files with backward-compatible defaults and animation-frame-preserving lifecycle propagation.
+- Added `showColorPlane` persistence in `.mvis-state` files with backward-compatible defaults and animation-frame-preserving lifecycle propagation.
 
 ## [1.1.16] — 2026-07-26
 
 ### Added
 - Added an interactive Brillouin-zone k-path editor: click deterministic Γ/vertex/edge/face landmarks to append nodes, orbit while editing, rename/reorder/delete points, undo or clear edits, restore the generated default, and export QE or XCrySDen KPF paths.
 - Rendered selectable BZ landmarks as white crosses only while editing, and the active route as depth-tested amber segments with cyan nodes; editing keeps the Metal canvas available even when graph or color-plane data is loaded.
-- Persisted edited routes in `.molvis-state` files and preserved them across animation-frame rebuilds and unrelated view changes.
+- Persisted edited routes in `.mvis-state` files and preserved them across animation-frame rebuilds and unrelated view changes.
 - Added a conventional File menu containing Open (`⌘O`), with Quit in the macOS application menu.
 
 ### Fixed
@@ -103,7 +110,7 @@ All notable changes to mcrysden will be documented in this file. The format is b
 - **Brillouin-zone overlay now renders for all lattice types**, including highly anisotropic slab cells (e.g. GaAsH), which previously returned a nil polyhedron and showed nothing. Root cause was the isotropic `shellCutoff` radius filter discarding the dense reciprocal directions of elongated cells, combined with a greedy primitive-basis reduction that over-reduced multi-atom conventional cells. Replaced with crystallographic centering detection (P/I/F) from the atomic basis offsets and a canonical primitive reduction; the G-star is now enumerated completely per-direction.
 - **`Cell.reciprocalVectors` corrected for non-orthogonal cells**: reciprocal vectors are columns of `v.inverse` (not `v.inverse.transpose`), verified `a*·b = 0`, `a*·a = 2π` exactly for skew cells. Cubic results unchanged.
 - **BZ overlay is cached** (`Renderer.build` keyed on cell + base atoms) so it builds once and redraws cheaply — fixing the seconds-long mouse-drag lag that occurred with the overlay on for crystals with a large G-star. Supercell expansion does not invalidate the cache.
-- **Slabs saved in a `.molvis-state` file are now actually applied** to the atoms (previously a bare field assignment; headless export ignored them).
+- **Slabs saved in a `.mvis-state` file are now actually applied** to the atoms (previously a bare field assignment; headless export ignored them).
 - **Saved animation frame (`currentFrame`) is honored again**: re-opening a state or headless export re-parses and renders the saved frame instead of the CLI default.
 
 ### Added 2026-07-10 (present in this release)

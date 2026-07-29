@@ -66,7 +66,7 @@ Three SPM targets (`Package.swift`):
 
 ### Module layout (Sources/MolVisApp/)
 
-`main.swift` (entry), `App.swift` (NSApp delegate + `--export` early-exit), `Model.swift`, `Parser.swift` (C→Swift bridge), `Renderer.swift` (Metal, contains embedded shader source), `Renderer2D.swift` (orthographic swap-in for 2D modes), `MetalView.swift` (MTKView + responder events → camera), `MainWindowController.swift` (NSWindow/NSSplitView owner), `SideBar.swift` + `SideBarState.swift` (SwiftUI), `StateStore.swift` (`.molvis-state` JSON), `PngExporter.swift`, `ElementTable.swift`, `Geometry.swift` (mesh generators), `Camera.swift` (matrix math), `Scene+Init.swift` (init, boundingSphere, widenSuperCell, applySlab).
+`main.swift` (entry), `App.swift` (NSApp delegate + `--export` early-exit), `Model.swift`, `Parser.swift` (C→Swift bridge), `Renderer.swift` (Metal, contains embedded shader source), `Renderer2D.swift` (orthographic swap-in for 2D modes), `MetalView.swift` (MTKView + responder events → camera), `MainWindowController.swift` (NSWindow/NSSplitView owner), `SideBar.swift` + `SideBarState.swift` (SwiftUI), `StateStore.swift` (`.mvis-state` JSON), `PngExporter.swift`, `ElementTable.swift`, `Geometry.swift` (mesh generators), `Camera.swift` (matrix math), `Scene+Init.swift` (init, boundingSphere, widenSuperCell, applySlab).
 
 ## Error handling principles
 
