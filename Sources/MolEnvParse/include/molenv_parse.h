@@ -44,6 +44,7 @@ typedef struct {
     int        periodic_dim; // 0..3
     char       title[256];
     MolEnvGrid *grid;        // first DATAGRID block, or NULL
+    int        symmetry_completeness; // 0 = complete, 1 = asymmetric unit, 2 = unknown
 } MolEnvScene;
 
 MolEnvScene* parse_xsf   (const char *path);

@@ -4,7 +4,7 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
-## [1.1.21] — 2026-07-28
+## [1.1.22] — 2026-07-29
 
 ### Added
 - Added File > Revert To Saved, File > Open Recent submenu (standard NSDocumentController recents with Clear), reopen-last-file on launch (UserDefaults-backed with empty-viewer fallback), and drag-and-drop file loading onto the viewer.
@@ -13,13 +13,17 @@ All notable changes to mcrysden will be documented in this file. The format is b
 - Added automatic source-file watching, multiple independent structure windows, and a dynamic Window menu.
 - Added configurable export dimensions, background color, and transparency with format-aware validation.
 - Added a searchable command palette with keyboard navigation and responder-chain routing for text-editing commands.
+- Added CIF declared symmetry-operation parsing, asymmetric-unit expansion with periodic deduplication, and completeness promotion enabling spglib analysis and canonical k-paths on expanded structures.
 
 ### Changed
 - Drag-and-drop parsing now runs off the main thread with generation-ordered install and directory rejection.
 - Edit menu follows standard macOS ordering (File, Edit, View).
 
+### Fixed
+- Hardened CIF tokenization, numeric parsing, cell assembly, and group dispatch against malformed, non-finite, and non-reentrant input with strict per-record validation and reentrant-state safety.
+
 ### Tests
-- Added focused tests for workflow integration, multi-window state, file watching, export options, and command-palette routing. Suite now at 658 tests.
+- Added focused tests for CIF symmetry expansion, periodic deduplication, completeness promotion, strict token/numeric/cell safety, workflow integration, multi-window state, file watching, export options, and command-palette routing. Suite now at 762 tests.
 
 ## [1.1.20] — 2026-07-27
 

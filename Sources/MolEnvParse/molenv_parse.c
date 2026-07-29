@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -1597,9 +1598,394 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
 
 /* ----- CIF ----- */
 
+#define MAX_SYMOPS 192
+#define MOLENV_ATOM_CAP 500000
+
+/* Case-insensitive match for CIF symmetry-operation tag names. */
+static int is_symop_tag(const char *tag) {
+    return strcasecmp(tag, "_symmetry_equiv_pos_as_xyz") == 0 ||
+           strcasecmp(tag, "_symmetry_equiv.pos_as_xyz") == 0 ||
+           strcasecmp(tag, "_space_group_symop_operation_xyz") == 0 ||
+           strcasecmp(tag, "_space_group_symop.operation_xyz") == 0;
+}
+
+/* Parse a CIF symmetry-operation expression "x, y, z", "-x, -y, -z", "x+1/2, y, z".
+   Extracts a 3x3 integer rotation matrix `rot` (values -1/0/1) and a double
+   translation vector `trans`. Returns 0 on success, -1 on error with a message
+   written to `err` (cap `err_cap`). */
+static int parse_symop(const char *str, int rot[3][3], double trans[3],
+                        char *err, size_t err_cap)
+{
+    char buf[256];
+    size_t slen = strlen(str);
+    if (slen >= sizeof(buf)) { snprintf(err, err_cap, "symmetry operation too long"); return -1; }
+    memcpy(buf, str, slen + 1);
+
+    /* Trim trailing whitespace; a trailing comma after any number of
+       collected components must be rejected. */
+    {
+        size_t blen = strlen(buf);
+        while (blen > 0 && (buf[blen-1] == ' ' || buf[blen-1] == '\t')) buf[--blen] = '\0';
+        if (blen > 0 && buf[blen-1] == ',') {
+            snprintf(err, err_cap, "trailing comma in operation component"); return -1;
+        }
+    }
+
+    /* Split on commas into exactly 3 nonempty component strings. */
+    char *comps[3] = {NULL, NULL, NULL};
+    int ncomp = 0;
+    char *p = buf, *start = buf;
+    while (*p) {
+        if (*p == ',') {
+            *p++ = '\0';
+            while (*start == ' ' || *start == '\t') start++;
+            if (*start == '\0') { snprintf(err, err_cap, "empty component in operation"); return -1; }
+            if (ncomp >= 3) { snprintf(err, err_cap, "more than 3 components in operation"); return -1; }
+            comps[ncomp++] = start;
+            start = p;
+        } else {
+            p++;
+        }
+    }
+    {
+        while (*start == ' ' || *start == '\t') start++;
+        if (*start) {
+            if (ncomp >= 3) { snprintf(err, err_cap, "more than 3 components in operation"); return -1; }
+            comps[ncomp++] = start;
+        } else if (ncomp < 3) {
+            snprintf(err, err_cap, "expected 3 components in operation, got %d", ncomp);
+            return -1;
+        }
+    }
+    /* Trailing comma results in empty last component — reject. */
+    if (ncomp != 3) { snprintf(err, err_cap, "expected 3 components in operation, got %d", ncomp); return -1; }
+    for (int k = 0; k < 3; k++) {
+        char *t = comps[k];
+        while (*t == ' ' || *t == '\t') t++;
+        if (*t == '\0') { snprintf(err, err_cap, "empty component in operation"); return -1; }
+    }
+
+    memset(rot, 0, 9 * sizeof(int));
+    trans[0] = trans[1] = trans[2] = 0.0;
+
+    for (int c = 0; c < 3; c++) {
+        char *s = comps[c];
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '\0') continue;
+
+        int first = 1;
+        while (*s) {
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == '\0') break;
+
+            /* Check for / * or other non-affine continuation after a completed term. */
+            if (!first) {
+                if (*s == '/') {
+                    s++; while (*s == ' ' || *s == '\t') s++;
+                    char *dend = NULL; double den = strtod(s, &dend);
+                    if (dend > s && den == 0.0) {
+                        snprintf(err, err_cap, "zero denominator in operation component %d", c + 1);
+                        return -1;
+                    }
+                    snprintf(err, err_cap, "non-affine term in operation component %d", c + 1);
+                    return -1;
+                }
+                if (*s == '*' || *s == '.' || *s == ',') {
+                    snprintf(err, err_cap, "non-affine term in operation component %d", c + 1);
+                    return -1;
+                }
+            }
+
+            int sign;
+            if (*s == '+') { sign = 1; s++; }
+            else if (*s == '-') { sign = -1; s++; }
+            else if (first) { sign = 1; }
+            else { snprintf(err, err_cap, "expected '+' or '-' between terms in operation component %d", c + 1); return -1; }
+            first = 0;
+
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == '\0') { snprintf(err, err_cap, "incomplete term in operation component %d", c + 1); return -1; }
+
+            /* Bare variable (x, y, z). */
+            if ((*s == 'x' || *s == 'X') && !isalnum((unsigned char)s[1])) {
+                rot[c][0] += sign; s++;
+                goto term_done;
+            }
+            if ((*s == 'y' || *s == 'Y') && !isalnum((unsigned char)s[1])) {
+                rot[c][1] += sign; s++;
+                goto term_done;
+            }
+            if ((*s == 'z' || *s == 'Z') && !isalnum((unsigned char)s[1])) {
+                rot[c][2] += sign; s++;
+                goto term_done;
+            }
+
+            {
+                /* Numeric coefficient, possibly with fraction or inf/nan. */
+                char *nend = NULL;
+                double coeff = strtod(s, &nend);
+                if (nend == s) {
+                    snprintf(err, err_cap, "invalid term in operation component %d", c + 1);
+                    return -1;
+                }
+                if (!isfinite(coeff)) {
+                    snprintf(err, err_cap, "non-finite (inf/nan) term in operation component %d", c + 1);
+                    return -1;
+                }
+                s = nend;
+
+                /* Fraction. */
+                if (*s == '/') {
+                    s++;
+                    while (*s == ' ' || *s == '\t') s++;
+                    char *dend = NULL;
+                    double den = strtod(s, &dend);
+                    if (dend == s || den == 0.0) {
+                        snprintf(err, err_cap, "zero denominator in operation component %d", c + 1);
+                        return -1;
+                    }
+                    if (!isfinite(den)) {
+                        snprintf(err, err_cap, "non-finite (inf/nan) denominator in operation component %d", c + 1);
+                        return -1;
+                    }
+                    coeff /= den;
+                    s = dend;
+                }
+
+                if (!isfinite(coeff)) {
+                    snprintf(err, err_cap, "non-finite (inf/nan) term in operation component %d", c + 1);
+                    return -1;
+                }
+
+                while (*s == ' ' || *s == '\t') s++;
+                if (*s == '*') { s++; while (*s == ' ' || *s == '\t') s++; }
+
+                if (*s == 'x' || *s == 'X') {
+                    if (coeff != floor(coeff) || coeff < -1.0 || coeff > 1.0) {
+                        snprintf(err, err_cap, "rotation coefficient out of range [-1,1] in operation component %d", c + 1);
+                        return -1;
+                    }
+                    rot[c][0] += sign * (int)coeff;
+                    s++;
+                } else if (*s == 'y' || *s == 'Y') {
+                    if (coeff != floor(coeff) || coeff < -1.0 || coeff > 1.0) {
+                        snprintf(err, err_cap, "rotation coefficient out of range [-1,1] in operation component %d", c + 1);
+                        return -1;
+                    }
+                    rot[c][1] += sign * (int)coeff;
+                    s++;
+                } else if (*s == 'z' || *s == 'Z') {
+                    if (coeff != floor(coeff) || coeff < -1.0 || coeff > 1.0) {
+                        snprintf(err, err_cap, "rotation coefficient out of range [-1,1] in operation component %d", c + 1);
+                        return -1;
+                    }
+                    rot[c][2] += sign * (int)coeff;
+                    s++;
+                } else {
+                    trans[c] += sign * coeff;
+                }
+            }
+
+        term_done:;
+        }
+    }
+
+    /* Validate determinant is ±1. */
+    {
+        int det = rot[0][0] * (rot[1][1] * rot[2][2] - rot[1][2] * rot[2][1])
+                - rot[0][1] * (rot[1][0] * rot[2][2] - rot[1][2] * rot[2][0])
+                + rot[0][2] * (rot[1][0] * rot[2][1] - rot[1][1] * rot[2][0]);
+        if (det != 1 && det != -1) {
+            snprintf(err, err_cap, "singular rotation in operation (determinant %d)", det);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* Compute inverse of a 3x3 cell matrix (columns are lattice vectors).
+   Returns 0 on success, -1 if singular. Row norms of the inverse are
+   written to `row_norm` (fractional shift per unit Cartesian distance). */
+static int invert_cell(const float cell[3][3], double inv[3][3],
+                        double row_norm[3]) {
+    double a0=cell[0][0], a1=cell[0][1], a2=cell[0][2];
+    double b0=cell[1][0], b1=cell[1][1], b2=cell[1][2];
+    double c0=cell[2][0], c1=cell[2][1], c2=cell[2][2];
+    double det = a0*(b1*c2-b2*c1) - a1*(b0*c2-b2*c0) + a2*(b0*c1-b1*c0);
+    double scale = sqrt(a0*a0+a1*a1+a2*a2) * sqrt(b0*b0+b1*b1+b2*b2) * sqrt(c0*c0+c1*c1+c2*c2);
+    if (fabs(det) <= 1e-15 * scale + 1e-30) return -1;
+    double id = 1.0/det;
+    inv[0][0] = (b1*c2-b2*c1)*id; inv[0][1] = (a2*c1-a1*c2)*id; inv[0][2] = (a1*b2-a2*b1)*id;
+    inv[1][0] = (b2*c0-b0*c2)*id; inv[1][1] = (a0*c2-a2*c0)*id; inv[1][2] = (a2*b0-a0*b2)*id;
+    inv[2][0] = (b0*c1-b1*c0)*id; inv[2][1] = (a1*c0-a0*c1)*id; inv[2][2] = (a0*b1-a1*b0)*id;
+    for (int i = 0; i < 3; i++) {
+        row_norm[i] = sqrt(inv[i][0]*inv[i][0]+inv[i][1]*inv[i][1]+inv[i][2]*inv[i][2]);
+        if (row_norm[i] < 1e-30) row_norm[i] = 1e-30;
+    }
+    return 0;
+}
+
+/* Exact threshold predicate: returns 1 if two fractional positions have a
+   periodic-image Cartesian distance < tol, 0 if none do, or -1 if the exact
+   integer search box would be impractically large (pathological cell).  For
+   each axis i, any integer shift n_i satisfying the bound is enumerated; the
+   bound is derived from |d_i - n_i| <= tol * inv_norm[i]. */
+#define DEDUP_BOX_LIMIT 100000
+static int frac_within_tol(double fx1, double fy1, double fz1,
+                            double fx2, double fy2, double fz2,
+                            const float cell[3][3],
+                            const double inv_norm[3],
+                            double tol) {
+    double df[3] = {fx1 - fx2, fy1 - fy2, fz1 - fz2};
+    double tol_sq = tol * tol;
+
+    int64_t lo[3], hi[3];
+    int64_t nr[3];
+    for (int i = 0; i < 3; i++) {
+        double bound = tol * inv_norm[i];
+        double d_lo = ceil(df[i] - bound - 1e-14);
+        double d_hi = floor(df[i] + bound + 1e-14);
+        if (d_lo < -1e15 || d_lo > 1e15 || d_hi < -1e15 || d_hi > 1e15) return -1;
+        lo[i] = (int64_t)d_lo;
+        hi[i] = (int64_t)d_hi;
+        if (hi[i] < lo[i]) return 0;
+        nr[i] = hi[i] - lo[i] + 1;
+        if (nr[i] <= 0) return 0;
+    }
+
+    int64_t total = nr[0];
+    if (total > DEDUP_BOX_LIMIT / nr[1]) return -1;
+    total *= nr[1];
+    if (total > DEDUP_BOX_LIMIT / nr[2]) return -1;
+    total *= nr[2];
+    if (total > DEDUP_BOX_LIMIT) return -1;
+
+    for (int n0 = lo[0]; n0 <= hi[0]; n0++) {
+        double d0 = df[0] - n0;
+        for (int n1 = lo[1]; n1 <= hi[1]; n1++) {
+            double d1 = df[1] - n1;
+            double cx1 = d0 * cell[0][0] + d1 * cell[1][0];
+            double cy1 = d0 * cell[0][1] + d1 * cell[1][1];
+            double cz1 = d0 * cell[0][2] + d1 * cell[1][2];
+            for (int n2 = lo[2]; n2 <= hi[2]; n2++) {
+                double d2 = df[2] - n2;
+                double cx = cx1 + d2 * cell[2][0];
+                double cy = cy1 + d2 * cell[2][1];
+                double cz = cz1 + d2 * cell[2][2];
+                double sq = cx*cx + cy*cy + cz*cz;
+                if (sq < tol_sq) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Dedup hash table for symmetry expansion. Key is bucket index in
+   fractional space.  Scale is derived from the cell's minimum singular
+   value so that any two atoms within 1e-5 Angstrom Cartesian distance
+   are guaranteed to fall in the same or adjacent buckets, with PBC
+   handled by wrapped bucket indices. */
+#define DEDUP_TOL 1e-5
+
+typedef struct {
+    int bx, by, bz;
+    int atomic_number;
+    char *label;             /* strdup'd; freed when table is destroyed */
+    double fx, fy, fz;        /* fractional coords for distance check */
+    int occupied;
+} DedupEntry;
+
+static uint64_t dedup_hash(int bx, int by, int bz, int z, const char *label) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    h ^= (uint64_t)(int32_t)bx; h *= 0x100000001b3ULL;
+    h ^= (uint64_t)(int32_t)by; h *= 0x100000001b3ULL;
+    h ^= (uint64_t)(int32_t)bz; h *= 0x100000001b3ULL;
+    h ^= (uint64_t)(uint32_t)z;  h *= 0x100000001b3ULL;
+    if (z == 0) {
+        for (const char *p = label; *p; p++) {
+            h ^= (uint64_t)(unsigned char)*p; h *= 0x100000001b3ULL;
+        }
+    }
+    return h;
+}
+
+/* Free all strdup'd labels in the hash table. */
+static void dedup_free_labels(DedupEntry *ht, size_t size) {
+    if (!ht) return;
+    for (size_t i = 0; i < size; i++) {
+        if (ht[i].occupied) free(ht[i].label);
+    }
+}
+
+/* Insert a new dedup entry. Label is strdup'd. Returns 0 on success, -1 on
+   table full or allocation failure. */
+static int dedup_insert(DedupEntry *ht, size_t ht_size, int bx, int by, int bz,
+                         int z, const char *label,
+                         double fx, double fy, double fz) {
+    uint64_t h = dedup_hash(bx, by, bz, z, label);
+    for (uint32_t i = 0; i < (uint32_t)ht_size; i++) {
+        uint32_t pos = (uint32_t)((h + i) % ht_size);
+        DedupEntry *e = &ht[pos];
+        if (!e->occupied) {
+            e->bx = bx; e->by = by; e->bz = bz;
+            e->atomic_number = z;
+            e->label = strdup(label);
+            if (!e->label) return -1;
+            e->fx = fx; e->fy = fy; e->fz = fz;
+            e->occupied = 1;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Tri-state duplicate check: returns 1 if candidate matches any previously
+   inserted atom within DEDUP_TOL, 0 if not, or -1 on error (pathological
+   cell prevents exact check).  Probes 3×3×3 periodic neighbor buckets and
+   uses the exact frac_within_tol predicate for each potential match. */
+static int dedup_is_dup(DedupEntry *ht, size_t ht_size,
+                         double fx, double fy, double fz,
+                         int z, const char *label,
+                         const float cell[3][3],
+                         const double inv_norm[3],
+                         int nbx, int nby, int nbz) {
+    int bx = (int)floor(fx*nbx); bx %= nbx; if (bx < 0) bx += nbx;
+    int by = (int)floor(fy*nby); by %= nby; if (by < 0) by += nby;
+    int bz = (int)floor(fz*nbz); bz %= nbz; if (bz < 0) bz += nbz;
+
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                int px = (bx+dx) % nbx; if (px < 0) px += nbx;
+                int py = (by+dy) % nby; if (py < 0) py += nby;
+                int pz = (bz+dz) % nbz; if (pz < 0) pz += nbz;
+
+                uint64_t h = dedup_hash(px, py, pz, z, label);
+                for (uint32_t i = 0; i < (uint32_t)ht_size; i++) {
+                    uint32_t pos = (uint32_t)((h+i) % ht_size);
+                    DedupEntry *e = &ht[pos];
+                    if (!e->occupied) break;
+                    if (e->bx == px && e->by == py && e->bz == pz &&
+                        e->atomic_number == z &&
+                        (z != 0 || strcmp(e->label, label) == 0)) {
+                        int r = frac_within_tol(fx, fy, fz,
+                                                e->fx, e->fy, e->fz,
+                                                cell, inv_norm, DEDUP_TOL);
+                        if (r < 0) return -1;
+                        if (r > 0) return 1;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 /* Split a line into whitespace-delimited tokens, respecting single- and
    double-quoted strings (a quoted value never splits on internal spaces).
-   Tokens point into the (mutated) line buffer. Returns token count. */
+   Tokens point into the (mutated) line buffer. Returns token count on
+   success, or -1 if an unterminated quoted string is encountered. */
 static int split_tokens(char *p, char **toks, int maxtoks) {
     int n = 0;
     while (*p && n < maxtoks) {
@@ -1609,7 +1995,8 @@ static int split_tokens(char *p, char **toks, int maxtoks) {
         if (*p == '\'' || *p == '"') {
             char q = *p++; start = p;
             while (*p && *p != q && *p != '\n' && *p != '\r') p++;
-            if (*p == q) *p++ = '\0';
+            if (*p == q) { *p++ = '\0'; }
+            else { return -1; }
         } else {
             start = p;
             while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
@@ -1620,25 +2007,61 @@ static int split_tokens(char *p, char **toks, int maxtoks) {
     return n;
 }
 
-/* Parse a CIF numeric value, stripping a trailing esd "(12)" if present. */
-static double cif_float(const char *s) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s", s);
-    char *op = strchr(buf, '(');
-    if (op) *op = '\0';
-    return atof(buf);
+/* Strict parse of a CIF numeric value. Accepts ".5", signed decimals,
+   trailing uncertainty "(digits)" before optional exponent, and rejects
+   ".", "?", empty, NaN/Inf, hex/octal/binary, garbage-after-parse.
+   Verifies finite after exponent application.
+   Returns 0 on success, -1 on failure (output not modified). */
+static int cif_strict_float(const char *s, double *out) {
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0') return -1;
+    if (s[0] == '?' || (s[0] == '.' && (s[1] == '\0' || s[1] == ' ' || s[1] == '\t' || s[1] == '('))) return -1;
+    if (strstr(s, "0x") || strstr(s, "0X") || strstr(s, "0o") || strstr(s, "0O") ||
+        strstr(s, "0b") || strstr(s, "0B")) return -1;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end == s || !isfinite(v)) return -1;
+    s = end;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '(') {
+        s++;
+        if (*s < '0' || *s > '9') return -1;
+        while (*s >= '0' && *s <= '9') s++;
+        if (*s != ')') return -1;
+        s++;
+    }
+    /* Exponent after uncertainty. */
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '+' || *s == '-') s++;
+        char *exp_end = NULL;
+        long exp = strtol(s, &exp_end, 10);
+        if (exp_end > s) { v *= pow(10.0, (double)exp); s = exp_end; }
+        else return -1;
+    }
+    if (!isfinite(v)) return -1;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s != '\0') return -1;
+    *out = v;
+    return 0;
 }
 
 /* Resolve an element symbol for a CIF atom label (e.g. "Fe1" -> "Fe",
-   "CA" -> "Ca"). Writes the canonical symbol into el (at most 3 chars + NUL,
-   so the buffer needs >= 4 bytes) and returns its atomic number via
-   molenv_symbol_to_z. Unknown -> el empty, Z 0. */
+   "Fe3+" -> "Fe", "CA" -> "Ca"). Strips trailing digits and charge
+   indicators (+/-). Writes the canonical symbol into el (at most 3 chars
+   + NUL, so the buffer needs >= 4 bytes) and returns its atomic number
+   via molenv_symbol_to_z. Unknown -> el empty, Z 0. */
 static int cif_resolve_z(const char *label, char *el) {
     char t[8] = {0};
     int i = 0;
     while (label[i] && i < 6) { t[i] = label[i]; i++; }
     t[i] = '\0';
-    while (i > 0 && t[i - 1] >= '0' && t[i - 1] <= '9') t[--i] = '\0';
+    int stripped = 1;
+    while (stripped) {
+        stripped = 0;
+        while (i > 0 && t[i - 1] >= '0' && t[i - 1] <= '9') { t[--i] = '\0'; stripped = 1; }
+        if (i > 0 && (t[i - 1] == '+' || t[i - 1] == '-')) { t[--i] = '\0'; stripped = 1; }
+    }
     if (i == 0) { el[0] = '\0'; return 0; }
     if (i > 3) i = 3; /* canonical symbols are <= 2 letters; cap defensively */
     el[0] = (char)toupper((unsigned char)t[0]);
@@ -1660,10 +2083,11 @@ static int cif_build_cell(double a, double b, double c,
     double alr = alpha * PI / 180.0;
     double ber = beta * PI / 180.0;
     double cgal = cos(gal), sg = sin(gal), cber = cos(ber), cal = cos(alr);
-    if (sg < 1e-12) sg = 1e-12; /* guard a degenerate gamma */
     double cx = c * cber;
     double cy = c * (cal - cber * cgal) / sg;
-    double cz = sqrt(fmax(0.0, c * c - cx * cx - cy * cy));
+    double cz2 = c * c - cx * cx - cy * cy;
+    if (cz2 <= 0) cz2 = 0;
+    double cz = sqrt(cz2);
     /* Validate every derived component in double before the (float) cast —
        cx/cy/cz can overflow to ±inf even from finite a/b/c/angles. */
     if (!in_float_range(a) || !in_float_range(b * cgal) || !in_float_range(b * sg) ||
@@ -1676,26 +2100,328 @@ static int cif_build_cell(double a, double b, double c,
     return 0;
 }
 
+/* ---------- Group validation for declared symmetry operations ---------- */
+
+/* Check if two 3x3 rotation matrices are equal. */
+static int rot_eq(int a[3][3], int b[3][3]) {
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            if (a[i][j] != b[i][j]) return 0;
+    return 1;
+}
+
+/* Check if two translation vectors are equivalent modulo lattice (tol 1e-10). */
+static int trans_eq_mod1(double a[3], double b[3]) {
+    for (int i = 0; i < 3; i++) {
+        double d = remainder(a[i] - b[i], 1.0);
+        if (fabs(d) > 1e-10) return 0;
+    }
+    return 1;
+}
+
+/* Compose two Seitz operations: (R2|t2) ° (R1|t1) = (R2*R1 | t2 + R2*t1). */
+static void seitz_compose(int r1[3][3], double t1[3],
+                           int r2[3][3], double t2[3],
+                           int rout[3][3], double tout[3]) {
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            rout[i][j] = r2[i][0]*r1[0][j] + r2[i][1]*r1[1][j] + r2[i][2]*r1[2][j];
+        }
+        tout[i] = t2[i] + r2[i][0]*t1[0] + r2[i][1]*t1[1] + r2[i][2]*t1[2];
+    }
+}
+
+/* Validate that the nops declared symmetry operations are valid and
+   self-consistent.  Checks identity presence and metric preservation.
+   Returns 0 on success, -1 on failure with error message written to
+   `err`. */
+static int validate_symmetry_group(int nops, int rot[MAX_SYMOPS][3][3],
+                                    double trans[MAX_SYMOPS][3],
+                                    const float cell[3][3],
+                                    char *err, size_t err_cap) {
+    /* 1. Identity must be present. */
+    int id_rot[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+    double zero[3] = {0};
+    int found_id = 0;
+    for (int i = 0; i < nops; i++) {
+        if (rot_eq(rot[i], id_rot) && trans_eq_mod1(trans[i], zero)) {
+            found_id = 1; break;
+        }
+    }
+    if (!found_id) {
+        snprintf(err, err_cap, "no identity operation in symmetry group");
+        return -1;
+    }
+
+    /* 2. Metric preservation: each rotation must satisfy R^T * G * R = G.
+          Tolerance is component-local (scale-aware), not a global gmax.
+          An anisotropic cell should not admit incompatible swaps while
+          float-rounded valid cells pass. */
+    double G[3][3];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            G[i][j] = cell[i][0]*(double)cell[j][0] +
+                      cell[i][1]*(double)cell[j][1] +
+                      cell[i][2]*(double)cell[j][2];
+
+    for (int m = 0; m < nops; m++) {
+        double RG[3][3], RTGR[3][3];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                RG[i][j] = rot[m][0][i]*G[0][j] +
+                           rot[m][1][i]*G[1][j] +
+                           rot[m][2][i]*G[2][j];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                RTGR[i][j] = RG[i][0]*rot[m][0][j] +
+                             RG[i][1]*rot[m][1][j] +
+                             RG[i][2]*rot[m][2][j];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) {
+                double scale = sqrt(fabs(G[i][i] * G[j][j]));
+                double mtol = 8.0 * FLT_EPSILON * scale;
+                if (fabs(RTGR[i][j] - G[i][j]) > mtol) {
+                    snprintf(err, err_cap, "operation does not preserve cell metric");
+                    return -1;
+                }
+            }
+    }
+
+    /* 3. Closure under composition: every ordered pair product
+          must match a declared operation (rotation + translation mod 1). */
+    for (int i = 0; i < nops; i++) {
+        for (int j = 0; j < nops; j++) {
+            int r_comp[3][3];
+            double t_comp[3];
+            seitz_compose(rot[j], trans[j],
+                          rot[i], trans[i],
+                          r_comp, t_comp);
+            int found = 0;
+            for (int k = 0; k < nops; k++) {
+                if (rot_eq(r_comp, rot[k]) &&
+                    trans_eq_mod1(t_comp, trans[k])) {
+                    found = 1; break;
+                }
+            }
+            if (!found) {
+                snprintf(err, err_cap, "symmetry group not closed under composition");
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* ---------- CIF token-stream reader ---------- */
+
+/* CIF tokenizer context — parse-local, no global state. */
+typedef struct {
+    char unread[2048];
+    int have_unread;
+    int unread_quoted;  /* quoted status of the unread token */
+    int unread_line;    /* line number of the unread token */
+    int line;           /* updated by each token read */
+    int quoted;         /* whether last-read token was quoted */
+    int error;          /* non-zero if last read encountered a fatal error */
+} CIFTokCtx;
+
+static int cif_read_token(CIFTokCtx *ctx, FILE *fp, char *buf, size_t cap) {
+    int c;
+    ctx->error = 0;
+    ctx->quoted = 0;
+
+    if (ctx->have_unread) {
+        strncpy(buf, ctx->unread, cap - 1); buf[cap - 1] = '\0';
+        ctx->quoted = ctx->unread_quoted;
+        ctx->line = ctx->unread_line;
+        ctx->have_unread = 0;
+        return 1;
+    }
+
+top:
+    c = fgetc(fp);
+    {
+        int col = 1;
+        while (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            if (c == '\n') { ctx->line++; col = 1; }
+            else if (c == ' ' || c == '\t') { col++; }
+            c = fgetc(fp);
+        }
+        if (c == EOF) return 0;
+        if (c == '#') {
+            while ((c = fgetc(fp)) != EOF && c != '\n');
+            if (c == '\n') ctx->line++;
+            goto top;
+        }
+        if (c == ';' && col == 1) {
+            ctx->quoted = 1;
+            int i = 0;
+            int eol = 1;
+            /* Capture content after opening ';' as the first line of text.
+               Normalize CRLF to LF: \r\n is a single line ending, bare \r is
+               content. */
+            while ((c = fgetc(fp)) != EOF && c != '\n') {
+                if (c == '\r') {
+                    int p = fgetc(fp);
+                    if (p == '\n') { c = '\n'; break; }
+                    if (p != EOF) ungetc(p, fp);
+                }
+                if (i >= (int)cap - 1) { ctx->error = 1; buf[0] = '\0'; return 0; }
+                buf[i++] = c;
+                eol = 0;
+            }
+            if (c == EOF) { ctx->error = 1; buf[0] = '\0'; return 0; }
+            if (c == '\n') { ctx->line++; eol = 1; }
+            /* Read subsequent lines until ';' in column 1. */
+            while ((c = fgetc(fp)) != EOF) {
+                if (c == '\r') {
+                    int p = fgetc(fp);
+                    if (p == '\n') c = '\n';
+                    else { if (p != EOF) ungetc(p, fp); }
+                }
+                if (eol && c == ';') break;
+                if (c == '\n') {
+                    ctx->line++;
+                    int next = fgetc(fp);
+                    if (next == '\r') {
+                        int nn = fgetc(fp);
+                        if (nn == '\n') next = '\n';
+                        else { if (nn != EOF) ungetc(nn, fp); }
+                    }
+                    if (next == ';') break;
+                    if (next != EOF) {
+                        if (next == '\n') { /* blank line: keep the newline */
+                            ctx->line++;
+                            if (i >= (int)cap - 1) { ctx->error = 1; buf[0] = '\0'; return 0; }
+                            buf[i++] = '\n';
+                            eol = 1;
+                            continue;
+                        }
+                        ungetc(next, fp);
+                    }
+                    if (i >= (int)cap - 1) { ctx->error = 1; buf[0] = '\0'; return 0; }
+                    buf[i++] = '\n';
+                    eol = 1;
+                } else {
+                    if (i >= (int)cap - 1) { ctx->error = 1; buf[0] = '\0'; return 0; }
+                    buf[i++] = c;
+                    eol = 0;
+                }
+            }
+            if (c == EOF) { ctx->error = 1; buf[0] = '\0'; return 0; }
+            buf[i] = '\0';
+            return 1;
+        }
+    }
+
+    int i = 0;
+
+    /* single/double-quoted.
+       The closing quote is recognized only when followed by whitespace
+       or EOF. A '#' immediately after the quote is NOT a legal
+       closing/comment boundary — CIF comments require a whitespace/token
+       boundary before '#' — so it is preserved as literal continuation on
+       the embedded-quote path. A closing quote followed by whitespace then
+       '#' remains a valid token followed by a comment. */
+    if (c == '\'' || c == '"') {
+        ctx->quoted = 1;
+        char q = c;
+        int escaped = 0;
+        while ((c = fgetc(fp)) != EOF) {
+            if (c == q) {
+                int peek = fgetc(fp);
+                if (peek == EOF || peek == ' ' || peek == '\t' || peek == '\n' || peek == '\r') {
+                    if (peek == '\n') {
+                        ctx->line++;
+                    } else if (peek != EOF) {
+                        ungetc(peek, fp);
+                    }
+                    break;
+                }
+                /* Quote char inside the string: emit it and continue. */
+                if (i >= (int)cap - 1) { ctx->error = 1; buf[0] = '\0'; return 0; }
+                buf[i++] = (char)q;
+                if (peek != EOF) ungetc(peek, fp);
+                continue;
+            }
+            if (c == '\n') { ctx->line++; ctx->error = 1; buf[0] = '\0'; return 0; }
+            if (i >= (int)cap - 1) { ctx->error = 1; buf[0] = '\0'; return 0; }
+            buf[i++] = c;
+        }
+        if (c == EOF) { ctx->error = 1; buf[0] = '\0'; return 0; }
+        buf[i] = '\0';
+        return 1;
+    }
+
+    /* unquoted: read until whitespace, EOF, or inline comment.
+       '#' at token boundary (i==0) starts a comment; inside a token
+       it is ordinary data. */
+    while (c != EOF && c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+        if (c == '#') {
+            if (i == 0) break;
+            if (i >= (int)cap - 1) { ctx->error = 1; buf[0] = '\0'; return 0; }
+            buf[i++] = c;
+            c = fgetc(fp);
+            continue;
+        }
+        if (i >= (int)cap - 1) { ctx->error = 1; buf[0] = '\0'; return 0; }
+        buf[i++] = c;
+        c = fgetc(fp);
+    }
+    buf[i] = '\0';
+    if (c == '#') {
+        while ((c = fgetc(fp)) != EOF && c != '\n');
+        if (c == '\n') ctx->line++;
+    } else if (c == '\n') {
+        ctx->line++;
+    } else if (c != EOF) {
+        ungetc(c, fp);
+    }
+    return 1;
+}
+
+static void cif_unread(CIFTokCtx *ctx, const char *tok) {
+    strncpy(ctx->unread, tok, sizeof(ctx->unread) - 1);
+    ctx->unread[sizeof(ctx->unread) - 1] = '\0';
+    ctx->have_unread = 1;
+    ctx->unread_quoted = ctx->quoted;
+    ctx->unread_line = ctx->line;
+}
+
+static int is_cell_tag(const char *tag) {
+    return strcasecmp(tag, "_cell_length_a") == 0 ||
+           strcasecmp(tag, "_cell_length_b") == 0 ||
+           strcasecmp(tag, "_cell_length_c") == 0 ||
+           strcasecmp(tag, "_cell_angle_alpha") == 0 ||
+           strcasecmp(tag, "_cell_angle_beta") == 0 ||
+           strcasecmp(tag, "_cell_angle_gamma") == 0;
+}
+
+/* Predefined symmetrically expected defaults for cell angles (used only when
+   all six cell fields are NOT present, so completeness is never claimed). */
+#define CIF_DEFAULT_ANGLE 90.0
+
+/* ---------- CIF parser ---------- */
+
 MolEnvScene* parse_cif(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
 
+    /* Cell parameters with presence tracking. */
     double len_a = 0, len_b = 0, len_c = 0;
-    double al_deg = 90.0, be_deg = 90.0, ga_deg = 90.0;
-    int in_block = 0;
+    double al_deg = CIF_DEFAULT_ANGLE, be_deg = CIF_DEFAULT_ANGLE, ga_deg = CIF_DEFAULT_ANGLE;
+    int cell_present[6] = {0};
 
     /* Working atom buffer. We record a per-atom `frac` flag and the raw
        (fractional) coordinates, then convert to Cartesian in a second pass
        once the cell parameters are known — the cell tags can legally appear
        before or after the atom loop. */
-    typedef struct { float coord[3]; int atomic_number; char label[8]; int frac; } Catom;
+    typedef struct { double coord[3]; int atomic_number; char *label; int frac; } Catom;
     Catom *at = NULL;
     int natoms = 0, acap = 0;
     char title[256] = {0};
-
-    char line[2048], held[2048];
-    int have_held = 0, ln = 0;
 
     enum { NORM, LOOP_HDRS, LOOP_DATA };
     int state = NORM;
@@ -1705,196 +2431,785 @@ MolEnvScene* parse_cif(const char *path) {
     int ncols = 0;
     int atom_loop = 0;
 
+    /* Symmetry operation tracking. */
+    int symop_rot[MAX_SYMOPS][3][3];
+    double symop_trans[MAX_SYMOPS][3];
+    int nops = 0, symop_loop = 0, col_symop = -1, have_symops = 0;
+    int symop_missing = 0;
+
+    /* Token accumulator for loop data rows. row_quoted parallels row_toks,
+       recording the quoted status of each accumulated token (quoted tokens
+       are never control words, and their `.`/`?` content is literal data). */
+    char *row_toks[64];
+    int row_quoted[64];
+    int row_used = 0;
+    int in_block = 0;
+    int block_started = 0;
+
+    char tok_buf[2048];
+    CIFTokCtx ctx = {0};
     while (1) {
-        if (have_held) { strcpy(line, held); have_held = 0; }
-        else if (!fgets(line, sizeof(line), fp)) break;
-        ln++;
-
-        size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t' ||
-                           line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-
-        if (*p == '#') continue;
-        if (*p == '\0') { if (state == LOOP_DATA) state = NORM; continue; }
-
-        if (state == NORM) {
-            if (strncmp(p, "data_", 5) == 0) {
-                if (!in_block) {
-                    in_block = 1;
-                    snprintf(title, sizeof(title), "%s", p + 5);
-                } else {
-                    break; /* stop after the first data_ block */
-                }
-                continue;
+        if (!cif_read_token(&ctx, fp, tok_buf, sizeof(tok_buf))) {
+            if (ctx.error) {
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); fclose(fp); set_error(path, ctx.line, "unterminated CIF token"); return NULL;
             }
-            if (!in_block) continue;               /* skip preamble */
-            if (strncmp(p, "loop_", 5) == 0) {
-                state = LOOP_HDRS;
-                col_label = col_type = -1;
-                col_fx = col_fy = col_fz = -1;
-                col_cx = col_cy = col_cz = -1;
-                ncols = 0;
-                atom_loop = 0;
-                continue;
+            /* Check for partial row on EOF. */
+            if (state == LOOP_DATA && row_used > 0) {
+                for (int k = 0; k < row_used; k++) free(row_toks[k]);
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); fclose(fp);
+                set_error(path, ctx.line, "partial CIF loop data row"); return NULL;
             }
-            /* single tag value: _tag value */
-            if (*p == '_') {
-                char *toks[4];
-                int nt = split_tokens(p, toks, 4);
-                if (nt >= 2) {
-                    char *tag = toks[0];
-                    double v = cif_float(toks[1]);
-                    /* Resolve the cell tag (if any) first, validate, then assign —
-                       so an invalid length/angle is never stored. cif_build_cell
-                       casts to float, so use in_float_range to catch both NaN/Inf and
-                       finite doubles whose magnitude exceeds FLT_MAX (which would
-                       overflow to ±inf on the cast, poisoning the whole lattice). */
-                    int is_cell = 0;
-                    double *dst = NULL;
-                    if (strcmp(tag, "_cell_length_a") == 0)        { is_cell = 1; dst = &len_a; }
-                    else if (strcmp(tag, "_cell_length_b") == 0)   { is_cell = 1; dst = &len_b; }
-                    else if (strcmp(tag, "_cell_length_c") == 0)   { is_cell = 1; dst = &len_c; }
-                    else if (strcmp(tag, "_cell_angle_alpha") == 0) { is_cell = 1; dst = &al_deg; }
-                    else if (strcmp(tag, "_cell_angle_beta") == 0)  { is_cell = 1; dst = &be_deg; }
-                    else if (strcmp(tag, "_cell_angle_gamma") == 0) { is_cell = 1; dst = &ga_deg; }
-                    if (is_cell && !in_float_range(v)) {
-                        free(at); fclose(fp); set_error(path, ln, "non-finite cell parameter"); return NULL;
+            break;
+        }
+        char *tok = tok_buf;
+
+        if (state == LOOP_DATA) {
+            int is_break = (!ctx.quoted &&
+                            (tok[0] == '_' ||
+                             strcasecmp(tok, "loop_") == 0 ||
+                             strncasecmp(tok, "data_", 5) == 0 ||
+                             strcasecmp(tok, "stop_") == 0 ||
+                             strncasecmp(tok, "save_", 5) == 0 ||
+                             strcasecmp(tok, "global_") == 0));
+
+            if (is_break && row_used == 0) {
+                state = NORM; cif_unread(&ctx, tok); continue;
+            }
+            if (is_break && row_used > 0) {
+                for (int k = 0; k < row_used; k++) free(row_toks[k]);
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); fclose(fp);
+                set_error(path, ctx.line, "partial CIF loop data row"); return NULL;
+            }
+
+            row_toks[row_used++] = strdup(tok);
+            if (!row_toks[row_used - 1]) {
+                for (int k = 0; k < row_used - 1; k++) free(row_toks[k]);
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); fclose(fp); set_error(path, ctx.line, "out of memory"); return NULL;
+            }
+            row_quoted[row_used - 1] = ctx.quoted;
+
+            if (row_used == ncols) {
+                if (symop_loop && col_symop >= 0 && col_symop < ncols) {
+                    char *val = row_toks[col_symop];
+                    if (!row_quoted[col_symop] && (strcmp(val, ".") == 0 || strcmp(val, "?") == 0)) {
+                        symop_missing = 1;
+                    } else if (nops >= MAX_SYMOPS) {
+                        for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "too many symmetry operations; exceeded max 192"); return NULL;
+                    } else {
+                        char *valp = val;
+                        size_t vl = strlen(valp);
+                        while (vl > 0 && (valp[vl-1] == ' ' || valp[vl-1] == '\t')) valp[--vl] = '\0';
+                        char op_err[128];
+                        if (parse_symop(valp, symop_rot[nops], symop_trans[nops], op_err, sizeof(op_err)) < 0) {
+                            for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                            for (int k = 0; k < natoms; k++) free(at[k].label);
+                            free(at); fclose(fp); set_error(path, ctx.line, op_err); return NULL;
+                        }
+                        nops++; have_symops = 1;
                     }
-                    if (dst) *dst = v;
                 }
-                continue;
+
+                if (atom_loop && (col_fx >= 0 || col_cx >= 0)) {
+                    int is_frac = (col_fx >= 0);
+                    int cx = is_frac ? col_fx : col_cx;
+                    int cy = is_frac ? col_fy : col_cy;
+                    int cz = is_frac ? col_fz : col_cz;
+                    if (cx >= 0 && cy >= 0 && cz >= 0 && cx < ncols && cy < ncols && cz < ncols) {
+                        double fx, fy, fz;
+                        if (cif_strict_float(row_toks[cx], &fx) < 0 ||
+                            cif_strict_float(row_toks[cy], &fy) < 0 ||
+                            cif_strict_float(row_toks[cz], &fz) < 0) {
+                            for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                            for (int k = 0; k < natoms; k++) free(at[k].label);
+                            free(at); fclose(fp);
+                            set_error(path, ctx.line, "malformed or non-finite atom coordinate"); return NULL;
+                        }
+                        if (!in_float_range(fx) || !in_float_range(fy) || !in_float_range(fz)) {
+                            for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                            for (int k = 0; k < natoms; k++) free(at[k].label);
+                            free(at); fclose(fp);
+                            set_error(path, ctx.line, "non-finite atom coordinate"); return NULL;
+                        }
+
+                        const char *lbl = (col_label >= 0 && col_label < ncols) ? row_toks[col_label] : NULL;
+                        const char *ts_val = (col_type >= 0 && col_type < ncols) ? row_toks[col_type] : NULL;
+                        int type_present = (ts_val && (row_quoted[col_type] || (strcmp(ts_val, ".") != 0 && strcmp(ts_val, "?") != 0)));
+                        char el[8] = {0};
+                        int z = 0;
+                        if (type_present)
+                            z = cif_resolve_z(ts_val, el);
+                        if (z == 0 && !type_present && lbl)
+                            z = cif_resolve_z(lbl, el);
+
+                        if (natoms >= 500000) {
+                            for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                            for (int k = 0; k < natoms; k++) free(at[k].label);
+                            free(at); fclose(fp);
+                            set_error(path, ctx.line, "too many CIF atoms"); return NULL;
+                        }
+                        if (natoms >= acap) {
+                            acap = acap ? acap * 2 : 16;
+                            Catom *t = realloc(at, acap * sizeof(Catom));
+                            if (!t) {
+                                for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                                for (int k = 0; k < natoms; k++) free(at[k].label);
+                                free(at); fclose(fp);
+                                set_error(path, ctx.line, "out of memory"); return NULL;
+                            }
+                            at = t;
+                        }
+                        Catom *a = &at[natoms];
+                        a->coord[0] = fx;
+                        a->coord[1] = fy;
+                        a->coord[2] = fz;
+                        a->frac = is_frac;
+                        a->atomic_number = z;
+                        if (z != 0 && el[0]) {
+                            a->label = strdup(el);
+                        } else if (type_present) {
+                            a->label = strdup(ts_val);
+                        } else if (lbl) {
+                            a->label = strdup(lbl);
+                        } else {
+                            a->label = strdup("");
+                        }
+                        if (!a->label) {
+                            for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                            for (int k = 0; k < natoms; k++) free(at[k].label);
+                            free(at); fclose(fp);
+                            set_error(path, ctx.line, "out of memory"); return NULL;
+                        }
+                        natoms++;
+                    }
+                }
+
+                for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                row_used = 0;
             }
             continue;
         }
 
-        if (state == LOOP_HDRS) {
-            if (*p == '_') {
-                ncols++;
-                if (strcmp(p, "_atom_site_label") == 0)            col_label = ncols - 1;
-                else if (strcmp(p, "_atom_site_type_symbol") == 0) col_type = ncols - 1;
-                else if (strcmp(p, "_atom_site_fract_x") == 0)     col_fx = ncols - 1;
-                else if (strcmp(p, "_atom_site_fract_y") == 0)     col_fy = ncols - 1;
-                else if (strcmp(p, "_atom_site_fract_z") == 0)     col_fz = ncols - 1;
-                else if (strcmp(p, "_atom_site_Cartn_x") == 0)     col_cx = ncols - 1;
-                else if (strcmp(p, "_atom_site_Cartn_y") == 0)     col_cy = ncols - 1;
-                else if (strcmp(p, "_atom_site_Cartn_z") == 0)     col_cz = ncols - 1;
-                continue;
+        /* NORM or LOOP_HDRS handling. */
+
+        /* First data block: capture title and start reading. Subsequent data_
+           blocks terminate the first block. */
+        if (ctx.quoted) { /* quoted tokens are never controls: skip */ }
+        else if (strncasecmp(tok, "data_", 5) == 0) {
+            if (state == LOOP_HDRS) state = NORM;
+            if (!block_started) {
+                in_block = 1;
+                block_started = 1;
+                snprintf(title, sizeof(title), "%s", tok + 5);
+            } else {
+                /* A second data_ block (e.g. after a global_ scope) must not
+                   re-enter and contaminate the already-selected first block. */
+                break;
             }
-            /* first non-header line -> this is the start of loop data. */
-            atom_loop = (col_label >= 0 || col_type >= 0) &&
-                        ((col_fx >= 0 && col_fy >= 0 && col_fz >= 0) ||
-                         (col_cx >= 0 && col_cy >= 0 && col_cz >= 0));
-            state = LOOP_DATA;
-            /* fall through into LOOP_DATA handling for this same line */
+            continue;
+        }
+        else if (strcasecmp(tok, "global_") == 0) {
+            if (state == LOOP_HDRS) state = NORM;
+            if (in_block) {
+                /* global_ after the selected first data block has begun: leave
+                   that block and enter an ignored global scope so subsequent
+                   global tags/loops cannot contaminate the parsed structure or
+                   its completeness. in_block=0 routes the rest through the
+                   !in_block skip guard below. */
+                in_block = 0;
+            }
+            /* global_ before the first data_ block must not consume it.
+               Skip global_ content without setting in_block. */
+            continue;
         }
 
-        if (state == LOOP_DATA) {
-            char *toks[64];
-            char saved[2048];
-            strcpy(saved, line);                         /* preserve un-tokenized line for redispatch */
-            int nt = split_tokens(p, toks, 64);
-            if (nt != ncols || ncols == 0 ||
-                (nt > 0 && (toks[0][0] == '_' || strcmp(toks[0], "loop_") == 0))) {
-                /* loop ended: token count mismatch, or a new tag/loop_ boundary (which may
-                   coincidentally have the same column count) -> re-dispatch in NORM. */
-                state = NORM;
-                strcpy(held, saved); have_held = 1;      /* re-dispatch the full line in NORM */
+        /* stop_ terminates only the current loop; data block stays active. */
+        if (!ctx.quoted && strcasecmp(tok, "stop_") == 0) {
+            if (state == LOOP_HDRS) state = NORM;
+            continue;
+        }
+        /* save_<name> enters a nested save frame; closing save_ returns to
+           the parent data block rather than discarding it. Skip through the
+           entire save frame. */
+        if (!ctx.quoted && strncasecmp(tok, "save_", 5) == 0) {
+            if (state == LOOP_HDRS) state = NORM;
+            if (strcasecmp(tok, "save_") != 0) {
+                /* save_<name>: skip all content until matching save_ */
+                char tmp[2048];
+                int depth = 1;
+                while (depth > 0 && cif_read_token(&ctx, fp, tmp, sizeof(tmp))) {
+                    if (ctx.quoted) continue;
+                    if (strncasecmp(tmp, "save_", 5) == 0) {
+                        if (strcasecmp(tmp, "save_") == 0) depth--;
+                        else depth++;
+                    }
+                }
+                if (ctx.error || depth > 0) {
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp);
+                    set_error(path, ctx.line, "unterminated save frame"); return NULL;
+                }
+            } /* else bare save_ closes the current save frame; stay in_block */
+            continue;
+        }
+
+        /* Outside a data block: skip everything. */
+        if (!in_block) continue;
+
+        if (state == NORM) {
+            if (!ctx.quoted && strcasecmp(tok, "loop_") == 0) {
+                state = LOOP_HDRS;
+                col_label = col_type = -1;
+                col_fx = col_fy = col_fz = -1;
+                col_cx = col_cy = col_cz = -1;
+                col_symop = -1; symop_loop = 0;
+                ncols = 0;
+                atom_loop = 0;
                 continue;
             }
-            if (atom_loop && (col_fx >= 0 || col_cx >= 0)) {
-                int is_frac = (col_fx >= 0);
-                int cx = is_frac ? col_fx : col_cx;
-                int cy = is_frac ? col_fy : col_cy;
-                int cz = is_frac ? col_fz : col_cz;
-                if (cx >= 0 && cy >= 0 && cz >= 0 && cx < nt && cy < nt && cz < nt) {
-                    double fx = cif_float(toks[cx]);
-                    double fy = cif_float(toks[cy]);
-                    double fz = cif_float(toks[cz]);
-                    if (!in_float_range(fx) || !in_float_range(fy) || !in_float_range(fz)) {
-                        free(at); fclose(fp); set_error(path, ln, "non-finite atom coordinate"); return NULL;
+
+            if (tok[0] == '_') {
+                char *tag = tok;
+                {
+                    int p = fgetc(fp);
+                    if (p == EOF) {
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "missing value after single tag"); return NULL;
                     }
-                    const char *lbl = NULL;
-                    if (col_label >= 0 && col_label < nt) lbl = toks[col_label];
-                    char el[8] = {0};
-                    int z = lbl ? cif_resolve_z(lbl, el) : 0;
-                    if (z == 0 && col_type >= 0 && col_type < nt)
-                        z = cif_resolve_z(toks[col_type], el);
-                    if (natoms >= 500000) {
-                        free(at); fclose(fp); set_error(path, ln, "too many CIF atoms"); return NULL;
-                    }
-                    if (natoms >= acap) {
-                        acap = acap ? acap * 2 : 16;
-                        Catom *t = realloc(at, acap * sizeof(Catom));
-                        if (!t) { free(at); fclose(fp); set_error(path, ln, "out of memory"); return NULL; }
-                        at = t;
-                    }
-                    Catom *a = &at[natoms];
-                    a->coord[0] = (float)fx;
-                    a->coord[1] = (float)fy;
-                    a->coord[2] = (float)fz;
-                    a->frac = is_frac;
-                    a->atomic_number = z;
-                    snprintf(a->label, sizeof(a->label), "%s", el[0] ? el : (lbl ? lbl : ""));
-                    natoms++;
+                    /* Value may follow on current or next line */
+                    if (p != EOF) ungetc(p, fp);
                 }
+                char val_buf[2048];
+                if (!cif_read_token(&ctx, fp, val_buf, sizeof(val_buf))) {
+                    if (ctx.error) {
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "unterminated CIF token"); return NULL;
+                    }
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp);
+                    set_error(path, ctx.line, "missing value after single tag"); return NULL;
+                }
+                char *val = val_buf;
+                int val_quoted = ctx.quoted;
+
+                /* An unquoted value that is itself a reserved/control token
+                   (data_*, loop_, stop_, save_/save_name, global_, or another
+                   data-name) is not a literal value — the tag is missing its
+                   value. Unread it so it is recognized as the next structural
+                   element and report the missing value. Quoted strings equal to
+                   controls remain valid literal values. */
+                if (!val_quoted &&
+                    (val[0] == '_' ||
+                     strcasecmp(val, "loop_") == 0 ||
+                     strncasecmp(val, "data_", 5) == 0 ||
+                     strcasecmp(val, "stop_") == 0 ||
+                     strncasecmp(val, "save_", 5) == 0 ||
+                     strcasecmp(val, "global_") == 0)) {
+                    cif_unread(&ctx, val);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp);
+                    set_error(path, ctx.line, "missing value after single tag"); return NULL;
+                }
+
+                char peek_buf[2048];
+                int have_peek = cif_read_token(&ctx, fp, peek_buf, sizeof(peek_buf));
+                if (ctx.error) {
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp);
+                    set_error(path, ctx.line, "unterminated CIF token"); return NULL;
+                }
+                if (have_peek) {
+                    int peek_break = (!ctx.quoted &&
+                                      (peek_buf[0] == '_' ||
+                                       strcasecmp(peek_buf, "loop_") == 0 ||
+                                       strncasecmp(peek_buf, "data_", 5) == 0 ||
+                                       strcasecmp(peek_buf, "stop_") == 0 ||
+                                       strncasecmp(peek_buf, "save_", 5) == 0 ||
+                                        strcasecmp(peek_buf, "global_") == 0));
+                    if (peek_break) {
+                        cif_unread(&ctx, peek_buf);
+                    } else if (is_symop_tag(tag) || is_cell_tag(tag)) {
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "surplus data after single tag value"); return NULL;
+                    } else {
+                        cif_unread(&ctx, peek_buf);
+                    }
+                }
+
+                int is_cell = 0;
+                int cell_idx = -1;
+                double *dst = NULL;
+                if (is_cell_tag(tag)) {
+                    is_cell = 1;
+                    if (strcasecmp(tag, "_cell_length_a") == 0)        { cell_idx = 0; dst = &len_a; }
+                    else if (strcasecmp(tag, "_cell_length_b") == 0)   { cell_idx = 1; dst = &len_b; }
+                    else if (strcasecmp(tag, "_cell_length_c") == 0)   { cell_idx = 2; dst = &len_c; }
+                    else if (strcasecmp(tag, "_cell_angle_alpha") == 0) { cell_idx = 3; dst = &al_deg; }
+                    else if (strcasecmp(tag, "_cell_angle_beta") == 0)  { cell_idx = 4; dst = &be_deg; }
+                    else if (strcasecmp(tag, "_cell_angle_gamma") == 0) { cell_idx = 5; dst = &ga_deg; }
+                } else if (is_symop_tag(tag)) {
+                    if (!val_quoted && (strcmp(val, ".") == 0 || strcmp(val, "?") == 0)) {
+                        symop_missing = 1;
+                    } else if (nops >= MAX_SYMOPS) {
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "too many symmetry operations; exceeded max 192"); return NULL;
+                    } else {
+                        char *vp = val;
+                        size_t vl = strlen(vp);
+                        while (vl > 0 && (vp[vl-1] == ' ' || vp[vl-1] == '\t')) vp[--vl] = '\0';
+                        char op_err[128];
+                        if (parse_symop(vp, symop_rot[nops], symop_trans[nops], op_err, sizeof(op_err)) < 0) {
+                            for (int k = 0; k < natoms; k++) free(at[k].label);
+                            free(at); fclose(fp); set_error(path, ctx.line, op_err); return NULL;
+                        }
+                        nops++; have_symops = 1;
+                    }
+                }
+                if (is_cell) {
+                    double v;
+                    if (cif_strict_float(val, &v) < 0) {
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "malformed or non-finite cell parameter"); return NULL;
+                    }
+                    if (!in_float_range(v)) {
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "non-finite cell parameter"); return NULL;
+                    }
+                    if (cell_idx >= 3 && (v <= 0 || v >= 180)) {
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "cell angle out of (0,180) range"); return NULL;
+                    }
+                    if (dst) {
+                        *dst = v;
+                        if (cell_idx >= 0) cell_present[cell_idx] = 1;
+                    }
+                }
+                continue;
+            }
+
+            /* Anything else in NORM state is a value without a tag — skip. */
+            continue;
+        }
+
+        /* state == LOOP_HDRS */
+        if (!ctx.quoted && tok[0] == '_') {
+            if (ncols >= 64) {
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); fclose(fp);
+                set_error(path, ctx.line, "too many columns in CIF loop (max 64)"); return NULL;
+            }
+            ncols++;
+            if (strcasecmp(tok, "_atom_site_label") == 0)            col_label = ncols - 1;
+            else if (strcasecmp(tok, "_atom_site_type_symbol") == 0) col_type = ncols - 1;
+            else if (strcasecmp(tok, "_atom_site_fract_x") == 0)     col_fx = ncols - 1;
+            else if (strcasecmp(tok, "_atom_site_fract_y") == 0)     col_fy = ncols - 1;
+            else if (strcasecmp(tok, "_atom_site_fract_z") == 0)     col_fz = ncols - 1;
+            else if (strcasecmp(tok, "_atom_site_Cartn_x") == 0)     col_cx = ncols - 1;
+            else if (strcasecmp(tok, "_atom_site_Cartn_y") == 0)     col_cy = ncols - 1;
+            else if (strcasecmp(tok, "_atom_site_Cartn_z") == 0)     col_cz = ncols - 1;
+            else if (is_symop_tag(tok)) { col_symop = ncols - 1; symop_loop = 1; have_symops = 1; }
+            continue;
+        }
+
+        if (ncols == 0) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); fclose(fp);
+            set_error(path, ctx.line, "loop_ with no data-name headers"); return NULL;
+        }
+        atom_loop = (col_label >= 0 || col_type >= 0) &&
+                    ((col_fx >= 0 && col_fy >= 0 && col_fz >= 0) ||
+                     (col_cx >= 0 && col_cy >= 0 && col_cz >= 0));
+        state = LOOP_DATA;
+        row_used = 0;
+        {
+            int is_break = (!ctx.quoted &&
+                            (tok[0] == '_' ||
+                             strcasecmp(tok, "loop_") == 0 ||
+                             strncasecmp(tok, "data_", 5) == 0 ||
+                             strcasecmp(tok, "stop_") == 0 ||
+                             strncasecmp(tok, "save_", 5) == 0 ||
+                             strcasecmp(tok, "global_") == 0));
+            if (is_break) {
+                state = NORM; cif_unread(&ctx, tok); continue;
+            }
+            row_toks[0] = strdup(tok);
+            if (!row_toks[0]) {
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); fclose(fp); set_error(path, ctx.line, "out of memory"); return NULL;
+            }
+            row_quoted[0] = ctx.quoted;
+            row_used = 1;
+            if (ncols == 1) {
+                goto process_row;
             }
         }
+        continue;
+
+process_row:
+        if (row_used != ncols) {
+            for (int k = 0; k < row_used; k++) free(row_toks[k]);
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); fclose(fp);
+            set_error(path, ctx.line, "partial CIF loop data row"); return NULL;
+        }
+
+        if (symop_loop && col_symop >= 0 && col_symop < ncols) {
+            char *val = row_toks[col_symop];
+            if (!row_quoted[col_symop] && (strcmp(val, ".") == 0 || strcmp(val, "?") == 0)) {
+                symop_missing = 1;
+            } else if (nops >= MAX_SYMOPS) {
+                for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); fclose(fp);
+                set_error(path, ctx.line, "too many symmetry operations; exceeded max 192"); return NULL;
+            } else {
+                char *vp = val;
+                size_t vl = strlen(vp);
+                while (vl > 0 && (vp[vl-1] == ' ' || vp[vl-1] == '\t')) vp[--vl] = '\0';
+                char op_err[128];
+                if (parse_symop(vp, symop_rot[nops], symop_trans[nops], op_err, sizeof(op_err)) < 0) {
+                    for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp); set_error(path, ctx.line, op_err); return NULL;
+                }
+                nops++; have_symops = 1;
+            }
+        }
+
+        if (atom_loop && (col_fx >= 0 || col_cx >= 0)) {
+            int is_frac = (col_fx >= 0);
+            int cx = is_frac ? col_fx : col_cx;
+            int cy = is_frac ? col_fy : col_cy;
+            int cz = is_frac ? col_fz : col_cz;
+            if (cx >= 0 && cy >= 0 && cz >= 0 && cx < ncols && cy < ncols && cz < ncols) {
+                double fx, fy, fz;
+                if (cif_strict_float(row_toks[cx], &fx) < 0 ||
+                    cif_strict_float(row_toks[cy], &fy) < 0 ||
+                    cif_strict_float(row_toks[cz], &fz) < 0) {
+                    for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp);
+                    set_error(path, ctx.line, "malformed or non-finite atom coordinate"); return NULL;
+                }
+                if (!in_float_range(fx) || !in_float_range(fy) || !in_float_range(fz)) {
+                    for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp);
+                    set_error(path, ctx.line, "non-finite atom coordinate"); return NULL;
+                }
+
+                const char *lbl = (col_label >= 0 && col_label < ncols) ? row_toks[col_label] : NULL;
+                const char *ts_val = (col_type >= 0 && col_type < ncols) ? row_toks[col_type] : NULL;
+                int type_present = (ts_val && (row_quoted[col_type] || (strcmp(ts_val, ".") != 0 && strcmp(ts_val, "?") != 0)));
+                char el[8] = {0};
+                int z = 0;
+                if (type_present)
+                    z = cif_resolve_z(ts_val, el);
+                if (z == 0 && !type_present && lbl)
+                    z = cif_resolve_z(lbl, el);
+
+                if (natoms >= 500000) {
+                    for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp);
+                    set_error(path, ctx.line, "too many CIF atoms"); return NULL;
+                }
+                if (natoms >= acap) {
+                    acap = acap ? acap * 2 : 16;
+                    Catom *t = realloc(at, acap * sizeof(Catom));
+                    if (!t) {
+                        for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                        for (int k = 0; k < natoms; k++) free(at[k].label);
+                        free(at); fclose(fp);
+                        set_error(path, ctx.line, "out of memory"); return NULL;
+                    }
+                    at = t;
+                }
+                Catom *a = &at[natoms];
+                a->coord[0] = fx;
+                a->coord[1] = fy;
+                a->coord[2] = fz;
+                a->frac = is_frac;
+                a->atomic_number = z;
+                if (z != 0 && el[0]) {
+                    a->label = strdup(el);
+                } else if (type_present) {
+                    a->label = strdup(ts_val);
+                } else if (lbl) {
+                    a->label = strdup(lbl);
+                } else {
+                    a->label = strdup("");
+                }
+                if (!a->label) {
+                    for (int k = 0; k < ncols; k++) free(row_toks[k]);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); fclose(fp);
+                    set_error(path, ctx.line, "out of memory"); return NULL;
+                }
+                natoms++;
+            }
+        }
+
+        for (int k = 0; k < ncols; k++) free(row_toks[k]);
+        row_used = 0;
+        continue;
     }
     fclose(fp);
 
     if (natoms == 0) {
+        for (int k = 0; k < natoms; k++) free(at[k].label);
         free(at);
         set_error(path, 0, "no atom sites found");
         return NULL;
     }
 
+    int all_six = cell_present[0] && cell_present[1] && cell_present[2] &&
+                  cell_present[3] && cell_present[4] && cell_present[5];
     int saw_cell = (len_a > 0 && len_b > 0 && len_c > 0);
     if (!saw_cell) {
         for (int i = 0; i < natoms; i++) {
             if (at[i].frac) {
-                free(at); set_error(path, 0, "fractional CIF coordinates require a cell"); return NULL;
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at);
+                set_error(path, 0, "fractional CIF coordinates require a cell"); return NULL;
             }
         }
     }
 
-    /* Convert any fractional coordinates to Cartesian now that the cell is
-       known (cell tags may have come before or after the atom loop). */
+    int all_frac = 1;
+    for (int i = 0; i < natoms; i++) { if (!at[i].frac) { all_frac = 0; break; } }
+
     float cell[3][3] = {{0}};
-    if (saw_cell) {
+    int completeness = 2;  /* unknown */
+
+    /* Expansion path: valid ops + all-six cell + all-fractional + no missing ./. */
+    if (have_symops && nops > 0 && !symop_missing && all_six && all_frac) {
+        /* Validate cell geometry before any conversion. */
+        if (len_a <= 0 || len_b <= 0 || len_c <= 0 ||
+            !isfinite(len_a) || !isfinite(len_b) || !isfinite(len_c)) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); set_error(path, 0, "non-positive or non-finite cell length"); return NULL;
+        }
+        if (al_deg <= 0 || al_deg >= 180 || be_deg <= 0 || be_deg >= 180 ||
+            ga_deg <= 0 || ga_deg >= 180) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); set_error(path, 0, "cell angle out of (0,180) range"); return NULL;
+        }
+
+        long long total = (long long)natoms * nops;
+        if (total > MOLENV_ATOM_CAP) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); set_error(path, 0, "operation cap exceeded"); return NULL;
+        }
+
         if (cif_build_cell(len_a, len_b, len_c, al_deg, be_deg, ga_deg, cell) < 0) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); set_error(path, 0, "non-finite cell components"); return NULL;
+        }
+
+        /* Reject geometrically degenerate cell: positive determinant (right-handed)
+           with scale-aware tolerance. */
+        {
+            double a0 = cell[0][0], a1 = cell[0][1], a2 = cell[0][2];
+            double b0 = cell[1][0], b1 = cell[1][1], b2 = cell[1][2];
+            double c0 = cell[2][0], c1 = cell[2][1], c2 = cell[2][2];
+            double det = a0*(b1*c2-b2*c1) - a1*(b0*c2-b2*c0) + a2*(b0*c1-b1*c0);
+            double det_scale = sqrt(a0*a0+a1*a1+a2*a2) * sqrt(b0*b0+b1*b1+b2*b2) * sqrt(c0*c0+c1*c1+c2*c2);
+            if (det <= 1e-15 * det_scale) {
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); set_error(path, 0, "degenerate (zero-volume) cell"); return NULL;
+            }
+        }
+
+        /* Validate group before expansion. */
+        {
+            char gerr[256];
+            if (validate_symmetry_group(nops, symop_rot, symop_trans, cell, gerr, sizeof(gerr)) < 0) {
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); set_error(path, 0, gerr); return NULL;
+            }
+        }
+
+        /* Compute per-axis bucket counts from inverse-lattice row norms.
+           bucket_width = 1/nbx must be >= inv_norm[i] * DEDUP_TOL, i.e.
+           nbx <= 1/(DEDUP_TOL * inv_norm[i]).  Compute in double domain,
+           then convert to int with a minimum of 1 (no unsafe nb>=100 clamp). */
+        double inv_norm[3];
+        {
+            double dummy_inv[3][3];
+            if (invert_cell(cell, dummy_inv, inv_norm) < 0) {
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); set_error(path, 0, "singular cell matrix"); return NULL;
+            }
+        }
+        double nbx_d = 1.0 / (DEDUP_TOL * inv_norm[0]);
+        double nby_d = 1.0 / (DEDUP_TOL * inv_norm[1]);
+        double nbz_d = 1.0 / (DEDUP_TOL * inv_norm[2]);
+        if (nbx_d > 1e9) nbx_d = 1e9;
+        if (nby_d > 1e9) nby_d = 1e9;
+        if (nbz_d > 1e9) nbz_d = 1e9;
+        int nbx = (int)floor(nbx_d);
+        int nby = (int)floor(nby_d);
+        int nbz = (int)floor(nbz_d);
+        if (nbx < 1) nbx = 1;
+        if (nby < 1) nby = 1;
+        if (nbz < 1) nbz = 1;
+
+        /* Dynamic hash table: size from candidate count at safe load factor ~0.67. */
+        size_t ht_size = (size_t)(total * 1.5);
+        if (ht_size < 64) ht_size = 64;
+        DedupEntry *ht = calloc(ht_size, sizeof(DedupEntry));
+        if (!ht) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); set_error(path, 0, "out of memory"); return NULL;
+        }
+
+        int expanded_cap = (int)total;
+        MolEnvAtom *expanded = calloc((size_t)expanded_cap, sizeof(MolEnvAtom));
+        if (!expanded) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); free(ht); set_error(path, 0, "out of memory"); return NULL;
+        }
+
+        int expanded_count = 0;
+        for (int i = 0; i < natoms; i++) {
+            double fx = at[i].coord[0], fy = at[i].coord[1], fz = at[i].coord[2];
+            for (int j = 0; j < nops; j++) {
+                double nx = symop_rot[j][0][0]*fx + symop_rot[j][0][1]*fy + symop_rot[j][0][2]*fz + symop_trans[j][0];
+                double ny = symop_rot[j][1][0]*fx + symop_rot[j][1][1]*fy + symop_rot[j][1][2]*fz + symop_trans[j][1];
+                double nz = symop_rot[j][2][0]*fx + symop_rot[j][2][1]*fy + symop_rot[j][2][2]*fz + symop_trans[j][2];
+
+                nx = nx - floor(nx);
+                ny = ny - floor(ny);
+                nz = nz - floor(nz);
+                if (nx >= 1.0) nx -= 1.0; if (nx < 0) nx = 0;
+                if (ny >= 1.0) ny -= 1.0; if (ny < 0) ny = 0;
+                if (nz >= 1.0) nz -= 1.0; if (nz < 0) nz = 0;
+
+                double cx = nx*cell[0][0] + ny*cell[1][0] + nz*cell[2][0];
+                double cy = nx*cell[0][1] + ny*cell[1][1] + nz*cell[2][1];
+                double cz = nx*cell[0][2] + ny*cell[1][2] + nz*cell[2][2];
+
+                if (!in_float_range(cx) || !in_float_range(cy) || !in_float_range(cz)) {
+                    dedup_free_labels(ht, ht_size);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); free(ht); free(expanded);
+                    set_error(path, 0, "non-finite Cartesian coordinate after expansion"); return NULL;
+                }
+
+                int znum = at[i].atomic_number;
+                int dup_ret = dedup_is_dup(ht, ht_size, nx, ny, nz, znum, at[i].label,
+                                           cell, inv_norm, nbx, nby, nbz);
+                if (dup_ret < 0) {
+                    dedup_free_labels(ht, ht_size);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); free(ht); free(expanded);
+                    set_error(path, 0, "dedup: pathological cell — exact check too expensive");
+                    return NULL;
+                }
+                if (dup_ret > 0) continue;
+
+                int ibx = (int)floor(nx*nbx); ibx %= nbx; if (ibx < 0) ibx += nbx;
+                int iby = (int)floor(ny*nby); iby %= nby; if (iby < 0) iby += nby;
+                int ibz = (int)floor(nz*nbz); ibz %= nbz; if (ibz < 0) ibz += nbz;
+
+                if (dedup_insert(ht, ht_size, ibx, iby, ibz,
+                    znum, at[i].label, nx, ny, nz) < 0) {
+                    dedup_free_labels(ht, ht_size);
+                    for (int k = 0; k < natoms; k++) free(at[k].label);
+                    free(at); free(ht); free(expanded);
+                    set_error(path, 0, "dedup hash table full"); return NULL;
+                }
+
+                expanded[expanded_count].coord[0] = (float)cx;
+                expanded[expanded_count].coord[1] = (float)cy;
+                expanded[expanded_count].coord[2] = (float)cz;
+                expanded[expanded_count].atomic_number = znum;
+                snprintf(expanded[expanded_count].label, sizeof(expanded[expanded_count].label), "%s", at[i].label);
+                expanded_count++;
+            }
+        }
+
+        dedup_free_labels(ht, ht_size);
+        free(ht);
+        for (int k = 0; k < natoms; k++) free(at[k].label);
+        free(at);
+        at = NULL;
+        natoms = expanded_count;
+        completeness = 0;  /* complete */
+
+        MolEnvScene *s = new_scene(path);
+        if (!s) { free(expanded); return NULL; }
+        s->symmetry_completeness = completeness;
+        s->atoms = expanded;
+        s->natoms = natoms;
+        s->is_crystal = 1;
+        s->periodic_dim = 3;
+        memcpy(s->cell, cell, sizeof(s->cell));
+        snprintf(s->title, sizeof(s->title), "%s", title);
+        s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
+        return s;
+    }
+
+    /* No expansion: convert fractional to Cartesian (if cell available). */
+    if (saw_cell) {
+        if (len_a <= 0 || len_b <= 0 || len_c <= 0 ||
+            !isfinite(len_a) || !isfinite(len_b) || !isfinite(len_c)) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
+            free(at); set_error(path, 0, "non-positive or non-finite cell length"); return NULL;
+        }
+        if (cif_build_cell(len_a, len_b, len_c, al_deg, be_deg, ga_deg, cell) < 0) {
+            for (int k = 0; k < natoms; k++) free(at[k].label);
             free(at); set_error(path, 0, "non-finite cell components"); return NULL;
         }
         for (int i = 0; i < natoms; i++) {
             if (!at[i].frac) continue;
             double fx = at[i].coord[0], fy = at[i].coord[1], fz = at[i].coord[2];
-            /* Compute in double and validate: individually finite fractions
-               and cell components can still overflow to ±inf when the product
-               is cast to float, poisoning the derived Cartesian coordinate. */
             double dx = fx*cell[0][0] + fy*cell[1][0] + fz*cell[2][0];
             double dy = fx*cell[0][1] + fy*cell[1][1] + fz*cell[2][1];
             double dz = fx*cell[0][2] + fy*cell[1][2] + fz*cell[2][2];
             if (!in_float_range(dx) || !in_float_range(dy) || !in_float_range(dz)) {
+                for (int k = 0; k < natoms; k++) free(at[k].label);
                 free(at); set_error(path, 0, "non-finite Cartesian coordinate"); return NULL;
             }
-            at[i].coord[0] = (float)dx;
-            at[i].coord[1] = (float)dy;
-            at[i].coord[2] = (float)dz;
+            at[i].coord[0] = dx;
+            at[i].coord[1] = dy;
+            at[i].coord[2] = dz;
         }
     }
 
     MolEnvScene *s = new_scene(path);
-    if (!s) { free(at); return NULL; }
+    if (!s) {
+        for (int k = 0; k < natoms; k++) free(at[k].label);
+        free(at); return NULL;
+    }
+    s->symmetry_completeness = completeness;
     s->atoms = calloc(natoms, sizeof(MolEnvAtom));
-    if (!s->atoms) { free(at); set_error(path, 0, "out of memory"); molenv_scene_free(s); return NULL; }
+    if (!s->atoms) {
+        for (int k = 0; k < natoms; k++) free(at[k].label);
+        free(at); set_error(path, 0, "out of memory"); molenv_scene_free(s); return NULL;
+    }
     for (int i = 0; i < natoms; i++) {
         s->atoms[i].coord[0] = at[i].coord[0];
         s->atoms[i].coord[1] = at[i].coord[1];
         s->atoms[i].coord[2] = at[i].coord[2];
         s->atoms[i].atomic_number = at[i].atomic_number;
-        memcpy(s->atoms[i].label, at[i].label, sizeof(s->atoms[i].label));
+        snprintf(s->atoms[i].label, sizeof(s->atoms[i].label), "%s", at[i].label);
     }
+    for (int k = 0; k < natoms; k++) free(at[k].label);
     free(at);
     s->natoms = natoms;
     snprintf(s->title, sizeof(s->title), "%s", title);

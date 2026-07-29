@@ -55,8 +55,10 @@ internal func gunzipData(_ url: URL) throws -> Data {
 }
 
 /// Whether the loaded atom list is sufficient for a truthful space-group
-/// analysis. CIF and CRYSCAL files commonly contain only an asymmetric unit;
-/// operation expansion is intentionally deferred to a later phase.
+/// analysis. The C parser records per-file completeness (complete, asymmetric
+/// unit, or unknown) in `MolEnvScene.symmetry_completeness`; CIF files may
+/// report any of the three. CRYSCAL files commonly contain only an asymmetric
+/// unit and their expansion remains deferred.
 enum SymmetryInputCompleteness: Equatable {
     case complete
     case asymmetricUnit
@@ -67,9 +69,21 @@ enum SymmetryInputCompleteness: Equatable {
         case .complete:
             return ""
         case .asymmetricUnit:
-            return "symmetry unavailable: the file contains an asymmetric unit; operation expansion is not implemented"
+            return "symmetry unavailable: the file contains an asymmetric unit; operation expansion is deferred"
         case .unknown:
             return "symmetry unavailable: the file's symmetry-input completeness is unknown"
+        }
+    }
+
+    /// Map the C `symmetry_completeness` field (0 = complete, 1 = asymmetric
+    /// unit, 2 = unknown) to the Swift enum, defaulting unexpected values to
+    /// `.unknown` so completeness is never falsely claimed.
+    static func fromC(_ raw: Int32) -> SymmetryInputCompleteness {
+        switch raw {
+        case 0: return .complete
+        case 1: return .asymmetricUnit
+        case 2: return .unknown
+        default: return .unknown
         }
     }
 }
@@ -314,8 +328,7 @@ enum Parser {
             throw ParseError.parse(path: path, line: line, reason: reason)
         }
         defer { molenv_scene_free(scene) }
-        let completeness: SymmetryInputCompleteness = effective == .cif ? .unknown : .complete
-        return copyOut(scene.pointee, symmetryInputCompleteness: completeness)
+        return copyOut(scene.pointee)
     }
 
     /// Number of animation frames in an animated file: ANIMSTEPS for AXSF, or
@@ -374,11 +387,10 @@ enum Parser {
         return copyOut(scene.pointee)
     }
 
-    private static func copyOut(_ s: MolEnvScene,
-                                symmetryInputCompleteness: SymmetryInputCompleteness = .complete) -> LoadedScene {
+    private static func copyOut(_ s: MolEnvScene) -> LoadedScene {
         var s = s
         var out = LoadedScene()
-        out.symmetryInputCompleteness = symmetryInputCompleteness
+        out.symmetryInputCompleteness = SymmetryInputCompleteness.fromC(s.symmetry_completeness)
         out.isCrystal = s.is_crystal != 0
         out.periodicDim = Int(s.periodic_dim)
         out.title = withUnsafePointer(to: &s.title) { ptr in

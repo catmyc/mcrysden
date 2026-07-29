@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-28 (v1.1.21 workflow and application integration)**.
+Last updated: **2026-07-29 (v1.1.22 CIF declared-operation symmetry expansion)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -98,7 +98,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
 
 ### Crystal input completeness
-- [ ] Expand CIF and CRYSCAL asymmetric-unit inputs through declared symmetry operations, with periodic-site deduplication and preserved species/index mappings, so they can use symmetry analysis and generated canonical k-paths.
+- [~] CIF declared-operation asymmetric-unit expansion is complete in v1.1.22 with periodic dedup/species mapping and downstream symmetry/k-path availability; CRYSCAL expansion remains pending.
 
 ### Structure information and analysis
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
