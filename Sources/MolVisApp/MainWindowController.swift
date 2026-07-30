@@ -374,6 +374,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onResetKPath = { [weak self] in self?.resetKPathDefault() }
         state.onSelectKPathNode = { [weak self] index in self?.selectKPathNode(index) }
         state.onShowAtomTable = { [weak self] in self?.showAtomTable() }
+        state.onExportElectronicAnalysisText = { [weak self] report in
+            guard let self else { return }
+            self.exportElectronicAnalysisText(report.summaryText)
+        }
+        state.onExportElectronicAnalysisCSV = { [weak self] report in
+            guard let self else { return }
+            self.exportElectronicAnalysisCSV(report.csv)
+        }
         // Cursor readouts for the electronic-structure graphs. Assigned after
         // super.init so the closures capture a fully-initialized self.
         bandGrapher.onCursor = { [weak self] info in
@@ -2800,6 +2808,59 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         } else {
             state.bandGapSummary = ""
         }
+
+        // Electronic-analysis report: prefer the actually-displayed DOS (viewport
+        // precedence — see updateContentVisibility), otherwise bands. No expected
+        // electron count is inferred because Scene/DOS metadata lacks it.
+        if let dos = scene.densityOfStates {
+            state.electronicAnalysisReport = ElectronicAnalysisPresentation.dosReport(dos)
+        } else if let bs = scene.bandStructure {
+            state.electronicAnalysisReport = ElectronicAnalysisPresentation.bandReport(bs)
+        } else {
+            state.electronicAnalysisReport = nil
+        }
+    }
+
+    // MARK: - Electronic-analysis export
+
+    private func exportElectronicAnalysisText(_ text: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "electronic-analysis.txt"
+        panel.allowedContentTypes = [.plainText]
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                print("[mcrysden] electronic-analysis text export failed: \(error)")
+                self.presentElectronicAnalysisExportError(error)
+            }
+        }
+    }
+
+    private func exportElectronicAnalysisCSV(_ csv: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "electronic-analysis.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do {
+                try csv.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                print("[mcrysden] electronic-analysis CSV export failed: \(error)")
+                self.presentElectronicAnalysisExportError(error)
+            }
+        }
+    }
+
+    private func presentElectronicAnalysisExportError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Electronic analysis export failed"
+        alert.informativeText = (error as? LocalizedError)?.errorDescription
+            ?? error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
     }
 
     private func colorFromHex(_ hex: String) -> (r: Double, g: Double, b: Double)? {

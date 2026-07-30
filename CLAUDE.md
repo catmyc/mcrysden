@@ -38,13 +38,13 @@ XCTest, under `Sources/MolVisAppTests` (not the empty top-level `Tests/`). Acces
 - **Snapshot tests** — `SnapshotTests` extends `Snapshotter`, renders a fixed scene+camera to a 64×64 texture, compares an FNV-1a pixel hash against committed goldens in `Sources/MolVisAppTests/Fixtures/golden/`. Regenerate goldens with env var `MCRYSDEN_REGENERATE=1`.
 - **Integration / regression tests** — coordination analysis, reciprocal-space UX, k-path editing, band/DOS parsing, export, state, atom table, periodic geometry, and pathological-input hardening.
 
-The tracked suite contains **1048 tests** (current, unreleased; 1053 as of the v1.1.25 release). Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
+The tracked suite contains **1173 tests** as of v1.1.28. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
 
 Fixtures live in `Sources/MolVisAppTests/Fixtures/` and are loaded at runtime via `#file`-relative paths. CI runs on `macos-14` (Apple Silicon) via `.github/workflows/ci.yml`.
 
 ## Architecture
 
-Four SPM targets (`Package.swift`):
+Four production SPM targets plus the `MolVisAppTests` test target (`Package.swift`):
 
 - **`MolEnvParse`** — C-only (`Sources/MolEnvParse/`). Exposes `parse_xsf`, `parse_axsf` (frame-indexed), `parse_xyz`, `parse_pdb`, `parse_cif`, each returning a heap-allocated `MolEnvScene*`. Also bond detection via a covalent-radii distance heuristic. Swift copies the returned data into value types, then calls `molenv_scene_free` — no C pointer is held across an async boundary.
 - **`SpglibCore`** — vendored spglib 2.7.0 (`Sources/SpglibCore/`).
@@ -65,7 +65,7 @@ Graph views (`BandGrapherView`, `DOSGrapherView`, `ColorPlaneView`) are viewport
 ### Data flow
 
 - **GUI:** argv → `App.applicationDidFinishLaunching` → `Parser.load` (C → Swift snapshot) → `Scene` → `MainWindowController` → `Renderer` → `MTKView` (SwiftUI `SideBar` mutates `Scene` via `SideBarState` → `syncFromState()`).
-- **Headless:** argv → scene parse → optional `StateStore.load` → `PngExporter.export` / `VectorExporter.export` (offscreen texture → image → PNG/PDF/SVG/EPS/PS) → `exit(0)`. No window is created. `main.swift` explicitly installs the `NSApplicationDelegate`; replacing it with a conventional `@main` delegate can leave the headless path hanging because this SwiftPM executable has no nib or Info.plist.
+- **Headless:** argv → scene parse → optional `StateStore.load` → `PngExporter.export` / `VectorExporter.export` (offscreen texture → image → PNG/PDF/SVG/EPS/PS) → `NSApp.terminate(nil)` on success, `exit(EXIT_FAILURE)` on error. No window is created. `main.swift` explicitly installs the `NSApplicationDelegate`; replacing it with a conventional `@main` delegate can leave the headless path hanging because this SwiftPM executable has no nib or Info.plist.
 
 ### Key types
 
@@ -110,7 +110,10 @@ Graph views (`BandGrapherView`, `DOSGrapherView`, `ColorPlaneView`) are viewport
 | `KPath.swift` | k-path interpolation, QE/KPF/VASP export |
 | `CanonicalPathGenerator.swift` | High-symmetry path generation |
 | `BandStructure.swift` | QE band structure + uniform-mesh detection |
+| `BandAnalysis.swift` | Band-analysis engine: VBM/CBM, gap, metallicity, effective masses |
 | `DensityOfStates.swift` | QE total/projected DOS tables |
+| `DOSAnalysis.swift` | DOS-analysis engine: band center, width, gap estimate, spin moment, electron-count consistency |
+| `ElectronicAnalysisPresentation.swift` | Band/DOS analysis readout, unavailable-state formatting, and text/CSV payloads |
 | `ForceParser.swift` | Force/energy/stress data parsing |
 | `Isosurface.swift` | 3D isosurface generation + caching (Marching Cubes) |
 | `MarchingCubesTables.swift` | Marching Cubes edge/triangle tables |

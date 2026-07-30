@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-30 (v1.1.27 electronic-structure analysis — BandAnalysis/DOSAnalysis engines, interactive grapher controls, and 1086 tests)**.
+Last updated: **2026-07-30 (v1.1.28 electronic-analysis presentation, text/CSV export, linked graph markers, and 1173 tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-## Implemented foundation (through v1.1.25)
+## Implemented foundation (through v1.1.28)
 
 ### File formats
 - [x] XSF (structure + `DATAGRID_3D`/`2D`, including `.xsf.gz`), AXSF animation
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 1086 tracked tests as of v1.1.27: unit, snapshot (FNV-1a pixel hash vs. committed goldens), model-layer cache, parser-hardening, renderer-safety, export, state, coordination-analysis, reciprocal-ux, electronic-structure analysis, grapher-interaction, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 1173 tracked tests as of v1.1.28: unit, snapshot (FNV-1a pixel hash vs. committed goldens), model-layer cache, parser-hardening, renderer-safety, export, state, coordination-analysis, reciprocal-ux, electronic-structure analysis/presentation, grapher-interaction, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
@@ -58,7 +58,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Shared conventional reciprocal-basis mapping for picking, rendering, state persistence, and export, including corrected fcc/bcc default conversion and bcc `N` coordinates.
 - [x] Editor-only white landmarks and persistent amber-route/cyan-node overlays share the cached BZ geometry and remain available when band, DOS, or color-plane views would normally replace the Metal canvas.
 - [x] Edited routes persist through `.mvis-state`, animation reloads, and unrelated sidebar changes; malformed saved route data fails transactionally.
-- [x] 69 focused editor tests; 433 tests in the full macOS suite.
+- [x] 69 focused editor tests; 433 tests in the v1.1.16 release suite.
 
 ## Implemented after v1.1.16: crystallographic symmetry, structure summary, k-path editing, sampling, and VASP export
 
@@ -70,7 +70,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Map canonical paths into the input reciprocal basis and carry disconnected boundaries through editing, interpolation, rendering, persistence, and QE/VASP export; disable KPF export when a route contains an unrepresentable break.
 - [x] Preserve generated-vs-user-edited route provenance across state reloads and geometry changes, remapping edited routes through Cartesian reciprocal space when the input cell changes.
 - [x] Keep analysis deterministic at one explicit tolerance, bounded to 4,096 base atoms, and unavailable for malformed, non-3D, or known-incomplete asymmetric-unit inputs.
-- [x] Verify all 29 variants against exact SeekPath-derived oracle fixtures; 545 tests pass in the full macOS suite.
+- [x] Verify all 29 variants against exact SeekPath-derived oracle fixtures; 545 tests in the then-current suite.
 
 ## v1.1.17–v1.1.19 (2026-07-27 session)
 
@@ -106,7 +106,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 ### Structure information and analysis
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
 - [~] Atom table with fractional/Cartesian coordinates, and coordination numbers. Read-only Cartesian/fractional table with element/label/CN filtering, coordination numbers, and linked multiple selection implemented; atom editing remains pending.
-- [~] Coordination shells, coordination coloring, selected nearest-neighbor readout, and minimum-image periodic distance are implemented for molecules and 1D/2D/3D skew cells; full neighbor tables, bond/angle distributions, radial distribution functions, and broader periodic measurements remain pending.
+- [~] Coordination shells, a single coordination-color toggle applied across supported render modes, selected nearest-neighbor readout, and minimum-image periodic distance are implemented for molecules and 1D/2D/3D skew cells; full neighbor tables, bond/angle distributions, radial distribution functions, and periodic angle/dihedral extensions remain pending.
 - [ ] Polyhedron volume/distortion metrics and two-structure comparison with displacement vectors and RMS displacement.
 - [~] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels. Linked atom-table element/label/CN filters and selection, plus coordination coloring, are implemented; region/expression filtering and on-screen bond-distance labels remain pending.
 
@@ -117,7 +117,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 
 ### Electronic-structure analysis
 - [~] Interactive band/DOS cursor readout, energy windows, Fermi adjustment, and zoom/pan are implemented for both graphers; linked plots and projected species/orbital coloring remain pending.
-- [~] Automatic VBM/CBM, direct/indirect band-gap, and effective-mass analysis are implemented (`BandAnalysis`); DOS band-center/width, gap estimate, and spin moment are implemented (`DOSAnalysis`); linked band/DOS analysis and effective-mass export remain pending.
+- [~] Band VBM/CBM, direct/indirect gap, metallicity, and effective masses plus DOS center, width, gap estimate, spin moment, and electron-count consistency are surfaced with explicit unavailable/insufficient-data states and text/CSV export. Band extrema and estimated DOS gap edges are linked to graph markers. Linked band/DOS analysis and projected species/orbital coloring remain pending.
 
 ### Volumetric data and rendering
 - [~] Paired positive/negative orbital lobes and fixed color-plane contours are implemented; arbitrary 3D-grid slices/clipping planes, multiple independent isovalues, region integration, and configurable colormaps/contour levels remain pending.

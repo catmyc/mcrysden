@@ -95,6 +95,10 @@ final class SideBarState: ObservableObject {
     /// Computed band-gap summary text (e.g. "Eg = 1.23 eV (direct)").
     /// Set by the controller; not a scene field.
     @Published var bandGapSummary: String = ""
+    /// Computed electronic-analysis report (band or DOS). Set by the controller
+    /// from the actually-displayed graph (DOS takes viewport precedence); nil
+    /// when neither graph is available. Not a scene field.
+    @Published var electronicAnalysisReport: ElectronicAnalysisReport?
     @Published var measurementMode: MeasurementMode = .none { didSet { onChange?() } }
     /// k-path state (crystal only). points carry fractional coords + labels; when
     /// empty the editor offers the default high-symmetry path for the structure.
@@ -220,6 +224,12 @@ final class SideBarState: ObservableObject {
     /// Present the atom table panel for the current scene. The controller owns the
     /// AtomTableView and lazily creates the auxiliary window on first use.
     var onShowAtomTable: (() -> Void)?
+    /// Export the electronic-analysis report as text. The controller presents a
+    /// save panel and writes `summaryText`. Not a scene field.
+    var onExportElectronicAnalysisText: ((ElectronicAnalysisReport) -> Void)?
+    /// Export the electronic-analysis report as CSV. The controller presents a
+    /// save panel and writes `csv`. Not a scene field.
+    var onExportElectronicAnalysisCSV: ((ElectronicAnalysisReport) -> Void)?
 
     /// Reflect a loaded scene's controls into the sidebar WITHOUT triggering
     /// onChange (so we don't immediately re-mutate the scene we just loaded).

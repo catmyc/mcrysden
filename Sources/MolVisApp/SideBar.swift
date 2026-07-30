@@ -266,15 +266,23 @@ struct SideBar: View {
                     Slider(value: $state.fermiShift, in: -5...5, step: 0.1) {
                         Text("Fermi shift: \(state.fermiShift, specifier: "%.1f") eV")
                     }
-                    if !state.bandGapSummary.isEmpty {
-                        Text(state.bandGapSummary)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.secondary)
-                    }
                     if !state.electronicStructureCursorText.isEmpty {
                         Text(state.electronicStructureCursorText)
                             .font(.caption)
                             .foregroundColor(.secondary)
+                    }
+                    if let report = state.electronicAnalysisReport {
+                        Divider()
+                        Text(report.summaryText)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack {
+                            Button("Export Text") { state.onExportElectronicAnalysisText?(report) }
+                            Button("Export CSV") { state.onExportElectronicAnalysisCSV?(report) }
+                        }
+                        .buttonStyle(.bordered)
+                        .font(.caption)
                     }
                 }
             }

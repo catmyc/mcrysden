@@ -4,6 +4,22 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.28] — 2026-07-30
+
+### Added
+
+- Electronic-analysis presentation in the sidebar for band VBM/CBM, gap type, metallicity, and effective masses, plus DOS center, width, gap estimate, spin moment, and electron-count consistency. Every metric reports available, unavailable, or insufficient-data status explicitly.
+- Concise text and RFC 4180 CSV export for the displayed band or DOS analysis.
+- Linked VBM/CBM markers on band plots and estimated DOS gap-edge markers on DOS plots, including exported graphs.
+
+### Tests
+
+- Added presentation, controller-integration, malformed-data, CSV, and graph-marker coverage. Full suite now contains 1173 tests.
+
+### Documentation
+
+- Reconciled `docs/ROADMAP.md`, `CLAUDE.md`, `AGENTS.md`, and `docs/SYMMETRY_AND_KPATH.md` with the current codebase, including package boundaries, headless termination, coordination status, reciprocal-editor contracts, electronic-analysis presentation, and the 1173-test suite.
+
 ## [1.1.27] — 2026-07-30
 
 ### Added

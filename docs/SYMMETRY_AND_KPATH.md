@@ -52,6 +52,20 @@ The flat `.mvis-state` format persists `kPathPoints`, `kPathBreaks`, `kPathProve
 
 Quantum Espresso `K_POINTS crystal` export can represent the interpolated points from disconnected components and preserves explicit singleton components. VASP line-mode `KPOINTS` export uses endpoint pairs and blank lines between segments; singleton components are rejected because line mode cannot represent them. XCrySDen KPF has no syntax for a disconnected boundary, so the UI disables that export for disconnected routes and the exporter rejects a programmatic request with a clear error.
 
+## Reciprocal editor UX (v1.1.25)
+
+The interactive k-path editor surfaces the following behavior:
+
+- **Physical distances.** Incoming and cumulative route distances are reported in Å⁻¹ using the conventional reciprocal metric and are break-aware across disconnected components.
+- **Cached bounded BZ candidates.** BZ landmark candidates (Γ, vertices, edge midpoints, face centers) are computed from the cached bounded BZ and reused across picks.
+- **Hover tooltip.** `NSTrackingArea` hover over a candidate shows a transient tooltip with the point label and fractional coordinates.
+- **Viewport node labels and selected style.** Route nodes are labeled in the viewport; the selected node uses a distinct style (amber route, cyan node, selected-route-node highlight).
+- **Accessibility and keyboard navigation.** AppKit button elements expose visible BZ landmark candidates to VoiceOver; arrow keys cycle candidates, and Space or Return appends the focused candidate to the route.
+- **Automatic BZ framing.** A one-shot editor entry frames the BZ (`BZPresentation.framedCamera`) and restores the previous camera, display, and BZ visibility on exit.
+- **Nonfatal unavailable status.** When the BZ cannot be constructed (incomplete cell, malformed geometry), the editor reports an unavailable state instead of trapping.
+- **Export filtering.** Route labels are exported with the canvas; the transient hover tooltip is excluded.
+- **BZ construction.** The BZ is built using bounded, scale-safe Double arithmetic with an adaptive G-star completeness proof and bounded construction budgets.
+
 ## Verification
 
 Run the project verification sequence on macOS:
@@ -62,4 +76,4 @@ swift test
 zsh scripts/smoke.sh
 ```
 
-The tracked suite contains 1086 tests as of v1.1.27. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.
+The tracked suite contains 1173 tests as of v1.1.28. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.

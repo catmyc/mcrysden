@@ -612,7 +612,7 @@ final class AppSafetyTests: XCTestCase {
         XCTAssertEqual(analysis.items.first { $0.tag == 3 }?.state, .off)
     }
 
-    func testAppVersionIs1127() {
-        XCTAssertEqual(App.appVersion, "1.1.27")
+    func testAppVersionIs1128() {
+        XCTAssertEqual(App.appVersion, "1.1.28")
     }
 }

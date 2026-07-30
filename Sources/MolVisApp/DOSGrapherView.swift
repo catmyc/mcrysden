@@ -95,6 +95,56 @@ final class DOSGrapherView: NSView {
         onCursor?(nil)
     }
 
+    /// Compute VBM/CBM gap-edge marker data for the first DOS series. Returns nil
+    /// when the analysis is unavailable (no series, no gap detected). DOS values
+    /// are interpolated from the actual energy grid at each gap edge. Testable.
+    func dosMarkerData() -> (vbm: (energy: Float, dosValue: Float), cbm: (energy: Float, dosValue: Float))? {
+        guard let dos = densityOfStates, !dos.series.isEmpty else { return nil }
+        guard let series = dos.series.first, series.values.count == dos.energies.count else { return nil }
+        // Reject malformed energy grids: nonfinite entries or not strictly increasing.
+        guard dos.energies.allSatisfy(\.isFinite), isStrictlyIncreasing(dos.energies) else { return nil }
+        // Reject nonfinite DOS values.
+        guard series.values.allSatisfy(\.isFinite) else { return nil }
+        guard let result = DOSAnalysis.dosGap(dos, seriesIndex: 0) else { return nil }
+        guard result.gapStart.isFinite, result.gapEnd.isFinite else { return nil }
+        guard let vbmDOS = interpolateDOSValue(at: result.gapStart, values: series.values, energies: dos.energies),
+              let cbmDOS = interpolateDOSValue(at: result.gapEnd, values: series.values, energies: dos.energies),
+              vbmDOS.isFinite, cbmDOS.isFinite else { return nil }
+        return (vbm: (energy: result.gapStart, dosValue: vbmDOS),
+                cbm: (energy: result.gapEnd, dosValue: cbmDOS))
+    }
+
+    /// Linearly interpolate the DOS value at `energy` from the energy grid. Returns nil
+    /// when the grid is malformed (fewer than 2 points, count mismatch, not strictly
+    /// increasing, nonfinite entries) or `energy` lies outside the grid range. Exact at
+    /// samples, linear between samples.
+    private func interpolateDOSValue(at energy: Float, values: [Float], energies: [Float]) -> Float? {
+        guard energies.count >= 2, energies.count == values.count else { return nil }
+        guard energies.allSatisfy(\.isFinite), values.allSatisfy(\.isFinite) else { return nil }
+        guard isStrictlyIncreasing(energies) else { return nil }
+        guard energy >= energies.first! && energy <= energies.last! else { return nil }
+        for i in 0..<(energies.count - 1) {
+            if energy >= energies[i] && energy <= energies[i + 1] {
+                let e0 = energies[i], e1 = energies[i + 1]
+                let v0 = values[i], v1 = values[i + 1]
+                let de = e1 - e0
+                guard de > 0 else { return nil }
+                // Exact at samples: t=0 returns v0, t=1 returns v1.
+                let t = (energy - e0) / de
+                return v0 + (v1 - v0) * t
+            }
+        }
+        return nil
+    }
+
+    private func isStrictlyIncreasing(_ values: [Float]) -> Bool {
+        guard values.count >= 2 else { return true }
+        for i in 1..<values.count {
+            guard values[i] > values[i - 1] else { return false }
+        }
+        return true
+    }
+
     /// When set, draw fills with this color (used for export).
     var exportBackground: NSColor?
     /// When true, draw skips the white fill for transparent export output.
@@ -224,6 +274,19 @@ final class DOSGrapherView: NSView {
             }
             path.stroke()
         }
+
+        // --- DOS gap markers ---
+        // Draw VBM/CBM gap-edge markers on the first DOS curve. Labels are marked
+        // as estimates because DOSAnalysis reports estimated threshold edges.
+        // When no gap is detected, dosMarkerData() returns nil and no markers are
+        // drawn.
+        if let markers = dosMarkerData() {
+            let vbmPoint = project(markers.vbm.dosValue, markers.vbm.energy)
+            let cbmPoint = project(markers.cbm.dosValue, markers.cbm.energy)
+            drawDOSMarker(at: vbmPoint, label: "VBM est.", color: .systemGreen)
+            drawDOSMarker(at: cbmPoint, label: "CBM est.", color: .systemRed)
+        }
+
         NSGraphicsContext.restoreGraphicsState()
 
         NSColor.black.setStroke()
@@ -328,6 +391,34 @@ final class DOSGrapherView: NSView {
     private func drawEmpty(_ message: String) {
         drawText(message, at: NSPoint(x: bounds.midX, y: bounds.midY), font: titleFont,
                  color: .darkGray, horizontal: .center, vertical: .center)
+    }
+
+    /// Draw a labelled VBM/CBM gap-edge marker at a projected point. The marker is
+    /// a filled circle with a contrasting halo and a coloured label, drawn in the
+    /// current (zoom/pan-transformed) coordinate space.
+    private func drawDOSMarker(at point: NSPoint, label: String, color: NSColor) {
+        let radius: CGFloat = 5
+        // White halo for contrast against DOS curves.
+        let halo = NSBezierPath(ovalIn: NSRect(
+            x: point.x - radius - 2, y: point.y - radius - 2,
+            width: (radius + 2) * 2, height: (radius + 2) * 2))
+        NSColor.white.setFill()
+        halo.fill()
+        // Colored marker with black border.
+        let marker = NSBezierPath(ovalIn: NSRect(
+            x: point.x - radius, y: point.y - radius,
+            width: radius * 2, height: radius * 2))
+        color.setFill()
+        NSColor.black.setStroke()
+        marker.fill()
+        marker.lineWidth = 1.5
+        marker.stroke()
+        // Label to the right of the marker.
+        let attrs: [NSAttributedString.Key: Any] = [.font: axisFont, .foregroundColor: color]
+        let attr = NSAttributedString(string: label, attributes: attrs)
+        var labelPt = NSPoint(x: point.x + radius + 4, y: point.y)
+        labelPt.y -= attr.size().height / 2
+        attr.draw(at: labelPt)
     }
 
     private enum HorizontalAlignment { case left, center, right }

@@ -54,7 +54,7 @@ Key rules:
 
 ## Package Boundaries
 
-- `Package.swift` defines three targets: C parser/bond library `MolEnvParse`, executable `MolVisApp`, spglib façade `MolEnvSpglib`, and tests at `Sources/MolVisAppTests` (not `Tests/`). Vendored spglib 2.7.0 lives in `Sources/SpglibCore`.
+- `Package.swift` defines five targets: C parser/bond library `MolEnvParse`, executable `MolVisApp`, spglib façade `MolEnvSpglib`, vendored spglib 2.7.0 library `SpglibCore` (`Sources/SpglibCore/`), and test target `MolVisAppTests` (`Sources/MolVisAppTests/`, not `Tests/`).
 - `Sources/MolVisApp/main.swift` explicitly installs the `NSApplicationDelegate`. Replacing it with a conventional `@main` delegate can leave the headless export path hanging because this SwiftPM executable has no nib or Info.plist.
 - `App.swift` owns CLI parsing, GUI/headless startup, export dispatch, the canonical format table, and the app version string. Add a force-format flag there and matching `ParseFormat` dispatch together.
 - `Parser.swift` is the main C-to-Swift bridge and also hosts Swift-only loaders. Copy `MolEnvScene` data into Swift values and free C allocations synchronously; do not retain C pointers across callbacks or async work. `Scene+Init.swift` is the intentional exception that calls the C bond heuristic when rebonding transformed structures.
@@ -94,6 +94,11 @@ Key rules:
 | `StateStore.swift` | `.mvis-state` JSON serialization |
 | `StructureSummary.swift` | Lattice, composition, density, symmetry data model |
 | `ElementTable.swift` | CPK colors, covalent/vdw radii, atomic masses |
+| `CoordinationAnalysis.swift` | Periodic image-aware coordination shells/CN, neighbor readout |
+| `Reciprocal.swift` | Reciprocal lattice, scale-safe Double math, G-star enumeration |
+| `BrillouinZone.swift` | BZ polyhedron construction, caching, centering detection |
+| `BandAnalysis.swift` | Band-analysis engine: VBM/CBM, gap, metallicity, effective masses |
+| `DOSAnalysis.swift` | DOS-analysis engine: band center, width, gap, spin, electron-count consistency |
 
 ## Tests And Fixtures
 
@@ -103,7 +108,7 @@ Key rules:
   MCRYSDEN_REGENERATE=1 swift test --filter SnapshotTests
   ```
   Review the changed hashes, then rerun snapshots without the environment variable.
-- The tracked suite contains 1048 tests as of v1.1.26. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
+- The tracked suite contains 1173 tests as of v1.1.28. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
 - Parser failures must become `ParseError` with a useful path/reason; malformed user files must not trap. C parsers report details through thread-local `molenv_last_error`.
 
 ## References

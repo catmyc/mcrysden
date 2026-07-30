@@ -115,6 +115,23 @@ final class BandGrapherView: NSView {
         return xMin + (xMax - xMin) * Float(fx)
     }
 
+    /// Compute VBM/CBM marker data for the current band structure. Returns nil when
+    /// the analysis is unavailable (no Fermi level, mesh, invalid layout). For
+    /// metallic paths, returns the highest-occupied / lowest-unoccupied extrema
+    /// (gap = 0) — the same VBM/CBM reported by BandAnalysis and the electronic
+    /// analysis presentation, so markers always link to plotted points. Energies in
+    /// original eV, k-point indices into `kPoints`. Testable directly.
+    func bandMarkerData() -> (vbm: (kIndex: Int, energy: Float), cbm: (kIndex: Int, energy: Float))? {
+        guard let bs = bandStructure, !bs.isMesh, bs.hasValidChannelLayout,
+              bs.nBands > 0, bs.nKPoints > 1 else { return nil }
+        guard let result = BandAnalysis.bandGap(bs) else { return nil }
+        guard result.vbmKPointIndex >= 0, result.vbmKPointIndex < bs.nKPoints,
+              result.cbmKPointIndex >= 0, result.cbmKPointIndex < bs.nKPoints,
+              result.vbm.isFinite, result.cbm.isFinite else { return nil }
+        return (vbm: (kIndex: result.vbmKPointIndex, energy: result.vbm),
+                cbm: (kIndex: result.cbmKPointIndex, energy: result.cbm))
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard NSGraphicsContext.current?.cgContext != nil,
               let bs = bandStructure, bs.nKPoints > 1, bs.nBands > 0,
@@ -298,6 +315,19 @@ final class BandGrapherView: NSView {
             }
         }
 
+        // --- band gap markers ---
+        // Draw VBM/CBM markers for every band structure with a valid analysis
+        // result. For insulators these are the true gap edges; for metallic paths
+        // they are the highest-occupied / lowest-unoccupied extrema (gap = 0), so
+        // the markers always link to the VBM/CBM reported by the electronic
+        // analysis presentation.
+        if let markers = bandMarkerData() {
+            let vbmPoint = proj(markers.vbm.kIndex, markers.vbm.energy)
+            let cbmPoint = proj(markers.cbm.kIndex, markers.cbm.energy)
+            drawBandMarker(at: vbmPoint, label: "VBM", color: .systemGreen)
+            drawBandMarker(at: cbmPoint, label: "CBM", color: .systemRed)
+        }
+
         NSGraphicsContext.restoreGraphicsState()
 
         // --- x-axis label + title (view space) ---
@@ -331,6 +361,34 @@ final class BandGrapherView: NSView {
         var pt = p
         if rightAligned { pt.x -= attr.size().width } else { pt.x -= attr.size().width / 2; pt.y -= attr.size().height / 2 }
         attr.draw(at: pt)
+    }
+
+    /// Draw a labelled VBM/CBM marker at a projected point. The marker is a filled
+    /// circle with a contrasting halo and a coloured label, drawn in the current
+    /// (zoom/pan-transformed) coordinate space.
+    private func drawBandMarker(at point: NSPoint, label: String, color: NSColor) {
+        let radius: CGFloat = 5
+        // White halo for contrast against band lines.
+        let halo = NSBezierPath(ovalIn: NSRect(
+            x: point.x - radius - 2, y: point.y - radius - 2,
+            width: (radius + 2) * 2, height: (radius + 2) * 2))
+        NSColor.white.setFill()
+        halo.fill()
+        // Colored marker with black border.
+        let marker = NSBezierPath(ovalIn: NSRect(
+            x: point.x - radius, y: point.y - radius,
+            width: radius * 2, height: radius * 2))
+        color.setFill()
+        NSColor.black.setStroke()
+        marker.fill()
+        marker.lineWidth = 1.5
+        marker.stroke()
+        // Label to the right of the marker.
+        let attrs: [NSAttributedString.Key: Any] = [.font: axisFont, .foregroundColor: color]
+        let attr = NSAttributedString(string: label, attributes: attrs)
+        var labelPt = NSPoint(x: point.x + radius + 4, y: point.y)
+        labelPt.y -= attr.size().height / 2
+        attr.draw(at: labelPt)
     }
 }
 
