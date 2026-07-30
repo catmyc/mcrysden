@@ -263,6 +263,107 @@ final class CoordinationIntegrationTests: XCTestCase {
         XCTAssertTrue(controller.buildInfoText().contains("image=("))
     }
 
+    func testCoordinationReadoutSortsByDistanceNotElement() async {
+        // Regression: the neighbor readout must sort by distance (nearest first),
+        // not by element symbol. Previously, alphabetically earlier but farther
+        // neighbors could displace closer neighbors under the 16-entry cap.
+        //
+        // The coordination analyzer's distance cutoff makes it hard to construct
+        // a scene with >16 neighbors naturally, so we inject a crafted analysis
+        // via the override mechanism. The crafted analysis has 10 Zn neighbors
+        // at closer distances and 10 Al neighbors at farther distances.
+
+        // Create atoms: index 0 = H (selected), indices 1-10 = Zn, indices 11-20 = Al
+        var scene = Scene()
+        scene.isCrystal = true
+        scene.periodicDim = 3
+        scene.cell = Cell(a: SIMD3(100, 0, 0), b: SIMD3(0, 100, 0), c: SIMD3(0, 0, 100))
+        scene.atoms = [Atom(coord: SIMD3(50, 50, 50), atomicNumber: 1, label: "H")]
+        for _ in 0..<10 {
+            scene.atoms.append(Atom(coord: SIMD3(50, 50, 50), atomicNumber: 30, label: "Zn"))
+        }
+        for _ in 0..<10 {
+            scene.atoms.append(Atom(coord: SIMD3(50, 50, 50), atomicNumber: 13, label: "Al"))
+        }
+
+        // Build crafted neighbor records: 10 Zn (closer) + 10 Al (farther)
+        var neighbors: [CoordinationNeighbor] = []
+        for i in 0..<10 {
+            let distance = Float(i + 1) * 0.3  // 0.3, 0.6, ..., 3.0 Å
+            neighbors.append(CoordinationNeighbor(
+                atomIndex: i + 1,  // indices 1-10 (Zn)
+                imageOffset: .zero,
+                displacement: SIMD3(distance, 0, 0),
+                distance: distance
+            ))
+        }
+        for i in 0..<10 {
+            let distance = Float(i + 1) * 0.3 + 3.0  // 3.3, 3.6, ..., 6.0 Å
+            neighbors.append(CoordinationNeighbor(
+                atomIndex: i + 11,  // indices 11-20 (Al)
+                imageOffset: .zero,
+                displacement: SIMD3(distance, 0, 0),
+                distance: distance
+            ))
+        }
+
+        let emptyNeighbors = Array(repeating: [CoordinationNeighbor](), count: 20)
+        let analysis = CoordinationAnalysis(neighborsByAtom: [neighbors] + emptyNeighbors,
+                                            candidateChecks: 0)
+
+        let controller = MainWindowController(scene: scene, showWindow: false)
+        controller.coordinationAnalyzerOverride = { _, _, _, _, _ in
+            return analysis
+        }
+        controller.state.coordinationEnabled = true
+        await waitForReady(controller)
+        controller.scene.selectedAtoms = [0]
+
+        let text = controller.buildInfoText()
+        let lines = text.components(separatedBy: "\n")
+
+        // Collect the order of neighbor entries in the readout
+        var neighborOrder: [(element: String, distance: Float)] = []
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.contains("Å") && trimmed.contains("#") {
+                let parts = trimmed.components(separatedBy: " ")
+                guard parts.count >= 4,
+                      let distanceStr = parts.dropLast().last,
+                      let distance = Float(distanceStr) else {
+                    XCTFail("Failed to parse neighbor line: \(trimmed)")
+                    continue
+                }
+                let element = parts[0]
+                neighborOrder.append((element: element, distance: distance))
+            }
+        }
+
+        // Verify that exactly 16 neighbors are shown (the cap)
+        XCTAssertEqual(neighborOrder.count, 16, "Should show exactly 16 neighbors (the cap)")
+
+        // Verify that all 10 Zn neighbors survive (they're closer)
+        let znCount = neighborOrder.filter { $0.element == "Zn" }.count
+        XCTAssertEqual(znCount, 10, "All 10 closer Zn neighbors should survive truncation")
+
+        // Verify that only 6 Al neighbors survive (4 are truncated)
+        let alCount = neighborOrder.filter { $0.element == "Al" }.count
+        XCTAssertEqual(alCount, 6, "Only 6 farther Al neighbors should survive truncation")
+
+        // Verify that neighbors are sorted by distance (nearest first)
+        for i in 1..<neighborOrder.count {
+            XCTAssertLessThanOrEqual(neighborOrder[i-1].distance, neighborOrder[i].distance,
+                                      "Neighbors must be sorted by distance (nearest first)")
+        }
+
+        // Verify that all Zn appear before any Al
+        let lastZn = neighborOrder.lastIndex(where: { $0.element == "Zn" })
+        let firstAl = neighborOrder.firstIndex(where: { $0.element == "Al" })
+        XCTAssertNotNil(lastZn, "Zn neighbors should appear in readout")
+        XCTAssertNotNil(firstAl, "Al neighbors should appear in readout")
+        XCTAssertLessThan(lastZn!, firstAl!, "All Zn must appear before any Al")
+    }
+
     func testScaleControlClampsToSidebarRange() {
         let state = SideBarState()
         state.coordinationRadiusScale = 3

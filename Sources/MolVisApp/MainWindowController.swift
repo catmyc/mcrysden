@@ -1504,11 +1504,16 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             let neighbors = analysis.neighbors(of: index)
                 .filter { $0.atomIndex >= 0 && $0.atomIndex < atoms.count && $0.distance.isFinite }
                 .sorted {
+                    // Show nearest neighbors first; symbol, index, and image offset
+                    // are only deterministic tie-breakers so the readout is stable.
+                    if $0.distance != $1.distance { return $0.distance < $1.distance }
                     let lhs = ElementTable.symbol(atoms[$0.atomIndex].atomicNumber)
                     let rhs = ElementTable.symbol(atoms[$1.atomIndex].atomicNumber)
                     if lhs != rhs { return lhs < rhs }
                     if $0.atomIndex != $1.atomIndex { return $0.atomIndex < $1.atomIndex }
-                    return $0.distance < $1.distance
+                    if $0.imageOffset.x != $1.imageOffset.x { return $0.imageOffset.x < $1.imageOffset.x }
+                    if $0.imageOffset.y != $1.imageOffset.y { return $0.imageOffset.y < $1.imageOffset.y }
+                    return $0.imageOffset.z < $1.imageOffset.z
                 }
             let neighborLimit = min(16, neighbors.count)
             for neighbor in neighbors.prefix(neighborLimit) {

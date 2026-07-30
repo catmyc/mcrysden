@@ -4,6 +4,17 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.26] — 2026-07-30
+
+### Fixed
+- Coordination neighbor readout now sorts by distance (nearest first) instead of element symbol, so the 16-neighbor cap keeps the closest neighbors.
+
+### Tests
+- Removed 6 diagnostic-only tests (print-only, no assertions) from `DiagnosticTests.swift`. Added a regression test for distance-first neighbor sorting. Full suite now at 1048 tests.
+
+### Documentation
+- Reconciled `CLAUDE.md` with the current codebase (1048 tests, four SPM targets, 38 modules, 16 parser families, render invariants, and state/UI traps).
+
 ## [1.1.25] — 2026-07-30
 
 ### Added
@@ -13,7 +24,7 @@ All notable changes to mcrysden will be documented in this file. The format is b
 - ReciprocalCell hardened with scale-safe Double arithmetic, adaptive G-star completeness proof, bounded construction budgets, and centering detection with one-to-one multiplicity matching.
 
 ### Tests
-- Added 125 tests: 10 CenteringDetectionTests, 13 BZFramingTests, 7 BZConstructionBudgetTests, 6 BZScaleInvarianceTests, 6 BZSkewCompletenessTests, 12 ReciprocalCellTests, 12 ReciprocalDistanceTests, 45 ReciprocalUXIntegrationTests, 12 MetalViewHoverTests, and 2 LabelOverlayViewTests. Full suite now at 1053 tests.
+- Added 125 tests: 11 new test files for reciprocal-space UX — CenteringDetectionTests, BZFramingTests, BZConstructionBudgetTests, BZScaleInvarianceTests, BZSkewCompletenessTests, ReciprocalCellTests, ReciprocalDistanceTests, ReciprocalUXIntegrationTests, MetalViewHoverTests, LabelOverlayViewTests, and ReciprocalAccessibilityTests — plus enhancements to existing test suites (AppExportTests, AppSafetyTests, KPathEditorTests, KPathNodeSelectionTests, RendererTests). Full suite now at 1053 tests.
 
 ## [1.1.24] — 2026-07-29
 

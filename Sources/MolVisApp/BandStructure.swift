@@ -354,7 +354,7 @@ enum BandParser {
     /// grid-like k-point layout (equal per-axis spacing, spanning ≥2 dimensions, and a
     /// row-uniform factorization of the total). Weights alone are insufficient — a uniform
     /// band path can share them — so the grid structure is the discriminating signature.
-    /// Testable directly (see DiagnosticTests).
+    /// Testable directly.
     static func detectUniformMesh(_ weights: [Float], records: [BandParserRecord]) -> Bool {
         guard weights.count > 1, records.count > 1 else { return false }
         // Require COMPLETE weight coverage: every k-point must have a weight. A partial

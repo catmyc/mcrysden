@@ -4,6 +4,25 @@
 
 For multi-component features, dispatch independent **Longcat subagents** in parallel, review their combined output, fix findings, and repeat until clean. Use DeepSeek subagents only if Longcat fails mid-task (token-insufficient). Do **not** write `edit`/`write`/`apply_patch` calls yourself for feature work — always use subagents.
 
+### Subagent Dispatch
+
+Launch subagents via the `pi` CLI in non-interactive mode. Always use the Longcat model (`longcat/LongCat-2.0` with `--thinking high`). **Never dispatch GPT models** (`openai-codex/*`, `openai/*`) for subagent work unless explicitly instructed to.
+
+```bash
+# Single subagent
+pi --model longcat/LongCat-2.0 --thinking high --no-session \
+  "Specific, file-constrained prompt with exact APIs"
+
+# Parallel subagents (file-disjoint scopes only)
+pi --model longcat/LongCat-2.0 --thinking high --no-session \
+  "Task A: fix X in file1.swift" &
+pi --model longcat/LongCat-2.0 --thinking high --no-session \
+  "Task B: fix Y in file2.swift" &
+wait
+```
+
+Subagents get full `read`/`bash`/`edit`/`write` tools by default. Give each subagent a crisp, file-constrained prompt with the exact APIs it may depend on. For one-shot code review (no edits), omit file-modifying tools with `--exclude-tools edit,write`.
+
 1. **Dispatch** — Break the feature into file-disjoint slices (e.g., model + UI + wiring). Launch Longcat agents concurrently via `Task(tool)`, each with a crisp, file-constrained prompt and the exact APIs it may depend on.
 2. **Review** — When all agents finish, launch a **review subagent** to inspect the combined diff. It reports only actionable findings with severity, file:line, and fix.
 3. **Fix** — Dispatch the findings back to Longcat agents (group related findings into the same agent to minimize context). Apply trivial/mechanical fixes directly if faster.
@@ -14,6 +33,8 @@ For multi-component features, dispatch independent **Longcat subagents** in para
 
 Key rules:
 - Never dispatch overlapping file scopes to parallel agents.
+- Always prioritize `longcat/LongCat-2.0` with `--thinking high` for subagent work.
+- Never dispatch GPT model series (`openai-codex/*`, `openai/*`) for subagent work unless explicitly instructed.
 - If a Longcat task returns empty, re-read the target files to see if it completed silently, then decide whether to re-dispatch or fix directly.
 - Remove diagnostic/development-only tests after features stabilize.
 - Update `CHANGELOG.md` and `docs/ROADMAP.md` after each commit that implements a roadmap item.
@@ -82,7 +103,7 @@ Key rules:
   MCRYSDEN_REGENERATE=1 swift test --filter SnapshotTests
   ```
   Review the changed hashes, then rerun snapshots without the environment variable.
-- The tracked suite contains 1053 tests as of v1.1.25. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
+- The tracked suite contains 1048 tests as of v1.1.26. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
 - Parser failures must become `ParseError` with a useful path/reason; malformed user files must not trap. C parsers report details through thread-local `molenv_last_error`.
 
 ## References
