@@ -4,6 +4,28 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.25] — 2026-07-30
+
+### Added
+- K-path-editor cumulative reciprocal distance display, candidate hover tooltips, viewport node labels, and automatic BZ framing. Physical incoming/cumulative distances (Å⁻¹) with break-aware component handling. MetalView NSTrackingArea hover with candidate tooltips. Label overlay styles (atom/routeNode/selectedRouteNode/tooltip) with export filtering. AppKit reciprocal accessibility elements and keyboard navigation. BZPresentation.framedCamera with one-shot entry framing and camera restoration. Scale-safe Double lattice/BZ math with adaptive G-star completeness proof and bounded construction budgets. Centering detection with one-to-one multiplicity matching.
+
+### Changed
+- ReciprocalCell hardened with scale-safe Double arithmetic, adaptive G-star completeness proof, bounded construction budgets, and centering detection with one-to-one multiplicity matching.
+
+### Tests
+- Added 125 tests: 10 CenteringDetectionTests, 13 BZFramingTests, 7 BZConstructionBudgetTests, 6 BZScaleInvarianceTests, 6 BZSkewCompletenessTests, 12 ReciprocalCellTests, 12 ReciprocalDistanceTests, 45 ReciprocalUXIntegrationTests, 12 MetalViewHoverTests, and 2 LabelOverlayViewTests. Full suite now at 1053 tests.
+
+## [1.1.24] — 2026-07-29
+
+### Added
+- Opt-in, lazy, cancellable accelerated periodic image-aware coordination analysis for molecules and skew 1D/2D/3D cells, with configurable covalent-radius scale, same-atom and multiple-periodic-image neighbors, deterministic shells/CN, bounded CSR storage/work, selected-neighbor readout, an atom-table CN column and `cn:` filtering, and optional 3D/2D/polyhedral coloring.
+
+### Changed
+- Added async debounce/stale-generation safety, effective expanded-cell handling for displayed supercells, and preservation of active coordination coloring in PNG and raster-backed vector exports.
+
+### Tests
+- Added 70 tests: 33 CoordinationAnalysisTests, 19 CoordinationIntegrationTests, 9 additional AtomTableViewTests, 5 additional RendererTests, and 4 additional AppExportTests. Full suite now at 928 tests.
+
 ## [1.1.23] — 2026-07-29
 
 ### Added

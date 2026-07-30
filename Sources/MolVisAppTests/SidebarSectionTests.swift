@@ -42,6 +42,7 @@ final class SidebarSectionTests: XCTestCase {
             .supercell: "SideBarCollapsed.supercell",
             .slab: "SideBarCollapsed.slab",
             .animation: "SideBarCollapsed.animation",
+            .coordination: "SideBarCollapsed.coordination",
         ]
         for (section, key) in expected {
             XCTAssertEqual(section.rawValue, key)
@@ -66,6 +67,25 @@ final class SidebarSectionTests: XCTestCase {
         // With keys now sourced from the enum, instantiating the sidebar must
         // compile and build a body without trapping.
         let sidebar = SideBar(state: SideBarState())
+        XCTAssertNotNil(sidebar.body)
+    }
+
+    func testReciprocalEditorStatusIsRuntimeOnlyAndClearsForNewScene() {
+        let state = SideBarState()
+        state.reciprocalEditorStatusText = "Brillouin zone unavailable for this cell."
+        XCTAssertFalse(state.reciprocalEditorAvailable)
+
+        state.syncFromScene(Scene())
+
+        XCTAssertTrue(state.reciprocalEditorAvailable)
+        XCTAssertNil(state.reciprocalEditorStatusText)
+    }
+
+    func testUnavailableReciprocalEditorSidebarStillBuilds() {
+        let state = SideBarState()
+        state.reciprocalEditorStatusText = "Brillouin zone unavailable for this cell."
+        let sidebar = SideBar(state: state)
+
         XCTAssertNotNil(sidebar.body)
     }
 

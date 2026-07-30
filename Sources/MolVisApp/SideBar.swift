@@ -37,6 +37,7 @@ struct SideBar: View {
     @AppStorage(CollapsibleSidebarSection.isosurface.rawValue) private var isosurfaceExpanded = true
     @AppStorage(CollapsibleSidebarSection.fermiSurface.rawValue) private var fermiSurfaceExpanded = true
     @AppStorage(CollapsibleSidebarSection.symmetry.rawValue) private var symmetryExpanded = true
+    @AppStorage(CollapsibleSidebarSection.coordination.rawValue) private var coordinationExpanded = true
 
     var body: some View {
         Form {
@@ -222,6 +223,28 @@ struct SideBar: View {
                     Slider(value: $state.slabB_dist, in: -20...20) { Text("Slab B dist: \(state.slabB_dist, specifier: "%.1f")") }
                 }
             }
+            // --- Coordination: opt-in covalent-radius neighbor analysis -----------
+            // The derived data is intentionally not part of Scene persistence. The
+            // section is available only when the displayed structure has atoms.
+            if state.structureSummary?.atomCount ?? 0 > 0 {
+                CollapsibleSection(title: "Coordination", isExpanded: $coordinationExpanded) {
+                    Toggle("Enable", isOn: $state.coordinationEnabled)
+                    Slider(value: $state.coordinationRadiusScale,
+                           in: 0.50...2.00, step: 0.05) {
+                        Text("Covalent-radius scale: \(state.coordinationRadiusScale, specifier: "%.2f")")
+                    }
+                    Text(state.coordinationStatusText)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    if !state.coordinationSummaryText.isEmpty {
+                        Text(state.coordinationSummaryText)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    Toggle("Color by coordination", isOn: $state.showCoordinationColors)
+                        .disabled(!state.coordinationEnabled || !state.coordinationAnalysisAvailable)
+                }
+            }
             // --- AXSF animation playback -------------------------------------------
             // Only shown for multi-frame AXSF files (frameCount > 1); the controls
             // reload the scene frame-by-frame through Parser.load(frameIndex:).
@@ -295,6 +318,24 @@ struct SideBar: View {
         String(v)
     }
 
+    private func reciprocalDistanceText(_ value: Float?) -> String {
+        guard let value, value.isFinite else { return "—" }
+        return String(format: "%.3f Å^-1", value)
+    }
+
+    private func kPathDistanceReadout(at index: Int) -> KPathDistanceReadout? {
+        guard state.kPathDistanceReadouts.indices.contains(index) else { return nil }
+        return state.kPathDistanceReadouts[index]
+    }
+
+    private func kPathIsComponentStart(at index: Int) -> Bool {
+        index == 0 || state.kPathBreaks.contains(index - 1)
+    }
+
+    private func kPathDistancePrefix(at index: Int) -> String {
+        kPathIsComponentStart(at: index) ? (index == 0 ? "Start" : "Start |") : "In"
+    }
+
     // Per-k-path-point rows: extracted to keep the Section builder below the
     // type-checker's complexity threshold.
     private var kPathRows: some View {
@@ -318,11 +359,19 @@ struct SideBar: View {
                         // Bounds-safe: a row closure can outlive a deletion/reorder.
                         get: { state.kPathPoints.indices.contains(i) ? state.kPathPoints[i].label : "" },
                         set: { state.updateLabel(at: i, to: $0) }
-                    ))
-                    .frame(maxWidth: 40)
+                     ))
+                     .frame(maxWidth: 40)
                     Text(String(format: "(%.2f,%.2f,%.2f)", kp.frac.x, kp.frac.y, kp.frac.z))
                         .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
                 }
+                Text("\(kPathDistancePrefix(at: i)) \(reciprocalDistanceText(kPathDistanceReadout(at: i)?.incomingDistance))  total \(reciprocalDistanceText(kPathDistanceReadout(at: i)?.cumulativeDistance))")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .accessibilityLabel(kPathIsComponentStart(at: i) && i > 0
+                        ? "Disconnected component start; incoming distance unavailable; cumulative distance \(reciprocalDistanceText(kPathDistanceReadout(at: i)?.cumulativeDistance))"
+                        : "Incoming distance \(reciprocalDistanceText(kPathDistanceReadout(at: i)?.incomingDistance)); cumulative distance \(reciprocalDistanceText(kPathDistanceReadout(at: i)?.cumulativeDistance))")
                 // Selected-node coordinate editor. Text fields are bound to local
                 // state so a partial edit (e.g. "0.") never commits an invalid
                 // float. Drafts are committed ONCE on focus loss or via the
@@ -416,6 +465,13 @@ struct SideBar: View {
     private var kPathContent: some View {
         Toggle("Brillouin Zone", isOn: $state.showBrillouinZone)
         Toggle("Edit on BZ", isOn: $state.editKPathOnBZ)
+            .disabled(!state.reciprocalEditorAvailable)
+        if let status = state.reciprocalEditorStatusText {
+            Text(status)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .accessibilityLabel("Reciprocal editor unavailable: \(status)")
+        }
         if state.editKPathOnBZ {
             // Concise active instruction. The controller shows white BZ-landmark
             // crosses; clicking appends one to the route.
@@ -431,6 +487,11 @@ struct SideBar: View {
             Button("Default") { state.resetToDefault() }
         }
         .buttonStyle(.bordered).font(.caption)
+        if !state.kPathPoints.isEmpty {
+            Text("Total connected: \(reciprocalDistanceText(state.kPathTotalDistance))")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+        }
         HStack {
             let route = KPath(points: state.kPathPoints, breaks: state.kPathBreaks)
             Button("QE (.pwscf)") { state.onExportKPath?(route, .qe) }

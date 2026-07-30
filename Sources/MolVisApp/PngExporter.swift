@@ -8,6 +8,9 @@ enum PngExportError: Error { case noGPU, noTex, noCGImage, noPNG, noQueue, noCom
 struct RenderExportOptions {
     var labels: [LabelOverlayView.Label] = []
     var showBZLandmarks = false
+    var coordinationNumbers: [Int] = []
+    var showCoordinationColors: Bool = false
+    var selectedKPathNode: Int? = nil
 }
 
 enum PngExporter {
@@ -33,6 +36,9 @@ enum PngExporter {
         let renderer = try Renderer(device: device)
         renderer.scene = scene
         renderer.showBZLandmarks = options.showBZLandmarks
+        renderer.coordinationNumbers = options.coordinationNumbers
+        renderer.showCoordinationColors = options.showCoordinationColors
+        renderer.selectedKPathNode = options.selectedKPathNode
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm
         desc.width = w; desc.height = h
@@ -87,19 +93,17 @@ enum PngExporter {
 
     /// Composite AppKit's top-left-origin label overlay onto an offscreen raster.
     static func composite(labels: [LabelOverlayView.Label], onto image: CGImage) throws -> CGImage {
-        guard !labels.isEmpty else { return image }
+        let exportableLabels = labels.filter(\.isExportable)
+        guard !exportableLabels.isEmpty else { return image }
         let rep = NSBitmapImageRep(cgImage: image)
         guard let context = NSGraphicsContext(bitmapImageRep: rep) else { throw PngExportError.noCGImage }
         NSGraphicsContext.saveGraphicsState()
         context.cgContext.translateBy(x: 0, y: CGFloat(image.height))
         context.cgContext.scaleBy(x: 1, y: -1)
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context.cgContext, flipped: true)
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-            .foregroundColor: NSColor.white,
-        ]
-        for label in labels {
-            (label.symbol as NSString).draw(at: NSPoint(x: label.x, y: label.y), withAttributes: attributes)
+        let bounds = NSRect(x: 0, y: 0, width: image.width, height: image.height)
+        for label in exportableLabels {
+            LabelOverlayView.draw(label, in: bounds)
         }
         context.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()

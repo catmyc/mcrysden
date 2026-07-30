@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-29 (v1.1.23 periodic minimum-image distance, read-only atom table, and 858 tests)**.
+Last updated: **2026-07-30 (v1.1.25 reciprocal-space UX: k-path distance readouts, hover tooltips, viewport labels, automatic BZ framing, and 1053 tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-## Implemented foundation (through v1.1.23)
+## Implemented foundation (through v1.1.25)
 
 ### File formats
 - [x] XSF (structure + `DATAGRID_3D`/`2D`, including `.xsf.gz`), AXSF animation
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 858 tracked tests as of v1.1.23: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache, parser-hardening, renderer-safety, export, state, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 1053 tracked tests as of v1.1.25: unit, snapshot (FNV-1a pixel hash vs. committed goldens), diagnostic, model-layer cache, parser-hardening, renderer-safety, export, state, coordination-analysis, reciprocal-ux, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
@@ -95,7 +95,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Direct fractional-coordinate editing with undo/provenance preservation and selected-node highlighting between sidebar and BZ.
 - [x] User-configurable per-segment k-path sampling for QE and VASP export.
 - [x] Export VASP `KPOINTS` (line-mode, endpoint-pair encoding, blank-line segment separation).
-- [ ] K-path-editor cumulative reciprocal distance display, candidate hover tooltips, viewport node labels, and automatic BZ framing. Band plots already use cumulative reciprocal distance.
+- [x] K-path-editor cumulative reciprocal distance display, candidate hover tooltips, viewport node labels, and automatic BZ framing (v1.1.25). Band plots already use cumulative reciprocal distance.
 - [ ] Import k-paths from QE, VASP, Wannier90, and KPF.
 - [ ] Export Wannier90 `kpoint_path` and additional QE band-path forms.
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
@@ -105,10 +105,10 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 
 ### Structure information and analysis
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
-- [~] Atom table with fractional/Cartesian coordinates, and coordination numbers. Read-only Cartesian/fractional table with element/label filtering and linked multiple selection implemented; coordination numbers and editing remain pending.
-- [~] Coordination shells, coordination coloring, nearest-neighbor tables, bond/angle distributions, radial distribution functions, and minimum-image periodic measurements. Periodic minimum-image distance measurement implemented; shells, coloring, neighbor tables, distributions, RDF, and broader periodic analysis remain pending.
+- [~] Atom table with fractional/Cartesian coordinates, and coordination numbers. Read-only Cartesian/fractional table with element/label/CN filtering, coordination numbers, and linked multiple selection implemented; atom editing remains pending.
+- [~] Coordination shells, coordination coloring, selected nearest-neighbor readout, and minimum-image periodic distance are implemented for molecules and 1D/2D/3D skew cells; full neighbor tables, bond/angle distributions, radial distribution functions, and broader periodic measurements remain pending.
 - [ ] Polyhedron volume/distortion metrics and two-structure comparison with displacement vectors and RMS displacement.
-- [ ] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels.
+- [~] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels. Linked atom-table element/label/CN filters and selection, plus coordination coloring, are implemented; region/expression filtering and on-screen bond-distance labels remain pending.
 
 ### Structure editing and generation
 - [ ] Insert, remove, substitute, and displace atoms; edit Cartesian/fractional coordinates and lattice parameters; and maintain full undo/redo history.

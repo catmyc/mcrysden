@@ -57,6 +57,26 @@ final class SideBarState: ObservableObject {
     @Published var slabB_k: Int = -1 { didSet { onChange?() } }
     @Published var slabB_l: Int = 0 { didSet { onChange?() } }
     @Published var slabB_dist: Float = 0 { didSet { onChange?() } }
+    /// Coordination analysis is a runtime-only opt-in. It is deliberately not
+    /// mirrored into Scene or persisted state: changing files must not serialize
+    /// derived neighbor data into a document.
+    @Published var coordinationEnabled: Bool = false { didSet { onChange?() } }
+    @Published var coordinationRadiusScale: Float = CoordinationAnalyzer.defaultRadiusScale {
+        didSet {
+            let bounded = min(2.0, max(0.50, coordinationRadiusScale))
+            if coordinationRadiusScale != bounded {
+                coordinationRadiusScale = bounded
+            } else {
+                onChange?()
+            }
+        }
+    }
+    @Published var showCoordinationColors: Bool = false { didSet { onChange?() } }
+    /// Runtime-only readouts populated by MainWindowController. These are not
+    /// scene fields and therefore do not participate in state-file persistence.
+    @Published var coordinationStatusText: String = "Off"
+    @Published var coordinationSummaryText: String = ""
+    @Published var coordinationAnalysisAvailable = false
     @Published var measurementMode: MeasurementMode = .none { didSet { onChange?() } }
     /// k-path state (crystal only). points carry fractional coords + labels; when
     /// empty the editor offers the default high-symmetry path for the structure.
@@ -64,10 +84,23 @@ final class SideBarState: ObservableObject {
     /// Indices i such that there is NO segment between kPathPoints[i] and
     /// kPathPoints[i+1]. Represents disconnected high-symmetry segments.
     @Published var kPathBreaks: Set<Int> = [] { didSet { kPathDidChange() } }
+    /// Runtime-only physical reciprocal-space readouts aligned with kPathPoints.
+    /// These are derived from the loaded scene cell and are not persisted.
+    @Published private(set) var kPathDistanceReadouts: [KPathDistanceReadout] = []
+    /// The final cumulative connected route distance, when the route is valid.
+    /// A nil value means the route or reciprocal basis contains invalid data.
+    var kPathTotalDistance: Float? {
+        kPathDistanceReadouts.last?.cumulativeDistance
+    }
     /// UI-only: when true the user is editing the k-path by clicking BZ landmarks.
     /// Forces Brillouin-zone visibility on (handled in syncFromState). Exiting
     /// this mode does not itself change the route.
     @Published var editKPathOnBZ: Bool = false { didSet { onChange?() } }
+    /// Runtime-only reciprocal-editor availability for the current base scene.
+    /// A failed BZ build or framing attempt sets the reason; scene/frame installs
+    /// clear it so a later scene can be tried independently.
+    @Published var reciprocalEditorStatusText: String? = nil
+    var reciprocalEditorAvailable: Bool { reciprocalEditorStatusText == nil }
     /// Per-segment k-path sampling density used when building the KPath for export.
     /// UI-only preference (not a scene field); the controller stamps it onto the
     /// route before exporting. Defaults to the KPath default of 20.
@@ -92,6 +125,9 @@ final class SideBarState: ObservableObject {
     /// editor operations batch the notification until both values agree.
     private var kPathMutationDepth = 0
     private var pendingKPathChange = false
+    /// Runtime-only cell used to derive the physical k-path readouts. It is
+    /// refreshed by syncFromScene and deliberately has no persistence path.
+    private var kPathCell: Cell?
     /// Bumped once per whole-route replacement (replaceKPath) so the controller can
     /// clear a stale node selection and the SideBar can drop its local editor draft.
     /// Single-node edits (updateLabel, updateKPathPoint, move, remove, append, ...)
@@ -190,8 +226,10 @@ final class SideBarState: ObservableObject {
         // route lives in the scene and must be copied back, never regenerated.
         // Provenance and signature travel with the geometry so the sidebar's idea
         // of the route's identity matches the scene's exactly.
+        refreshKPathMetrics(for: scene.cell)
         replaceKPath(points: scene.kPathPoints, breaks: scene.kPathBreaks,
                      provenance: scene.kPathProvenance, signature: scene.kPathSignature)
+        clearReciprocalEditorStatus()
         editKPathOnBZ = false   // loading a new scene exits edit mode
         kPathUndo = []          // drop stale undo history from the previous scene
         measurementMode = scene.measurementMode
@@ -240,6 +278,12 @@ final class SideBarState: ObservableObject {
         onChange = saved
     }
 
+    /// Clear the transient reciprocal-editor failure for a new scene or frame.
+    /// This intentionally does not invoke `onChange`: the status is not scene state.
+    func clearReciprocalEditorStatus() {
+        reciprocalEditorStatusText = nil
+    }
+
     // MARK: - k-path editing (UI-only mutations; each fires onChange → sync)
 
     /// Record the current route on the undo stack before mutating it. The snapshot
@@ -268,6 +312,7 @@ final class SideBarState: ObservableObject {
             kPathMutationDepth -= 1
             if kPathMutationDepth == 0, pendingKPathChange {
                 pendingKPathChange = false
+                refreshKPathDistanceReadouts()
                 onChange?()
             }
         }
@@ -278,8 +323,26 @@ final class SideBarState: ObservableObject {
         if kPathMutationDepth > 0 {
             pendingKPathChange = true
         } else {
+            refreshKPathDistanceReadouts()
             onChange?()
         }
+    }
+
+    private func refreshKPathDistanceReadouts() {
+        guard let cell = kPathCell else {
+            kPathDistanceReadouts = []
+            return
+        }
+        let route = KPath(points: kPathPoints, breaks: kPathBreaks)
+        kPathDistanceReadouts = route.reciprocalDistanceReadouts(cell: cell)
+    }
+
+    /// Refresh the runtime reciprocal metric after a frame or scene geometry
+    /// replacement. This deliberately does not invoke onChange: the route is
+    /// unchanged and callers may use it while holding the controller's sync guard.
+    func refreshKPathMetrics(for cell: Cell?) {
+        kPathCell = cell
+        refreshKPathDistanceReadouts()
     }
 
     /// Replace the whole route atomically from the controller (for example when
@@ -488,6 +551,7 @@ enum CollapsibleSidebarSection: String, CaseIterable {
     case supercell = "SideBarCollapsed.supercell"
     case slab = "SideBarCollapsed.slab"
     case animation = "SideBarCollapsed.animation"
+    case coordination = "SideBarCollapsed.coordination"
 
     var defaultsKey: String { rawValue }
 }

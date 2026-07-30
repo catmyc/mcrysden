@@ -40,11 +40,15 @@ final class BzCacheTests: XCTestCase {
     }
 
     func testBZVisibleForSlabViaRenderer() throws {
-        // GaAsH slab (originally returned NIL and lagged): with BZ on the render MUST
-        // differ from BZ off, and both builds return a closed polyhedron.
+        // GaAsH slab (originally returned nil after an oversized prefix): with BZ on
+        // the render MUST differ from BZ off, and the bounded build must be closed.
         let assets = URL(fileURLWithPath: #file).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Assets")
         var scene = Scene(loaded: try Parser.load(assets.appendingPathComponent("GaAsH.xsf")))
+        let bz = try XCTUnwrap(BrillouinZone.build(cell: try XCTUnwrap(scene.cell), atoms: scene.baseAtoms))
+        XCTAssertEqual(bz.faces.count, bz.normals.count)
+        XCTAssertGreaterThanOrEqual(bz.faces.count, 6)
+        XCTAssertTrue(bz.faces.allSatisfy { $0.count >= 3 && $0.allSatisfy(\.isFinite) })
         scene.displayMode = .ballStick
         let off = try render(scene)
         scene.showBrillouinZone = true

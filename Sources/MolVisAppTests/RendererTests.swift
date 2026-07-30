@@ -103,6 +103,133 @@ final class RendererTests: XCTestCase {
         XCTAssertEqual(ElementTable.covalentRadius(1), 0.31, accuracy: 0.01)
     }
 
+    func testCoordinationPaletteIsDeterministicAndBounded() {
+        let samples = [Int.min, -1, 0, 1, 9, 10, Int.max]
+        for number in samples {
+            let color = Renderer.coordinationColor(number)
+            XCTAssertEqual(color, Renderer.coordinationColor(number))
+            for component in [color.x, color.y, color.z] {
+                XCTAssertTrue(component.isFinite)
+                XCTAssertGreaterThanOrEqual(component, 0)
+                XCTAssertLessThanOrEqual(component, 1)
+            }
+        }
+        XCTAssertEqual(Renderer.coordinationColor(-1), Renderer.coordinationColor(0))
+        XCTAssertEqual(Renderer.coordinationColor(Int.max), Renderer.coordinationColor(10))
+        XCTAssertNotEqual(Renderer.coordinationColor(0), Renderer.coordinationColor(1))
+    }
+
+    func testCoordinationColorFallbackAndSelectionOverride() {
+        let cpk = ElementTable.color(6)
+        let coordination = Renderer.coordinationColor(3)
+        XCTAssertEqual(Renderer.baseAtomColor(atomicNumber: 6, coordinationNumber: 3,
+                                              showCoordinationColors: true), coordination)
+        XCTAssertEqual(Renderer.baseAtomColor(atomicNumber: 6, coordinationNumber: nil,
+                                              showCoordinationColors: true), cpk,
+                       "an incomplete coordination array must retain CPK colors")
+        XCTAssertEqual(Renderer.baseAtomColor(atomicNumber: 6, coordinationNumber: 3,
+                                              showCoordinationColors: false), cpk)
+        XCTAssertEqual(Renderer.atomColor(atomicNumber: 6, coordinationNumber: 3,
+                                          showCoordinationColors: true, selected: true),
+                       SIMD3<Float>(1, 1, 0.2))
+    }
+
+    func testCoordinationColorsChange3DAnd2DFrames() throws {
+        var scene = Scene()
+        scene.background = "#000000"
+        scene.showAxes = false
+        scene.showCellFrame = false
+        scene.atoms = [Atom(coord: SIMD3(-1.2, 0, 0), atomicNumber: 6, label: "C"),
+                       Atom(coord: SIMD3(1.2, 0, 0), atomicNumber: 8, label: "O")]
+
+        let baseline3D = try render(scene: scene, dist: 8)
+        let coordination3D = try render(scene: scene, dist: 8,
+                                         coordinationNumbers: [0, 9],
+                                         showCoordinationColors: true)
+        XCTAssertNotEqual(pixelHash(baseline3D), pixelHash(coordination3D))
+
+        var scene2D = scene
+        scene2D.displayMode = .point2D
+        let baseline2D = try render(scene: scene2D, dist: 8)
+        let coordination2D = try render(scene: scene2D, dist: 8,
+                                         coordinationNumbers: [0, 9],
+                                         showCoordinationColors: true)
+        XCTAssertNotEqual(pixelHash(baseline2D), pixelHash(coordination2D))
+    }
+
+    func testCoordinationColorsDisabledDoNotChangeFrame() throws {
+        var scene = Scene()
+        scene.background = "#000000"
+        scene.showAxes = false
+        scene.showCellFrame = false
+        scene.atoms = [Atom(coord: SIMD3(-1, 0, 0), atomicNumber: 6, label: "C"),
+                       Atom(coord: SIMD3(1, 0, 0), atomicNumber: 8, label: "O")]
+
+        let baseline = try render(scene: scene, dist: 8)
+        let disabled = try render(scene: scene, dist: 8,
+                                  coordinationNumbers: [0, 9],
+                                  showCoordinationColors: false)
+        XCTAssertEqual(pixelHash(baseline), pixelHash(disabled),
+                       "disabled coordination coloring must preserve the existing frame")
+
+        let mismatched = try render(scene: scene, dist: 8,
+                                    coordinationNumbers: [0],
+                                    showCoordinationColors: true)
+        XCTAssertEqual(pixelHash(baseline), pixelHash(mismatched),
+                       "a mismatched coordination array must retain the existing frame")
+    }
+
+    func testRenderer2DCoordinationPropertiesPassthrough() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let renderer2D = try Renderer2D(device: device)
+        XCTAssertEqual(renderer2D.coordinationNumbers, [])
+        XCTAssertFalse(renderer2D.showCoordinationColors)
+
+        renderer2D.coordinationNumbers = [1, 4, 9]
+        renderer2D.showCoordinationColors = true
+        XCTAssertEqual(renderer2D.coordinationNumbers, [1, 4, 9])
+        XCTAssertTrue(renderer2D.showCoordinationColors)
+        XCTAssertEqual(renderer2D.renderer.coordinationNumbers, [1, 4, 9])
+        XCTAssertTrue(renderer2D.renderer.showCoordinationColors)
+    }
+
+    func testInstalledBZCacheAvoidsBuildAndSceneInvalidationStillRebuilds() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let renderer = try Renderer(device: device)
+        let cell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(0, 5, 0), c: SIMD3(0, 0, 5))
+        let atoms = [Atom(coord: .zero, atomicNumber: 14, label: "Si")]
+        var scene = Scene()
+        scene.isCrystal = true
+        scene.cell = cell
+        scene.baseAtoms = atoms
+        scene.atoms = atoms
+        scene.showBrillouinZone = true
+        renderer.scene = scene
+        let bz = try XCTUnwrap(BrillouinZone.build(cell: cell, atoms: atoms))
+        renderer.installBrillouinZoneCache(bz: bz, candidates: bz.candidates())
+
+        let texture = try XCTUnwrap(device.makeTexture(descriptor: wtx(64, 64)))
+        let viewport = MTLViewport(originX: 0, originY: 0, width: 64, height: 64, znear: 0, zfar: 1)
+        func encode() throws {
+            let commandBuffer = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+            XCTAssertTrue(renderer.encode(to: commandBuffer, target: texture,
+                                           viewport: viewport, camera: renderer.currentCamera))
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+        }
+
+        try encode()
+        XCTAssertEqual(renderer.bzRebuildCount, 0)
+
+        var changed = scene
+        changed.cell = Cell(a: SIMD3(6, 0, 0), b: SIMD3(0, 6, 0), c: SIMD3(0, 0, 6))
+        renderer.scene = changed
+        try encode()
+        XCTAssertEqual(renderer.bzRebuildCount, 1,
+                       "cell invalidation must discard an installed controller cache")
+    }
+
     // Decode a CGImage to RGBA and count foreground (non-black) pixels.
     private func foregroundPixels(_ cg: CGImage) -> Int {
         let w = cg.width, h = cg.height
@@ -353,10 +480,14 @@ final class RendererTests: XCTestCase {
 
     private func render(scene: Scene, dist: Float,
                         rotation: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
-                        w: Int = 96, h: Int = 96) throws -> MTLTexture {
+                        w: Int = 96, h: Int = 96,
+                        coordinationNumbers: [Int] = [],
+                        showCoordinationColors: Bool = false) throws -> MTLTexture {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
         let r = try Renderer(device: device)
         r.scene = scene
+        r.coordinationNumbers = coordinationNumbers
+        r.showCoordinationColors = showCoordinationColors
         r.currentCamera.distance = dist
         r.currentCamera.rotation = rotation
         let desc = MTLTextureDescriptor()

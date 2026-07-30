@@ -50,6 +50,21 @@ final class AtomTableViewTests: XCTestCase {
         XCTAssertEqual(view.value(atRow: 4, columnIdentifier: AtomTableView.colElement), "Fe")
     }
 
+    func testCoordinationColumnShowsValuesAndRequiresExactAtomCount() {
+        let view = makeView()
+        let atoms = makeAtoms()
+        XCTAssertTrue(view.searchField.placeholderString?.contains("cn:N") == true)
+        view.update(atoms: atoms, cell: makeCell(), selectedAtoms: [],
+                    coordinationNumbers: [4, 4, 2, 2, 3])
+        let column = view.tableView.tableColumns.first { $0.identifier == AtomTableView.colCoordination }
+        XCTAssertEqual(column?.title, "CN")
+        XCTAssertEqual(view.value(atRow: 0, columnIdentifier: AtomTableView.colCoordination), "4")
+        XCTAssertEqual(view.value(atRow: 4, columnIdentifier: AtomTableView.colCoordination), "3")
+
+        view.update(atoms: atoms, cell: makeCell(), selectedAtoms: [], coordinationNumbers: [4])
+        XCTAssertNil(view.value(atRow: 0, columnIdentifier: AtomTableView.colCoordination))
+    }
+
     func testCartesianColumnsFormatValues() {
         let view = makeView()
         view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [])
@@ -155,6 +170,147 @@ final class AtomTableViewTests: XCTestCase {
         view.searchChanged(view.searchField)
         XCTAssertEqual(view.tableView.numberOfRows, 2)
         XCTAssertEqual(view.filteredAtomIndices, [0, 1])
+    }
+
+    func testFilterByCoordinationExactAndRanges() {
+        let view = makeView()
+        view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [],
+                    coordinationNumbers: [4, 4, 2, 2, 0])
+
+        view.searchField.stringValue = "cn:4"
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.filteredAtomIndices, [0, 1])
+
+        view.searchField.stringValue = "CN:>=4"
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.filteredAtomIndices, [0, 1])
+
+        view.searchField.stringValue = "cn:<=2"
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.filteredAtomIndices, [2, 3, 4])
+    }
+
+    func testCoordinationFilterCombinesTextTermsAndWhitespace() {
+        let view = makeView()
+        view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [],
+                    coordinationNumbers: [4, 4, 2, 2, 4])
+        view.searchField.stringValue = "  sI   CN:>=4  "
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.filteredAtomIndices, [0, 1])
+    }
+
+    func testMalformedNegativeHugeAndUnavailableCoordinationFiltersMatchNothing() {
+        let view = makeView()
+        view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [],
+                    coordinationNumbers: [4, 4, 2, 2, 0])
+
+        for query in ["cn:", "cn:wat", "cn:-1", "cn:>=-2", "cn:999999999999999999999999"] {
+            view.searchField.stringValue = query
+            view.searchChanged(view.searchField)
+            XCTAssertEqual(view.filteredAtomIndices, [], query)
+        }
+
+        view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [])
+        view.searchField.stringValue = "cn:>=0"
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.filteredAtomIndices, [])
+    }
+
+    func testCoordinationFilterPreservesSelectionWhenAppliedAndRemoved() {
+        let view = makeView()
+        view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [0, 2],
+                    coordinationNumbers: [4, 4, 2, 2, 0])
+        var callbackCount = 0
+        view.onSelectionChange = { _ in callbackCount += 1 }
+
+        view.searchField.stringValue = "cn:4"
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.tableView.selectedRowIndexes, IndexSet([0]))
+
+        view.searchField.stringValue = ""
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.tableView.selectedRowIndexes, IndexSet([0, 2]))
+        XCTAssertEqual(callbackCount, 0)
+    }
+
+    func testCoordinationOnlyUpdatesFromNilValuesChangedAndBackToNil() {
+        let view = makeView()
+        let atoms = makeAtoms()
+        view.update(atoms: atoms, cell: makeCell(), selectedAtoms: [])
+        XCTAssertNil(view.value(atRow: 0, columnIdentifier: AtomTableView.colCoordination))
+        let fractionalConversions = view.fractionalConversionCount
+        let filterRebuilds = view.filterRebuildCount
+
+        view.searchField.stringValue = "cn:>=4"
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.filteredAtomIndices, [])
+        let cnFilterRebuilds = view.filterRebuildCount
+
+        view.updateCoordinationNumbers([4, 4, 2, 2, 0])
+        XCTAssertEqual(view.filteredAtomIndices, [0, 1])
+        XCTAssertEqual(view.value(atRow: 0, columnIdentifier: AtomTableView.colCoordination), "4")
+        XCTAssertEqual(view.fractionalConversionCount, fractionalConversions)
+        XCTAssertEqual(view.filterRebuildCount, cnFilterRebuilds + 1)
+
+        view.updateCoordinationNumbers([1, 1, 5, 5, 0])
+        XCTAssertEqual(view.filteredAtomIndices, [2, 3])
+        XCTAssertEqual(view.value(atRow: 0, columnIdentifier: AtomTableView.colCoordination), "5")
+        XCTAssertEqual(view.fractionalConversionCount, fractionalConversions)
+
+        view.updateCoordinationNumbers(nil)
+        XCTAssertEqual(view.filteredAtomIndices, [])
+        XCTAssertNil(view.value(atRow: 0, columnIdentifier: AtomTableView.colCoordination))
+        XCTAssertEqual(view.fractionalConversionCount, fractionalConversions)
+        XCTAssertEqual(view.filterRebuildCount, filterRebuilds + 4)
+    }
+
+    func testCoordinationOnlyUpdateTreatsMismatchedValuesAsUnavailable() {
+        let view = makeView()
+        view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [])
+
+        view.updateCoordinationNumbers([4])
+        XCTAssertNil(view.value(atRow: 0, columnIdentifier: AtomTableView.colCoordination))
+
+        view.searchField.stringValue = "cn:>=0"
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.filteredAtomIndices, [])
+    }
+
+    func testCoordinationOnlyPlainQueryKeepsMappingAndSelectionWithoutCallback() {
+        let view = makeView()
+        view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [0, 3])
+        view.searchField.stringValue = "O"
+        view.searchChanged(view.searchField)
+        let filteredIndices = view.filteredAtomIndices
+        let filterRebuilds = view.filterRebuildCount
+        var callbackCount = 0
+        view.onSelectionChange = { _ in callbackCount += 1 }
+
+        view.updateCoordinationNumbers([4, 4, 2, 2, 0])
+
+        XCTAssertEqual(view.filteredAtomIndices, filteredIndices)
+        XCTAssertEqual(view.tableView.selectedRowIndexes, IndexSet([1]))
+        XCTAssertEqual(view.filterRebuildCount, filterRebuilds)
+        XCTAssertEqual(callbackCount, 0)
+        XCTAssertEqual(view.value(atRow: 0, columnIdentifier: AtomTableView.colCoordination), "2")
+    }
+
+    func testCoordinationOnlyUpdatePreservesCanonicalSelectionForCNQueryWithoutCallback() {
+        let view = makeView()
+        view.update(atoms: makeAtoms(), cell: makeCell(), selectedAtoms: [0, 2])
+        view.searchField.stringValue = "cn:>=4"
+        view.searchChanged(view.searchField)
+        var callbackCount = 0
+        view.onSelectionChange = { _ in callbackCount += 1 }
+
+        view.updateCoordinationNumbers([4, 4, 2, 2, 0])
+        XCTAssertEqual(view.tableView.selectedRowIndexes, IndexSet([0]))
+        view.updateCoordinationNumbers([1, 1, 5, 5, 0])
+        XCTAssertEqual(view.tableView.selectedRowIndexes, IndexSet([0]))
+        view.searchField.stringValue = ""
+        view.searchChanged(view.searchField)
+        XCTAssertEqual(view.tableView.selectedRowIndexes, IndexSet([0, 2]))
+        XCTAssertEqual(callbackCount, 0)
     }
 
     func testEmptyFilterShowsAll() {
@@ -353,6 +509,12 @@ final class AtomTableViewTests: XCTestCase {
             Atom(coord: SIMD3<Float>(Float($0), 0, 0), atomicNumber: 1, label: "H")
         }
         view.update(atoms: atoms, cell: nil, selectedAtoms: [])
+        XCTAssertEqual(view.tableView.numberOfRows, count)
+        let filterRebuilds = view.filterRebuildCount
+        view.updateCoordinationNumbers(Array(repeating: 4, count: count))
+        XCTAssertEqual(view.tableView.numberOfRows, count)
+        XCTAssertEqual(view.filterRebuildCount, filterRebuilds)
+        XCTAssertEqual(view.value(atRow: count - 1, columnIdentifier: AtomTableView.colCoordination), "4")
         view.setSelectedAtomIndices([count - 1, count / 2, 0, count - 1])
         XCTAssertEqual(view.tableView.selectedRowIndexes,
                        IndexSet([0, count / 2, count - 1]))

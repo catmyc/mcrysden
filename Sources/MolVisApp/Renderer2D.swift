@@ -28,6 +28,25 @@ final class Renderer2D: NSObject, MTKViewDelegate {
         set { renderer.scene = newValue }
     }
 
+    var selectedKPathNode: Int? {
+        get { renderer.selectedKPathNode }
+        set { renderer.selectedKPathNode = newValue }
+    }
+
+    var coordinationNumbers: [Int] {
+        get { renderer.coordinationNumbers }
+        set { renderer.coordinationNumbers = newValue }
+    }
+
+    var showCoordinationColors: Bool {
+        get { renderer.showCoordinationColors }
+        set { renderer.showCoordinationColors = newValue }
+    }
+
+    internal func installBrillouinZoneCache(bz: BrillouinZone?, candidates: [BZCandidate]) {
+        renderer.installBrillouinZoneCache(bz: bz, candidates: candidates)
+    }
+
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {

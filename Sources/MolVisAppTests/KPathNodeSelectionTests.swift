@@ -91,6 +91,31 @@ final class KPathNodeSelectionTests: XCTestCase {
         XCTAssertNil(c.renderer?.selectedKPathNode)
     }
 
+    func testSelectionSynchronizes2DRendererAcrossDelegateSwitches() throws {
+        let c = MainWindowController(scene: try routeScene(), showWindow: false)
+        guard c.renderer != nil, c.renderer2D != nil else { throw NoGpu() }
+
+        c.selectKPathNode(1)
+        XCTAssertEqual(c.renderer?.selectedKPathNode, 1)
+        XCTAssertEqual(c.renderer2D?.selectedKPathNode, 1)
+
+        c.state.displayMode = .ballStick2D
+        XCTAssertTrue(c.scene.displayMode.is2D)
+        XCTAssertTrue(c.canvas.delegate === c.renderer2D)
+        XCTAssertEqual(c.renderer2D?.selectedKPathNode, 1)
+        XCTAssertEqual(c.labelOverlay.labels.filter { $0.style == .selectedRouteNode }.map(\.symbol), ["X"])
+
+        c.selectKPathNode(nil)
+        XCTAssertNil(c.renderer?.selectedKPathNode)
+        XCTAssertNil(c.renderer2D?.selectedKPathNode)
+
+        c.state.displayMode = .ballStick
+        XCTAssertTrue(c.canvas.delegate === c.renderer)
+        c.selectKPathNode(0)
+        c.state.displayMode = .ballStick2D
+        XCTAssertEqual(c.renderer2D?.selectedKPathNode, 0)
+    }
+
     // Loading a fresh scene clears any stale node highlight from the previous
     // scene so an out-of-range index can't linger.
     func testLoadFileClearsSelectedNode() throws {

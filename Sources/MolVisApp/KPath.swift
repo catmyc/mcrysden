@@ -10,6 +10,14 @@ import simd
 // vectors include the 2pi factor (see Cell.reciprocalVectors); band codes that
 // use the crystallographer's convention (no 2pi) divide accordingly on import.
 
+/// Physical reciprocal-space distances associated with one special k-point.
+/// Nil values mean that the corresponding readout could not be computed safely.
+struct KPathDistanceReadout: Equatable {
+    let incomingDistance: Float?
+    let cumulativeDistance: Float?
+    let isComponentStart: Bool
+}
+
 extension KPath {
     /// Break indices that actually separate two nodes in the current route.
     /// The model is deliberately tolerant of programmatic malformed values so
@@ -43,6 +51,116 @@ extension KPath {
         }
         if start < points.count {
             result.append(start..<points.count)
+        }
+        return result
+    }
+
+    /// Return physical incoming and cumulative distances for each route node.
+    /// Fractional route coordinates are mapped through the conventional
+    /// reciprocal basis from `Cell.reciprocalVectors`, whose vectors include
+    /// 2pi and therefore produce inverse-Angstrom distances.
+    ///
+    /// A break starts a new component: its node has no incoming distance and
+    /// retains the cumulative value reached by the preceding component. The
+    /// returned array always has one entry per route node, including invalid
+    /// entries, so callers can keep readouts aligned with the editor rows.
+    func reciprocalDistanceReadouts(cell: Cell) -> [KPathDistanceReadout] {
+        guard !points.isEmpty else { return [] }
+
+        let reciprocal = cell.reciprocalVectors
+        let basis = [reciprocal.a, reciprocal.b, reciprocal.c]
+        let basisFinite = basis.allSatisfy { vector in
+            vector.x.isFinite && vector.y.isFinite && vector.z.isFinite
+        }
+
+        // Check the reciprocal basis by a scale-relative determinant in Double.
+        // This avoids accepting Cell.reciprocalVectors' zero fallback and avoids
+        // Float overflow while validating very large but finite components.
+        let basisValid: Bool = {
+            guard basisFinite else { return false }
+            let aa = basis[0], bb = basis[1], cc = basis[2]
+            let ax = Double(aa.x), ay = Double(aa.y), az = Double(aa.z)
+            let bx = Double(bb.x), by = Double(bb.y), bz = Double(bb.z)
+            let cx = Double(cc.x), cy = Double(cc.y), cz = Double(cc.z)
+            let la = sqrt(ax * ax + ay * ay + az * az)
+            let lb = sqrt(bx * bx + by * by + bz * bz)
+            let lc = sqrt(cx * cx + cy * cy + cz * cz)
+            let determinant = ax * (by * cz - bz * cy)
+                - ay * (bx * cz - bz * cx)
+                + az * (bx * cy - by * cx)
+            let scale = la * lb * lc
+            return la.isFinite && lb.isFinite && lc.isFinite
+                && la > 0 && lb > 0 && lc > 0
+                && determinant.isFinite && scale.isFinite
+                && abs(determinant) > 1e-12 * scale
+        }()
+
+        let validBreaks = self.validBreaks
+        var result: [KPathDistanceReadout] = []
+        result.reserveCapacity(points.count)
+
+        var cumulative = 0.0
+        var cumulativeValid = basisValid
+        let maxFloat = Double(Float.greatestFiniteMagnitude)
+
+        func finiteDistance(_ lhs: SIMD3<Float>, _ rhs: SIMD3<Float>) -> Double? {
+            guard lhs.x.isFinite && lhs.y.isFinite && lhs.z.isFinite,
+                  rhs.x.isFinite && rhs.y.isFinite && rhs.z.isFinite,
+                  basisValid else { return nil }
+
+            let dx = Double(rhs.x) - Double(lhs.x)
+            let dy = Double(rhs.y) - Double(lhs.y)
+            let dz = Double(rhs.z) - Double(lhs.z)
+            let cartX = Double(reciprocal.a.x) * dx
+                + Double(reciprocal.b.x) * dy
+                + Double(reciprocal.c.x) * dz
+            let cartY = Double(reciprocal.a.y) * dx
+                + Double(reciprocal.b.y) * dy
+                + Double(reciprocal.c.y) * dz
+            let cartZ = Double(reciprocal.a.z) * dx
+                + Double(reciprocal.b.z) * dy
+                + Double(reciprocal.c.z) * dz
+            let squared = cartX * cartX + cartY * cartY + cartZ * cartZ
+            guard cartX.isFinite && cartY.isFinite && cartZ.isFinite,
+                  squared.isFinite, squared >= 0 else { return nil }
+            let distance = sqrt(squared)
+            return distance.isFinite ? distance : nil
+        }
+
+        for index in points.indices {
+            let startsComponent = index == 0 || validBreaks.contains(index - 1)
+            let point = points[index].frac
+            let pointFinite = point.x.isFinite && point.y.isFinite && point.z.isFinite
+            var incoming: Float?
+            var nodeCumulative: Float?
+
+            if pointFinite {
+                if startsComponent {
+                    if cumulativeValid && cumulative.isFinite && cumulative <= maxFloat {
+                        nodeCumulative = Float(cumulative)
+                    }
+                } else if let distance = finiteDistance(points[index - 1].frac, point),
+                          distance <= maxFloat {
+                    incoming = Float(distance)
+                    if cumulativeValid {
+                        let next = cumulative + distance
+                        if next.isFinite && next <= maxFloat {
+                            cumulative = next
+                            nodeCumulative = Float(next)
+                        } else {
+                            cumulativeValid = false
+                        }
+                    }
+                } else {
+                    cumulativeValid = false
+                }
+            } else {
+                cumulativeValid = false
+            }
+
+            result.append(KPathDistanceReadout(incomingDistance: incoming,
+                                               cumulativeDistance: nodeCumulative,
+                                               isComponentStart: startsComponent))
         }
         return result
     }

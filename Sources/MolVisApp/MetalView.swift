@@ -5,6 +5,7 @@ import simd
 protocol World: AnyObject {
     var camera: Camera { get set }
     var scene: Scene { get set }
+    var isReciprocalPathEditing: Bool { get }
     func setNeedsRender()
     /// The camera actually used to render the scene (2D modes override with
     /// identity rotation + ortho). Hit-testing must use this to match pixels.
@@ -19,12 +20,121 @@ protocol World: AnyObject {
     /// Returns true if the click was consumed — when it was, the caller must skip
     /// atom hit-testing so selection never fires while editing the route.
     func handleReciprocalPathClick(at click: SIMD2<Float>, viewport: SIMD2<Float>) -> Bool
+    /// Handle pointer movement in reciprocal k-path edit mode. `point` is nil when
+    /// the pointer leaves the view or a gesture begins; otherwise it is a top-origin
+    /// coordinate in the view's logical drawable space, matching the click hook.
+    /// `viewport` is the corresponding finite, positive logical drawable size.
+    func handleReciprocalPathHover(at point: SIMD2<Float>?, viewport: SIMD2<Float>)
+    /// Called once for each actual valid logical viewport-size change. The default
+    /// implementation below preserves ordinary redraw behavior for other worlds.
+    func reciprocalViewportSizeDidChange(_ viewport: SIMD2<Float>)
+    func reciprocalAccessibilityDescriptors(viewport: SIMD2<Float>) -> [ReciprocalAccessibilityDescriptor]
+    func focusReciprocalAccessibilityCandidate(_ descriptor: ReciprocalAccessibilityDescriptor)
+    func activateReciprocalAccessibilityCandidate(_ descriptor: ReciprocalAccessibilityDescriptor) -> Bool
+    func clearReciprocalAccessibilityFocus()
+}
+
+extension World {
+    var isReciprocalPathEditing: Bool { false }
+    func reciprocalViewportSizeDidChange(_ viewport: SIMD2<Float>) { setNeedsRender() }
+    func reciprocalAccessibilityDescriptors(viewport: SIMD2<Float>)
+        -> [ReciprocalAccessibilityDescriptor] { [] }
+    func focusReciprocalAccessibilityCandidate(_ descriptor: ReciprocalAccessibilityDescriptor) {}
+    func activateReciprocalAccessibilityCandidate(_ descriptor: ReciprocalAccessibilityDescriptor) -> Bool { false }
+    func clearReciprocalAccessibilityFocus() {}
+}
+
+enum ReciprocalKeyboardAction {
+    case previous
+    case next
+    case activate
+    case clear
+}
+
+struct ReciprocalAccessibilityDescriptor: Equatable {
+    let candidate: BZCandidate
+    let screenPoint: SIMD2<Float>
+    let screenRadius: Float
+    let label: String
+    let value: String
+    let help: String
+
+    init(candidate: BZCandidate, screenPoint: SIMD2<Float>, screenRadius: Float = 8,
+         label: String, value: String, help: String) {
+        self.candidate = candidate
+        self.screenPoint = screenPoint
+        self.screenRadius = screenRadius
+        self.label = label
+        self.value = value
+        self.help = help
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.candidate.point == rhs.candidate.point
+            && lhs.candidate.cartesian == rhs.candidate.cartesian
+            && lhs.candidate.type.rawValue == rhs.candidate.type.rawValue
+            && lhs.screenPoint == rhs.screenPoint
+            && lhs.screenRadius == rhs.screenRadius
+            && lhs.label == rhs.label
+            && lhs.value == rhs.value
+            && lhs.help == rhs.help
+    }
+}
+
+final class ReciprocalAccessibilityElement: NSAccessibilityElement {
+    let descriptor: ReciprocalAccessibilityDescriptor
+    weak var owner: MetalView?
+
+    init(descriptor: ReciprocalAccessibilityDescriptor, owner: MetalView) {
+        self.descriptor = descriptor
+        self.owner = owner
+        super.init()
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(descriptor.label)
+        setAccessibilityValue(descriptor.value)
+        setAccessibilityHelp(descriptor.help)
+        setAccessibilityEnabled(true)
+    }
+
+    override func accessibilityParent() -> Any? { owner }
+
+    override func accessibilityFrame() -> NSRect {
+        guard let owner else { return .zero }
+        return owner.accessibilityFrame(for: descriptor.screenPoint,
+                                        radius: descriptor.screenRadius,
+                                        viewport: owner.bounds.size)
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        owner?.activateReciprocalAccessibilityElement(self) ?? false
+    }
 }
 
 final class MetalView: MTKView {
     weak var world: World?
     private var lastMouse: NSPoint?
     private var mouseDownPos: NSPoint?
+    private var reciprocalHoverTrackingArea: NSTrackingArea?
+    private var lastReciprocalHoverViewport: SIMD2<Float>?
+    private var lastLogicalBoundsSize: CGSize?
+    private var reciprocalAccessibilityElements: [ReciprocalAccessibilityElement] = []
+    private var reciprocalAccessibilityDescriptors: [ReciprocalAccessibilityDescriptor] = []
+    private var reciprocalKeyboardFocusIndex: Int?
+    private var reciprocalAccessibilityWasQueried = false
+
+    /// Tests replace this with a recorder; production keeps AppKit's global
+    /// notification mechanism as the default.
+    var accessibilityNotificationPoster: (NSAccessibility.Notification, Any) -> Void = {
+        notification, element in
+        NSAccessibility.post(element: element, notification: notification)
+    }
+
+    /// VoiceOver and keyboard focus are meaningful only while the reciprocal
+    /// editor is active. Returning false outside that mode leaves normal view
+    /// focus and key handling to AppKit.
+    override var acceptsFirstResponder: Bool {
+        world?.isReciprocalPathEditing == true
+    }
 
     override init(frame: NSRect, device: MTLDevice?) {
         super.init(frame: frame, device: device)
@@ -40,14 +150,153 @@ final class MetalView: MTKView {
         // camera/scene change instead of driving a continuous display loop.
         enableSetNeedsDisplay = true
         isPaused = true
+        if bounds.size.width.isFinite, bounds.size.height.isFinite,
+           bounds.size.width > 0, bounds.size.height > 0 {
+            lastLogicalBoundsSize = bounds.size
+        }
         // delegate is the Renderer, set by owner after init
     }
 
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        notifyWorldOfLogicalSizeChange()
+    }
+
+    override func setBoundsSize(_ newSize: NSSize) {
+        super.setBoundsSize(newSize)
+        notifyWorldOfLogicalSizeChange()
+    }
+
+    /// Resize the persistent overlay through the normal World render path, but
+    /// only once for each valid logical drawable size. This also catches split
+    /// divider changes, which do not require an NSWindow resize notification.
+    private func notifyWorldOfLogicalSizeChange() {
+        let size = bounds.size
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0 else {
+            guard lastLogicalBoundsSize != nil else { return }
+            lastLogicalBoundsSize = nil
+            clearReciprocalFocusForResize()
+            return
+        }
+        guard lastLogicalBoundsSize != size else { return }
+        lastLogicalBoundsSize = size
+        clearReciprocalFocusForResize()
+        world?.reciprocalViewportSizeDidChange(SIMD2<Float>(Float(size.width), Float(size.height)))
+    }
+
+    private func clearReciprocalFocusForResize() {
+        invalidateReciprocalAccessibilityFocus()
+        world?.clearReciprocalAccessibilityFocus()
+    }
+
+    /// Converts AppKit's bottom-origin view point to the top-origin coordinates
+    /// consumed by reciprocal-space picking. The returned viewport intentionally
+    /// uses the same logical bounds as `mouseUp`, rather than a backing-scale
+    /// conversion, so hover and click projections remain identical.
+    static func reciprocalHoverPayload(for point: NSPoint, bounds: NSRect)
+        -> (point: SIMD2<Float>, viewport: SIMD2<Float>)? {
+        guard let viewport = reciprocalHoverViewport(for: bounds),
+              point.x.isFinite, point.y.isFinite else { return nil }
+        let x = Float(point.x)
+        let y = Float(bounds.height) - Float(point.y)
+        guard x.isFinite, y.isFinite,
+              x >= 0, x <= viewport.x, y >= 0, y <= viewport.y else { return nil }
+        return (SIMD2<Float>(x, y), viewport)
+    }
+
+    /// Returns a finite, positive viewport or nil for a zero/invalid view.
+    static func reciprocalHoverViewport(for bounds: NSRect) -> SIMD2<Float>? {
+        guard bounds.origin.x.isFinite, bounds.origin.y.isFinite,
+              bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0 else { return nil }
+        let viewport = SIMD2<Float>(Float(bounds.width), Float(bounds.height))
+        guard viewport.x.isFinite, viewport.y.isFinite else { return nil }
+        return viewport
+    }
+
+    override func updateTrackingAreas() {
+        if let area = reciprocalHoverTrackingArea {
+            removeTrackingArea(area)
+            reciprocalHoverTrackingArea = nil
+        }
+        super.updateTrackingAreas()
+
+        // `.inVisibleRect` makes AppKit keep this area aligned with clipping and
+        // resizing; no continuous MTKView rendering loop is needed for tracking.
+        // Do not clear hover or accessibility state here: AppKit can rebuild
+        // tracking areas without changing geometry, and the hover callback also
+        // owns the keyboard tooltip state. Mouse exit, gestures, and explicit
+        // geometry invalidation handle genuine pointer/presentation changes.
+        guard Self.reciprocalHoverViewport(for: bounds) != nil else { return }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        reciprocalHoverTrackingArea = area
+    }
+
+    private func sendReciprocalPathHover(for event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let payload = Self.reciprocalHoverPayload(for: point, bounds: bounds) else { return }
+        clearReciprocalAccessibilityFocusForPointer()
+        lastReciprocalHoverViewport = payload.viewport
+        world?.handleReciprocalPathHover(at: payload.point, viewport: payload.viewport)
+    }
+
+    private var hasReciprocalAccessibilityFocus: Bool {
+        reciprocalKeyboardFocusIndex != nil
+            || reciprocalAccessibilityElements.contains(where: { $0.isAccessibilityFocused() })
+    }
+
+    /// Pointer hover owns the shared reciprocal tooltip. Clear every local AX
+    /// representation before the world receives the pointer candidate, so the
+    /// controller cannot leave a keyboard-focused child behind the pointer UI.
+    private func clearReciprocalAccessibilityFocusForPointer() {
+        guard hasReciprocalAccessibilityFocus else { return }
+        reciprocalKeyboardFocusIndex = nil
+        clearAccessibilityElementFocus()
+        world?.clearReciprocalAccessibilityFocus()
+        postReciprocalAccessibilityNotification(.focusedUIElementChanged)
+    }
+
+    private func clearReciprocalPathHover() {
+        // If the view was resized to zero before the exit event arrived, retain
+        // the last valid viewport so the clear notification still has valid data.
+        guard let viewport = Self.reciprocalHoverViewport(for: bounds) ?? lastReciprocalHoverViewport else {
+            return
+        }
+        lastReciprocalHoverViewport = nil
+        world?.handleReciprocalPathHover(at: nil, viewport: viewport)
+    }
+
+    override func mouseEntered(with e: NSEvent) {
+        super.mouseEntered(with: e)
+        sendReciprocalPathHover(for: e)
+    }
+
+    override func mouseMoved(with e: NSEvent) {
+        super.mouseMoved(with: e)
+        sendReciprocalPathHover(for: e)
+    }
+
+    override func mouseExited(with e: NSEvent) {
+        clearReciprocalPathHover()
+        super.mouseExited(with: e)
+    }
+
     override func mouseDown(with e: NSEvent) {
+        clearReciprocalPathHover()
         // Defensive: ignore clicks delivered while a modal tracking loop is
         // active (e.g. the Open panel) so we never hit-test against a stale
         // scene or a zero-sized canvas.
         guard let w = window, w.isVisible else { return }
+        if world?.isReciprocalPathEditing == true {
+            w.makeFirstResponder(self)
+        }
         let p = convert(e.locationInWindow, from: nil)
         lastMouse = p; mouseDownPos = p
     }
@@ -226,18 +475,37 @@ final class MetalView: MTKView {
         world?.adjustSlabPlaneA(by: delta)
     }
     override func rightMouseDown(with e: NSEvent) {
+        clearReciprocalPathHover()
         lastMouse = convert(e.locationInWindow, from: nil)
     }
     override func rightMouseUp(with e: NSEvent) {
         lastMouse = nil
     }
+
+    /// Apply a zoom factor accepted by one of the gesture handlers. A neutral
+    /// factor remains a render-only no-op, while an actual zoom invalidates
+    /// reciprocal-space hover before changing the camera.
+    func applyZoom(factor: Float) {
+        if factor != 1 {
+            clearReciprocalPathHover()
+        }
+        world?.camera.distance = max(2, (world?.camera.distance ?? 20) * factor)
+        world?.setNeedsRender()
+    }
+
+    /// Apply a scroll delta after validating the value that will affect the
+    /// camera. Keeping the guard here makes malformed scroll input a complete
+    /// no-op before hover or camera state is touched.
+    func applyScrollZoom(delta: CGFloat) {
+        guard let factor = MetalView.scrollZoomFactor(delta) else { return }
+        applyZoom(factor: factor)
+    }
+
     override func scrollWheel(with e: NSEvent) {
         // A non-finite scrolling delta (garbage trackpad event) would make the
         // factor NaN/Inf and corrupt camera.distance, so treat it as a no-op.
         // Swift's `max(2, x)` collapses NaN to 2 but NOT Inf, so guard explicitly.
-        guard let factor = MetalView.scrollZoomFactor(e.scrollingDeltaY) else { return }
-        world?.camera.distance = max(2, (world?.camera.distance ?? 20) * factor)
-        world?.setNeedsRender()
+        applyScrollZoom(delta: e.scrollingDeltaY)
     }
 
     /// Distance scale factor for a scroll delta, or `nil` for a non-finite delta
@@ -254,7 +522,204 @@ final class MetalView: MTKView {
     }
     override func magnify(with e: NSEvent) {
         let factor = MetalView.magnifyFactor(for: Float(e.magnification))
-        world?.camera.distance = max(2, (world?.camera.distance ?? 20) * factor)
-        world?.setNeedsRender()
+        applyZoom(factor: factor)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let action = Self.reciprocalKeyboardAction(for: event),
+              handleReciprocalKeyboard(action) else {
+            super.keyDown(with: event)
+            return
+        }
+    }
+
+    /// Translate only unmodified editor keys. Ordinary command/control/option
+    /// shortcuts continue through AppKit, as do all keys outside edit mode.
+    static func reciprocalKeyboardAction(for event: NSEvent) -> ReciprocalKeyboardAction? {
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        guard modifiers.isEmpty else { return nil }
+        switch event.keyCode {
+        case 123, 126: return .previous
+        case 124, 125: return .next
+        case 36, 76, 49: return .activate
+        case 53: return .clear
+        default: return nil
+        }
+    }
+
+    /// Direct seam for tests and the event handler. Arrow order follows the
+    /// deterministic BZ candidate order; left/up move backward and right/down
+    /// move forward through that same order.
+    @discardableResult
+    func handleReciprocalKeyboard(_ action: ReciprocalKeyboardAction) -> Bool {
+        guard let world, world.isReciprocalPathEditing else { return false }
+        guard let viewport = Self.reciprocalHoverViewport(for: bounds) else {
+            invalidateReciprocalAccessibilityFocus()
+            world.clearReciprocalAccessibilityFocus()
+            return false
+        }
+
+        switch action {
+        case .clear:
+            let hadFocus = hasReciprocalAccessibilityFocus
+            reciprocalKeyboardFocusIndex = nil
+            clearAccessibilityElementFocus()
+            world.clearReciprocalAccessibilityFocus()
+            if hadFocus {
+                postReciprocalAccessibilityNotification(.focusedUIElementChanged)
+            }
+            return true
+        case .activate:
+            let descriptors = currentReciprocalAccessibilityDescriptors(viewport: viewport)
+            guard let index = reciprocalKeyboardFocusIndex,
+                  descriptors.indices.contains(index) else { return false }
+            return world.activateReciprocalAccessibilityCandidate(descriptors[index])
+        case .previous, .next:
+            let descriptors = currentReciprocalAccessibilityDescriptors(viewport: viewport)
+            guard !descriptors.isEmpty else { return false }
+            let previousFocus = reciprocalKeyboardFocusIndex
+            let delta = action == .previous ? -1 : 1
+            let nextIndex: Int
+            if let current = reciprocalKeyboardFocusIndex, descriptors.indices.contains(current) {
+                nextIndex = (current + delta + descriptors.count) % descriptors.count
+            } else {
+                nextIndex = delta < 0 ? descriptors.count - 1 : 0
+            }
+            reciprocalKeyboardFocusIndex = nextIndex
+            clearAccessibilityElementFocus()
+            world.focusReciprocalAccessibilityCandidate(descriptors[nextIndex])
+            _ = accessibilityElementsForReciprocalLandmarks()
+            if let element = reciprocalAccessibilityElements[safe: nextIndex] {
+                element.setAccessibilityFocused(true)
+            }
+            if previousFocus != nextIndex {
+                if let element = reciprocalAccessibilityElements[safe: nextIndex] {
+                    postReciprocalAccessibilityNotification(.focusedUIElementChanged,
+                                                             element: element)
+                }
+            }
+            return true
+        }
+    }
+
+    /// Return the current AX children directly for tests and embedding paths
+    /// where VoiceOver is unavailable. The normal AppKit path uses the same
+    /// collection through `accessibilityChildren()`.
+    func reciprocalAccessibilityElementsForTesting() -> [NSAccessibilityElement] {
+        accessibilityElementsForReciprocalLandmarks()
+    }
+
+    /// Current keyboard focus is intentionally exposed only as an index into
+    /// the current visible descriptor list; it is never persisted in Scene.
+    var reciprocalKeyboardFocusIndexForTesting: Int? { reciprocalKeyboardFocusIndex }
+
+    override func accessibilityChildren() -> [Any]? {
+        let base = super.accessibilityChildren() ?? []
+        let reciprocal = accessibilityElementsForReciprocalLandmarks()
+        return base + reciprocal
+    }
+
+    private func currentReciprocalAccessibilityDescriptors(viewport: SIMD2<Float>)
+        -> [ReciprocalAccessibilityDescriptor] {
+        guard world?.isReciprocalPathEditing == true else {
+            invalidateReciprocalAccessibilityFocus()
+            return []
+        }
+        return world?.reciprocalAccessibilityDescriptors(viewport: viewport) ?? []
+    }
+
+    private func accessibilityElementsForReciprocalLandmarks() -> [ReciprocalAccessibilityElement] {
+        guard let viewport = Self.reciprocalHoverViewport(for: bounds),
+              world?.isReciprocalPathEditing == true else {
+            invalidateReciprocalAccessibilityFocus()
+            return []
+        }
+        let wasQueried = reciprocalAccessibilityWasQueried
+        reciprocalAccessibilityWasQueried = true
+        let descriptors = currentReciprocalAccessibilityDescriptors(viewport: viewport)
+        guard descriptors != reciprocalAccessibilityDescriptors else {
+            return reciprocalAccessibilityElements
+        }
+        let hadExistingAccessibilityState = !reciprocalAccessibilityDescriptors.isEmpty
+            || !reciprocalAccessibilityElements.isEmpty
+        clearAccessibilityElementFocus()
+        reciprocalAccessibilityDescriptors = descriptors
+        reciprocalAccessibilityElements = descriptors.map {
+            ReciprocalAccessibilityElement(descriptor: $0, owner: self)
+        }
+        if let index = reciprocalKeyboardFocusIndex,
+           reciprocalAccessibilityElements.indices.contains(index) {
+            reciprocalAccessibilityElements[index].setAccessibilityFocused(true)
+        } else if !reciprocalAccessibilityElements.indices.contains(reciprocalKeyboardFocusIndex ?? -1) {
+            reciprocalKeyboardFocusIndex = nil
+        }
+        if hadExistingAccessibilityState || wasQueried {
+            postReciprocalAccessibilityNotification(.layoutChanged)
+        }
+        return reciprocalAccessibilityElements
+    }
+
+    func invalidateReciprocalAccessibilityFocus() {
+        let hadAccessibilityState = reciprocalAccessibilityWasQueried
+            || !reciprocalAccessibilityDescriptors.isEmpty
+            || !reciprocalAccessibilityElements.isEmpty
+        let hadFocus = hasReciprocalAccessibilityFocus
+        reciprocalKeyboardFocusIndex = nil
+        clearAccessibilityElementFocus()
+        reciprocalAccessibilityDescriptors = []
+        reciprocalAccessibilityElements = []
+        reciprocalAccessibilityWasQueried = false
+        if hadAccessibilityState {
+            postReciprocalAccessibilityNotification(.layoutChanged)
+        }
+        if hadFocus {
+            postReciprocalAccessibilityNotification(.focusedUIElementChanged)
+        }
+    }
+
+    private func clearAccessibilityElementFocus() {
+        for element in reciprocalAccessibilityElements {
+            element.setAccessibilityFocused(false)
+        }
+    }
+
+    fileprivate func activateReciprocalAccessibilityElement(_ element: ReciprocalAccessibilityElement) -> Bool {
+        guard let viewport = Self.reciprocalHoverViewport(for: bounds),
+              let current = currentReciprocalAccessibilityDescriptors(viewport: viewport)
+                .first(where: { $0 == element.descriptor }) else { return false }
+        return world?.activateReciprocalAccessibilityCandidate(current) ?? false
+    }
+
+    private func postReciprocalAccessibilityNotification(
+        _ notification: NSAccessibility.Notification,
+        element: Any? = nil
+    ) {
+        accessibilityNotificationPoster(notification, element ?? self)
+    }
+
+    func accessibilityFrame(for point: SIMD2<Float>, radius: Float, viewport: CGSize) -> NSRect {
+        guard point.x.isFinite, point.y.isFinite,
+              radius.isFinite, radius > 0,
+              let window else { return .zero }
+        guard let logicalViewport = Self.reciprocalHoverViewport(
+            for: NSRect(origin: .zero, size: viewport)) else { return .zero }
+        let localY = CGFloat(logicalViewport.y) - CGFloat(point.y)
+        let diameter = CGFloat(radius) * 2
+        let local = NSRect(x: CGFloat(point.x) - CGFloat(radius), y: localY - CGFloat(radius),
+                           width: diameter, height: diameter)
+        let inWindow = convert(local, to: nil)
+        return window.convertToScreen(inWindow)
+    }
+
+    /// Compatibility seam for callers that do not have a projected landmark
+    /// descriptor. Real reciprocal elements always use the dynamic overload.
+    func accessibilityFrame(for point: SIMD2<Float>, viewport: CGSize) -> NSRect {
+        accessibilityFrame(for: point, radius: 8, viewport: viewport)
+    }
+}
+
+private extension Array {
+    subscript(safe index: Index) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }

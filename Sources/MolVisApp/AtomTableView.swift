@@ -6,7 +6,7 @@ import AppKit
 /// NSTableView showing one row per (filtered) atom. Data-source backed —
 /// never builds one view per atom, so it scales to 500k+ rows.
 ///
-/// Columns (stable identifiers): index, element, x, y, z, a, b, c.
+/// Columns (stable identifiers): index, element, coordination, x, y, z, a, b, c.
 /// The a/b/c columns show fractional coordinates when a valid finite
 /// nonsingular cell is supplied, else blank.
 final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
@@ -27,6 +27,13 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     /// Parallel to `atoms`: fractional coordinate per atom, or nil when the
     /// cell is missing/singular or the conversion is non-finite.
     private var fractionalCoords: [SIMD3<Float>?] = []
+    /// Coordination values are available only when analysis produced one
+    /// value for every atom.
+    private var coordinationNumbers: [Int]?
+
+    // Internal counters keep coordination-only updates testable without timing.
+    internal private(set) var fractionalConversionCount = 0
+    internal private(set) var filterRebuildCount = 0
 
     /// Guards programmatic selection so it never recurses through onSelectionChange.
     private var isProgrammaticSelection = false
@@ -35,6 +42,7 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     static let colIndex = NSUserInterfaceItemIdentifier("index")
     static let colElement = NSUserInterfaceItemIdentifier("element")
+    static let colCoordination = NSUserInterfaceItemIdentifier("coordination")
     static let colX = NSUserInterfaceItemIdentifier("x")
     static let colY = NSUserInterfaceItemIdentifier("y")
     static let colZ = NSUserInterfaceItemIdentifier("z")
@@ -63,6 +71,7 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private func setup() {
         searchField.translatesAutoresizingMaskIntoConstraints = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        searchField.placeholderString = "Element/label terms; cn:N, cn:>=N, cn:<=N"
 
         searchField.target = self
         searchField.action = #selector(searchChanged(_:))
@@ -88,6 +97,7 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         for (id, title, width) in [
             (Self.colIndex, "#", CGFloat(44)),
             (Self.colElement, "Element", CGFloat(64)),
+            (Self.colCoordination, "CN", CGFloat(48)),
             (Self.colX, "x", CGFloat(84)),
             (Self.colY, "y", CGFloat(84)),
             (Self.colZ, "z", CGFloat(84)),
@@ -115,12 +125,19 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     /// Refreshes atoms/cell/filter mapping and selection safely. Preserves the
     /// current search text. Handles empty and 500k-scale inputs.
-    func update(atoms: [Atom], cell: Cell?, selectedAtoms: [Int]) {
+    func update(atoms: [Atom], cell: Cell?, selectedAtoms: [Int],
+                coordinationNumbers: [Int]? = nil) {
         self.atoms = atoms
         self.cell = cell
         self.fractionalCoords = atoms.map { cartesianToFractional($0.coord) }
         selectedOriginalAtomIndices = normalizedOriginalIndices(selectedAtoms)
-        rebuildFilterPreservingSelection()
+        updateCoordinationNumbers(coordinationNumbers, rebuildFilterWhenNoCoordinationTerm: true)
+    }
+
+    /// Updates only coordination data. Atom-derived values and mappings are
+    /// retained unless the current query depends on coordination numbers.
+    func updateCoordinationNumbers(_ numbers: [Int]?) {
+        updateCoordinationNumbers(numbers, rebuildFilterWhenNoCoordinationTerm: false)
     }
 
     /// Selects rows by original atom index. Never invokes onSelectionChange.
@@ -143,6 +160,9 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
             return "\(orig + 1)"
         case Self.colElement:
             return atom.label.isEmpty ? ElementTable.symbol(atom.atomicNumber) : atom.label
+        case Self.colCoordination:
+            guard let coordinationNumbers, orig < coordinationNumbers.count else { return nil }
+            return String(coordinationNumbers[orig])
         case Self.colX:
             return formatFloat(atom.coord.x)
         case Self.colY:
@@ -166,20 +186,60 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         rebuildFilterPreservingSelection()
     }
 
-    private func applyFilter() {
-        let query = searchField.stringValue.trimmingCharacters(in: .whitespaces)
-        let lower = query.lowercased()
+    private struct FilterQuery {
+        let textTerms: [String]
+        let coordinationFilters: [CoordinationFilter]
+        let hasInvalidCoordinationTerm: Bool
+
+        var containsCoordinationTerm: Bool {
+            hasInvalidCoordinationTerm || !coordinationFilters.isEmpty
+        }
+    }
+
+    private func currentFilterQuery() -> FilterQuery {
+        let terms = searchField.stringValue.split(whereSeparator: { $0.isWhitespace })
+        var textTerms: [String] = []
+        var coordinationFilters: [CoordinationFilter] = []
+        var hasInvalidCoordinationTerm = false
+        for rawTerm in terms {
+            let term = String(rawTerm)
+            if term.lowercased().hasPrefix("cn:") {
+                guard let filter = parseCoordinationFilter(String(term.dropFirst(3))) else {
+                    hasInvalidCoordinationTerm = true
+                    continue
+                }
+                coordinationFilters.append(filter)
+            } else {
+                textTerms.append(term.lowercased())
+            }
+        }
+
+        return FilterQuery(textTerms: textTerms,
+                           coordinationFilters: coordinationFilters,
+                           hasInvalidCoordinationTerm: hasInvalidCoordinationTerm)
+    }
+
+    private func applyFilter(_ query: FilterQuery) {
+        filterRebuildCount += 1
+
         var indices: [Int] = []
         var rowsByOriginalIndex: [Int: Int] = [:]
-        if query.isEmpty {
+        if query.textTerms.isEmpty && query.coordinationFilters.isEmpty
+            && !query.hasInvalidCoordinationTerm {
             indices.reserveCapacity(atoms.count)
             rowsByOriginalIndex.reserveCapacity(atoms.count)
         }
 
         for (originalIndex, atom) in atoms.enumerated() {
-            let matches = query.isEmpty ||
-                ElementTable.symbol(atom.atomicNumber).lowercased().contains(lower) ||
-                atom.label.lowercased().contains(lower)
+            let symbol = ElementTable.symbol(atom.atomicNumber).lowercased()
+            let label = atom.label.lowercased()
+            let matches = !query.hasInvalidCoordinationTerm &&
+                query.textTerms.allSatisfy { symbol.contains($0) || label.contains($0) } &&
+                query.coordinationFilters.allSatisfy { filter in
+                    guard let coordinationNumbers,
+                          originalIndex < coordinationNumbers.count else { return false }
+                    return filter.matches(coordinationNumbers[originalIndex])
+                }
             if matches {
                 rowsByOriginalIndex[originalIndex] = indices.count
                 indices.append(originalIndex)
@@ -189,14 +249,75 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         filteredRowByOriginalIndex = rowsByOriginalIndex
     }
 
+    private func updateCoordinationNumbers(_ numbers: [Int]?,
+                                           rebuildFilterWhenNoCoordinationTerm: Bool) {
+        coordinationNumbers = numbers?.count == atoms.count ? numbers : nil
+        let query = currentFilterQuery()
+        if rebuildFilterWhenNoCoordinationTerm || query.containsCoordinationTerm {
+            rebuildFilterPreservingSelection(using: query)
+        } else {
+            reloadCoordinationColumn()
+        }
+    }
+
+    private enum CoordinationFilter {
+        case equal(Int)
+        case atLeast(Int)
+        case atMost(Int)
+
+        func matches(_ value: Int) -> Bool {
+            switch self {
+            case .equal(let expected): value == expected
+            case .atLeast(let minimum): value >= minimum
+            case .atMost(let maximum): value <= maximum
+            }
+        }
+    }
+
+    private func parseCoordinationFilter(_ expression: String) -> CoordinationFilter? {
+        let operation: (Int) -> CoordinationFilter
+        let numberText: String
+        if expression.hasPrefix(">=") {
+            operation = CoordinationFilter.atLeast
+            numberText = String(expression.dropFirst(2))
+        } else if expression.hasPrefix("<=") {
+            operation = CoordinationFilter.atMost
+            numberText = String(expression.dropFirst(2))
+        } else {
+            operation = CoordinationFilter.equal
+            numberText = expression
+        }
+
+        guard !numberText.isEmpty,
+              numberText.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+              let number = Int(numberText) else { return nil }
+        return operation(number)
+    }
+
     private func rebuildFilterPreservingSelection() {
+        rebuildFilterPreservingSelection(using: currentFilterQuery())
+    }
+
+    private func rebuildFilterPreservingSelection(using query: FilterQuery) {
         isProgrammaticSelection = true
-        applyFilter()
+        applyFilter(query)
         tableView.reloadData()
         tableView.selectRowIndexes(filteredRows(for: selectedOriginalAtomIndices),
                                    byExtendingSelection: false)
         isProgrammaticSelection = false
         revealSelectedRows()
+    }
+
+    private func reloadCoordinationColumn() {
+        guard let column = tableView.tableColumns.firstIndex(where: {
+            $0.identifier == Self.colCoordination
+        }) else { return }
+
+        let wasProgrammaticSelection = isProgrammaticSelection
+        isProgrammaticSelection = true
+        tableView.reloadData(forRowIndexes: IndexSet(integersIn: 0..<filteredAtomIndices.count),
+                             columnIndexes: IndexSet(integer: column))
+        isProgrammaticSelection = wasProgrammaticSelection
     }
 
     private func normalizedOriginalIndices(_ indices: [Int]) -> [Int] {
@@ -261,6 +382,7 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     /// Cramer's rule on the [a b c] system. Returns nil for a missing/singular
     /// cell or a non-finite result.
     private func cartesianToFractional(_ p: SIMD3<Float>) -> SIMD3<Float>? {
+        fractionalConversionCount += 1
         guard let cell else { return nil }
         let a = SIMD3<Double>(Double(cell.a.x), Double(cell.a.y), Double(cell.a.z))
         let b = SIMD3<Double>(Double(cell.b.x), Double(cell.b.y), Double(cell.b.z))

@@ -82,7 +82,7 @@ Key rules:
   MCRYSDEN_REGENERATE=1 swift test --filter SnapshotTests
   ```
   Review the changed hashes, then rerun snapshots without the environment variable.
-- The tracked suite contains 858 tests as of v1.1.23. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
+- The tracked suite contains 1053 tests as of v1.1.25. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
 - Parser failures must become `ParseError` with a useful path/reason; malformed user files must not trap. C parsers report details through thread-local `molenv_last_error`.
 
 ## References

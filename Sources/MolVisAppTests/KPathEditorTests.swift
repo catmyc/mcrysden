@@ -130,6 +130,8 @@ final class KPathEditorTests: XCTestCase {
         let center = scene.centroid
 
         XCTAssertEqual(pres.inv, inv, accuracy: 1e-6)
+        XCTAssertEqual(pres.displayedHalfExtent, targetExtent, accuracy: 1e-6)
+        XCTAssertEqual(pres.landmarkHalfExtent, max(0.06, targetExtent * 0.10), accuracy: 1e-6)
         XCTAssertTrue(allComponentsEqual(pres.center, center))
 
         // A candidate's Cartesian and fractional mappings must agree and be finite.
@@ -812,8 +814,8 @@ final class KPathEditorTests: XCTestCase {
         c.state.editKPathOnBZ = true
         var cam = Camera(); cam.perspective = false; cam.distance = 40
         c.camera = cam
-        XCTAssertEqual(c.bzBuildCount, 0, "fresh controller starts uncached")
-        // First click builds the BZ.
+        XCTAssertEqual(c.bzBuildCount, 1, "entering edit mode frames and caches the BZ once")
+        // The first click reuses the entry cache.
         c.handleReciprocalPathClick(at: SIMD2<Float>(100, 100), viewport: SIMD2<Float>(200, 200))
         XCTAssertEqual(c.bzBuildCount, 1)
         // Repeated clicks on the same scene reuse the cached build.
@@ -851,6 +853,8 @@ final class KPathEditorTests: XCTestCase {
         // Advancing to a new frame (reloadFrame) invalidates the cache.
         c.state.frameIndex = 1
         XCTAssertEqual(c.scene.currentFrame, 1)
+        XCTAssertFalse(c.state.editKPathOnBZ, "frame replacement must exit reciprocal edit mode")
+        c.state.editKPathOnBZ = true
         c.handleReciprocalPathClick(at: SIMD2<Float>(100, 100), viewport: SIMD2<Float>(200, 200))
         XCTAssertEqual(c.bzBuildCount, 2, "frame install must invalidate the cache")
     }
@@ -1327,10 +1331,11 @@ final class KPathEditorTests: XCTestCase {
     /// displayed extent fills most of the viewport. Returns raw RGBA bytes and
     /// the live renderer (so callers can inspect bzRebuildCount).
     @discardableResult
-    private func renderBZ(_ scene: Scene, viewport: Int = 120, showBZLandmarks: Bool = false) throws -> (pixels: [UInt8], renderer: Renderer) {
+    private func renderBZ(_ scene: Scene, viewport: Int = 120, showBZLandmarks: Bool = false,
+                          showStructure: Bool = false) throws -> (pixels: [UInt8], renderer: Renderer) {
         var s = scene
         s.background = "#000000"
-        s.showStructure = false
+        s.showStructure = showStructure
         s.showAxes = false
         s.showCellFrame = false
         s.showIsoSurface = false
@@ -1390,24 +1395,35 @@ final class KPathEditorTests: XCTestCase {
         return n
     }
 
+    private func purplePixels(_ px: [UInt8]) -> Int {
+        var n = 0
+        for i in stride(from: 0, to: px.count, by: 4) {
+            if px[i] > 150 && px[i + 2] > 150 && px[i + 1] < 110 { n += 1 }
+        }
+        return n
+    }
+
     /// Render with an empty route vs a two-node route: the output must change
-    /// (route overlay drawn) while BZ geometry (purple faces + white landmarks)
-    /// stays present in both.
+    /// (route overlay drawn) while BZ geometry stays present in both. Route
+    /// primitives can overlap the center landmark, so the stable BZ assertion
+    /// uses the purple wireframe rather than a particular landmark pixel.
     func testRouteOverlayChangesOutputWhileBZStaysPresent() throws {
         let empty = try renderBZ(bzScene(), showBZLandmarks: true)
-        let twoNode = bzScene(kPath: [KPoint(SIMD3(0, 0, 0), "Γ"),
-                                      KPoint(SIMD3(0.5, 0.5, 0.5), "L")])
+        let twoNode = bzScene(kPath: [KPoint(SIMD3(0.25, 0.25, 0.25), "L"),
+                                      KPoint(SIMD3(0.5, 0, 0), "X")])
         let withRoute = try renderBZ(twoNode, showBZLandmarks: true)
         XCTAssertNotEqual(pixelHash(empty.pixels), pixelHash(withRoute.pixels),
                           "a two-node route must change the rendered output")
         XCTAssertGreaterThan(pixelDiff(empty.pixels, withRoute.pixels), 5,
                              "route overlay should add visible pixels")
-        // BZ geometry present in both: near-white landmark pixels near center.
+        // BZ geometry present in both.
         let w = 120, h = 120
         XCTAssertGreaterThan(whitePixelsNear(empty.pixels, w: w, h: h, cx: w / 2, cy: h / 2, radius: 6), 0,
                              "BZ landmarks must be visible with an empty route")
-        XCTAssertGreaterThan(whitePixelsNear(withRoute.pixels, w: w, h: h, cx: w / 2, cy: h / 2, radius: 6), 0,
-                              "BZ landmarks must remain visible with a route")
+        XCTAssertGreaterThan(purplePixels(empty.pixels), 0,
+                             "BZ wireframe must be visible with an empty route")
+        XCTAssertGreaterThan(purplePixels(withRoute.pixels), 0,
+                             "BZ wireframe must remain visible with a route")
     }
 
     /// The controller's renderer hides BZ landmarks by default and shows them only
@@ -1439,15 +1455,31 @@ final class KPathEditorTests: XCTestCase {
                              "landmarks enabled: white cross must appear at Gamma")
 
         // Purple BZ wireframe present in both. bzColor == (0.85, 0.30, 0.95): high red+blue, low green.
-        func purple(_ px: [UInt8]) -> Int {
-            var n = 0
-            for i in stride(from: 0, to: px.count, by: 4) {
-                if px[i] > 150 && px[i + 2] > 150 && px[i + 1] < 110 { n += 1 }
-            }
-            return n
-        }
-        XCTAssertGreaterThan(purple(hidden.pixels), 0, "purple BZ must be present with landmarks hidden")
-        XCTAssertGreaterThan(purple(shown.pixels), 0, "purple BZ must be present with landmarks shown")
+        XCTAssertGreaterThan(purplePixels(hidden.pixels), 0, "purple BZ must be present with landmarks hidden")
+        XCTAssertGreaterThan(purplePixels(shown.pixels), 0, "purple BZ must be present with landmarks shown")
+    }
+
+    /// A structure centered on Gamma must occlude the normal BZ wireframe, but an
+    /// edit landmark at the same projected position remains visible and actionable.
+    /// Adding the landmark overlay must not change the inactive wireframe's depth
+    /// result because the overlay is no-write and scoped to the white crosses.
+    func testOccludedEditLandmarkIsVisibleWithoutChangingBZWireDepth() throws {
+        var occluded = bzScene()
+        occluded.atoms = [Atom(coord: .zero, atomicNumber: 6, label: "C")]
+
+        let noStructure = try renderBZ(bzScene(), showBZLandmarks: false, showStructure: false)
+        let hidden = try renderBZ(occluded, showBZLandmarks: false, showStructure: true)
+        let shown = try renderBZ(occluded, showBZLandmarks: true, showStructure: true)
+
+        let w = 120, h = 120
+        XCTAssertEqual(whitePixelsNear(hidden.pixels, w: w, h: h, cx: w / 2, cy: h / 2, radius: 6), 0,
+                       "the occluding structure must hide the inactive landmark")
+        XCTAssertGreaterThan(whitePixelsNear(shown.pixels, w: w, h: h, cx: w / 2, cy: h / 2, radius: 6), 0,
+                             "the edit landmark must remain visible over the structure")
+        XCTAssertLessThan(purplePixels(hidden.pixels), purplePixels(noStructure.pixels),
+                          "the inactive BZ wireframe must remain depth-tested by the structure")
+        XCTAssertLessThan(purplePixels(shown.pixels), purplePixels(noStructure.pixels),
+                          "the landmark overlay must not disable BZ wireframe depth testing")
     }
 
     /// A one-node route draws a visible node cross and the encode succeeds.

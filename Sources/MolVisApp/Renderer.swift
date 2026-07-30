@@ -73,6 +73,60 @@ final class Renderer: NSObject {
     }
     var currentCamera = Camera()
 
+    /// Runtime-only atom coloring inputs. These are intentionally renderer state,
+    /// not Scene state, so coordination coloring is never persisted.
+    var coordinationNumbers: [Int] = []
+    var showCoordinationColors: Bool = false
+
+    /// Discrete, colorblind-readable colors indexed by coordination number. Values
+    /// below zero and zero map to the first color; values >= the maximum valid
+    /// palette index map to the last color. This keeps malformed or large inputs safe.
+    private static let coordinationPalette: [SIMD3<Float>] = [
+        SIMD3<Float>(0.267, 0.005, 0.329),
+        SIMD3<Float>(0.283, 0.141, 0.458),
+        SIMD3<Float>(0.254, 0.265, 0.530),
+        SIMD3<Float>(0.207, 0.372, 0.553),
+        SIMD3<Float>(0.164, 0.471, 0.558),
+        SIMD3<Float>(0.128, 0.567, 0.551),
+        SIMD3<Float>(0.135, 0.659, 0.518),
+        SIMD3<Float>(0.267, 0.749, 0.441),
+        SIMD3<Float>(0.478, 0.821, 0.318),
+        SIMD3<Float>(0.741, 0.873, 0.150),
+    ]
+
+    static func coordinationColor(_ number: Int) -> SIMD3<Float> {
+        let index = max(0, min(number, coordinationPalette.count - 1))
+        return coordinationPalette[index]
+    }
+
+    /// Pure base-color seam shared by every atom rendering path. The caller passes
+    /// nil when the coordination array is not a complete match for the scene.
+    static func baseAtomColor(atomicNumber: Int, coordinationNumber: Int?,
+                              showCoordinationColors: Bool) -> SIMD3<Float> {
+        guard showCoordinationColors, let coordinationNumber else {
+            return ElementTable.color(atomicNumber)
+        }
+        return coordinationColor(coordinationNumber)
+    }
+
+    static func atomColor(atomicNumber: Int, coordinationNumber: Int?,
+                          showCoordinationColors: Bool, selected: Bool) -> SIMD3<Float> {
+        if selected { return SIMD3<Float>(1, 1, 0.2) }
+        return baseAtomColor(atomicNumber: atomicNumber,
+                             coordinationNumber: coordinationNumber,
+                             showCoordinationColors: showCoordinationColors)
+    }
+
+    private func atomColor(at index: Int, selected: Bool) -> SIMD3<Float> {
+        let coordinationNumber = coordinationNumbers.count == scene.atoms.count
+            ? coordinationNumbers[index]
+            : nil
+        return Renderer.atomColor(atomicNumber: scene.atoms[index].atomicNumber,
+                                  coordinationNumber: coordinationNumber,
+                                  showCoordinationColors: showCoordinationColors,
+                                  selected: selected)
+    }
+
     // Brillouin-zone cache. The BZ depends only on the conventional cell + its base
     // atoms, which are static across render frames, so build it ONCE and reuse.
     // Without this, drawBrillouinZone rebuilds an O(m^3) Wigner-Seitz cell every
@@ -101,6 +155,15 @@ final class Renderer: NSObject {
     private func invalidateBrillouinZoneCache() {
         cachedBZ = nil; bzBuilt = false
         cachedCandidates = nil
+    }
+
+    /// Install a BZ that was built by the controller. The renderer remains the
+    /// authority for invalidating this cache when its scene's cell or base atoms
+    /// change, while route and appearance-only scene changes retain it.
+    internal func installBrillouinZoneCache(bz: BrillouinZone?, candidates: [BZCandidate]) {
+        cachedBZ = bz
+        cachedCandidates = candidates
+        bzBuilt = true
     }
 
     // Isosurface cache. Marching cubes over a large grid is comparable in cost to
@@ -586,10 +649,7 @@ final class Renderer: NSObject {
         for (i, a) in scene.atoms.enumerated() {
             let radius = atomRadius(z: a.atomicNumber)
             if radius <= 0 { continue }                  // polyhedral/wireFrame: atoms not drawn
-            var c = ElementTable.color(a.atomicNumber)
-            if selected.contains(i) {
-                c = SIMD3<Float>(1, 1, 0.2)               // bright yellow highlight
-            }
+            let c = atomColor(at: i, selected: selected.contains(i))
             inst.append(InstanceData(model: float4x4(translation: a.coord),
                                      color: SIMD4(c.x, c.y, c.z, 1.0),
                                      radius: radius, metalness: 0.0))
@@ -647,6 +707,7 @@ final class Renderer: NSObject {
             let model = float4x4(translation: mid)
                 * .rotation(fromYTo: dir / len)
                 * float4x4(scale: SIMD3<Float>(scene.bondRadius, len, scene.bondRadius))
+            // Coordination coloring is intentionally atom-only; bonds retain CPK colors.
             let c = ElementTable.color(atoms[b.i].atomicNumber)
             inst.append(InstanceData(model: model, color: SIMD4(c.x, c.y, c.z, 1.0), radius: 1.0, metalness: 0.0))
         }
@@ -755,8 +816,7 @@ final class Renderer: NSObject {
                 : max(3.0, ElementTable.covalentRadius(a.atomicNumber) * scene.atomScale * 12.0)
             let rx = rPx / (wF * 0.5)
             let ry = rPx / (hF * 0.5)
-            var c = ElementTable.color(a.atomicNumber)
-            if selected.contains(i) { c = SIMD3<Float>(1, 1, 0.2) }
+            let c = atomColor(at: i, selected: selected.contains(i))
             let corners: [(Float, Float)] = [(-1, -1), (1, -1), (-1, 1), (-1, 1), (1, -1), (1, 1)]
             for (lx, ly) in corners {
                 verts.append(V(px: ndc.x + lx * rx, py: ndc.y + ly * ry, lx: lx, ly: ly, r: c.x, g: c.y, b: c.z))
@@ -818,9 +878,13 @@ final class Renderer: NSObject {
     private func drawPolyhedral(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
         let atoms = scene.atoms
         guard atoms.count > 1 else { return true }
-        let key = (atoms: atoms, bonds: scene.bonds, selected: scene.selectedAtoms)
+        let key = (atoms: atoms, bonds: scene.bonds, selected: scene.selectedAtoms,
+                   coordinationNumbers: coordinationNumbers,
+                   showCoordinationColors: showCoordinationColors)
         if let pk = cachedPolyKey,
            pk.selected == key.selected,
+           pk.coordinationNumbers == key.coordinationNumbers,
+           pk.showCoordinationColors == key.showCoordinationColors,
            pk.atoms.count == key.atoms.count, zip(pk.atoms, key.atoms).allSatisfy({ $0.coord == $1.coord && $0.atomicNumber == $1.atomicNumber }),
            pk.bonds.count == key.bonds.count, zip(pk.bonds, key.bonds).allSatisfy({ $0.i == $1.i && $0.j == $1.j }) {
             // cache hit (possibly an empty mesh). Draw only if geometry is present.
@@ -841,8 +905,7 @@ final class Renderer: NSObject {
         for (i, a) in atoms.enumerated() {
             guard neigh[i].count >= 3 else { continue }
             guard let tris = Geometry.polyhedronFaces(center: a.coord, neighbors: neigh[i], maxNeighbors: 12) else { continue }
-            var col = ElementTable.color(a.atomicNumber)
-            if selected.contains(i) { col = SIMD3<Float>(1, 1, 0.2) }
+            let col = atomColor(at: i, selected: selected.contains(i))
             var j = 0
             while j < tris.count {
                 let p0 = tris[j], p1 = tris[j + 1], p2 = tris[j + 2]
@@ -1178,13 +1241,11 @@ final class Renderer: NSObject {
         // the scene center; guard against a non-finite or zero scale so a malformed
         // BZ is skipped rather than drawing a degenerate blob at the origin.
         guard pres.inv.isFinite, pres.inv > 0 else { return true }
-        // Displayed BZ half-extent in world units (= targetExtent). Marker arms scale
-        // with it so they stay visible as the scene is zoomed; the floor keeps a
-        // tiny reciprocal zone's landmarks from collapsing to sub-pixel specks.
-        let displayedHalfExtent = max(1.0, scene.boundingSphere().1) * 0.45
-        guard displayedHalfExtent > 1e-5 else { return true }
+        // Landmark geometry is shared with controller-side picking and AX framing.
+        let displayedHalfExtent = pres.displayedHalfExtent
+        guard displayedHalfExtent.isFinite, displayedHalfExtent > 1e-5 else { return true }
         let bzColor = SIMD3<Float>(0.85, 0.30, 0.95)
-        let landmarkHalf = max(0.06, displayedHalfExtent * 0.10)   // white BZ landmark crosses
+        let landmarkHalf = pres.landmarkHalfExtent                 // white BZ landmark crosses
         let routeNodeHalf = max(0.10, displayedHalfExtent * 0.16)  // larger cyan k-path nodes
 
         // Face wireframe (purple) — the static BZ geometry, drawn first.
@@ -1210,12 +1271,25 @@ final class Renderer: NSObject {
                 landmarkSegs.append(contentsOf: Renderer.crossLineSegments(pres.world(cartesian: cand.cartesian), half: landmarkHalf))
             }
         }
-        let landmarkOK = landmarkSegs.isEmpty ? true : drawLineBuffer(landmarkSegs, color: SIMD3(1, 1, 1), enc: enc, frameBuffer: frameBuffer)
+        // Edit landmarks are actionable picking targets, so they must not vanish
+        // behind the structure. Scope the always-pass state to these crosses only;
+        // the face wireframe remains normally depth-tested and route rendering
+        // below restores its own less-equal/no-write semantics.
+        let landmarkOK: Bool
+        if landmarkSegs.isEmpty {
+            landmarkOK = true
+        } else {
+            enc.setDepthStencilState(overlayDepthState)
+            landmarkOK = drawLineBuffer(landmarkSegs, color: SIMD3(1, 1, 1), enc: enc, frameBuffer: frameBuffer)
+            if let depthStencilState { enc.setDepthStencilState(depthStencilState) }
+        }
 
         // k-path route overlay: amber segments between consecutive valid nodes, and a
         // larger cyan 3-axis cross at every valid node. Drawn on top of the landmarks
         // with a `.lessEqual`/no-write depth state so equal-depth route fragments are
-        // not dropped behind the white landmarks drawn a moment earlier.
+        // not dropped behind the white landmarks drawn a moment earlier. The normal
+        // state was restored after the landmark overlay, so route fragments still
+        // respect structure/BZ depth.
         // Switch to the less-equal/no-write state for the route overlay so its
         // equal-depth fragments aren't dropped behind the landmarks drawn above,
         // then restore the authoritative state for subsequent passes.
@@ -1407,7 +1481,8 @@ final class Renderer: NSObject {
     // Polyhedral cache: reuses vertex buffer across camera-only frames.
     private var cachedPolyBuffer: MTLBuffer?
     private var cachedPolyVertexCount: Int = 0
-    private var cachedPolyKey: (atoms: [Atom], bonds: [Bond], selected: [Int])?
+    private var cachedPolyKey: (atoms: [Atom], bonds: [Bond], selected: [Int],
+                                coordinationNumbers: [Int], showCoordinationColors: Bool)?
 
     // One-entry distance cache. An optional vertex array distinguishes a cached
     // malformed-geometry failure from an uncached key, so failed periodic solves

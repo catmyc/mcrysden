@@ -5,7 +5,115 @@ import MetalKit
 import simd
 import SwiftUI
 
+private struct RouteLabelBucket: Hashable {
+    let x: Int
+    let y: Int
+}
+
+private struct RouteLabelMeasurementKey: Hashable {
+    let text: String
+    let style: LabelOverlayView.Label.Style
+}
+
+/// Spatial index for the bounded route-label set. A label is inserted into every
+/// bucket its rectangle spans, so labels crossing bucket boundaries are not missed.
+private struct RouteLabelSpatialIndex {
+    private static let bucketSize: CGFloat = 64
+    private static let maximumIndexedBuckets = 4096
+    private var rectangles: [NSRect] = []
+    private var buckets: [RouteLabelBucket: [Int]] = [:]
+    private var broadRectangles: [Int] = []
+
+    mutating func intersects(_ rect: NSRect) -> Bool {
+        for index in broadRectangles where rectangles[index].intersects(rect) {
+            return true
+        }
+
+        var visited = Set<Int>()
+        for bucket in buckets(for: rect) {
+            for index in buckets[bucket, default: []] {
+                guard visited.insert(index).inserted else { continue }
+                if rectangles[index].intersects(rect) { return true }
+            }
+        }
+        return false
+    }
+
+    mutating func insert(_ rect: NSRect) {
+        let index = rectangles.count
+        rectangles.append(rect)
+        let keys = buckets(for: rect)
+        guard !keys.isEmpty, keys.count <= Self.maximumIndexedBuckets else {
+            broadRectangles.append(index)
+            return
+        }
+        for bucket in keys {
+            buckets[bucket, default: []].append(index)
+        }
+    }
+
+    private func buckets(for rect: NSRect) -> [RouteLabelBucket] {
+        guard rect.minX.isFinite, rect.maxX.isFinite,
+              rect.minY.isFinite, rect.maxY.isFinite,
+              let minX = bucketCoordinate(rect.minX),
+              let maxX = bucketCoordinate(rect.maxX),
+              let minY = bucketCoordinate(rect.minY),
+              let maxY = bucketCoordinate(rect.maxY),
+              maxX >= minX, maxY >= minY else { return [] }
+
+        let (xDifference, xOverflow) = maxX.subtractingReportingOverflow(minX)
+        let (yDifference, yOverflow) = maxY.subtractingReportingOverflow(minY)
+        guard !xOverflow, !yOverflow else { return [] }
+        let (xCount, xCountOverflow) = xDifference.addingReportingOverflow(1)
+        let (yCount, yCountOverflow) = yDifference.addingReportingOverflow(1)
+        guard xCount > 0, yCount > 0,
+              !xCountOverflow, !yCountOverflow,
+              xCount <= Self.maximumIndexedBuckets,
+              yCount <= Self.maximumIndexedBuckets,
+              xCount <= Self.maximumIndexedBuckets / yCount else { return [] }
+
+        var result: [RouteLabelBucket] = []
+        result.reserveCapacity(xCount * yCount)
+        for y in minY...maxY {
+            for x in minX...maxX {
+                result.append(RouteLabelBucket(x: x, y: y))
+            }
+        }
+        return result
+    }
+
+    private func bucketCoordinate(_ value: CGFloat) -> Int? {
+        let scaled = value / Self.bucketSize
+        guard scaled.isFinite,
+              scaled >= CGFloat(Int.min), scaled <= CGFloat(Int.max) else { return nil }
+        return Int(floor(scaled))
+    }
+}
+
 final class MainWindowController: NSObject, World, NSWindowDelegate {
+    private final class CoordinationCancellationToken: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        func isCancelled() -> Bool {
+            lock.lock()
+            let value = cancelled
+            lock.unlock()
+            return value
+        }
+    }
+
+    internal typealias CoordinationAnalyzerOverride =
+        ([Atom], Cell?, Int, Float, @escaping () -> Bool) -> CoordinationAnalysis?
+    internal typealias CoordinationDebounceScheduler =
+        (TimeInterval, @escaping () -> Void) -> (() -> Void)
+
     let window: NSWindow
     let split = NSSplitView()
     let sidebar: NSHostingView<SideBar>
@@ -33,13 +141,63 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// graphs/labels/sidebar and only the 3D canvas stays blank (never a hard crash).
     let renderer: Renderer?
     private let device: MTLDevice?
-    private lazy var renderer2D: Renderer2D? = device.flatMap { try? Renderer2D(device: $0) }
-    var scene: Scene { didSet { renderer?.scene = scene; renderer2D?.scene = scene } }
-    var camera = Camera()
+    private(set) lazy var renderer2D: Renderer2D? = device.flatMap { try? Renderer2D(device: $0) }
+    var scene: Scene {
+        didSet {
+            renderer?.scene = scene
+            renderer2D?.scene = scene
+            if Self.reciprocalGeometryChanged(from: oldValue, to: scene) {
+                bzEpoch += 1
+                bzEditCache = BZEditCache()
+            }
+            invalidateRouteLabelMeasurementCache()
+        }
+    }
+    var camera = Camera() {
+        didSet {
+            // Camera mutations can come directly from MetalView orbit/pan/zoom
+            // handlers, so invalidate reciprocal hover at the mutation boundary.
+            clearReciprocalHover()
+            canvas.invalidateReciprocalAccessibilityFocus()
+        }
+    }
     /// Test-only seam: when true, renderer creation is forced to fail so the graceful
     /// Metal-unavailable path is exercisable without a real GPU-less machine.
     internal static var forceRendererFailure = false
     let state: SideBarState
+    /// Derived coordination data for the currently displayed atom ordering. It
+    /// is runtime-only and is discarded whenever the displayed geometry changes.
+    private(set) var coordinationAnalysis: CoordinationAnalysis? = nil
+    /// Test seam for deterministic async integration tests. Production uses the
+    /// synchronous engine entry point below; the closure receives a CoW snapshot
+    /// and a cancellation predicate owned by this request.
+    internal var coordinationAnalyzerOverride: CoordinationAnalyzerOverride?
+    /// Called on the main thread after a current result is installed or deemed
+    /// unavailable. Tests use this instead of sleeping for implementation timing.
+    internal var coordinationAnalysisDidUpdate: (() -> Void)?
+    /// Injectable scheduler for the scale debounce. The default keeps exactly one
+    /// cancellable main-queue work item pending at a time.
+    internal var coordinationDebounceScheduler: CoordinationDebounceScheduler = { delay, action in
+        let item = DispatchWorkItem(block: action)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+        return { item.cancel() }
+    }
+    private var coordinationWorkItem: DispatchWorkItem?
+    private var coordinationCancellationToken: CoordinationCancellationToken?
+    private var coordinationDebounceCancellation: (() -> Void)?
+    private var coordinationGeneration = 0
+    private var lastCoordinationEnabled = false
+    private var lastCoordinationScale = CoordinationAnalyzer.defaultRadiusScale
+    /// Complete CN data installed for the currently displayed atom ordering.
+    /// This is the only CN array consumed by renderers and avoids deriving it on
+    /// camera-only renders.
+    private var installedCoordinationNumbers: [Int] = []
+    private var lastCoordinationDelegateIs2D: Bool?
+    /// Test counters for lifecycle-only renderer/table updates. They deliberately
+    /// do not increment from `setNeedsRender()`.
+    internal private(set) var coordinationRendererUpdateCount = 0
+    internal private(set) var coordinationTableUpdateCount = 0
+    internal private(set) var coordinationFullTableRefreshCount = 0
     /// The on-disk source + forced format of the currently-loaded file, kept so
     /// the animation controls can re-parse an arbitrary frame (AXSF animation
     /// is re-decoded frame-by-frame; the parsed LoadedScene is otherwise
@@ -62,6 +220,28 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Test-only count of actual editor BZ builds (cache misses). Lets tests confirm
     /// at-most-once-per-scene construction and invalidation on file/frame install.
     internal var bzBuildCount = 0
+    /// Reciprocal edit focus is transient: it is never persisted with the scene.
+    private var reciprocalStructureCamera: Camera?
+    private var reciprocalStructureDisplayMode: DisplayMode?
+    private var reciprocalStructureShowBZ: Bool?
+    private var reciprocalStructureOrthographic: Bool?
+    private var lastEditKPathOnBZ = false
+    private var reciprocalHoverCandidate: BZCandidate?
+    private var reciprocalHoverCursor: SIMD2<Float>?
+    /// Keep this alongside the optional renderer so label styling remains correct
+    /// in the Metal-unavailable test path too.
+    private var selectedRouteNodeIndex: Int?
+    /// Route labels are bounded to 1024 nodes, with a separate style entry for
+    /// a selected node. Keep the per-controller cache bounded and unsynchronized.
+    private static let routeLabelMeasurementCacheCapacity = 2048
+    private var routeLabelMeasurementCache: [RouteLabelMeasurementKey: CGSize] = [:]
+    private var routeLabelTextSignature: [String]?
+    /// Test-only count of actual route text measurements. Cache hits do not
+    /// increment this value.
+    internal private(set) var routeLabelMeasurementCount = 0
+    internal private(set) var reciprocalEditorFrameCount = 0
+    /// Test-only count of render requests, including ordinary scene redraws.
+    internal private(set) var renderRequestCount = 0
     /// Test-only seam: true while an active file watcher is installed for the
     /// loaded source. Lets tests assert watching starts/loads without a real fs event.
     internal var isWatchingFile: Bool { fileWatchSource != nil }
@@ -75,6 +255,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Repeating timer driving AXSF playback. Held weakly by the runloop; we
     /// recreate it on Play and invalidate on Pause/stop in `syncFromState`.
     private var playTimer: Timer?
+
+    deinit {
+        cancelCoordinationRequest()
+    }
 
     // MARK: - File watching
 
@@ -245,6 +429,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// populates the animation controls (frameCount > 1 => show playback).
     func loadFile(_ scene: Scene, from url: URL? = nil, format: ParseFormat? = nil, frameIndex: Int = 0) {
         loadGeneration += 1   // cancel any pending background drop loads
+        clearReciprocalFocusForSceneReplacement()
         self.scene = scene
         self.sourceURL = url
         self.forcedFormat = format
@@ -266,6 +451,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // resync the token so the next syncFromState does not treat the fresh route as
         // a wholesale replacement and clear a newly-set selection.
         renderer?.selectedKPathNode = nil
+        renderer2D?.selectedKPathNode = nil
+        selectedRouteNodeIndex = nil
         lastRouteGeneration = state.routeGeneration
         applyCameraForNewSceneIfNeeded()
         // Graph data replaces the Metal canvas. DOS takes precedence if a loaded
@@ -300,6 +487,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.isPlaying = false
         state.onChange = saved
         stopPlayback()
+        coordinationGeometryDidChange()
         refreshAtomTable()
         // The readout stays hidden until the user selects an atom.
         setNeedsRender()
@@ -400,8 +588,45 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     }
 
     private func updateAtomTable() {
-        atomTable.update(atoms: scene.atoms, cell: scene.cell, selectedAtoms: scene.selectedAtoms)
+        coordinationFullTableRefreshCount += 1
+        atomTable.update(atoms: scene.atoms, cell: scene.cell, selectedAtoms: scene.selectedAtoms,
+                         coordinationNumbers: installedCoordinationNumbers.isEmpty
+                            ? nil : installedCoordinationNumbers)
         lastSyncedSelection = scene.selectedAtoms
+    }
+
+    private func updateCoordinationTable() {
+        guard let window = atomTableWindow, window.isVisible else { return }
+        coordinationTableUpdateCount += 1
+        atomTable.updateCoordinationNumbers(installedCoordinationNumbers.isEmpty
+                                            ? nil : installedCoordinationNumbers)
+    }
+
+    /// Push complete CN data only when analysis data is installed or cleared.
+    private func installCoordinationNumbers(_ numbers: [Int]) {
+        installedCoordinationNumbers = numbers
+        renderer?.coordinationNumbers = numbers
+        renderer2D?.coordinationNumbers = numbers
+        coordinationRendererUpdateCount += 1
+        updateCoordinationTable()
+        applyCoordinationColors()
+    }
+
+    private func clearCoordinationNumbers() {
+        installedCoordinationNumbers = []
+        renderer?.coordinationNumbers = []
+        renderer2D?.coordinationNumbers = []
+        coordinationRendererUpdateCount += 1
+        updateCoordinationTable()
+        applyCoordinationColors()
+    }
+
+    /// Color is a renderer toggle, not an analysis input. Changing it must not
+    /// copy or derive the CN array again.
+    private func applyCoordinationColors() {
+        let enabled = !installedCoordinationNumbers.isEmpty && state.showCoordinationColors
+        renderer?.showCoordinationColors = enabled
+        renderer2D?.showCoordinationColors = enabled
     }
 
     /// Synchronize the table's row selection to match `scene.selectedAtoms`, but
@@ -419,13 +644,27 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if scene.displayMode.is2D {
             canvas.delegate = renderer2D
             renderer2D?.scene = scene
+            renderer2D?.selectedKPathNode = selectedRouteNodeIndex
             if let color = renderer?.background { renderer2D?.background = color }
         } else {
             canvas.delegate = renderer
+            renderer2D?.scene = scene
+            renderer?.selectedKPathNode = selectedRouteNodeIndex
         }
+        let is2D = scene.displayMode.is2D
+        if lastCoordinationDelegateIs2D != is2D {
+            if is2D {
+                renderer2D?.coordinationNumbers = installedCoordinationNumbers
+                renderer2D?.showCoordinationColors = !installedCoordinationNumbers.isEmpty
+                    && state.showCoordinationColors
+            }
+            lastCoordinationDelegateIs2D = is2D
+        }
+        installEditorBZCache()
     }
 
     func setNeedsRender() {
+        renderRequestCount += 1
         renderer?.currentCamera = camera
         renderer2D?.currentCamera = camera
         refreshDelegate()
@@ -485,11 +724,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         guard (notification.object as? NSWindow) == window else { return }
         stopFileWatching()
         stopPlayback()
+        cancelCoordinationRequest()
+        coordinationGeneration += 1
         state.isPlaying = false
         infoWindow.orderOut(nil)
     }
 
     // MARK: - World protocol
+
+    var isReciprocalPathEditing: Bool {
+        state.editKPathOnBZ && scene.isCrystal
+    }
 
     func renderCamera() -> Camera {
         // Mirror Renderer.encode: 2D display modes force identity rotation and
@@ -503,6 +748,91 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         return camera
     }
 
+    func reciprocalViewportSizeDidChange(_ viewport: SIMD2<Float>) {
+        guard validReciprocalViewport(viewport) else {
+            return
+        }
+        guard isReciprocalPathEditing else {
+            setNeedsRender()
+            return
+        }
+        // A resize can briefly produce an aspect ratio that cannot fit inside the
+        // fixed depth range. Keep the established editor camera and defer the fit;
+        // entry/projection failures still use their rejecting paths below.
+        clearReciprocalHover()
+        canvas.invalidateReciprocalAccessibilityFocus()
+        _ = frameReciprocalEditor(viewport: viewport)
+        setNeedsRender()
+    }
+
+    /// Project one BZ candidate exactly as the mouse picker does. Accessibility
+    /// and keyboard descriptors use this seam so offscreen, clipped, or behind
+    /// landmarks cannot become actions that are not actually visible.
+    static func projectVisibleBZCandidate(
+        _ candidate: BZCandidate,
+        presentation: BZPresentation,
+        camera: Camera,
+        viewport: SIMD2<Float>
+    ) -> (point: SIMD2<Float>, depth: Float, screenRadius: Float)? {
+        guard viewport.x > 0, viewport.y > 0,
+              viewport.x.isFinite, viewport.y.isFinite,
+              (try? Camera.validated(camera)) != nil,
+              candidate.point.frac.x.isFinite,
+              candidate.point.frac.y.isFinite,
+              candidate.point.frac.z.isFinite,
+              candidate.cartesian.x.isFinite,
+              candidate.cartesian.y.isFinite,
+              candidate.cartesian.z.isFinite else { return nil }
+        let aspect = viewport.x / viewport.y
+        guard aspect.isFinite, aspect > 0 else { return nil }
+        let view = camera.viewMatrix()
+        let projection = camera.projectionMatrix(aspect: aspect)
+        func project(_ world: SIMD3<Float>, requireVisible: Bool) -> (point: SIMD2<Float>, depth: Float)? {
+            guard world.x.isFinite, world.y.isFinite, world.z.isFinite else { return nil }
+            let viewPosition = view * SIMD4<Float>(world.x, world.y, world.z, 1)
+            let depth = -viewPosition.z
+            guard depth > 0.01, depth.isFinite else { return nil }
+            let clip = projection * viewPosition
+            guard clip.x.isFinite, clip.y.isFinite, clip.z.isFinite, clip.w.isFinite,
+                  clip.w > 1e-10 else { return nil }
+            let ndc = clip / clip.w
+            guard ndc.x.isFinite, ndc.y.isFinite, ndc.z.isFinite else { return nil }
+            if requireVisible {
+                guard ndc.x >= -1, ndc.x <= 1,
+                      ndc.y >= -1, ndc.y <= 1,
+                      ndc.z >= 0, ndc.z <= 1 else { return nil }
+            }
+            let point = SIMD2<Float>((ndc.x * 0.5 + 0.5) * viewport.x,
+                                     (1 - (ndc.y * 0.5 + 0.5)) * viewport.y)
+            guard point.x.isFinite, point.y.isFinite else { return nil }
+            return (point, depth)
+        }
+
+        let world = presentation.world(cartesian: candidate.cartesian)
+        guard let projectedCenter = project(world, requireVisible: true) else { return nil }
+        let half = presentation.landmarkHalfExtent
+        guard half.isFinite, half > 0 else { return nil }
+
+        // Use the exact six endpoints emitted by Renderer.crossLineSegments. A
+        // clipped endpoint contributes no unbounded radius; the final cap keeps
+        // malformed perspective geometry from turning the whole canvas clickable.
+        var maximumRadius: Float = 0
+        for endpoint in Renderer.crossLineSegments(world, half: half) {
+            guard let projectedEndpoint = project(endpoint, requireVisible: false) else { continue }
+            let delta = projectedEndpoint.point - projectedCenter.point
+            let radius = sqrt(delta.x * delta.x + delta.y * delta.y)
+            guard radius.isFinite else { continue }
+            maximumRadius = max(maximumRadius, radius)
+        }
+        let minimumRadius = BZPresentation.landmarkPickMinimumRadius
+        let viewportRadius = max(viewport.x, viewport.y)
+        let safeCap = max(minimumRadius,
+                          min(BZPresentation.landmarkScreenRadiusCap, viewportRadius))
+        let screenRadius = min(safeCap, max(minimumRadius, maximumRadius))
+        guard screenRadius.isFinite, screenRadius > 0 else { return nil }
+        return (projectedCenter.point, projectedCenter.depth, screenRadius)
+    }
+
     /// Project BZ-candidate world positions with the effective render camera and
     /// pick the nearest *visible* candidate to `click`. Primary ordering is screen-space
     /// distance (closest to the pointer wins); depth is only a tie-break for markers that
@@ -514,47 +844,34 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         camera: Camera,
         viewport: SIMD2<Float>,
         click: SIMD2<Float>,
-        radiusPx: Float = 10
+        radiusPx: Float? = nil
     ) -> BZCandidate? {
         // Validate the query before doing any work: a positive finite radius, a positive
         // finite viewport, and a finite click that actually falls inside the viewport.
-        guard radiusPx > 0, radiusPx.isFinite,
-              viewport.x > 0, viewport.y > 0,
+        if let radiusPx {
+            guard radiusPx > 0, radiusPx.isFinite else { return nil }
+        }
+        guard viewport.x > 0, viewport.y > 0,
               viewport.x.isFinite, viewport.y.isFinite,
               click.x.isFinite, click.y.isFinite,
               click.x >= 0, click.x <= viewport.x,
               click.y >= 0, click.y <= viewport.y else { return nil }
-        let aspect = viewport.x / viewport.y
-        guard aspect.isFinite, aspect > 0 else { return nil }
-        let view = camera.viewMatrix()
-        let proj = camera.projectionMatrix(aspect: aspect)
         var best: BZCandidate?
         var bestDist = Float.infinity        // best screen-space distance squared
         var bestDepth = Float.infinity       // tie-break: nearest (smallest view -z)
-        let radiusSq = radiusPx * radiusPx
         for cand in candidates {
-            let world = presentation.world(cartesian: cand.cartesian)
-            guard world.x.isFinite, world.y.isFinite, world.z.isFinite else { continue }
-            let worldPos = SIMD4<Float>(world.x, world.y, world.z, 1)
-            let viewPos = view * worldPos
-            let depth = -viewPos.z           // positive into screen (Metal: -z forward)
-            guard depth > 0.01 else { continue }   // behind camera
-            let clip = proj * viewPos
-            guard clip.x.isFinite, clip.y.isFinite, clip.z.isFinite, clip.w.isFinite,
-                  abs(clip.w) > 1e-10 else { continue }
-            let ndc = clip / clip.w
-            guard ndc.x.isFinite, ndc.y.isFinite, ndc.z.isFinite else { continue }
-            // Reject landmarks outside the visible frustum (Metal NDC xy in [-1,1], z in [0,1]).
-            guard ndc.x >= -1, ndc.x <= 1, ndc.y >= -1, ndc.y <= 1,
-                  ndc.z >= 0, ndc.z <= 1 else { continue }
-            let sx = (ndc.x * 0.5 + 0.5) * viewport.x
-            let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * viewport.y   // top-origin
-            let dx = sx - click.x, dy = sy - click.y
+            guard let projected = projectVisibleBZCandidate(cand, presentation: presentation,
+                                                             camera: camera, viewport: viewport) else { continue }
+            let hitRadius = radiusPx ?? projected.screenRadius
+            guard hitRadius.isFinite, hitRadius > 0 else { continue }
+            let radiusSq = hitRadius * hitRadius
+            guard radiusSq.isFinite else { continue }
+            let dx = projected.point.x - click.x, dy = projected.point.y - click.y
             let dist = dx * dx + dy * dy
             guard dist <= radiusSq else { continue }
             // Closer on screen wins; an actual/near screen-distance tie goes to depth.
-            if dist < bestDist - 1e-3 || (dist <= bestDist + 1e-3 && depth < bestDepth) {
-                bestDist = dist; bestDepth = depth; best = cand
+            if dist < bestDist - 1e-3 || (dist <= bestDist + 1e-3 && projected.depth < bestDepth) {
+                bestDist = dist; bestDepth = projected.depth; best = cand
             }
         }
         return best
@@ -578,8 +895,105 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             }
             bzBuildCount += 1
         }
+        installEditorBZCache()
         guard let bz = bzEditCache.bz else { return (bzEditCache.candidates, nil) }
         return (bzEditCache.candidates, BZPresentation(bz: bz, scene: scene))
+    }
+
+    /// Keep both live renderer implementations on the same controller-built
+    /// positive or negative BZ cache. Standalone renderers still build lazily.
+    private func installEditorBZCache() {
+        guard bzEditCache.epoch == bzEpoch else { return }
+        renderer?.installBrillouinZoneCache(bz: bzEditCache.bz,
+                                            candidates: bzEditCache.candidates)
+        renderer2D?.installBrillouinZoneCache(bz: bzEditCache.bz,
+                                              candidates: bzEditCache.candidates)
+    }
+
+    static let maximumReciprocalAccessibilityChildren = 4096
+
+    static func reciprocalCandidateTypeName(_ type: BZPointType) -> String {
+        switch type {
+        case .center: return "Gamma point"
+        case .edge: return "BZ vertex"
+        case .line: return "BZ edge midpoint"
+        case .polyface: return "BZ face center"
+        }
+    }
+
+    private static func reciprocalFractionDescription(_ frac: SIMD3<Float>) -> String {
+        String(format: "(%.4f, %.4f, %.4f)", frac.x, frac.y, frac.z)
+    }
+
+    /// Return only the landmarks that are actually drawable in the current
+    /// editor viewport. The BZ and candidate array come from editorLandmarks(),
+    /// so AX queries and keyboard cycling never rebuild the BZ.
+    func reciprocalAccessibilityDescriptors(viewport: SIMD2<Float>)
+        -> [ReciprocalAccessibilityDescriptor] {
+        guard isReciprocalPathEditing,
+              !canvas.isHidden,
+              validReciprocalViewport(viewport) else { return [] }
+        let (candidates, presentation) = editorLandmarks()
+        guard let presentation, validBZPresentation(presentation) else { return [] }
+        let camera = renderCamera()
+        var descriptors: [ReciprocalAccessibilityDescriptor] = []
+        descriptors.reserveCapacity(min(candidates.count, Self.maximumReciprocalAccessibilityChildren))
+        for candidate in candidates.prefix(Self.maximumReciprocalAccessibilityChildren) {
+            guard let projected = Self.projectVisibleBZCandidate(candidate,
+                                                                   presentation: presentation,
+                                                                   camera: camera,
+                                                                   viewport: viewport) else { continue }
+            let candidateLabel = candidate.point.label.isEmpty ? "Unnamed landmark" : candidate.point.label
+            let type = Self.reciprocalCandidateTypeName(candidate.type)
+            let coordinates = Self.reciprocalFractionDescription(candidate.point.frac)
+            let summary = "\(candidateLabel), \(type), fractional coordinates \(coordinates)"
+            descriptors.append(ReciprocalAccessibilityDescriptor(
+                candidate: candidate,
+                screenPoint: projected.point,
+                screenRadius: projected.screenRadius,
+                label: "Reciprocal landmark: \(summary)",
+                value: summary,
+                help: "Activate to append \(summary) to the k-path."))
+        }
+        return descriptors
+    }
+
+    func focusReciprocalAccessibilityCandidate(_ descriptor: ReciprocalAccessibilityDescriptor) {
+        guard let current = reciprocalAccessibilityDescriptors(viewport: descriptorViewport())
+            .first(where: { $0 == descriptor }) else {
+            clearReciprocalHover()
+            return
+        }
+        reciprocalHoverCandidate = current.candidate
+        reciprocalHoverCursor = current.screenPoint
+        updateTransientTooltip()
+    }
+
+    func activateReciprocalAccessibilityCandidate(_ descriptor: ReciprocalAccessibilityDescriptor) -> Bool {
+        let current = reciprocalAccessibilityDescriptors(viewport: descriptorViewport())
+            .first(where: { $0 == descriptor })
+        guard let current else { return false }
+        return appendReciprocalCandidate(current.candidate)
+    }
+
+    func clearReciprocalAccessibilityFocus() {
+        clearReciprocalHover()
+    }
+
+    private func descriptorViewport() -> SIMD2<Float> {
+        SIMD2<Float>(Float(canvas.bounds.width), Float(canvas.bounds.height))
+    }
+
+    @discardableResult
+    private func appendReciprocalCandidate(_ candidate: BZCandidate) -> Bool {
+        guard isReciprocalPathEditing,
+              finite(candidate.point.frac) else { return false }
+        state.append(candidate.point)
+        // SideBarState.append owns duplicate suppression, cap enforcement,
+        // undo, and provenance. Keep this scene mirror identical to mouse picks.
+        scene.kPathPoints = state.kPathPoints
+        setNeedsRender()
+        return true
     }
 
     /// Reciprocal k-path edit click handler. Edit mode OFF → returns false (not
@@ -599,12 +1013,47 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let cam = renderCamera()
         if let cand = Self.pickBZCandidate(candidates: candidates, presentation: presentation,
                                            camera: cam, viewport: viewport, click: click) {
-            state.append(cand.point)
+            _ = appendReciprocalCandidate(cand)
+        } else {
+            // Push the (possibly edited) route into the scene and re-render.
+            scene.kPathPoints = state.kPathPoints
+            setNeedsRender()
         }
-        // Push the (possibly edited) route into the scene and re-render.
-        scene.kPathPoints = state.kPathPoints
-        setNeedsRender()
         return true
+    }
+
+    /// Update only the overlay for reciprocal-space hover. Pointer movement must
+    /// not enter the route editor or trigger a Metal redraw.
+    func handleReciprocalPathHover(at point: SIMD2<Float>?, viewport: SIMD2<Float>) {
+        guard state.editKPathOnBZ, scene.isCrystal else {
+            clearReciprocalHover()
+            return
+        }
+        guard let point,
+              validReciprocalViewport(viewport),
+              point.x.isFinite, point.y.isFinite,
+              point.x >= 0, point.x <= viewport.x,
+              point.y >= 0, point.y <= viewport.y else {
+            clearReciprocalHover()
+            return
+        }
+        let (candidates, presentation) = editorLandmarks()
+        guard let presentation, validBZPresentation(presentation) else {
+            clearReciprocalHover()
+            return
+        }
+        let candidate = Self.pickBZCandidate(candidates: candidates,
+                                             presentation: presentation,
+                                             camera: renderCamera(),
+                                             viewport: viewport,
+                                             click: point)
+        guard let candidate, finite(candidate.point.frac) else {
+            clearReciprocalHover()
+            return
+        }
+        reciprocalHoverCandidate = candidate
+        reciprocalHoverCursor = point
+        updateTransientTooltip()
     }
 
     /// Highlight the route node at `index` in the BZ viewport, linking the
@@ -613,7 +1062,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// out-of-range indices are a safe no-op there. This is the hook the
     /// SidebarState/UI invokes on selection (it sets this from a callback).
     func selectKPathNode(_ index: Int?) {
+        selectedRouteNodeIndex = index
         renderer?.selectedKPathNode = index
+        renderer2D?.selectedKPathNode = index
         setNeedsRender()
     }
 
@@ -684,43 +1135,305 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// syncFromState does not re-enter, then apply the slab directly.
     func adjustSlabPlaneA(by delta: Float) {
         guard scene.slab != nil else { return }
+        let reciprocalPresentationBefore = reciprocalPresentationSignature(for: scene)
+        let oldSlab = scene.slab
         isSyncingState = true
         state.slabA_dist += delta
         isSyncingState = false
         let slab = Slab(planeA: Plane(h: state.slabA_h, k: state.slabA_k, l: state.slabA_l, distance: state.slabA_dist),
                         planeB: Plane(h: state.slabB_h, k: state.slabB_k, l: state.slabB_l, distance: state.slabB_dist))
         scene = scene.applySlab(slab)
+        let slabChanged = scene.slab != oldSlab
+        let reciprocalPresentationAfter = reciprocalPresentationSignature(for: scene)
+        if slabChanged, reciprocalPresentationChanged(from: reciprocalPresentationBefore,
+                                                       to: reciprocalPresentationAfter) {
+            clearReciprocalHover()
+            canvas.invalidateReciprocalAccessibilityFocus()
+        }
+        coordinationGeometryDidChange()
         refreshAtomTable()
         setNeedsRender()
     }
 
-    /// Project each atom to screen coordinates and overlay its element symbol.
+    /// Project atom and persistent reciprocal-route labels. Route labels are a
+    /// separate layer: hiding atom labels must not hide a visible BZ route.
     func updateLabels() {
-        guard scene.showLabels, !scene.atoms.isEmpty else {
-            labelOverlay.labels = []; return
-        }
-        let cw = Float(canvas.bounds.width), ch = Float(canvas.bounds.height)
-        guard cw > 0, ch > 0 else { labelOverlay.labels = []; return }
-        let aspect = cw / ch
-        // Use the renderer's *effective* camera (which forces identity rotation
-        // + orthographic projection in 2D modes) so labels track the atoms
-        // exactly — `camera` alone would drift off in 2D.
-        let cam = renderCamera()
-        let view = cam.viewMatrix()
-        let proj = cam.projectionMatrix(aspect: aspect)
-        // Atom element labels
-        let labels: [LabelOverlayView.Label] = scene.atoms.compactMap { atom in
-            let clip = proj * view * SIMD4<Float>(atom.coord.x, atom.coord.y, atom.coord.z, 1)
-            guard abs(clip.w) > 1e-10 else { return nil }
-            let ndc = clip / clip.w
-            guard ndc.z >= 0, ndc.z <= 1 else { return nil }
-            let sx = CGFloat((ndc.x * 0.5 + 0.5) * cw)
-            let sy = CGFloat((1 - (ndc.y * 0.5 + 0.5)) * ch)   // flip for AppKit y-down
-            return LabelOverlayView.Label(symbol: ElementTable.symbol(atom.atomicNumber),
-                                          x: sx - 10, y: sy - 12)  // offset so text centres near atom
+        if !state.editKPathOnBZ {
+            reciprocalHoverCandidate = nil
+            reciprocalHoverCursor = nil
         }
 
+        guard let viewport = labelViewport(for: canvas.bounds.size) else {
+            reciprocalHoverCandidate = nil
+            reciprocalHoverCursor = nil
+            canvas.invalidateReciprocalAccessibilityFocus()
+            labelOverlay.labels = []
+            return
+        }
+        let cam = renderCamera()
+        guard (try? Camera.validated(cam)) != nil else {
+            reciprocalHoverCandidate = nil
+            reciprocalHoverCursor = nil
+            canvas.invalidateReciprocalAccessibilityFocus()
+            labelOverlay.labels = []
+            return
+        }
+
+        var labels = persistentLabels(viewport: viewport, camera: cam)
+        if let tooltip = reciprocalTooltipLabel() {
+            labels.append(tooltip)
+        }
         labelOverlay.labels = labels
+    }
+
+    /// Generate only persistent labels for an explicit render viewport. This is
+    /// also used by export, where the live canvas may have a different aspect.
+    private func persistentLabels(viewport: SIMD2<Float>, camera: Camera) -> [LabelOverlayView.Label] {
+        guard validReciprocalViewport(viewport),
+              (try? Camera.validated(camera)) != nil else { return [] }
+
+        var labels: [LabelOverlayView.Label] = []
+        if scene.showLabels {
+            labels += scene.atoms.compactMap { atom in
+                guard let projected = projectLabelPoint(atom.coord, camera: camera, viewport: viewport) else {
+                    return nil
+                }
+                return LabelOverlayView.Label(symbol: ElementTable.symbol(atom.atomicNumber),
+                                              x: projected.x - 10, y: projected.y - 12)
+            }
+        }
+
+        let routeVisible = !canvas.isHidden && scene.isCrystal && scene.showBrillouinZone
+        if routeVisible, !scene.kPathPoints.isEmpty {
+            synchronizeRouteLabelMeasurementCache()
+            let (candidates, presentation) = editorLandmarks()
+            guard let presentation, validBZPresentation(presentation) else { return labels }
+            _ = candidates // The cache is intentionally shared with picking/framing.
+            let selected = selectedRouteNodeIndex ?? renderer?.selectedKPathNode
+            let labelBounds = NSRect(x: 0, y: 0, width: CGFloat(viewport.x), height: CGFloat(viewport.y))
+            var projected: [(index: Int, label: LabelOverlayView.Label, rect: NSRect, selected: Bool)] = []
+            for (index, point) in scene.kPathPoints.prefix(1024).enumerated() {
+                guard finite(point.frac),
+                      let screen = projectLabelPoint(presentation.world(frac: point.frac),
+                                                     camera: camera, viewport: viewport) else {
+                    continue
+                }
+                let isSelected = selected == index
+                let style: LabelOverlayView.Label.Style = isSelected ? .selectedRouteNode : .routeNode
+                let symbol = point.label.isEmpty ? "K\(index + 1)" : String(point.label.prefix(64))
+                let rawLabel = LabelOverlayView.Label(symbol: symbol,
+                                                      x: screen.x + 6, y: screen.y - 6,
+                                                      style: style)
+                let measuredSize = measuredRouteLabelSize(text: symbol, style: style)
+                let label = Self.clampedRouteLabel(rawLabel, in: labelBounds, measuredSize: measuredSize)
+                projected.append((index, label,
+                                  LabelOverlayView.drawingRect(for: label, measuredSize: measuredSize),
+                                  isSelected))
+            }
+
+            // Select the highlighted node first, then retain the lowest route index
+            // for ordinary overlaps. Expanding each rect makes near-coincident
+            // projections deterministic without considering atom labels.
+            let ordered = projected.sorted { lhs, rhs in
+                if lhs.selected != rhs.selected { return lhs.selected }
+                return lhs.index < rhs.index
+            }
+            var occupied = RouteLabelSpatialIndex()
+            for item in ordered {
+                let collisionRect = item.rect.insetBy(dx: -4, dy: -4)
+                guard !occupied.intersects(collisionRect) else { continue }
+                occupied.insert(collisionRect)
+                labels.append(item.label)
+            }
+        }
+        return labels
+    }
+
+    /// Shift a persistent route label's complete drawing rectangle into the
+    /// viewport when it fits. The label origin remains node-relative unless a
+    /// viewport edge requires a correction; oversized labels are anchored at
+    /// the corresponding viewport edge rather than producing invalid geometry.
+    static func clampedRouteLabel(_ label: LabelOverlayView.Label, in bounds: NSRect) -> LabelOverlayView.Label {
+        clampedRouteLabel(label, in: bounds, measuredSize: LabelOverlayView.measuredSize(for: label))
+    }
+
+    private static func clampedRouteLabel(_ label: LabelOverlayView.Label, in bounds: NSRect,
+                                          measuredSize: CGSize) -> LabelOverlayView.Label {
+        guard label.style == .routeNode || label.style == .selectedRouteNode,
+               !bounds.isEmpty else { return label }
+        let rect = LabelOverlayView.drawingRect(for: label, measuredSize: measuredSize)
+        guard rect.origin.x.isFinite, rect.origin.y.isFinite,
+              rect.width.isFinite, rect.height.isFinite else { return label }
+
+        let targetX: CGFloat
+        if rect.width <= bounds.width {
+            targetX = min(max(rect.minX, bounds.minX), bounds.maxX - rect.width)
+        } else {
+            targetX = bounds.minX
+        }
+        let targetY: CGFloat
+        if rect.height <= bounds.height {
+            targetY = min(max(rect.minY, bounds.minY), bounds.maxY - rect.height)
+        } else {
+            targetY = bounds.minY
+        }
+        return LabelOverlayView.Label(symbol: label.symbol,
+                                      x: label.x + targetX - rect.minX,
+                                      y: label.y + targetY - rect.minY,
+                                      style: label.style)
+    }
+
+    private func measuredRouteLabelSize(text: String,
+                                        style: LabelOverlayView.Label.Style) -> CGSize {
+        let key = RouteLabelMeasurementKey(text: text, style: style)
+        if let cached = routeLabelMeasurementCache[key] { return cached }
+        let measured = LabelOverlayView.measuredSize(
+            for: LabelOverlayView.Label(symbol: text, x: 0, y: 0, style: style))
+        routeLabelMeasurementCount += 1
+        if routeLabelMeasurementCache.count < Self.routeLabelMeasurementCacheCapacity {
+            routeLabelMeasurementCache[key] = measured
+        }
+        return measured
+    }
+
+    private func synchronizeRouteLabelMeasurementCache() {
+        let signature = scene.kPathPoints.prefix(1024).enumerated().map { index, point in
+            point.label.isEmpty ? "K\(index + 1)" : String(point.label.prefix(64))
+        }
+        guard routeLabelTextSignature != signature else { return }
+        routeLabelMeasurementCache.removeAll(keepingCapacity: true)
+        routeLabelTextSignature = signature
+    }
+
+    private func invalidateRouteLabelMeasurementCache() {
+        routeLabelMeasurementCache.removeAll(keepingCapacity: true)
+        routeLabelTextSignature = nil
+    }
+
+    private func labelViewport(for size: CGSize) -> SIMD2<Float>? {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0,
+              size.width <= CGFloat(Float.greatestFiniteMagnitude),
+              size.height <= CGFloat(Float.greatestFiniteMagnitude) else { return nil }
+        let width = Float(size.width)
+        let height = Float(size.height)
+        guard width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+        return SIMD2<Float>(width, height)
+    }
+
+    private func projectLabelPoint(_ world: SIMD3<Float>, camera: Camera,
+                                   viewport: SIMD2<Float>) -> CGPoint? {
+        guard finite(world), validReciprocalViewport(viewport) else { return nil }
+        let viewPosition = camera.viewMatrix() * SIMD4<Float>(world.x, world.y, world.z, 1)
+        let depth = -viewPosition.z
+        guard depth > 0.01, depth.isFinite else { return nil }
+        let aspect = viewport.x / viewport.y
+        guard aspect.isFinite, aspect > 0 else { return nil }
+        let clip = camera.projectionMatrix(aspect: aspect) * viewPosition
+        guard clip.x.isFinite, clip.y.isFinite, clip.z.isFinite, clip.w.isFinite,
+              clip.w > 1e-10 else { return nil }
+        let ndc = clip / clip.w
+        guard ndc.x.isFinite, ndc.y.isFinite, ndc.z.isFinite,
+              ndc.x >= -1, ndc.x <= 1, ndc.y >= -1, ndc.y <= 1,
+              ndc.z >= 0, ndc.z <= 1 else { return nil }
+        let x = (ndc.x * 0.5 + 0.5) * viewport.x
+        let y = (1 - (ndc.y * 0.5 + 0.5)) * viewport.y
+        guard x.isFinite, y.isFinite else { return nil }
+        return CGPoint(x: CGFloat(x), y: CGFloat(y))
+    }
+
+    private func validBZPresentation(_ presentation: BZPresentation) -> Bool {
+        finite(presentation.center) && presentation.inv.isFinite && presentation.inv > 0
+            && finite(presentation.reciprocal.a)
+            && finite(presentation.reciprocal.b)
+            && finite(presentation.reciprocal.c)
+             && BrillouinZone.isFiniteInvertible(simd_float3x3(
+                columns: (presentation.reciprocal.a,
+                          presentation.reciprocal.b,
+                          presentation.reciprocal.c)))
+    }
+
+    private static func reciprocalGeometryChanged(from old: Scene, to new: Scene) -> Bool {
+        guard old.cell?.a != new.cell?.a || old.cell?.b != new.cell?.b
+                || old.cell?.c != new.cell?.c else {
+            guard old.baseAtoms.count == new.baseAtoms.count else { return true }
+            return zip(old.baseAtoms, new.baseAtoms).contains {
+                $0.coord != $1.coord || $0.atomicNumber != $1.atomicNumber
+            }
+        }
+        return true
+    }
+
+    private func validReciprocalViewport(_ viewport: SIMD2<Float>) -> Bool {
+        viewport.x.isFinite && viewport.y.isFinite && viewport.x > 0 && viewport.y > 0
+    }
+
+    private func reciprocalPresentationSignature(for scene: Scene)
+        -> (center: SIMD3<Float>, inv: Float)? {
+        guard bzEditCache.epoch == bzEpoch, let bz = bzEditCache.bz else { return nil }
+        let presentation = BZPresentation(bz: bz, scene: scene)
+        guard validBZPresentation(presentation) else { return nil }
+        return (presentation.center, presentation.inv)
+    }
+
+    private func reciprocalPresentationChanged(
+        from before: (center: SIMD3<Float>, inv: Float)?,
+        to after: (center: SIMD3<Float>, inv: Float)?) -> Bool {
+        switch (before, after) {
+        case (nil, nil): return false
+        case (nil, _), (_, nil): return true
+        case let (before?, after?):
+            return before.center != after.center || before.inv != after.inv
+        }
+    }
+
+    private func finite(_ vector: SIMD3<Float>) -> Bool {
+        vector.x.isFinite && vector.y.isFinite && vector.z.isFinite
+    }
+
+    private func finite(_ vector: SIMD2<Float>) -> Bool {
+        vector.x.isFinite && vector.y.isFinite
+    }
+
+    private func reciprocalTooltipLabel() -> LabelOverlayView.Label? {
+        guard state.editKPathOnBZ,
+              let candidate = reciprocalHoverCandidate,
+              let cursor = reciprocalHoverCursor,
+              finite(cursor), finite(candidate.point.frac) else { return nil }
+        let label = candidate.point.label.isEmpty ? "K" : String(candidate.point.label.prefix(64))
+        let type: String
+        switch candidate.type {
+        case .center: type = "Gamma"
+        case .edge: type = "vertex"
+        case .line: type = "edge midpoint"
+        case .polyface: type = "face center"
+        }
+        let f = candidate.point.frac
+        let coordinates = String(format: "(%.4f, %.4f, %.4f)", f.x, f.y, f.z)
+        return LabelOverlayView.Label(symbol: "\(label)\n\(type)\n\(coordinates)",
+                                      x: CGFloat(cursor.x + 14), y: CGFloat(cursor.y + 14),
+                                      style: .tooltip)
+    }
+
+    private func clearReciprocalHover() {
+        let hadHover = reciprocalHoverCandidate != nil || reciprocalHoverCursor != nil
+        reciprocalHoverCandidate = nil
+        reciprocalHoverCursor = nil
+        if hadHover || labelOverlay.labels.contains(where: { $0.style == .tooltip }) {
+            updateTransientTooltip()
+        }
+    }
+
+    /// Replace only the transient tooltip entry. Persistent atom and route labels
+    /// remain untouched during pointer movement.
+    private func updateTransientTooltip() {
+        var labels = labelOverlay.labels.filter { $0.style != .tooltip }
+        if let tooltip = reciprocalTooltipLabel() {
+            labels.append(tooltip)
+        }
+        if labels != labelOverlay.labels {
+            labelOverlay.labels = labels
+        }
     }
 
     /// Build the text shown in the info/selection readout — selected-atom
@@ -763,12 +1476,57 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 lines.append(String(format: "%3d  %-4@  %@", idx + 1, sym, cart))
             }
         }
+        appendCoordinationDetails(to: &lines, selection: sel, atoms: atoms)
         if let r = scene.measurementResult {
             lines.append("")
             lines.append("Measurement:")
             lines.append("  " + r.summary)
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// Add bounded coordination detail to the selection readout. The engine's
+    /// neighbor records are runtime-derived, so every index is validated against
+    /// the live displayed atom array before it is formatted.
+    private func appendCoordinationDetails(to lines: inout [String], selection: [Int], atoms: [Atom]) {
+        guard state.coordinationEnabled,
+              let analysis = coordinationAnalysis,
+              installedCoordinationNumbers.count == atoms.count else { return }
+        let validSelection = selection.filter { $0 >= 0 && $0 < atoms.count }
+        guard !validSelection.isEmpty else { return }
+
+        lines.append("")
+        lines.append("Coordination:")
+        let selectedLimit = min(8, validSelection.count)
+        for index in validSelection.prefix(selectedLimit) {
+            guard index < installedCoordinationNumbers.count else { continue }
+            lines.append("  Atom \(index + 1) CN \(installedCoordinationNumbers[index])")
+            let neighbors = analysis.neighbors(of: index)
+                .filter { $0.atomIndex >= 0 && $0.atomIndex < atoms.count && $0.distance.isFinite }
+                .sorted {
+                    let lhs = ElementTable.symbol(atoms[$0.atomIndex].atomicNumber)
+                    let rhs = ElementTable.symbol(atoms[$1.atomIndex].atomicNumber)
+                    if lhs != rhs { return lhs < rhs }
+                    if $0.atomIndex != $1.atomIndex { return $0.atomIndex < $1.atomIndex }
+                    return $0.distance < $1.distance
+                }
+            let neighborLimit = min(16, neighbors.count)
+            for neighbor in neighbors.prefix(neighborLimit) {
+                let symbol = ElementTable.symbol(atoms[neighbor.atomIndex].atomicNumber)
+                let offset = neighbor.imageOffset
+                let image = offset == .zero
+                    ? ""
+                    : " image=(\(offset.x),\(offset.y),\(offset.z))"
+                lines.append(String(format: "    %@ #%d %.3f Å%@", symbol as NSString,
+                                    neighbor.atomIndex + 1, neighbor.distance, image as NSString))
+            }
+            if neighbors.count > neighborLimit {
+                lines.append("    … and \(neighbors.count - neighborLimit) more neighbors")
+            }
+        }
+        if validSelection.count > selectedLimit {
+            lines.append("  … and \(validSelection.count - selectedLimit) more selected atoms")
+        }
     }
 
     /// Menu-item action: toggle element labels on/off and update the overlay.
@@ -794,13 +1552,16 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// for "reframe only", and other tests depend on resetView() not touching
     /// appearance state. Reset lighting/background separately via the sidebar.
     func resetView() {
+        clearReciprocalHover()
         camera.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         // A view reset is a natural clearing point for the transient node highlight;
         // the route is unchanged, so this only drops the render toggle, not appearance.
         // Bumping viewResetGeneration signals the SideBar to clear its local selected
         // node/editor too, keeping the sidebar selection in sync with the renderer.
         state.notifyViewReset()
+        selectedRouteNodeIndex = nil
         renderer?.selectedKPathNode = nil
+        renderer2D?.selectedKPathNode = nil
         applyCameraForNewSceneIfNeeded()
         // applyCameraForNewSceneIfNeeded() replaces the camera with
         // scene.defaultCamera(), whose projection defaults to orthographic — restore
@@ -823,8 +1584,79 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// projection afterward.
     private func reframeForDisplayMode(previous: DisplayMode) {
         guard previous.is2D != scene.displayMode.is2D else { return }
+        clearReciprocalHover()
         applyCameraForNewSceneIfNeeded()
         camera.perspective = !state.orthographic
+    }
+
+    private func frameReciprocalEditor(viewport requestedViewport: SIMD2<Float>? = nil) -> Bool {
+        let viewport = requestedViewport
+            ?? SIMD2<Float>(Float(canvas.bounds.width), Float(canvas.bounds.height))
+        // A view can be transiently zero-sized while its window is being laid out.
+        // Use the established entry fallback in that case; a valid resize callback
+        // always supplies its actual logical viewport.
+        let fitViewport = validReciprocalViewport(viewport) ? viewport : SIMD2<Float>(800, 600)
+        let (candidates, presentation) = editorLandmarks()
+        guard let bz = bzEditCache.bz,
+              !candidates.isEmpty,
+              let presentation,
+              validBZPresentation(presentation),
+              let framed = presentation.framedCamera(bz: bz, current: camera,
+                                                     viewport: fitViewport) else { return false }
+        reciprocalEditorFrameCount += 1
+        camera = framed
+        return true
+    }
+
+    /// Scene/frame installation must never restore a camera captured for the old
+    /// structure. It also drops the one transient hover candidate.
+    private func clearReciprocalFocusForSceneReplacement() {
+        reciprocalStructureCamera = nil
+        reciprocalStructureDisplayMode = nil
+        reciprocalStructureShowBZ = nil
+        reciprocalStructureOrthographic = nil
+        lastEditKPathOnBZ = false
+        reciprocalHoverCandidate = nil
+        reciprocalHoverCursor = nil
+        selectedRouteNodeIndex = nil
+        renderer?.showBZLandmarks = false
+        canvas.invalidateReciprocalAccessibilityFocus()
+    }
+
+    private func rejectReciprocalEditor(reason: String = "Brillouin zone unavailable for this cell.") {
+        let wasSyncingState = isSyncingState
+        isSyncingState = true
+        defer { isSyncingState = wasSyncingState }
+        state.reciprocalEditorStatusText = reason
+        state.editKPathOnBZ = false
+        lastEditKPathOnBZ = false
+
+        if let mode = reciprocalStructureDisplayMode {
+            state.displayMode = mode
+            scene.displayMode = mode
+        }
+        if let showBZ = reciprocalStructureShowBZ {
+            state.showBrillouinZone = showBZ
+            scene.showBrillouinZone = showBZ
+        }
+        if let savedCamera = reciprocalStructureCamera {
+            camera = savedCamera
+            state.orthographic = reciprocalStructureOrthographic ?? !savedCamera.perspective
+        }
+        scene.camera = camera
+        reciprocalStructureCamera = nil
+        reciprocalStructureDisplayMode = nil
+        reciprocalStructureShowBZ = nil
+        reciprocalStructureOrthographic = nil
+        renderer?.showBZLandmarks = false
+        clearReciprocalHover()
+        canvas.invalidateReciprocalAccessibilityFocus()
+        if window.firstResponder === canvas {
+            window.makeFirstResponder(nil)
+        }
+        updateContentVisibility()
+        refreshDelegate()
+        setNeedsRender()
     }
 
     func syncFromState() {
@@ -852,6 +1684,49 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         isSyncingState = true
         defer { isSyncingState = false }
 
+        let enteringReciprocalEdit = state.editKPathOnBZ && !lastEditKPathOnBZ
+        let exitingReciprocalEdit = !state.editKPathOnBZ && lastEditKPathOnBZ
+        if enteringReciprocalEdit {
+            // Capture the complete pre-editor presentation before any validation
+            // or 2D->3D transition, so every failure uses the same rejection path.
+            reciprocalStructureCamera = camera
+            reciprocalStructureDisplayMode = state.displayMode
+            reciprocalStructureShowBZ = state.showBrillouinZone
+            reciprocalStructureOrthographic = state.orthographic
+            guard renderer != nil else {
+                rejectReciprocalEditor(reason: "Metal renderer unavailable.")
+                return
+            }
+            guard scene.isCrystal, state.reciprocalEditorAvailable else {
+                rejectReciprocalEditor()
+                return
+            }
+            let (candidates, presentation) = editorLandmarks()
+            guard !candidates.isEmpty,
+                  let presentation,
+                  validBZPresentation(presentation) else {
+                rejectReciprocalEditor()
+                return
+            }
+            lastEditKPathOnBZ = true
+            reciprocalHoverCandidate = nil
+            reciprocalHoverCursor = nil
+            canvas.invalidateReciprocalAccessibilityFocus()
+        } else if exitingReciprocalEdit {
+            reciprocalHoverCandidate = nil
+            reciprocalHoverCursor = nil
+            canvas.invalidateReciprocalAccessibilityFocus()
+            if window.firstResponder === canvas {
+                window.makeFirstResponder(nil)
+            }
+            if let mode = reciprocalStructureDisplayMode {
+                state.displayMode = mode
+            }
+            if let showBZ = reciprocalStructureShowBZ {
+                state.showBrillouinZone = showBZ
+            }
+        }
+
         // k-path edit mode needs the BZ visible. Force it on BEFORE the state->scene
         // pushes below, so the scene receives true (we're inside the isSyncingState
         // guard, so the onChange from this assignment returns early at the guard).
@@ -870,6 +1745,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
 
         let previousMode = scene.displayMode
+        let requestedPerspective = exitingReciprocalEdit
+            ? (reciprocalStructureCamera?.perspective ?? !state.orthographic)
+            : !state.orthographic
+        let projectionChanged = camera.perspective != requestedPerspective
+        if previousMode != state.displayMode || projectionChanged {
+            clearReciprocalHover()
+            canvas.invalidateReciprocalAccessibilityFocus()
+        }
         scene.displayMode = state.displayMode
         scene.atomScale = state.atomScale
         scene.bondRadius = state.bondRadius
@@ -881,7 +1764,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.showBrillouinZone = state.showBrillouinZone
         // Projection toggle: orthographic checked => perspective off. Bound to
         // the live render camera (the renderer reads camera.perspective).
-        camera.perspective = !state.orthographic
+        if camera.perspective != requestedPerspective {
+            camera.perspective = requestedPerspective
+        }
         // Hide-structure toggle: suppress atoms/bonds/polyhedra, keep frame/axes/BZ.
         scene.showStructure = state.showStructure
         // Multi-orbital cube: selecting an orbital swaps the renderer's scalarField
@@ -916,6 +1801,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // canvas shows EITHER the 3D scene or the color plane, never both — so the
         // plane wins only while the toggle is on AND a grid is present.
         updateContentVisibility()
+        if enteringReciprocalEdit, window.isVisible {
+            window.makeFirstResponder(canvas)
+        }
         scene.measurementMode = state.measurementMode
         // Scene-derived mirrors flow state <- scene purely to keep the sidebar
         // indicators in sync; guarded above against re-entrant onChange.
@@ -937,7 +1825,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // node keeps its highlight.
         if state.routeGeneration != lastRouteGeneration {
             lastRouteGeneration = state.routeGeneration
+            selectedRouteNodeIndex = nil
             renderer?.selectedKPathNode = nil
+            renderer2D?.selectedKPathNode = nil
         }
         // lighting + background — the renderer currently uses a fixed shader and
         // solid clear color (the richer shader is owned by another agent); we
@@ -947,6 +1837,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.backgroundType = state.backgroundType
         scene.background = state.backgroundHex
         scene.backgroundBottom = state.backgroundBottomHex
+        let reciprocalPresentationBefore = reciprocalPresentationSignature(for: scene)
         // supercell — compare the (n1,n2,n3) tuple, not just total, so changing
         // replication DIRECTION (e.g. 2×1×1 → 1×2×1, same total) re-widen happens.
         let sc = SuperCell(n1: state.n1, n2: state.n2, n3: state.n3)
@@ -972,12 +1863,58 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if superCellChanged || scene.slab != slab {
             scene = scene.applySlab(slab)
         }
-        if superCellChanged || scene.slab != oldSlab {
+        let slabChanged = scene.slab != oldSlab
+        let reciprocalPresentationAfter = reciprocalPresentationSignature(for: scene)
+        if (superCellChanged || slabChanged), reciprocalPresentationChanged(
+            from: reciprocalPresentationBefore, to: reciprocalPresentationAfter) {
+            clearReciprocalHover()
+            canvas.invalidateReciprocalAccessibilityFocus()
+        }
+        syncCoordinationState(geometryChanged: superCellChanged || slabChanged)
+        if superCellChanged || slabChanged {
             refreshAtomTable()
         }
         // Reframe when crossing the 2D↔3D boundary — after supercell/slab
         // mutations so the camera fits the final geometry.
-        reframeForDisplayMode(previous: previousMode)
+        if !exitingReciprocalEdit {
+            reframeForDisplayMode(previous: previousMode)
+        }
+        if enteringReciprocalEdit {
+            // Entry framing is deliberately one-shot. It runs after a possible
+            // 2D->3D structure reframe and therefore preserves the final mode.
+            guard frameReciprocalEditor() else {
+                rejectReciprocalEditor()
+                return
+            }
+            state.clearReciprocalEditorStatus()
+        } else if projectionChanged && state.editKPathOnBZ {
+            // Projection changes alter the distance needed to fit the BZ. Refit
+            // once after applying the new projection, without changing rotation.
+            guard frameReciprocalEditor() else {
+                rejectReciprocalEditor()
+                return
+            }
+        }
+        if exitingReciprocalEdit {
+            if let reciprocalStructureCamera {
+                camera = reciprocalStructureCamera
+                // Keep the sidebar projection mirror aligned with the restored
+                // camera while the existing sync guard is active.
+                state.orthographic = !reciprocalStructureCamera.perspective
+            }
+            scene.camera = camera
+            reciprocalStructureCamera = nil
+            reciprocalStructureDisplayMode = nil
+            reciprocalStructureShowBZ = nil
+            reciprocalStructureOrthographic = nil
+            lastEditKPathOnBZ = false
+        } else if !state.editKPathOnBZ {
+            lastEditKPathOnBZ = false
+            reciprocalStructureCamera = nil
+            reciprocalStructureDisplayMode = nil
+            reciprocalStructureShowBZ = nil
+            reciprocalStructureOrthographic = nil
+        }
         // background clear color (solid top color today; gradient rendering is
         // pending on the shader work).
         if let c = colorFromHex(state.backgroundHex) {
@@ -988,6 +1925,223 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if state.isPlaying && playTimer == nil { startPlayback() }
         if !state.isPlaying && playTimer != nil { stopPlayback() }
         setNeedsRender()
+    }
+
+    // MARK: - Coordination lifecycle
+
+    /// Keep analysis work behind an explicit opt-in. Geometry changes are routed
+    /// here only after the final displayed atom array (including supercell and
+    /// slab filtering) has been installed.
+    private func syncCoordinationState(geometryChanged: Bool) {
+        let enabledChanged = state.coordinationEnabled != lastCoordinationEnabled
+        let scaleChanged = state.coordinationRadiusScale != lastCoordinationScale
+        lastCoordinationEnabled = state.coordinationEnabled
+        lastCoordinationScale = state.coordinationRadiusScale
+
+        guard state.coordinationEnabled else {
+            if coordinationCancellationToken != nil || coordinationAnalysis != nil
+                || !installedCoordinationNumbers.isEmpty
+                || state.coordinationAnalysisAvailable
+                || state.coordinationStatusText != "Off" || !state.coordinationSummaryText.isEmpty {
+                clearCoordinationAnalysis(status: "Off", summary: "")
+            }
+            if state.showCoordinationColors { state.showCoordinationColors = false }
+            return
+        }
+
+        if geometryChanged || enabledChanged {
+            startCoordinationAnalysis(debounced: false)
+        } else if scaleChanged {
+            startCoordinationAnalysis(debounced: true)
+        } else {
+            applyCoordinationColors()
+        }
+    }
+
+    /// Called by file/frame/slab paths that replace `scene` outside the normal
+    /// sidebar mirror transaction. The generation bump invalidates every result
+    /// from the old atom ordering before launching work for the new one.
+    private func coordinationGeometryDidChange() {
+        if state.coordinationEnabled {
+            lastCoordinationEnabled = true
+            lastCoordinationScale = state.coordinationRadiusScale
+            startCoordinationAnalysis(debounced: false)
+        } else {
+            if coordinationCancellationToken != nil || coordinationAnalysis != nil
+                || !installedCoordinationNumbers.isEmpty {
+                clearCoordinationAnalysis(status: "Off", summary: "")
+            }
+        }
+    }
+
+    /// The analyzer receives the displayed atoms, not `baseAtoms`. For an explicit
+    /// supercell, widen only the periodic cell vectors so replicas do not collapse
+    /// onto one another through the minimum-image search. Non-periodic axes retain
+    /// their original vector and the slab-filtered atom set remains unchanged.
+    internal func effectiveCoordinationCell(for scene: Scene) -> Cell? {
+        guard let cell = scene.cell else { return nil }
+        let n1 = scene.periodicDim >= 1 ? max(1, scene.superCell.n1) : 1
+        let n2 = scene.periodicDim >= 2 ? max(1, scene.superCell.n2) : 1
+        let n3 = scene.periodicDim >= 3 ? max(1, scene.superCell.n3) : 1
+        return Cell(a: cell.a * Float(n1), b: cell.b * Float(n2), c: cell.c * Float(n3))
+    }
+
+    private func cancelCoordinationRequest() {
+        coordinationCancellationToken?.cancel()
+        coordinationCancellationToken = nil
+        coordinationWorkItem?.cancel()
+        coordinationWorkItem = nil
+        coordinationDebounceCancellation?()
+        coordinationDebounceCancellation = nil
+    }
+
+    private func startCoordinationAnalysis(debounced: Bool) {
+        cancelCoordinationRequest()
+        coordinationGeneration += 1
+        let generation = coordinationGeneration
+        let token = CoordinationCancellationToken()
+        coordinationCancellationToken = token
+        coordinationAnalysis = nil
+        clearCoordinationNumbers()
+        state.coordinationAnalysisAvailable = false
+        state.coordinationStatusText = scene.atoms.isEmpty ? "Unavailable" : "Calculating…"
+        state.coordinationSummaryText = scene.atoms.isEmpty ? "No atoms" : ""
+        guard !scene.atoms.isEmpty else {
+            token.cancel()
+            coordinationCancellationToken = nil
+            coordinationAnalysisDidUpdate?()
+            return
+        }
+
+        let atoms = scene.atoms
+        let cell = effectiveCoordinationCell(for: scene)
+        let periodicDim = scene.periodicDim
+        let scale = state.coordinationRadiusScale
+        let slab = scene.slab
+        let override = coordinationAnalyzerOverride
+
+        let launch = { [weak self, weak token] in
+            guard let self, let token,
+                  self.coordinationGeneration == generation,
+                  self.coordinationCancellationToken === token,
+                  !token.isCancelled() else { return }
+            self.launchCoordinationAnalysis(generation: generation, token: token,
+                                            atoms: atoms, cell: cell, periodicDim: periodicDim,
+                                            scale: scale, slab: slab, override: override)
+        }
+
+        if debounced {
+            coordinationDebounceCancellation = coordinationDebounceScheduler(0.20, launch)
+        } else {
+            launch()
+        }
+    }
+
+    private func launchCoordinationAnalysis(
+        generation: Int,
+        token: CoordinationCancellationToken,
+        atoms: [Atom],
+        cell: Cell?,
+        periodicDim: Int,
+        scale: Float,
+        slab: Slab?,
+        override: CoordinationAnalyzerOverride?
+    ) {
+        guard !token.isCancelled() else { return }
+        coordinationDebounceCancellation = nil
+        let work = DispatchWorkItem { [weak self] in
+            guard !token.isCancelled() else { return }
+            let result: CoordinationAnalysis?
+            if let override {
+                result = override(atoms, cell, periodicDim, scale, token.isCancelled)
+            } else {
+                result = CoordinationAnalyzer.analyze(atoms: atoms, cell: cell,
+                                                       periodicDim: periodicDim,
+                                                       radiusScale: scale,
+                                                       isCancelled: token.isCancelled)
+            }
+            guard !token.isCancelled() else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard !token.isCancelled() else { return }
+                self?.installCoordinationAnalysis(result, generation: generation,
+                                                  token: token, atoms: atoms, cell: cell,
+                                                  periodicDim: periodicDim, scale: scale,
+                                                  slab: slab)
+            }
+        }
+        coordinationWorkItem = work
+        DispatchQueue.global(qos: .userInitiated).async(execute: work)
+    }
+
+    private func installCoordinationAnalysis(_ result: CoordinationAnalysis?,
+                                             generation: Int,
+                                             token: CoordinationCancellationToken,
+                                             atoms: [Atom], cell: Cell?,
+                                             periodicDim: Int, scale: Float,
+                                             slab: Slab?) {
+        guard generation == coordinationGeneration,
+              coordinationCancellationToken === token,
+              !token.isCancelled(),
+              state.coordinationEnabled,
+              state.coordinationRadiusScale == scale,
+              scene.atoms == atoms,
+              scene.periodicDim == periodicDim,
+              scene.slab == slab,
+              cellsEqual(effectiveCoordinationCell(for: scene), cell) else { return }
+
+        guard let result else {
+            finishCoordinationUnavailable(summary: "No complete coordination result")
+            return
+        }
+        let numbers = result.coordinationNumbers
+        guard numbers.count == atoms.count, !atoms.isEmpty,
+              numbers.allSatisfy({ $0 >= 0 }) else {
+            finishCoordinationUnavailable(summary: "No complete coordination result")
+            return
+        }
+
+        coordinationAnalysis = result
+        state.coordinationAnalysisAvailable = true
+        state.coordinationStatusText = "Ready"
+        let lo = numbers.min() ?? 0
+        let hi = numbers.max() ?? 0
+        state.coordinationSummaryText = "Atoms: \(numbers.count); coordination range: \(lo)…\(hi)"
+        installCoordinationNumbers(numbers)
+        coordinationWorkItem = nil
+        coordinationCancellationToken = nil
+        setNeedsRender()
+        coordinationAnalysisDidUpdate?()
+    }
+
+    private func finishCoordinationUnavailable(summary: String) {
+        coordinationCancellationToken?.cancel()
+        coordinationCancellationToken = nil
+        coordinationWorkItem = nil
+        coordinationAnalysis = nil
+        clearCoordinationNumbers()
+        state.coordinationAnalysisAvailable = false
+        state.coordinationStatusText = "Unavailable"
+        state.coordinationSummaryText = summary
+        coordinationAnalysisDidUpdate?()
+    }
+
+    private func clearCoordinationAnalysis(status: String, summary: String) {
+        cancelCoordinationRequest()
+        coordinationGeneration += 1
+        coordinationAnalysis = nil
+        clearCoordinationNumbers()
+        state.coordinationAnalysisAvailable = false
+        state.coordinationStatusText = status
+        state.coordinationSummaryText = summary
+        coordinationAnalysisDidUpdate?()
+    }
+
+    private func cellsEqual(_ lhs: Cell?, _ rhs: Cell?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil): return true
+        case let (l?, r?): return l.a == r.a && l.b == r.b && l.c == r.c
+        default: return false
+        }
     }
 
     /// Default high-symmetry k-path for the active crystal (crystal only).
@@ -1080,22 +2234,64 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     @MainActor
     internal var currentSourceURL: URL? { sourceURL }
 
+    /// Build the renderer options for the layer currently visible in the viewport.
+    /// Coordination data is only exportable while a complete, current analysis is
+    /// installed for the displayed atom ordering.
+    internal var currentRenderExportOptions: RenderExportOptions {
+        let metalCanvasVisible = !canvas.isHidden
+        let labels = metalCanvasVisible ? labelOverlay.labels.filter(\.isExportable) : []
+        return makeRenderExportOptions(labels: labels, metalCanvasVisible: metalCanvasVisible)
+    }
+
+    private func makeRenderExportOptions(labels: [LabelOverlayView.Label],
+                                         metalCanvasVisible: Bool) -> RenderExportOptions {
+        let exportCoordinationNumbers = metalCanvasVisible
+            && state.coordinationAnalysisAvailable
+            && coordinationAnalysis != nil
+            && installedCoordinationNumbers.count == scene.atoms.count
+            ? installedCoordinationNumbers : []
+        let selectedRouteNode = metalCanvasVisible && scene.isCrystal && scene.showBrillouinZone
+            ? (selectedRouteNodeIndex ?? renderer?.selectedKPathNode).flatMap { index in
+                let renderedCount = min(scene.kPathPoints.count, 1024)
+                return index >= 0 && index < renderedCount ? index : nil
+            }
+            : nil
+        return RenderExportOptions(labels: labels,
+                                   showBZLandmarks: metalCanvasVisible && state.editKPathOnBZ && scene.isCrystal,
+                                   coordinationNumbers: exportCoordinationNumbers,
+                                   showCoordinationColors: metalCanvasVisible
+                                       && !exportCoordinationNumbers.isEmpty
+                                       && state.showCoordinationColors,
+                                   selectedKPathNode: selectedRouteNode)
+    }
+
+    /// Build export options with labels projected for the requested output size,
+    /// rather than reusing positions from the live canvas.
+    internal func exportRenderOptions(for size: CGSize) throws -> RenderExportOptions {
+        let validated = try App.validatedExportSize(size)
+        let metalCanvasVisible = !canvas.isHidden
+        guard metalCanvasVisible else {
+            return makeRenderExportOptions(labels: [], metalCanvasVisible: false)
+        }
+        // App.validatedExportSize bounds the dimensions before these conversions;
+        // the resulting Int values are finite and safely representable as Float.
+        let viewport = SIMD2<Float>(Float(validated.width), Float(validated.height))
+        let labels = persistentLabels(viewport: viewport, camera: renderCamera())
+        return makeRenderExportOptions(labels: labels, metalCanvasVisible: true)
+    }
+
     /// Export the layer currently displayed in the viewport. Graph and color-plane
     /// payloads hidden by the view state must not supersede the Metal canvas.
     @MainActor
     @discardableResult
     internal func exportCurrentView(to url: URL, size: CGSize, options: ExportOptions? = nil) throws -> CGImage {
-        // The export size is the current logical viewport size; reproject labels
-        // after a resize before copying the live overlay.
-        updateLabels()
+        let renderOptions = try exportRenderOptions(for: size)
         var visibleScene = scene
         if dosGrapher.isHidden { visibleScene.densityOfStates = nil }
         if bandGrapher.isHidden { visibleScene.bandStructure = nil }
         if colorPlane.isHidden { visibleScene.grid2D = nil }
         // Apply export options: if the caller passes explicit options, use them;
         // otherwise render with the scene's own background (preserving gradients).
-        let renderOptions = RenderExportOptions(labels: canvas.isHidden ? [] : labelOverlay.labels,
-                                                showBZLandmarks: !canvas.isHidden && state.editKPathOnBZ && scene.isCrystal)
         if let options {
             // Apply background override to the scene copy for ALL export paths
             // (graph, vector, and Metal) so background/transparency settings are
@@ -1137,6 +2333,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// from sourceURL via Parser.load(frameIndex:).
     private func reloadFrame(_ index: Int) {
         guard let url = sourceURL else { return }
+        let wasReciprocalEditing = state.editKPathOnBZ || lastEditKPathOnBZ
         guard index >= 0, index < state.frameCount else {
             isReloadingFrame = true
             state.isPlaying = false
@@ -1162,15 +2359,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // (not state.*, which lags by one onChange) so scrolling frames never
         // resets the view, supercell, slab, or appearance settings.
         var next = Scene(loaded: loaded)
-        next.camera = camera
-        next.displayMode = scene.displayMode
+        let restoredDisplayMode = wasReciprocalEditing
+            ? (reciprocalStructureDisplayMode ?? scene.displayMode)
+            : scene.displayMode
+        let restoredShowBZ = wasReciprocalEditing
+            ? (reciprocalStructureShowBZ ?? scene.showBrillouinZone)
+            : scene.showBrillouinZone
+        let restoredOrthographic = wasReciprocalEditing
+            ? (reciprocalStructureOrthographic ?? state.orthographic)
+            : state.orthographic
+        next.displayMode = restoredDisplayMode
         next.atomScale = scene.atomScale
         next.bondRadius = scene.bondRadius
         next.showCellFrame = scene.showCellFrame
         next.showAxes = scene.showAxes
         next.showLabels = scene.showLabels
         next.showStructure = scene.showStructure
-        next.showBrillouinZone = scene.showBrillouinZone
+        next.showBrillouinZone = restoredShowBZ
         // The freshly parsed scene already owns the right generated route for
         // its current structure/input reciprocal basis.  Transfer only a user
         // route, remapping fractional coordinates through Cartesian reciprocal
@@ -1218,6 +2423,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // focused unit test (testMultiOrbitalSelectionAppliedDuringReload).
         let nOrbitals = next.multiOrbitalFields.count
         applySelectedOrbitalAndClampIso(scene: &next, currentOrbital: state.currentOrbital)
+        if wasReciprocalEditing {
+            // A reciprocal editor camera is tied to the old frame's BZ. Leave the
+            // replacement in its normal structure framing instead of carrying it.
+            next.camera = next.defaultCamera()
+            next.camera.perspective = !restoredOrthographic
+        } else {
+            next.camera = camera
+        }
         // ---- Side-bar per-frame metadata transaction ----
         // Hold BOTH isSyncingState AND isReloadingFrame true for the metadata writes
         // below so (a) the @Published didSet -> onChange -> syncFromState short-circuits
@@ -1235,6 +2448,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             isSyncingState = outerSyncingState
         }
         state.frameIndex = index     // keep the two in sync; guarded from re-entry
+        if wasReciprocalEditing {
+            state.editKPathOnBZ = false
+            state.displayMode = restoredDisplayMode
+            state.showBrillouinZone = restoredShowBZ
+            state.orthographic = restoredOrthographic
+        }
+        state.clearReciprocalEditorStatus()
         // Presence gates (no @Published, but harmlessly inside the held guard).
         state.hasScalarField = (next.scalarField != nil)
         state.hasFermiSurface = (next.fermiSurface != nil)
@@ -1256,10 +2476,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // back into the newly installed frame and misclassify its provenance.
         state.replaceKPath(points: next.kPathPoints, breaks: next.kPathBreaks,
                            provenance: next.kPathProvenance, signature: next.kPathSignature)
+        state.refreshKPathMetrics(for: next.cell)
         // The frame's route replaced the previous one wholesale; clear any stale
         // node highlight (the held isSyncingState guard fences syncFromState from
         // detecting the generation bump here, so clear directly and resync the token).
         renderer?.selectedKPathNode = nil
+        renderer2D?.selectedKPathNode = nil
+        selectedRouteNodeIndex = nil
         lastRouteGeneration = state.routeGeneration
         // Orbital picker: mirror the preserved & validated scene selection exactly
         // (applySelectedOrbitalAndClampIso already clamped + bounded it) so the
@@ -1278,9 +2501,24 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             state.isoRange = 0...1
         }
         // ---- end of held-guard transaction ----
+        reciprocalStructureCamera = nil
+        reciprocalStructureDisplayMode = nil
+        reciprocalStructureShowBZ = nil
+        reciprocalStructureOrthographic = nil
+        reciprocalHoverCandidate = nil
+        reciprocalHoverCursor = nil
+        selectedRouteNodeIndex = nil
+        lastEditKPathOnBZ = false
+        renderer?.showBZLandmarks = false
+        canvas.invalidateReciprocalAccessibilityFocus()
         loadGeneration += 1   // cancel any pending background drop loads
         self.scene = next
         bzEpoch += 1   // freshly parsed frame: cell/baseAtoms may differ, rebuild the editor BZ
+        if wasReciprocalEditing {
+            camera = scene.defaultCamera()
+            camera.perspective = !restoredOrthographic
+            scene.camera = camera
+        }
         // Refresh the color-plane overlay when the reloaded frame changes grid2D
         // presence or data, mirroring loadFile so the plane's data/labels/contours
         // stay consistent across frame reloads.
@@ -1293,6 +2531,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             colorPlane.grid = nil
         }
         updateContentVisibility()
+        coordinationGeometryDidChange()
         refreshAtomTable()
         setNeedsRender()
     }

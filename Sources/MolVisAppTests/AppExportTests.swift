@@ -1,4 +1,5 @@
 import AppKit
+import simd
 import XCTest
 
 @testable import MolVisApp
@@ -13,6 +14,54 @@ final class AppExportTests: XCTestCase {
             NSColor.blue.setFill()
             NSRect(x: 0, y: bounds.height / 2, width: bounds.width, height: bounds.height / 2).fill()
         }
+    }
+
+    private func coordinationScene() -> Scene {
+        var scene = Scene()
+        scene.background = "#000000"
+        scene.showAxes = false
+        scene.showCellFrame = false
+        scene.atoms = [
+            Atom(coord: SIMD3(-1.2, 0, 0), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(1.2, 0, 0), atomicNumber: 8, label: "O"),
+        ]
+        return scene
+    }
+
+    private func reciprocalScene() throws -> (Scene, Camera) {
+        let fixture = URL(fileURLWithPath: #file).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si110.xsf")
+        var scene = Scene(loaded: try Parser.load(fixture))
+        scene.background = "#000000"
+        scene.showAxes = false
+        scene.showCellFrame = false
+        scene.showStructure = false
+        scene.showBrillouinZone = true
+        scene.kPathPoints = [KPoint(.zero, "G")]
+        scene.kPathBreaks = []
+        guard let cell = scene.cell,
+              let bz = BrillouinZone.build(cell: cell, atoms: scene.baseAtoms) else {
+            throw NSError(domain: "AppExportTests", code: 1)
+        }
+        let presentation = BZPresentation(bz: bz, scene: scene)
+        let camera = try XCTUnwrap(presentation.framedCamera(
+            bz: bz, current: scene.defaultCamera(), viewport: SIMD2<Float>(128, 128)))
+        return (scene, camera)
+    }
+
+    private func rgba(_ image: CGImage) -> [UInt8] {
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let context = CGContext(data: &pixels, width: image.width, height: image.height,
+                                bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                                space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return pixels
+    }
+
+    private func exportURL(_ ext: String) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-coordination-\(UUID().uuidString).\(ext)")
     }
 
     // MARK: - exportSizeForViewport
@@ -62,6 +111,120 @@ final class AppExportTests: XCTestCase {
         let bottom = 70 * image.width * 4 + 10 * 4
         XCTAssertGreaterThan(pixels[top], pixels[top + 2], "top of a flipped view must remain red")
         XCTAssertGreaterThan(pixels[bottom + 2], pixels[bottom], "bottom of a flipped view must remain blue")
+    }
+
+    func testCoordinationColorsReachPngExportAndPreserveCPKFallback() throws {
+        let scene = coordinationScene()
+        let baselineURL = exportURL("png")
+        let disabledURL = exportURL("png")
+        let mismatchedURL = exportURL("png")
+        let enabledURL = exportURL("png")
+        defer {
+            for url in [baselineURL, disabledURL, mismatchedURL, enabledURL] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+
+        let baseline = try PngExporter.export(scene: scene, camera: nil, to: baselineURL,
+                                              size: CGSize(width: 128, height: 128))
+        let disabled = try PngExporter.export(
+            scene: scene, camera: nil, to: disabledURL, size: CGSize(width: 128, height: 128),
+            options: RenderExportOptions(coordinationNumbers: [0, 9], showCoordinationColors: false))
+        let mismatched = try PngExporter.export(
+            scene: scene, camera: nil, to: mismatchedURL, size: CGSize(width: 128, height: 128),
+            options: RenderExportOptions(coordinationNumbers: [0], showCoordinationColors: true))
+        let enabled = try PngExporter.export(
+            scene: scene, camera: nil, to: enabledURL, size: CGSize(width: 128, height: 128),
+            options: RenderExportOptions(coordinationNumbers: [0, 9], showCoordinationColors: true))
+
+        XCTAssertEqual(rgba(baseline), rgba(disabled), "disabled coordination coloring must preserve CPK")
+        XCTAssertEqual(rgba(baseline), rgba(mismatched), "an incomplete array must fall back to CPK")
+        XCTAssertNotEqual(rgba(baseline), rgba(enabled), "complete coordination coloring must change pixels")
+    }
+
+    func testCoordinationColorsReachRasterBackedPDFExport() throws {
+        let scene = coordinationScene()
+        let offURL = exportURL("pdf")
+        let onURL = exportURL("pdf")
+        defer {
+            try? FileManager.default.removeItem(at: offURL)
+            try? FileManager.default.removeItem(at: onURL)
+        }
+
+        let off = try RasterExporter.export(scene: scene, camera: nil, to: offURL,
+                                             size: CGSize(width: 128, height: 128))
+        let on = try RasterExporter.export(
+            scene: scene, camera: nil, to: onURL, size: CGSize(width: 128, height: 128),
+            options: RenderExportOptions(coordinationNumbers: [0, 9], showCoordinationColors: true))
+
+        XCTAssertNotEqual(rgba(off), rgba(on), "PDF's raster-backed renderer must receive coordination state")
+        XCTAssertEqual(String(data: try Data(contentsOf: onURL).prefix(5), encoding: .ascii), "%PDF-")
+    }
+
+    func testSelectedKPathNodeReachesPngAndRasterBackedPDFExport() throws {
+        let (scene, camera) = try reciprocalScene()
+        let pngOffURL = exportURL("png")
+        let pngOnURL = exportURL("png")
+        let pdfOffURL = exportURL("pdf")
+        let pdfOnURL = exportURL("pdf")
+        defer {
+            for url in [pngOffURL, pngOnURL, pdfOffURL, pdfOnURL] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+
+        let pngOff = try PngExporter.export(scene: scene, camera: camera, to: pngOffURL,
+                                             size: CGSize(width: 128, height: 128))
+        let pngOn = try PngExporter.export(
+            scene: scene, camera: camera, to: pngOnURL, size: CGSize(width: 128, height: 128),
+            options: RenderExportOptions(selectedKPathNode: 0))
+        XCTAssertNotEqual(rgba(pngOff), rgba(pngOn), "PNG must render the selected route marker")
+
+        let pdfOff = try RasterExporter.export(scene: scene, camera: camera, to: pdfOffURL,
+                                               size: CGSize(width: 128, height: 128))
+        let pdfOn = try RasterExporter.export(
+            scene: scene, camera: camera, to: pdfOnURL, size: CGSize(width: 128, height: 128),
+            options: RenderExportOptions(selectedKPathNode: 0))
+        XCTAssertNotEqual(rgba(pdfOff), rgba(pdfOn),
+                          "raster-backed PDF must render the selected route marker")
+        XCTAssertEqual(String(data: try Data(contentsOf: pdfOnURL).prefix(5), encoding: .ascii), "%PDF-")
+    }
+
+    func testHeadlessRenderExportOptionsDefaultToCPK() {
+        let options = RenderExportOptions()
+        XCTAssertTrue(options.coordinationNumbers.isEmpty)
+        XCTAssertFalse(options.showCoordinationColors)
+        XCTAssertNil(options.selectedKPathNode)
+    }
+
+    @MainActor
+    func testControllerExportOptionsUseOnlyCurrentVisibleAnalysis() async {
+        let controller = MainWindowController(scene: coordinationScene(), showWindow: false)
+        let ready = expectation(description: "coordination analysis installed")
+        controller.coordinationAnalyzerOverride = { _, _, _, _, _ in
+            CoordinationAnalysis(neighborsByAtom: [[], []])
+        }
+        controller.coordinationAnalysisDidUpdate = {
+            if controller.state.coordinationAnalysisAvailable { ready.fulfill() }
+        }
+        controller.state.coordinationEnabled = true
+        await fulfillment(of: [ready], timeout: 3)
+        controller.state.showCoordinationColors = true
+
+        let active = controller.currentRenderExportOptions
+        XCTAssertEqual(active.coordinationNumbers, [0, 0])
+        XCTAssertTrue(active.showCoordinationColors)
+
+        controller.canvas.isHidden = true
+        let graph = controller.currentRenderExportOptions
+        XCTAssertTrue(graph.coordinationNumbers.isEmpty)
+        XCTAssertFalse(graph.showCoordinationColors)
+
+        controller.canvas.isHidden = false
+        controller.state.coordinationEnabled = false
+        let unavailable = controller.currentRenderExportOptions
+        XCTAssertTrue(unavailable.coordinationNumbers.isEmpty)
+        XCTAssertFalse(unavailable.showCoordinationColors)
     }
 
     // MARK: - Menu wiring
