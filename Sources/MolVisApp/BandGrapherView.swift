@@ -4,6 +4,12 @@ import AppKit
 // same 2D-overlay approach as LabelOverlayView — no Metal needed for a static plot.
 // x-axis = k-path distance (cumulative fractional-reciprocal length), y-axis = energy
 // in eV; a dashed Fermi-level line and high-symmetry k-point gridlines are overlaid.
+//
+// Interaction: an energy window clips the y-axis, a Fermi shift slides the displayed
+// energy reference, and a cursor callback reports the energy/k-distance at the mouse.
+// Zoom/pan apply a transform to the plot content only (axes/labels stay fixed). All
+// interaction is disabled during export (exportBackground != nil) so exported pixels
+// are identical to the pre-interaction renderer.
 final class BandGrapherView: NSView {
     var bandStructure: BandStructure? {
         didSet { needsDisplay = true }
@@ -15,12 +21,99 @@ final class BandGrapherView: NSView {
     /// When true, draw skips the white fill for transparent export output.
     var isExportTransparent: Bool = false
 
+    // --- interaction state (all inert during export) ---
+    /// When set, the y-axis is clipped to this range (in DISPLAYED / shifted eV).
+    /// nil auto-fits to the (shifted) eigenvalues.
+    var energyWindow: ClosedRange<Float>? {
+        didSet { needsDisplay = true }
+    }
+    /// Energy reference shift in eV. Displayed energy = energy - fermiShift. The Fermi
+    /// line moves with the shift. 0 preserves the original rendering.
+    var fermiShift: Float = 0 {
+        didSet { needsDisplay = true }
+    }
+    /// Plot-content zoom (1.0 = no zoom). Axes and labels stay fixed.
+    var zoomScale: CGFloat = 1.0 {
+        didSet { needsDisplay = true }
+    }
+    /// Plot-content pan in view points.
+    var panOffset: NSPoint = .zero {
+        didSet { needsDisplay = true }
+    }
+    /// Fires on mouse move with the data-coordinate under the cursor, or nil on exit.
+    var onCursor: ((BandCursorInfo?) -> Void)?
+
     private let axisFont = NSFont.systemFont(ofSize: 11)
     private let titleFont = NSFont.boldSystemFont(ofSize: 13)
     private let margin = NSPoint(x: 64, y: 44)   // left/bottom margin for axes
     private let topMargin: CGFloat = 28
 
     override var isFlipped: Bool { true }
+
+    /// Data-coordinate under a view point, used for cursor readout and tests. Returns
+    /// nil when the point is outside the plot area. Reported in ORIGINAL eV (unshifted).
+    func energyAtViewPoint(_ point: NSPoint) -> Float? {
+        guard let bs = bandStructure, bs.nKPoints > 1, bs.nBands > 0 else { return nil }
+        let origin = NSPoint(x: margin.x, y: bounds.height - margin.y)
+        // Top edge is topMargin from the top (flipped coords: smaller y = higher up).
+        let plot = NSPoint(x: bounds.width - 20, y: topMargin)
+        let plotW = plot.x - origin.x, plotH = origin.y - plot.y
+        guard plotW > 0, plotH > 0 else { return nil }
+        let fx = (point.x - origin.x) / plotW
+        guard fx >= 0, fx <= 1 else { return nil }
+        // Mirror draw()'s range computation: shifted energies (e - fermiShift) with
+        // the same padding and Fermi-level inclusion, so the cursor readout matches
+        // what is actually drawn.
+        func dE(_ e: Float) -> Float { e - fermiShift }
+        let allE = bs.kPoints.flatMap { $0.energies.map(dE) }
+        var yMin = allE.min()!, yMax = allE.max()!
+        let yPad = max(0.5, (yMax - yMin) * 0.08)
+        yMin -= yPad; yMax += yPad
+        let shiftedFermi = bs.fermiEnergy.map(dE)
+        if let ef = shiftedFermi {
+            if ef < yMin { yMin = ef - 0.5 }
+            if ef > yMax { yMax = ef + 0.5 }
+        }
+        if let window = energyWindow { yMin = window.lowerBound; yMax = window.upperBound }
+        let fy = (origin.y - point.y) / plotH
+        guard fy >= 0, fy <= 1 else { return nil }
+        let displayed = yMin + (yMax - yMin) * Float(fy)
+        return displayed + fermiShift   // back to original eV
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
+                                   owner: self, userInfo: nil)
+        addTrackingArea(area)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if let e = energyAtViewPoint(p) {
+            let dist = kDistanceAtViewPoint(p) ?? 0
+            onCursor?(BandCursorInfo(energy: e, kDistance: dist))
+        } else {
+            onCursor?(nil)
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onCursor?(nil)
+    }
+
+    private func kDistanceAtViewPoint(_ point: NSPoint) -> Float? {
+        guard let bs = bandStructure, bs.nKPoints > 1 else { return nil }
+        let origin = NSPoint(x: margin.x, y: bounds.height - margin.y)
+        let plotW = (bounds.width - 20) - origin.x
+        guard plotW > 0 else { return nil }
+        let fx = (point.x - origin.x) / plotW
+        guard fx >= 0, fx <= 1 else { return nil }
+        let distances = bs.kDistances
+        let xMin = distances.first!, xMax = distances.last!
+        return xMin + (xMax - xMin) * Float(fx)
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         guard NSGraphicsContext.current?.cgContext != nil,
@@ -33,6 +126,16 @@ final class BandGrapherView: NSView {
               bs.fermiEnergy?.isFinite ?? true
         else { drawEmpty(dirtyRect); return }
 
+        // Export path: force interaction to defaults so exported pixels match the
+        // pre-interaction renderer exactly (snapshot/export identity).
+        let isExport = exportBackground != nil
+        let effShift = isExport ? 0 : fermiShift
+        let effWindow: ClosedRange<Float>? = isExport ? nil : energyWindow
+        let effZoom = isExport ? 1.0 : zoomScale
+        let effPan = isExport ? .zero : panOffset
+
+        func dE(_ e: Float) -> Float { e - effShift }
+
         // Export path: fill with custom background if provided; transparent export
         // leaves the context empty. On-screen: default white fill.
         if let bg = exportBackground {
@@ -43,7 +146,8 @@ final class BandGrapherView: NSView {
             dirtyRect.fill()
         }
 
-        let plot = NSPoint(x: bounds.width - 20, y: bounds.height - topMargin)
+        // Top edge is topMargin from the top (flipped coords: smaller y = higher up).
+        let plot = NSPoint(x: bounds.width - 20, y: topMargin)
         let origin = NSPoint(x: margin.x, y: bounds.height - margin.y)
         let plotW = plot.x - origin.x
         let plotH = origin.y - plot.y
@@ -51,25 +155,28 @@ final class BandGrapherView: NSView {
 
         let distances = bs.kDistances
         let xMin = distances.first!, xMax = distances.last!
-        let allE = bs.kPoints.flatMap { $0.energies }
+        let allE = bs.kPoints.flatMap { $0.energies.map(dE) }
         var yMin = allE.min()!, yMax = allE.max()!
-        // pad range; include the Fermi level in the window ONLY when present
+        // pad range; include the (shifted) Fermi level in the window ONLY when present
         // (metallic). Insulating outputs have no Fermi energy and we must not
         // forge a 0 eV line, so nil leaves the window to the eigenvalues.
         let yPad = max(0.5, (yMax - yMin) * 0.08)
         yMin -= yPad; yMax += yPad
-        if let ef = bs.fermiEnergy {
+        let shiftedFermi = bs.fermiEnergy.map(dE)
+        if let ef = shiftedFermi {
             if ef < yMin { yMin = ef - 0.5 }
             if ef > yMax { yMax = ef + 0.5 }
         }
+        // Energy window overrides the auto range (interpreted in the shifted frame).
+        if let window = effWindow { yMin = window.lowerBound; yMax = window.upperBound }
 
         func proj(_ ix: Int, _ energy: Float) -> NSPoint {
             let fx = xMin == xMax ? 0 : CGFloat((distances[ix] - xMin) / (xMax - xMin))
-            let fy = yMin == yMax ? 0.5 : CGFloat((energy - yMin) / (yMax - yMin))
+            let fy = yMin == yMax ? 0.5 : CGFloat((dE(energy) - yMin) / (yMax - yMin))
             return NSPoint(x: origin.x + fx * plotW, y: origin.y - fy * plotH)
         }
 
-        // --- box + axes ---
+        // --- box + axes (drawn in view space, outside the zoom/pan transform) ---
         let axis = NSColor.black
         axis.setStroke()
         let box = NSBezierPath()
@@ -90,21 +197,30 @@ final class BandGrapherView: NSView {
             let p = NSPoint(x: origin.x, y: origin.y - plotH * frac)
             let tick = NSBezierPath()
             tick.move(to: p); tick.line(to: NSPoint(x: p.x - 4, y: p.y)); tick.stroke()
-            drawLabel(String(format: "%.1f", e), at: NSPoint(x: p.x - 8, y: p.y), font: axisFont,
+            // Tick labels show original eV (shifted frame + shift) so they match the
+            // unshifted energies the user expects to read.
+            drawLabel(String(format: "%.1f", e + effShift), at: NSPoint(x: p.x - 8, y: p.y), font: axisFont,
                       color: axis, rightAligned: true)
         }
         // "E (eV)" axis label
         drawLabel("E (eV)", at: NSPoint(x: 6, y: origin.y - plotH - 14), font: titleFont, color: axis, rightAligned: false)
 
+        // --- plot content (gridlines, Fermi, bands) under the zoom/pan transform ---
+        // Clip to the plot rectangle so out-of-window bands never overwrite axes.
+        NSBezierPath(rect: NSRect(x: origin.x, y: origin.y - plotH, width: plotW, height: plotH)).addClip()
+        let ctx = NSGraphicsContext.current!.cgContext
+        let center = NSPoint(x: origin.x + plotW / 2, y: origin.y - plotH / 2)
+        NSGraphicsContext.saveGraphicsState()
+        ctx.translateBy(x: center.x + effPan.x, y: center.y + effPan.y)
+        ctx.scaleBy(x: effZoom, y: effZoom)
+        ctx.translateBy(x: -center.x, y: -center.y)
+
         // --- Fermi level (metallic only) ---
-        // Insulating QE outputs report highest-occupied/lowest-unoccupied levels
-        // instead of a Fermi energy; bs.fermiEnergy is then nil and we skip the
-        // red line entirely rather than forging a value.
-        if let ef = bs.fermiEnergy {
+        if shiftedFermi != nil {
             NSColor.red.withAlphaComponent(0.8).setStroke()
             let fermiPath = NSBezierPath()
             fermiStyle(fermiPath)
-            let f0 = proj(0, ef), f1 = proj(bs.nKPoints - 1, ef)
+            let f0 = proj(0, bs.fermiEnergy!), f1 = proj(bs.nKPoints - 1, bs.fermiEnergy!)
             fermiPath.move(to: f0); fermiPath.line(to: f1)
             fermiPath.stroke()
             drawLabel("Ef", at: NSPoint(x: f1.x + 3, y: f1.y), font: axisFont, color: .red, rightAligned: false)
@@ -134,8 +250,6 @@ final class BandGrapherView: NSView {
         // mesh holds spectra at all bands, not just the first. Its x-axis is the
         // k-point INDEX (categorical), not a physical distance — cumulative path
         // length through the mesh's arbitrary listing order would be meaningless.
-        // x-axis label depends on mode: a mesh is plotted against the k-point index
-        // (categorical), a band path against the physical k-path distance.
         let xLabel: String
         if bs.isMesh {
             let n = bs.kPoints.count
@@ -144,7 +258,7 @@ final class BandGrapherView: NSView {
             for ik in 0..<n {
                 let px = origin.x + fxOf(ik) * plotW
                 for ib in 0..<bs.nBands {
-                    let fy = yMin == yMax ? 0.5 : CGFloat((bs.kPoints[ik].energies[ib] - yMin) / (yMax - yMin))
+                    let fy = yMin == yMax ? 0.5 : CGFloat((dE(bs.kPoints[ik].energies[ib]) - yMin) / (yMax - yMin))
                     let py = origin.y - fy * plotH
                     let rect = NSRect(x: px - 1.5, y: py - 1.5, width: 3, height: 3)
                     NSBezierPath(ovalIn: rect).fill()
@@ -184,11 +298,13 @@ final class BandGrapherView: NSView {
             }
         }
 
-        // --- x-axis label ---
+        NSGraphicsContext.restoreGraphicsState()
+
+        // --- x-axis label + title (view space) ---
         drawLabel(xLabel, at: NSPoint(x: origin.x + plotW / 2, y: origin.y + 16), font: titleFont, color: axis, rightAligned: false)
 
         // title — show the Fermi energy in the title only when the calculation
-        // reports one (metallic); insulators get the plain label.
+        // reports one (metallic); insulators get the plain label. Reported in original eV.
         let titleStr: String
         if let ef = bs.fermiEnergy {
             titleStr = "Band Structure (E\u{2081} = \(String(format: "%.3f", ef)) eV)"
@@ -217,3 +333,6 @@ final class BandGrapherView: NSView {
         attr.draw(at: pt)
     }
 }
+
+/// Data-coordinate under the cursor for the band grapher. Energies in original eV.
+struct BandCursorInfo { let energy: Float; let kDistance: Float }

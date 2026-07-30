@@ -2,10 +2,35 @@ import AppKit
 
 // Density-of-states diagram. Energy is vertical and DOS is horizontal; signed
 // spin channels naturally fall on opposite sides of the zero-DOS axis.
+//
+// Interaction: an energy window clips the energy (y) axis, a Fermi shift slides the
+// displayed energy reference, and a cursor callback reports the energy/DOS at the
+// mouse. Zoom/pan apply a transform to the plot content only. All interaction is
+// disabled during export so exported pixels match the pre-interaction renderer.
 final class DOSGrapherView: NSView {
     var densityOfStates: DensityOfStates? {
         didSet { needsDisplay = true }
     }
+
+    // --- interaction state (all inert during export) ---
+    /// When set, the energy (y) axis is clipped to this range (in DISPLAYED / shifted eV).
+    var energyWindow: ClosedRange<Float>? {
+        didSet { needsDisplay = true }
+    }
+    /// Energy reference shift in eV. Displayed energy = energy - fermiShift.
+    var fermiShift: Float = 0 {
+        didSet { needsDisplay = true }
+    }
+    /// Plot-content zoom (1.0 = no zoom). Axes and labels stay fixed.
+    var zoomScale: CGFloat = 1.0 {
+        didSet { needsDisplay = true }
+    }
+    /// Plot-content pan in view points.
+    var panOffset: NSPoint = .zero {
+        didSet { needsDisplay = true }
+    }
+    /// Fires on mouse move with the data-coordinate under the cursor, or nil on exit.
+    var onCursor: ((DOSCursorInfo?) -> Void)?
 
     private let axisFont = NSFont.systemFont(ofSize: 11)
     private let titleFont = NSFont.boldSystemFont(ofSize: 13)
@@ -15,6 +40,60 @@ final class DOSGrapherView: NSView {
     ]
 
     override var isFlipped: Bool { true }
+
+    /// Data-coordinate under a view point for the DOS grapher. Returns nil outside the
+    /// plot area. Energy reported in ORIGINAL eV (unshifted); DOS in original units.
+    func dataAtViewPoint(_ point: NSPoint) -> DOSCursorInfo? {
+        guard let dos = densityOfStates else { return nil }
+        let samples = dos.series.map { series in
+            Array(zip(dos.energies, series.values).filter { $0.0.isFinite && $0.1.isFinite })
+        }
+        guard let first = samples.first, !first.isEmpty else { return nil }
+        let leftMargin: CGFloat = 66
+        let rightMargin: CGFloat = 24
+        let topMargin: CGFloat = 38
+        let bottomMargin: CGFloat = 54
+        let plotRect = NSRect(x: leftMargin, y: topMargin,
+                              width: max(0, bounds.width - leftMargin - rightMargin),
+                              height: max(0, bounds.height - topMargin - bottomMargin))
+        guard plotRect.width >= 24, plotRect.height >= 24 else { return nil }
+        guard point.y >= plotRect.minY, point.y <= plotRect.maxY else { return nil }
+        func dE(_ e: Float) -> Float { e - fermiShift }
+        var energyMin = dos.energies.first!
+        var energyMax = dos.energies.last!
+        // Energy window overrides the auto range (must mirror draw()).
+        if let window = energyWindow, window.lowerBound < window.upperBound {
+            energyMin = window.lowerBound; energyMax = window.upperBound
+        }
+        // Map the (unshifted) cursor energy back from the displayed (shifted) frame.
+        let displayedEnergy = energyMin + (energyMax - energyMin) * Float((plotRect.maxY - point.y) / plotRect.height)
+        let energy = displayedEnergy + fermiShift
+        // DOS at this energy: linearly interpolate the first series.
+        var dosValue: Float = 0
+        if let series = dos.series.first?.values {
+            let frac = Float((energyMin == energyMax) ? 0 : (energy - energyMin) / (energyMax - energyMin))
+            let idx = min(series.count - 1, max(0, Int(frac * Float(series.count - 1))))
+            dosValue = series[idx]
+        }
+        return DOSCursorInfo(energy: energy, dosValue: dosValue)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
+                                   owner: self, userInfo: nil)
+        addTrackingArea(area)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        onCursor?(dataAtViewPoint(p))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onCursor?(nil)
+    }
 
     /// When set, draw fills with this color (used for export).
     var exportBackground: NSColor?
@@ -33,6 +112,16 @@ final class DOSGrapherView: NSView {
             drawEmpty("No density of states")
             return
         }
+
+        // Export path: force interaction to defaults so exported pixels match the
+        // pre-interaction renderer exactly.
+        let isExport = exportBackground != nil
+        let effShift = isExport ? 0 : fermiShift
+        let effWindow: ClosedRange<Float>? = isExport ? nil : energyWindow
+        let effZoom = isExport ? 1.0 : zoomScale
+        let effPan = isExport ? .zero : panOffset
+
+        func dE(_ e: Float) -> Float { e - effShift }
 
         let samples = dos.series.map { series in
             Array(zip(dos.energies, series.values).filter { $0.0.isFinite && $0.1.isFinite })
@@ -55,9 +144,20 @@ final class DOSGrapherView: NSView {
         dosMin -= dosPadding
         dosMax += dosPadding
 
-        if let fermi = dos.fermiEnergy, fermi.isFinite {
+        let shiftedFermi = dos.fermiEnergy.map(dE)
+        if let fermi = shiftedFermi, fermi.isFinite {
             if fermi < energyMin { energyMin = fermi - max((energyMax - energyMin) * 0.05, 0.5) }
             if fermi > energyMax { energyMax = fermi + max((energyMax - energyMin) * 0.05, 0.5) }
+        }
+        // Energy window overrides the auto range (interpreted in the shifted frame).
+        // Reject equal bounds (would NaN the projection); fall back to a padded range.
+        if let window = effWindow {
+            if window.lowerBound < window.upperBound {
+                energyMin = window.lowerBound; energyMax = window.upperBound
+            }
+        }
+        if energyMax - energyMin < 1e-4 {
+            expandConstantRange(minimum: &energyMin, maximum: &energyMax, minimumPadding: 0.5)
         }
 
         let leftMargin: CGFloat = 66
@@ -74,13 +174,21 @@ final class DOSGrapherView: NSView {
 
         func project(_ value: Float, _ energy: Float) -> NSPoint {
             let xFraction = CGFloat((value - dosMin) / (dosMax - dosMin))
-            let yFraction = CGFloat((energy - energyMin) / (energyMax - energyMin))
+            let yFraction = CGFloat((dE(energy) - energyMin) / (energyMax - energyMin))
             return NSPoint(x: plotRect.minX + xFraction * plotRect.width,
                            y: plotRect.maxY - yFraction * plotRect.height)
         }
 
         drawGrid(in: plotRect, dosMin: dosMin, dosMax: dosMax,
-                 energyMin: energyMin, energyMax: energyMax)
+                 energyMin: energyMin, energyMax: energyMax, effShift: effShift)
+
+        // --- plot content (zero axis, Fermi, curves) under the zoom/pan transform ---
+        let ctx = NSGraphicsContext.current!.cgContext
+        let center = NSPoint(x: plotRect.midX, y: plotRect.midY)
+        NSGraphicsContext.saveGraphicsState()
+        ctx.translateBy(x: center.x + effPan.x, y: center.y + effPan.y)
+        ctx.scaleBy(x: effZoom, y: effZoom)
+        ctx.translateBy(x: -center.x, y: -center.y)
 
         let zeroX = project(0, energyMin).x
         NSColor.darkGray.setStroke()
@@ -90,8 +198,8 @@ final class DOSGrapherView: NSView {
         zeroAxis.lineWidth = 1
         zeroAxis.stroke()
 
-        if let fermi = dos.fermiEnergy, fermi.isFinite {
-            let y = project(0, fermi).y
+        if let fermi = shiftedFermi, fermi.isFinite {
+            let y = project(0, dos.fermiEnergy!).y
             NSColor.systemRed.withAlphaComponent(0.85).setStroke()
             let line = NSBezierPath()
             line.move(to: NSPoint(x: plotRect.minX, y: y))
@@ -103,7 +211,6 @@ final class DOSGrapherView: NSView {
                      color: .systemRed, horizontal: .right, vertical: .bottom)
         }
 
-        NSGraphicsContext.saveGraphicsState()
         NSBezierPath(rect: plotRect).addClip()
         for (index, points) in samples.enumerated() where !points.isEmpty {
             palette[index % palette.count].setStroke()
@@ -134,7 +241,7 @@ final class DOSGrapherView: NSView {
     }
 
     private func drawGrid(in plotRect: NSRect, dosMin: Float, dosMax: Float,
-                          energyMin: Float, energyMax: Float) {
+                          energyMin: Float, energyMax: Float, effShift: Float) {
         let xTickCount = 4
         let yTickCount = 5
         let grid = NSBezierPath()
@@ -156,7 +263,8 @@ final class DOSGrapherView: NSView {
             grid.move(to: NSPoint(x: plotRect.minX, y: y))
             grid.line(to: NSPoint(x: plotRect.maxX, y: y))
             let value = energyMin + (energyMax - energyMin) * Float(fraction)
-            drawText(formatTick(value), at: NSPoint(x: plotRect.minX - 8, y: y), font: axisFont,
+            // Label in original eV so the axis matches the unshifted energies.
+            drawText(formatTick(value + effShift), at: NSPoint(x: plotRect.minX - 8, y: y), font: axisFont,
                      color: .darkGray, horizontal: .right, vertical: .center)
         }
         grid.stroke()
@@ -250,6 +358,9 @@ final class DOSGrapherView: NSView {
                         options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 }
+
+/// Data-coordinate under the cursor for the DOS grapher. Energy in original eV.
+struct DOSCursorInfo { let energy: Float; let dosValue: Float }
 
 enum DOSExportError: Error { case invalidSize, noBitmap, noContext, noImage }
 

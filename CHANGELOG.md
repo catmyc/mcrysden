@@ -4,6 +4,17 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.27] — 2026-07-30
+
+### Added
+- Electronic-structure analysis: `BandAnalysis` (VBM/CBM, direct/indirect band gap with band-crossing metallicity detection, effective mass via nonuniform finite differences) and `DOSAnalysis` (band center/width, gap estimate with interpolated threshold-crossing edges, spin moment, electron-count consistency). Interactive band/DOS grapher controls: energy window, Fermi-level shift, cursor readout, and zoom/pan. Sidebar "Electronic Structure" section wires the controls and shows a live band-gap summary.
+
+### Tests
+- Added 38 tests: 14 `BandAnalysisTests`, 11 `DOSAnalysisTests`, 8 `BandGrapherTests`, 5 `DOSGrapherTests`. Full suite now at 1086 tests.
+
+### Fixed
+- Band/DOS grapher plot geometry: the plot top-edge used `bounds.height - topMargin`, which always produced a negative plot height and rendered the graphs empty; corrected to `topMargin` so the graphs actually draw.
+
 ## [1.1.26] — 2026-07-30
 
 ### Fixed

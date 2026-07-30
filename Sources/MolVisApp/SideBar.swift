@@ -38,6 +38,7 @@ struct SideBar: View {
     @AppStorage(CollapsibleSidebarSection.fermiSurface.rawValue) private var fermiSurfaceExpanded = true
     @AppStorage(CollapsibleSidebarSection.symmetry.rawValue) private var symmetryExpanded = true
     @AppStorage(CollapsibleSidebarSection.coordination.rawValue) private var coordinationExpanded = true
+    @AppStorage(CollapsibleSidebarSection.electronicStructure.rawValue) private var electronicStructureExpanded = true
 
     var body: some View {
         Form {
@@ -243,6 +244,38 @@ struct SideBar: View {
                     }
                     Toggle("Color by coordination", isOn: $state.showCoordinationColors)
                         .disabled(!state.coordinationEnabled || !state.coordinationAnalysisAvailable)
+                }
+            }
+            // --- Electronic-structure graph interaction -----------------------------
+            // Available when the loaded scene carries band or DOS data. Lets the
+            // user clip the energy window, shift the Fermi reference, and read the
+            // cursor energy / band gap. Gated on electronicStructureEnabled.
+            if state.electronicStructureEnabled {
+                CollapsibleSection(title: "Electronic Structure", isExpanded: $electronicStructureExpanded) {
+                    Toggle("Energy window", isOn: $state.energyWindowEnabled)
+                    if state.energyWindowEnabled {
+                        HStack {
+                            Text("Min")
+                            TextField("Min", value: $state.energyWindowMin, format: .number)
+                                .textFieldStyle(.roundedBorder)
+                            Text("Max")
+                            TextField("Max", value: $state.energyWindowMax, format: .number)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                    Slider(value: $state.fermiShift, in: -5...5, step: 0.1) {
+                        Text("Fermi shift: \(state.fermiShift, specifier: "%.1f") eV")
+                    }
+                    if !state.bandGapSummary.isEmpty {
+                        Text(state.bandGapSummary)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    if !state.electronicStructureCursorText.isEmpty {
+                        Text(state.electronicStructureCursorText)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
             // --- AXSF animation playback -------------------------------------------

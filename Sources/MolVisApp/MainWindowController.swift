@@ -374,6 +374,28 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onResetKPath = { [weak self] in self?.resetKPathDefault() }
         state.onSelectKPathNode = { [weak self] index in self?.selectKPathNode(index) }
         state.onShowAtomTable = { [weak self] in self?.showAtomTable() }
+        // Cursor readouts for the electronic-structure graphs. Assigned after
+        // super.init so the closures capture a fully-initialized self.
+        bandGrapher.onCursor = { [weak self] info in
+            guard let self else { return }
+            self.state.electronicStructureCursorText = info.map {
+                String(format: "E = %.3f eV", $0.energy)
+            } ?? ""
+        }
+        dosGrapher.onCursor = { [weak self] info in
+            guard let self else { return }
+            self.state.electronicStructureCursorText = info.map {
+                String(format: "E = %.3f eV, DOS = %.3f", $0.energy, $0.dosValue)
+            } ?? ""
+        }
+        // Install electronic-structure data from the initial scene (if constructed
+        // directly with band/DOS data, e.g. in tests), so the section shows without
+        // an explicit loadFile. Guarded against re-entrancy via isSyncingState.
+        let initHasBands = scene.bandStructure != nil
+        bandGrapher.bandStructure = scene.bandStructure
+        dosGrapher.densityOfStates = scene.densityOfStates
+        state.electronicStructureEnabled = initHasBands || scene.densityOfStates != nil
+        updateElectronicStructureGraphs()
         atomTable.onSelectionChange = { [weak self] indices in
             guard let self else { return }
             // Map filtered rows back to original displayed indices; keep them
@@ -463,6 +485,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             bandGrapher.highSymmetryIndices = []   // parsed labels go here once k-labels are read
         }
         dosGrapher.densityOfStates = scene.densityOfStates
+        // Electronic-structure section is available when either graph is populated.
+        // (Not a @Published scene field — set directly, not via state, to avoid
+        // persisting view-only availability into the scene.)
+        state.electronicStructureEnabled = hasBands || scene.densityOfStates != nil
+        updateElectronicStructureGraphs()
         // A 2D scalar grid: the color-plane overlay is available. On load we push
         // the grid data and show the plane by default (the canvas is hidden so the
         // plane fills the viewport); the sidebar toggle drives showColorPlane.
@@ -1929,6 +1956,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // torn down on pause or when not animating at all.
         if state.isPlaying && playTimer == nil { startPlayback() }
         if !state.isPlaying && playTimer != nil { stopPlayback() }
+        // Electronic-structure graph interaction (energy window, Fermi shift) is
+        // view-only state -> push it to the grapher views and recompute readouts.
+        if state.electronicStructureEnabled { updateElectronicStructureGraphs() }
         setNeedsRender()
     }
 
@@ -2743,6 +2773,33 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if showDOS { dosGrapher.needsDisplay = true }
         if showBands { bandGrapher.needsDisplay = true }
         if showPlane { colorPlane.needsDisplay = true }
+    }
+
+    /// Push the sidebar's electronic-structure interaction state into the grapher
+    /// views and recompute the cursor/gap readouts. Called from syncFromState so any
+    /// sidebar change (energy window, Fermi shift) redraws the graphs immediately.
+    private func updateElectronicStructureGraphs() {
+        let window: ClosedRange<Float>?
+        if state.energyWindowEnabled {
+            window = min(state.energyWindowMin, state.energyWindowMax)...max(state.energyWindowMin, state.energyWindowMax)
+        } else {
+            window = nil
+        }
+        bandGrapher.energyWindow = window
+        bandGrapher.fermiShift = state.fermiShift
+        dosGrapher.energyWindow = window
+        dosGrapher.fermiShift = state.fermiShift
+
+        // Band gap summary (only meaningful when band data is shown).
+        if let bs = scene.bandStructure, !bs.isMesh,
+           let gap = BandAnalysis.bandGap(bs) {
+            let kind = gap.isMetallic ? "metallic" : (gap.isDirect ? "direct" : "indirect")
+            state.bandGapSummary = String(format: "Eg = %.3f eV (%@)", gap.gap, kind as NSString)
+        } else if scene.bandStructure != nil {
+            state.bandGapSummary = "Eg: no gap data"
+        } else {
+            state.bandGapSummary = ""
+        }
     }
 
     private func colorFromHex(_ hex: String) -> (r: Double, g: Double, b: Double)? {

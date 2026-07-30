@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-30 (v1.1.26 coordination readout sort fix, diagnostic-test cleanup, documentation reconciliation, and 1048 tests)**.
+Last updated: **2026-07-30 (v1.1.27 electronic-structure analysis — BandAnalysis/DOSAnalysis engines, interactive grapher controls, and 1086 tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 1048 tracked tests as of v1.1.26: unit, snapshot (FNV-1a pixel hash vs. committed goldens), model-layer cache, parser-hardening, renderer-safety, export, state, coordination-analysis, reciprocal-ux, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 1086 tracked tests as of v1.1.27: unit, snapshot (FNV-1a pixel hash vs. committed goldens), model-layer cache, parser-hardening, renderer-safety, export, state, coordination-analysis, reciprocal-ux, electronic-structure analysis, grapher-interaction, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
@@ -116,8 +116,8 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [ ] Defect workflows for vacancies, substitutions, and interstitials, with export to XSF, CIF, POSCAR, XYZ, and QE input.
 
 ### Electronic-structure analysis
-- [ ] Interactive band/DOS zoom, pan, cursor readout, energy windows, Fermi adjustment, linked plots, and projected species/orbital coloring.
-- [ ] Automatic VBM/CBM, direct/indirect band-gap, and effective-mass analysis.
+- [~] Interactive band/DOS cursor readout, energy windows, Fermi adjustment, and zoom/pan are implemented for both graphers; linked plots and projected species/orbital coloring remain pending.
+- [~] Automatic VBM/CBM, direct/indirect band-gap, and effective-mass analysis are implemented (`BandAnalysis`); DOS band-center/width, gap estimate, and spin moment are implemented (`DOSAnalysis`); linked band/DOS analysis and effective-mass export remain pending.
 
 ### Volumetric data and rendering
 - [~] Paired positive/negative orbital lobes and fixed color-plane contours are implemented; arbitrary 3D-grid slices/clipping planes, multiple independent isovalues, region integration, and configurable colormaps/contour levels remain pending.

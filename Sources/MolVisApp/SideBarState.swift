@@ -77,6 +77,24 @@ final class SideBarState: ObservableObject {
     @Published var coordinationStatusText: String = "Off"
     @Published var coordinationSummaryText: String = ""
     @Published var coordinationAnalysisAvailable = false
+    // --- Electronic-structure graph interaction ---------------------------------
+    // View-only state driving the band/DOS grapher views. None of these are scene
+    // fields, so they do not participate in state-file persistence. The controller
+    // mirrors them into the grapher views from syncFromState() / the onChange hook.
+    /// Master enable for the electronic-structure section. Hides the section when false.
+    @Published var electronicStructureEnabled: Bool = false { didSet { onChange?() } }
+    /// When true, the grapher y-axis is clipped to energyWindowMin...energyWindowMax.
+    @Published var energyWindowEnabled: Bool = false { didSet { onChange?() } }
+    @Published var energyWindowMin: Float = -10 { didSet { onChange?() } }
+    @Published var energyWindowMax: Float = 10 { didSet { onChange?() } }
+    /// Fermi-level shift applied to the displayed energies (eV).
+    @Published var fermiShift: Float = 0 { didSet { onChange?() } }
+    /// Live cursor readout text ("E = ... eV" / "E = ... eV, DOS = ...").
+    /// Set by the controller from the grapher's cursor callback; not a scene field.
+    @Published var electronicStructureCursorText: String = ""
+    /// Computed band-gap summary text (e.g. "Eg = 1.23 eV (direct)").
+    /// Set by the controller; not a scene field.
+    @Published var bandGapSummary: String = ""
     @Published var measurementMode: MeasurementMode = .none { didSet { onChange?() } }
     /// k-path state (crystal only). points carry fractional coords + labels; when
     /// empty the editor offers the default high-symmetry path for the structure.
@@ -552,6 +570,7 @@ enum CollapsibleSidebarSection: String, CaseIterable {
     case slab = "SideBarCollapsed.slab"
     case animation = "SideBarCollapsed.animation"
     case coordination = "SideBarCollapsed.coordination"
+    case electronicStructure = "SideBarCollapsed.electronicStructure"
 
     var defaultsKey: String { rawValue }
 }
