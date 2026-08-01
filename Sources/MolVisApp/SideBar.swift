@@ -536,24 +536,28 @@ struct SideBar: View {
                 .foregroundColor(.secondary)
         }
         HStack {
-            let route = KPath(points: state.kPathPoints, breaks: state.kPathBreaks)
-            Button("QE (.pwscf)") { state.onExportKPath?(route, .qe) }
-                .disabled(!KPathExport.isEnabledInEditor(route, as: .qe))
-                .help(KPathExport.editorHelp(route, as: .qe))
-            // KPF cannot represent disconnected segments: a repeated label only
-            // indicates a break when the shared endpoint happens to be that label,
-            // which is ambiguous. Disable the button and explain why when it cannot
-            // encode the route.
-            Button("kpf") { state.onExportKPath?(route, .kpf) }
-                .disabled(!KPathExport.isEnabledInEditor(route, as: .kpf))
-                .help(KPathExport.editorHelp(route, as: .kpf))
-            Button("VASP") { state.onExportKPath?(route, .vasp) }
-                .disabled(!KPathExport.isEnabledInEditor(route, as: .vasp))
-                .help(KPathExport.editorHelp(route, as: .vasp))
+            exportButton("QE (.pwscf)", .qe)
+            exportButton("QE crystal_b", .qeCrystalB)
+            exportButton("Wannier90", .wannier90)
+        }
+        .buttonStyle(.bordered).font(.caption)
+        HStack {
+            exportButton("kpf", .kpf)
+            exportButton("VASP", .vasp)
         }
         .buttonStyle(.bordered).font(.caption)
         Stepper("Samples per segment \(state.kPathSampling)",
                 value: $state.kPathSampling, in: 2...200)
+    }
+
+    /// One k-path export action. Disabled with an explanatory tooltip when the
+    /// current route cannot be encoded in the format (per KPathExport policy);
+    /// otherwise invokes the controller's export path via `onExportKPath`.
+    private func exportButton(_ title: String, _ format: KPathExportFormat) -> some View {
+        let route = KPath(points: state.kPathPoints, breaks: state.kPathBreaks)
+        return Button(title) { state.onExportKPath?(route, format) }
+            .disabled(!KPathExport.isEnabledInEditor(route, as: format))
+            .help(KPathExport.editorHelp(route, as: format))
     }
 }
 

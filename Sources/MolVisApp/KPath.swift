@@ -382,7 +382,24 @@ extension KPath {
 enum CubicLattice { case fcc, bcc, sc }
 
 /// k-path export formats offered in the UI k-path editor.
-enum KPathExportFormat: String { case qe = "qe", kpf = "kpf", vasp = "vasp" }
+enum KPathExportFormat: String {
+    case qe = "qe"
+    case qeCrystalB = "qe-crystal-b"
+    case kpf = "kpf"
+    case vasp = "vasp"
+    case wannier90 = "wannier90"
+
+    /// Suggested filename for a freshly exported file of this format.
+    var defaultFilename: String {
+        switch self {
+        case .qe: return "kpath.qe"
+        case .qeCrystalB: return "kpath.crystal_b"
+        case .kpf: return "kpath.kpf"
+        case .vasp: return "KPOINTS"
+        case .wannier90: return "kpath.win"
+        }
+    }
+}
 
 extension KPath {
     /// Detect the cubic Bravais type from the conventional cell + its atomic
@@ -440,36 +457,58 @@ func classifyCubic(cell: Cell, atoms: [SIMD3<Float>]) -> CubicLattice? {
 
 private func length(_ v: SIMD3<Float>) -> Float { sqrt(dot(v, v)) }
 
-/// Text exporters for a k-path (mirror XCrySDen's kPath.tcl targets). v1 ships
-/// QE `K_POINTS crystal` and the native `.kpf`; PWscf/CRYSTAL/WIEN2k card formats
-// are added by reusing these same interpolated points.
+/// Text exporters for a k-path (mirror XCrySDen's kPath.tcl targets): QE
+/// `K_POINTS crystal` and `K_POINTS crystal_b` card bodies, Wannier90
+/// `kpoint_path`, VASP line-mode KPOINTS, and the native `.kpf`.
 enum KPathExport {
+    /// Route-node cap for the pair-based exporters, matching the editor's and
+    /// import parser's 1024-node route limit.
+    static let maxRoutePoints = 1024
+
     enum ExportError: Error, LocalizedError {
         case disconnectedKPF
         case noConnectedEdge
+        case tooFewPoints
+        case tooManyPoints(Int)
+        case nonFiniteRoute
+        case orphanSingleton
 
         var errorDescription: String? {
             switch self {
             case .disconnectedKPF:
                 return "KPF export requires a fully connected path (no breaks). Use QE format for disconnected paths."
             case .noConnectedEdge:
-                return "VASP export requires at least one connected pair of k-points."
+                return "Export requires at least one connected pair of k-points."
+            case .tooFewPoints:
+                return "Export requires at least two k-points."
+            case .tooManyPoints(let count):
+                return "Export requires at most \(KPathExport.maxRoutePoints) route points; got \(count)."
+            case .nonFiniteRoute:
+                return "Export requires all k-point coordinates to be finite."
+            case .orphanSingleton:
+                return "Wannier90 kpoint_path export requires every route point to belong to an edge (no orphan singleton nodes)."
             }
         }
     }
 
     /// Availability policy for the sidebar editor. QE accepts any nonempty
     /// explicit k-point list, including a singleton. KPF is useful only for an
-    /// actual connected path and has no encoding for arbitrary breaks.
+    /// actual connected path and has no encoding for arbitrary breaks. QE
+    /// crystal_b and Wannier90 are pair-based line formats: crystal_b encodes
+    /// any route with two or more points (breaks become official weight-0
+    /// lines), while Wannier90 additionally rejects orphan singleton nodes.
     static func isEnabledInEditor(_ path: KPath, as format: KPathExportFormat) -> Bool {
         switch format {
         case .qe:
             return !path.points.isEmpty
+        case .qeCrystalB:
+            return path.points.count >= 2
         case .kpf:
             return path.points.count >= 2 && !path.hasDisconnectedSegments
-        case .vasp:
-            // VASP line-mode requires at least one connected pair (two points
-            // with no break between them) and no orphan singleton components.
+        case .vasp, .wannier90:
+            // Pair-based line formats require at least one connected pair (two
+            // points with no break between them) and no orphan singleton
+            // components.
             let segs = path.segments()
             let hasPair = segs.contains(where: { $0.count >= 2 })
             let hasSingleton = segs.contains(where: { $0.count < 2 })
@@ -483,6 +522,10 @@ enum KPathExport {
             return "QE export requires at least one k-point."
         case .qe:
             return "Export explicit QE K_POINTS crystal data"
+        case .qeCrystalB where path.points.count < 2:
+            return "QE crystal_b export requires at least two k-points (one line)."
+        case .qeCrystalB:
+            return "Export explicit QE K_POINTS crystal_b card data"
         case .kpf where path.points.count < 2:
             return "KPF export requires at least two route points."
         case .kpf where path.hasDisconnectedSegments:
@@ -497,6 +540,14 @@ enum KPathExport {
             return "VASP line-mode requires a fully connected path (no orphan singleton nodes)."
         case .vasp:
             return "Export VASP line-mode KPOINTS file"
+        case .wannier90 where path.points.count < 2:
+            return "Wannier90 kpoint_path requires at least two k-points (one segment)."
+        case .wannier90 where path.segments().allSatisfy({ $0.count < 2 }):
+            return "Wannier90 kpoint_path requires at least one connected pair of k-points."
+        case .wannier90 where path.segments().contains(where: { $0.count < 2 }):
+            return "Wannier90 kpoint_path requires a fully connected path (no orphan singleton nodes)."
+        case .wannier90:
+            return "Export Wannier90 kpoint_path block"
         }
     }
 
@@ -559,15 +610,166 @@ enum KPathExport {
         return s
     }
 
-    /// Export text for the given UI format: `.qe` => QE K_POINTS crystal,
-    /// `.kpf` => XCrySDen native k-path file, `.vasp` => VASP line-mode KPOINTS.
-    /// KPF export throws if the path has breaks, since the format cannot
-    /// represent disconnected segments unambiguously.
+    /// QE `K_POINTS crystal_b` card body (a `'bands'`-calculation path card).
+    ///
+    /// Official syntax (QE 7.x `Modules/read_cards.f90` and `Doc/brillouin_zones.pdf`):
+    /// the count line gives the number of rows; each row is the START of one
+    /// line in reciprocal space, written `kx ky kz w`. `generate_k_along_lines`
+    /// emits the first row's point once, separately, then `wkaux(i)` subsequent
+    /// increments per line — w subdivisions through the next endpoint
+    /// (t = 1/w ... 1). So w is NOT an endpoint-inclusive point count: the
+    /// line's start is carried over from the previous line (or the path start),
+    /// consecutive lines share their junction point, and a line together with
+    /// its carried start carries w+1 = n endpoint-inclusive samples.
+    /// Coordinates are crystal (fractional) coordinates, same basis as
+    /// `qeKPointsCrystal`.
+    ///
+    /// Policy implemented here (matching the route editor):
+    /// - One row per route point, in order. The desired endpoint-inclusive
+    ///   sample count per edge is `n = max(2, round(perSeg * d / L))` for an
+    ///   edge of length d in a component of total length L (zero-length edges
+    ///   get 2) — exactly the allocation `interpolated()` uses, bounded
+    ///   2...200. Because `generate_k_along_lines` emits the line start
+    ///   separately, the exported fourth column is the number of subdivisions
+    ///   `w = n - 1` (bounded 1...199), which makes QE's output point count
+    ///   exactly match the editor's interpolation for every edge.
+    /// - A line crossing a route break gets weight 0. QE 7.x officially treats
+    ///   a zero weight as a jump that emits only the next row's point (the
+    ///   count formula in `read_cards.f90` compensates for such lines), so
+    ///   disconnected components are NOT silently connected.
+    /// - The final row's weight is ignored by QE (no line follows it); we
+    ///   write 0.
+    /// - Routes with more than `maxRoutePoints` (1024) nodes are rejected
+    ///   before any output is constructed, matching the editor and import cap.
+    /// - A route with fewer than two points or non-finite coordinates is
+    ///   rejected rather than emitting bogus data.
+    ///
+    /// Like `qeKPointsCrystal`, this returns the card BODY only, not the card
+    /// line: the text must be pasted or written immediately after a
+    /// `K_POINTS crystal_b` card line (the UI save writes the body as-is).
+    /// Uses POSIX locale.
+    static func qeKPointsCrystalB(_ path: KPath) throws -> String {
+        let pts = path.points
+        guard pts.count >= 2 else { throw ExportError.tooFewPoints }
+        guard pts.count <= KPathExport.maxRoutePoints else { throw ExportError.tooManyPoints(pts.count) }
+        guard pts.allSatisfy({ $0.frac.x.isFinite && $0.frac.y.isFinite && $0.frac.z.isFinite }) else {
+            throw ExportError.nonFiniteRoute
+        }
+        let posixLocale = Locale(identifier: "en_US_POSIX")
+        let perSeg = min(200, max(2, path.pointsPerSegment))
+
+        // Desired endpoint-inclusive samples per edge in Double math (Float
+        // coordinates are finite, so a Double distance is always finite and
+        // NaN-free), then convert to QE line weights n-1.
+        var weights = Array(repeating: 0, count: pts.count)
+        for range in path.segments() {
+            var lengths: [Double] = []
+            var componentLength = 0.0
+            for i in range.lowerBound..<(range.upperBound - 1) {
+                let p = pts[i].frac, q = pts[i + 1].frac
+                let dx = Double(q.x) - Double(p.x)
+                let dy = Double(q.y) - Double(p.y)
+                let dz = Double(q.z) - Double(p.z)
+                let d = sqrt(dx * dx + dy * dy + dz * dz)
+                lengths.append(d)
+                componentLength += d
+            }
+            for (offset, d) in lengths.enumerated() {
+                let apportioned: Double
+                if componentLength > 0 {
+                    apportioned = Double(perSeg) * d / componentLength
+                } else {
+                    apportioned = 2
+                }
+                let samples = min(200.0, max(2.0, apportioned.rounded()))
+                weights[range.lowerBound + offset] = Int(samples) - 1
+            }
+        }
+
+        var lines = ["\(pts.count)"]
+        for (i, kp) in pts.enumerated() {
+            let w = (i < pts.count - 1) ? weights[i] : 0
+            lines.append(String(format: "%.6f %.6f %.6f %d", locale: posixLocale,
+                                arguments: [kp.frac.x, kp.frac.y, kp.frac.z, w]))
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Wannier90 `kpoint_path` block for a band-structure route. Official
+    /// syntax:
+    ///   begin kpoint_path
+    ///   label1 x1 y1 z1 label2 x2 y2 z2
+    ///   ...
+    ///   end kpoint_path
+    /// One row per connected EDGE; disconnected components yield non-sharing
+    /// rows, so breaks are preserved without any special encoding.
+    ///
+    /// Policy implemented here:
+    /// - Routes with fewer than two points, with more than `maxRoutePoints`
+    ///   (1024) nodes (rejected before any output is constructed, matching the
+    ///   editor and import cap), with no connected edge at all, or with orphan
+    ///   singleton components (route points belonging to no edge) are
+    ///   rejected; non-finite coordinates are rejected.
+    /// - Labels are sanitized to a single whitespace-free token capped at 64
+    ///   characters; blank/whitespace labels get deterministic generated labels
+    ///   "K1", "K2", ... by stable route index, so a shared endpoint carries
+    ///   the same generated label in both adjacent rows.
+    ///
+    /// Uses POSIX locale.
+    static func wannier90KPointPath(_ path: KPath) throws -> String {
+        let pts = path.points
+        guard pts.count >= 2 else { throw ExportError.tooFewPoints }
+        guard pts.count <= KPathExport.maxRoutePoints else { throw ExportError.tooManyPoints(pts.count) }
+        guard pts.allSatisfy({ $0.frac.x.isFinite && $0.frac.y.isFinite && $0.frac.z.isFinite }) else {
+            throw ExportError.nonFiniteRoute
+        }
+        let segs = path.segments()
+        guard segs.contains(where: { $0.count >= 2 }) else { throw ExportError.noConnectedEdge }
+        guard !segs.contains(where: { $0.count < 2 }) else { throw ExportError.orphanSingleton }
+
+        let posixLocale = Locale(identifier: "en_US_POSIX")
+        func fmt(_ frac: SIMD3<Float>) -> String {
+            String(format: "%.6f %.6f %.6f", locale: posixLocale,
+                   arguments: [frac.x, frac.y, frac.z])
+        }
+        var s = "begin kpoint_path\n"
+        for range in segs {
+            for i in range.lowerBound..<(range.upperBound - 1) {
+                s += "\(wannier90Label(pts[i].label, routeIndex: i)) \(fmt(pts[i].frac)) "
+                s += "\(wannier90Label(pts[i + 1].label, routeIndex: i + 1)) \(fmt(pts[i + 1].frac))\n"
+            }
+        }
+        s += "end kpoint_path\n"
+        return s
+    }
+
+    /// Deterministic Wannier90 label for a route node: a blank/whitespace
+    /// label becomes "K<routeIndex+1>"; otherwise whitespace is removed so the
+    /// label is a single token, Wannier90 comment characters `!` and `#` are
+    /// replaced with `_` so they can never start a comment in the exported
+    /// file, and the result is capped at 64 characters.
+    static func wannier90Label(_ raw: String, routeIndex: Int) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "K\(routeIndex + 1)" }
+        let sanitized = String(trimmed
+            .filter { !$0.isWhitespace }
+            .map { ($0 == "!" || $0 == "#") ? "_" : $0 }
+            .prefix(64))
+        return sanitized.isEmpty ? "K\(routeIndex + 1)" : sanitized
+    }
+
+    /// Export text for the given UI format: `.qe` => QE K_POINTS crystal card
+    /// body, `.qeCrystalB` => QE K_POINTS crystal_b card body, `.kpf` =>
+    /// XCrySDen native k-path file, `.vasp` => VASP line-mode KPOINTS,
+    /// `.wannier90` => Wannier90 kpoint_path block. Formats that cannot
+    /// represent the path (e.g. KPF with breaks) throw a precise ExportError.
     static func export(_ path: KPath, as format: KPathExportFormat) throws -> String {
         switch format {
         case .qe: return qeKPointsCrystal(path)
+        case .qeCrystalB: return try qeKPointsCrystalB(path)
         case .kpf: return try xcrysdnenKPF(path)
         case .vasp: return try vaspKPoints(path)
+        case .wannier90: return try wannier90KPointPath(path)
         }
     }
 

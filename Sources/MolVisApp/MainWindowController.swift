@@ -2273,7 +2273,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private func exportKPath(_ path: KPath, _ format: KPathExportFormat) {
         guard !path.points.isEmpty else { return }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = format == .vasp ? "KPOINTS" : "kpath.\(format.rawValue)"
+        panel.nameFieldStringValue = format.defaultFilename
         panel.allowedContentTypes = format == .vasp ? [] : [.plainText]
         if format == .vasp { panel.allowsOtherFileTypes = true }
         panel.beginSheetModal(for: window) { result in

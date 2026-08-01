@@ -4,6 +4,22 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.31] — 2026-08-01
+
+### Added
+
+- Wannier90 `kpoint_path` export: official `begin/end kpoint_path` block with one row per connected edge; labels sanitized to single whitespace-free tokens capped at 64 characters, with deterministic generated labels (`K1`, `K2`, … by stable route index) for blank labels so a shared endpoint carries the same generated label in adjacent rows; disconnected components yield non-sharing rows, preserving breaks without special encoding; rejects routes with fewer than two points, over 1,024 nodes, no connected edge, orphan singleton nodes, or non-finite coordinates.
+- QE `K_POINTS crystal_b` card-body export: one row per route point with official weight-0 jumps for route breaks (QE treats zero weight as a jump that emits only the next row's point, so disconnected components are not silently connected) and `w = n−1` subdivisions per edge for the editor's endpoint-inclusive sample count `n` (2…200 sampling, apportioned by edge length per component), so QE's generated point count exactly matches the editor's interpolation; the final row's weight is 0 and ignored by QE; rejects fewer than two points, over 1,024 nodes, and non-finite coordinates.
+- Sidebar k-path export actions for all five formats in two rows (QE (.pwscf), QE crystal_b, Wannier90 / kpf, VASP) with per-format default filenames (`kpath.qe`, `kpath.crystal_b`, `kpath.win`, `kpath.kpf`, `KPOINTS`) and save-panel wiring; buttons that cannot encode the current route are disabled with an explanatory tooltip.
+
+### Tests
+
+- Added 24 tests: 18 `KPathExportInteropTests` (Wannier90/QE crystal_b output syntax and round trips, generated-label stability, break encoding, rejection paths) and 6 `KPathExportIntegrationTests` (export availability/help policy, per-format default filenames, sampling stamping, sidebar construction). Full suite now contains 1286 tests (up from 1262).
+
+### Documentation
+
+- Updated `docs/ROADMAP.md` (v1.1.31, 1286 tests), `docs/SYMMETRY_AND_KPATH.md` (export contract), `CLAUDE.md`, and the version test.
+
 ## [1.1.30] — 2026-08-01
 
 ### Fixed
