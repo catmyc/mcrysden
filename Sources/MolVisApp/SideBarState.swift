@@ -212,6 +212,11 @@ final class SideBarState: ObservableObject {
     /// a save panel and writes the text). `.qe` => QE K_POINTS crystal;
     /// `.kpf` => XCrySDen native k-path file.
     var onExportKPath: ((KPath, KPathExportFormat) -> Void)?
+    /// Import a k-path from a file (the controller presents an open panel and
+    /// parses the chosen route). Imported routes are marked user-edited exactly
+    /// like other user edits, so they are never auto-regenerated when the
+    /// structure changes.
+    var onImportKPath: (() -> Void)?
     /// Recalculate the default high-symmetry route for the current scene and
     /// install it (the "Default" control). The controller owns the scene, so it
     /// wires this to recompute `makeDefaultKPath`.
@@ -498,6 +503,16 @@ final class SideBarState: ObservableObject {
         pushUndo()
         markUserEdited()
         replaceKPath(points: [], breaks: [], provenance: .userEdited, signature: nil)
+    }
+
+    /// Import a route from a file. Records the current route on the undo stack
+    /// (so Undo restores the pre-import route), then replaces it with the imported
+    /// one marked as user-edited — imported routes must NOT be auto-regenerated
+    /// when the structure changes, exactly like other user edits.
+    func importKPath(points: [KPoint], breaks: Set<Int>) {
+        guard !points.isEmpty else { return }
+        pushUndo()
+        replaceKPath(points: points, breaks: breaks, provenance: .userEdited, signature: nil)
     }
 
     /// Toggle a break at the given index. A break at i means no segment joins

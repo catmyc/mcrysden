@@ -55,6 +55,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var inputURL: URL?
         var stateURL: URL?
         var exportURL: URL?
+        var kPathImportURL: URL?
         var format: ParseFormat?
         var frame = -1
         var help = false
@@ -158,6 +159,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 }
                 index += 1
                 options.exportURL = URL(fileURLWithPath: args[index])
+            } else if !optionsEnded && argument == "--kpath" {
+                guard options.kPathImportURL == nil, index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--kpath requires exactly one file path")
+                }
+                index += 1
+                options.kPathImportURL = URL(fileURLWithPath: args[index])
             } else if !optionsEnded && argument == "--frame" {
                 guard options.frame == -1, index + 1 < args.count,
                       let frame = Int(args[index + 1]), frame >= 0, frame <= Int(Int32.max) else {
@@ -197,6 +204,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             guard options.inputURL != nil else { throw CLIError.invalid("--export requires an input file") }
             guard supportedExportExtensions.contains(output.pathExtension.lowercased()) else {
                 throw CLIError.invalid("unsupported export extension: \(output.pathExtension)")
+            }
+        }
+        if let kpathURL = options.kPathImportURL {
+            guard options.inputURL != nil else { throw CLIError.invalid("a structure file is required to import a k-path") }
+            for protected in [options.inputURL, options.stateURL].compactMap({ $0 }) where sameFile(kpathURL, protected) {
+                throw CLIError.invalid("--kpath file aliases the input or state file: \(protected.path)")
             }
         }
         return options
@@ -252,7 +265,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     /// re-apply the structural transforms. Without this, the saved currentFrame
     /// would be metadata-only and the saved frame's geometry would never show.
     private static func loadScene(from url: URL, format: ParseFormat?, cliFrame: Int,
-                                  stateURL: URL?, kPathSampling: inout Int) throws -> (scene: Scene, camera: Camera?) {
+                                  stateURL: URL?, kPathImportURL: URL? = nil,
+                                  kPathSampling: inout Int) throws -> (scene: Scene, camera: Camera?) {
         if let stateURL, sameFile(url, stateURL) {
             throw CLIError.invalid("input and state alias the same file: \(url.path)")
         }
@@ -275,6 +289,11 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         // helper so the GUI path and the frame-state tests run IDENTICAL logic.
         try resolveAnimationFrame(scene: &scene, from: url, format: format,
                                   loadedFrame: loadedFrame, fc: fc)
+        // A --kpath import wins over any route restored from a companion state file,
+        // so apply it last (after the state's route has been carried onto the scene).
+        if let kPathImportURL {
+            try applyKPathImport(to: &scene, from: kPathImportURL, kPathSampling: &kPathSampling)
+        }
         return (scene, camera)
     }
 
@@ -364,6 +383,20 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
     }
 
+    /// Apply a --kpath import to a freshly-loaded scene. The imported route is marked
+    /// user-edited (signature cleared) so it is never auto-regenerated. The flag wins
+    /// over any route restored from a companion state file because this runs AFTER the
+    /// state is applied.
+    static func applyKPathImport(to scene: inout Scene, from url: URL, kPathSampling: inout Int) throws {
+        guard scene.cell != nil else { throw CLIError.invalid("--kpath \(url.path) requires a crystal structure") }
+        let imported = try KPathImport.importKPath(from: url)
+        scene.kPathPoints = imported.path.points
+        scene.kPathBreaks = imported.path.breaks
+        scene.kPathProvenance = .userEdited
+        scene.kPathSignature = nil
+        kPathSampling = min(200, max(2, imported.path.pointsPerSegment))
+    }
+
     /// Resolve which file to open at launch. An explicit CLI input always wins;
     /// with no CLI input, fall back to the stored lastOpenedURL (implicit reopen).
     /// The `isReopen` flag lets the caller treat an implicit reopen failure as
@@ -420,6 +453,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 var kPathSampling = 20
                 let (scene, camera) = try Self.loadScene(from: inURL, format: options.format,
                                                          cliFrame: options.frame, stateURL: options.stateURL,
+                                                         kPathImportURL: options.kPathImportURL,
                                                          kPathSampling: &kPathSampling)
                 let exportSize = CGSize(width: 800, height: 800)
                 try Self.exportScene(scene, camera: camera, to: outURL, size: exportSize)
@@ -440,6 +474,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 var kPathSampling = 20
                 let (scene, camera) = try Self.loadScene(from: inURL, format: options.format,
                                                          cliFrame: options.frame, stateURL: options.stateURL,
+                                                         kPathImportURL: options.kPathImportURL,
                                                          kPathSampling: &kPathSampling)
                 let wc = MainWindowController(scene: Scene())
                 windowRegistry.add(wc)
@@ -984,7 +1019,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.28"
+    static let appVersion = "1.1.29"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -999,6 +1034,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
           mcrysden <file> <state.mvis-state>           # open with saved state
           mcrysden <file> --export out.png             # headless raster render
           mcrysden <file> --export out.pdf             # raster render in a vector container (pdf, svg, eps, ps)
+          mcrysden <file> --kpath route.kpf            # import a k-path (QE K_POINTS, VASP KPOINTS, Wannier90 kpoint_path, XCrySDen KPF)
           mcrysden --help
         Input formats are chosen by extension (\(exts)). Angstrom-based input
         (.cube/.bxsf/.struct) is kept in Angstrom; Bohr-based input is converted.

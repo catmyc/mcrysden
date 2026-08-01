@@ -4,6 +4,22 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.29] — 2026-08-01
+
+### Added
+
+- K-path import from QE `K_POINTS crystal` cards, VASP line-mode `KPOINTS` files, Wannier90 `kpoint_path` blocks, and XCrySDen `.kpf` files, with content-based format detection, endpoint coalescing and break reconstruction for VASP/Wannier90 segments, VASP points-per-segment propagation (clamped to 2…200), and provenance-safe imported routes (`userEdited`, never auto-regenerated).
+- GUI k-path import via a sidebar "Import…" open panel and CLI `--kpath <file>` import, including undo support, import-error sheets, aliasing guards against the input/state files, and crystal-only validation.
+- Hardened parsing: 16 MB file bound, 1,024-node route cap, non-finite coordinate/weight rejection, automatic/grid and Cartesian VASP rejection with "not a band path" diagnostics, UTF-8 BOM and CRLF handling, and descriptive `KPathImportError` failures instead of traps.
+
+### Tests
+
+- Added 74 tests: 53 `KPathImportTests` unit tests (format detection, QE/VASP/Wannier90/KPF parsers, error paths, limits, export→import round trips) and 21 `KPathImportIntegrationTests` (sidebar undo/provenance, controller import, CLI `--kpath` parsing, sampling propagation, QE/VASP export round trips). Full suite now contains 1247 tests.
+
+### Documentation
+
+- Updated `docs/ROADMAP.md` (import feature complete, v1.1.29, 1247 tests), `docs/SYMMETRY_AND_KPATH.md` (import contract), `CLAUDE.md`, and the version test.
+
 ## [1.1.28] — 2026-07-30
 
 ### Added

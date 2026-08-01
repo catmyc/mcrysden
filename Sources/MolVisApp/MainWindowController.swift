@@ -371,6 +371,21 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             guard let self else { return }
             self.exportKPath(self.kPathForExport(path), format)
         }
+        state.onImportKPath = { [weak self] in
+            guard let self else { return }
+            let panel = NSOpenPanel()
+            panel.allowedContentTypes = [.plainText]
+            panel.allowsOtherFileTypes = true
+            panel.beginSheetModal(for: self.window) { result in
+                guard result == .OK, let url = panel.url else { return }
+                do {
+                    try self.importKPath(from: url)
+                } catch {
+                    print("[mcrysden] k-path import failed: \(error)")
+                    self.presentImportError(error)
+                }
+            }
+        }
         state.onResetKPath = { [weak self] in self?.resetKPathDefault() }
         state.onSelectKPathNode = { [weak self] index in self?.selectKPathNode(index) }
         state.onShowAtomTable = { [weak self] in self?.showAtomTable() }
@@ -2217,6 +2232,29 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.replaceKPath(points: path.points, breaks: path.breaks, provenance: .generated, signature: signature)
     }
 
+    /// Import a k-path from `url` and install it as the current route. Requires a
+    /// crystal structure (a cell) so the route's reciprocal basis is meaningful.
+    /// The imported route is marked user-edited (signature cleared) so it is never
+    /// auto-regenerated when the structure changes.
+    func importKPath(from url: URL) throws {
+        guard scene.cell != nil else {
+            throw KPathImportError.notAPath(path: url.path, reason: "k-path import requires a crystal structure")
+        }
+        let imported = try KPathImport.importKPath(from: url)
+        let path = imported.path
+        // Update the scene first, then publish the sidebar route as one snapshot.
+        // Otherwise kPathPoints.didSet synchronously re-enters syncFromState with
+        // the previous break set and can briefly pair new points with old breaks.
+        scene.kPathPoints = path.points
+        scene.kPathBreaks = path.breaks
+        scene.kPathProvenance = .userEdited
+        scene.kPathSignature = nil
+        state.importKPath(points: path.points, breaks: path.breaks)
+        // Propagate the imported sampling density; clamp to the UI range 2...200.
+        // kPathSampling has no didSet onChange, so this does not re-enter syncFromState.
+        state.kPathSampling = min(200, max(2, path.pointsPerSegment))
+    }
+
     /// Install the canonical path from the scene's symmetry analysis into the
     /// scene. Called when the structure changes and the path was auto-generated.
     private func regenerateCanonicalPathIfNeeded() {
@@ -2260,6 +2298,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "k-path export failed"
+        alert.informativeText = (error as? LocalizedError)?.errorDescription
+            ?? error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
+    }
+
+    /// Present an import-failure alert as a sheet on the main window.
+    private func presentImportError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "k-path import failed"
         alert.informativeText = (error as? LocalizedError)?.errorDescription
             ?? error.localizedDescription
         alert.addButton(withTitle: "OK")

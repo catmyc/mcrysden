@@ -52,6 +52,17 @@ The flat `.mvis-state` format persists `kPathPoints`, `kPathBreaks`, `kPathProve
 
 Quantum Espresso `K_POINTS crystal` export can represent the interpolated points from disconnected components and preserves explicit singleton components. VASP line-mode `KPOINTS` export uses endpoint pairs and blank lines between segments; singleton components are rejected because line mode cannot represent them. XCrySDen KPF has no syntax for a disconnected boundary, so the UI disables that export for disconnected routes and the exporter rejects a programmatic request with a clear error.
 
+## Import behavior
+
+Routes can be imported from QE `K_POINTS crystal` cards, VASP line-mode `KPOINTS` files, Wannier90 `kpoint_path` blocks, and XCrySDen `.kpf` files, via the sidebar "Import…" panel or `mcrysden <structure> --kpath <file>`. Format detection uses extension/filename hints first (`kpf`, exact `KPOINTS`) and then content sniffing (`K_POINTS` card, `kpoint_path` block, or the VASP line-mode layout); anything else is rejected as unsupported.
+
+- All coordinates are read as fractional (crystal) coordinates in the conventional reciprocal basis. QE data lines may carry an optional weight column (validated but not stored). VASP Cartesian line-mode and QE `automatic`/`tpiba_b`/`gamma` grid cards are rejected with a clear "not a band path" diagnostic.
+- VASP line-mode files carry an explicit points-per-segment integer N, which becomes the imported route's `pointsPerSegment` clamped to the editor range 2…200. QE, Wannier90, and KPF imports default to 20.
+- Consecutive VASP/Wannier90 segments that share an endpoint (within 1e-4 per component) coalesce into one continuous route; non-sharing consecutive segments receive a break index, matching the disconnected-route model above.
+- KPF files are a flat ISS-scaled point list with no break syntax, so imported KPF routes are always fully connected.
+- Imported routes are marked `userEdited` with the generated signature cleared, so they are never auto-regenerated when the structure changes, and they participate in undo exactly like manual edits. A CLI `--kpath` import is applied after any companion `.mvis-state` route, so the flag always wins.
+- Parsing is bounded: files over 16 MB, routes over 1,024 nodes, non-finite coordinates/weights, malformed counts, and unsupported formats fail with a descriptive error instead of trapping.
+
 ## Reciprocal editor UX (v1.1.25)
 
 The interactive k-path editor surfaces the following behavior:

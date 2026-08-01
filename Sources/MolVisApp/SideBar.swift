@@ -526,6 +526,8 @@ struct SideBar: View {
             Button("Undo") { state.undoLast() }.disabled(!state.canUndo)
             Button("Clear") { state.clear() }.disabled(state.kPathPoints.isEmpty)
             Button("Default") { state.resetToDefault() }
+            Button("Import…") { state.onImportKPath?() }
+                .help("Import a k-path from QE K_POINTS, VASP KPOINTS, Wannier90 kpoint_path, or XCrySDen KPF")
         }
         .buttonStyle(.bordered).font(.caption)
         if !state.kPathPoints.isEmpty {

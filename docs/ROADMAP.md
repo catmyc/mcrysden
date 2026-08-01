@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-07-30 (v1.1.28 electronic-analysis presentation, text/CSV export, linked graph markers, and 1173 tests)**.
+Last updated: **2026-08-01 (v1.1.29 k-path import from QE/VASP/Wannier90/KPF, provenance-safe imported routes, `--kpath` CLI, and 1247 tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 1173 tracked tests as of v1.1.28: unit, snapshot (FNV-1a pixel hash vs. committed goldens), model-layer cache, parser-hardening, renderer-safety, export, state, coordination-analysis, reciprocal-ux, electronic-structure analysis/presentation, grapher-interaction, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 1247 tracked tests as of v1.1.29: unit, snapshot (FNV-1a pixel hash vs. committed goldens), model-layer cache, parser-hardening, renderer-safety, export, state, coordination-analysis, reciprocal-ux, electronic-structure analysis/presentation, grapher-interaction, k-path-import, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
@@ -96,7 +96,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] User-configurable per-segment k-path sampling for QE and VASP export.
 - [x] Export VASP `KPOINTS` (line-mode, endpoint-pair encoding, blank-line segment separation).
 - [x] K-path-editor cumulative reciprocal distance display, candidate hover tooltips, viewport node labels, and automatic BZ framing (v1.1.25). Band plots already use cumulative reciprocal distance.
-- [ ] Import k-paths from QE, VASP, Wannier90, and KPF.
+- [x] Import k-paths from QE `K_POINTS crystal`, VASP line-mode `KPOINTS`, Wannier90 `kpoint_path`, and XCrySDen `.kpf` (v1.1.29): format sniffing, endpoint coalescing with break reconstruction, VASP sampling-density propagation, 1,024-node/16 MB bounds, provenance-safe user-edited routes, GUI Import panel, and CLI `--kpath`.
 - [ ] Export Wannier90 `kpoint_path` and additional QE band-path forms.
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
 
