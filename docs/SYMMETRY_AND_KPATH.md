@@ -54,13 +54,15 @@ Quantum Espresso `K_POINTS crystal` export can represent the interpolated points
 
 ## Import behavior
 
-Routes can be imported from QE `K_POINTS crystal` cards, VASP line-mode `KPOINTS` files, Wannier90 `kpoint_path` blocks, and XCrySDen `.kpf` files, via the sidebar "Import…" panel or `mcrysden <structure> --kpath <file>`. Format detection uses extension/filename hints first (`kpf`, exact `KPOINTS`) and then content sniffing (`K_POINTS` card, `kpoint_path` block, or the VASP line-mode layout); anything else is rejected as unsupported.
+Routes can be imported from QE `K_POINTS crystal` cards, VASP line-mode `KPOINTS` files, Wannier90 `kpoint_path` blocks, and XCrySDen `.kpf` files, via the sidebar "Import…" panel or `mcrysden <structure> --kpath <file>`. Format detection uses extension/filename hints first (`kpf`, exact `KPOINTS`) and then content sniffing (`K_POINTS` card, `kpoint_path` block, or the VASP line-mode layout); anything else is rejected as unsupported. A UTF-8 BOM is stripped before detection and parsing, and CRLF files parse identically to LF.
 
 - All coordinates are read as fractional (crystal) coordinates in the conventional reciprocal basis. QE data lines may carry an optional weight column (validated but not stored). VASP Cartesian line-mode and QE `automatic`/`tpiba_b`/`gamma` grid cards are rejected with a clear "not a band path" diagnostic.
-- VASP line-mode files carry an explicit points-per-segment integer N, which becomes the imported route's `pointsPerSegment` clamped to the editor range 2…200. QE, Wannier90, and KPF imports default to 20.
+- VASP line-mode files carry an explicit points-per-segment integer N, which becomes the imported route's `pointsPerSegment` clamped to the editor range 2…200. QE, Wannier90, and KPF imports synthesize the default of 20. The sampling density propagates to the sidebar/CLI preference **only** for VASP files; importing QE, Wannier90, or KPF never clobbers a sampling preference restored from `.mvis-state` or set by the user. A CLI `--kpath` import is applied after any companion `.mvis-state` route, so the flag always wins for the route while preserving the non-VASP sampling preference.
+- VASP k-point labels are preserved from a bare fourth column or, when the file uses the app's own export style, as the first token after the earliest `!`/`#` comment marker on the line.
+- Wannier90 parsing follows the documented interleaved form: an explicit `begin kpoint_path` / `end kpoint_path` block (inline `!`/`#` comments allowed on the delimiter lines; an unterminated block is rejected) whose rows are `label1 x1 y1 z1 label2 x2 y2 z2`. The legacy `label1 label2 x1 y1 z1 x2 y2 z2` layout is also accepted per row, and a legacy bare `kpoint_path` header must match exactly (no fuzzy substring) and ends at the next keyword line or scalar assignment. Malformed, ambiguous, or non-numeric-label rows fail with a descriptive error instead of being skipped.
 - Consecutive VASP/Wannier90 segments that share an endpoint (within 1e-4 per component) coalesce into one continuous route; non-sharing consecutive segments receive a break index, matching the disconnected-route model above.
 - KPF files are a flat ISS-scaled point list with no break syntax, so imported KPF routes are always fully connected.
-- Imported routes are marked `userEdited` with the generated signature cleared, so they are never auto-regenerated when the structure changes, and they participate in undo exactly like manual edits. A CLI `--kpath` import is applied after any companion `.mvis-state` route, so the flag always wins.
+- Imported routes are marked `userEdited` with the generated signature cleared, so they are never auto-regenerated when the structure changes, and they participate in undo exactly like manual edits.
 - Parsing is bounded: files over 16 MB, routes over 1,024 nodes, non-finite coordinates/weights, malformed counts, and unsupported formats fail with a descriptive error instead of trapping.
 
 ## Reciprocal editor UX (v1.1.25)
@@ -87,4 +89,4 @@ swift test
 zsh scripts/smoke.sh
 ```
 
-The tracked suite contains 1173 tests as of v1.1.28. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.
+The tracked suite contains 1262 tests as of v1.1.30. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.

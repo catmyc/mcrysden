@@ -46,7 +46,7 @@ enum KPathImport {
             throw KPathImportError.unsupportedFile(path: url.path,
                                                    reason: "could not read file: \(error.localizedDescription)")
         }
-        return try detectFormat(text: text, url: url)
+        return try detectFormat(text: normalize(text), url: url)
     }
 
     /// Parse a k-path file into editor coordinates (fractional crystal coords).
@@ -250,8 +250,11 @@ enum KPathImport {
         let dataLines = sig[(startIdx + 3)...]
         var kpoints: [KPoint] = []
         for line in dataLines {
-            let stripped = stripTrailingComment(line)
-            let tokens = stripped.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            // Coordinates come from the pre-delimiter portion; a label may sit
+            // as a bare fourth column or as a suffix after the first !/# marker
+            // (the app's own VASP export writes labels there).
+            let coordsText = stripTrailingComment(line)
+            let tokens = coordsText.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
             guard tokens.count >= 3 else {
                 throw KPathImportError.malformed(path: path,
                                                  reason: "VASP k-point line must have at least 3 coordinates: '\(line)'")
@@ -264,7 +267,9 @@ enum KPathImport {
             }
             var label = ""
             if tokens.count > 3 {
-                label = normalizeGamma(String(tokens[3...].joined(separator: " ").prefix(64)))
+                label = normalizeGamma(String(tokens[3].prefix(64)))
+            } else if let suffix = trailingCommentLabel(line), !suffix.isEmpty {
+                label = normalizeGamma(String(suffix.prefix(64)))
             }
             kpoints.append(KPoint(SIMD3<Float>(x, y, z), label))
         }
@@ -298,13 +303,14 @@ enum KPathImport {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-        // Prefer an explicit "begin kpoint_path" delimiter; fall back to a bare
-        // "kpoint_path" line for legacy files.
+        // Prefer an explicit "begin kpoint_path" delimiter (inline comments
+        // allowed, since Wannier90 treats text after !/# as comments); fall
+        // back to an exact bare "kpoint_path" line for legacy files.
         var blockStart: Int?
         var blockEnd: Int?
         var usingBeginEnd = false
         for (i, line) in lines.enumerated() {
-            if line.lowercased() == "begin kpoint_path" {
+            if delimiterKey(line) == "begin kpoint_path" {
                 blockStart = i
                 usingBeginEnd = true
                 break
@@ -312,7 +318,7 @@ enum KPathImport {
         }
         if blockStart == nil {
             for (i, line) in lines.enumerated() {
-                if !isCommentLine(line) && line.lowercased().contains("kpoint_path") {
+                if !isCommentLine(line) && delimiterKey(line) == "kpoint_path" {
                     blockStart = i
                     break
                 }
@@ -324,10 +330,14 @@ enum KPathImport {
 
         if usingBeginEnd {
             for i in (blockStart + 1)..<lines.count {
-                if lines[i].lowercased() == "end kpoint_path" {
+                if delimiterKey(lines[i]) == "end kpoint_path" {
                     blockEnd = i
                     break
                 }
+            }
+            guard blockEnd != nil else {
+                throw KPathImportError.malformed(path: path,
+                                                 reason: "kpoint_path block is not terminated by 'end kpoint_path'")
             }
         }
 
@@ -336,43 +346,57 @@ enum KPathImport {
         for i in (blockStart + 1)..<endIdx {
             let line = lines[i]
             if line.isEmpty || isCommentLine(line) { continue }
-            // For bare blocks, stop at a line whose first token is begin/end.
+            // Wannier90 treats characters after the earliest `!` or `#` as an
+            // inline comment; strip it before tokenizing the row.
+            let content = stripTrailingComment(line)
+            let tokens = content.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
             if !usingBeginEnd {
-                let firstToken = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) ?? ""
-                if firstToken.lowercased() == "begin" || firstToken.lowercased() == "end" { break }
+                // For bare legacy blocks, a short all-nonnumeric line or a
+                // scalar keyword assignment (e.g. "bands_plot = true") is a
+                // likely following keyword; stop the block there.
+                let shortKeyword = tokens.count <= 2 && tokens.allSatisfy({ !isNumeric($0) })
+                let assignmentKeyword = tokens.count >= 2 && !isNumeric(tokens[0])
+                    && (tokens[1] == "=" || tokens[1] == ":")
+                if shortKeyword || assignmentKeyword { break }
+                if tokens.count <= 2 {
+                    throw KPathImportError.malformed(path: path,
+                                                     reason: "malformed kpoint_path row: '\(line)'")
+                }
             }
-            let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            if tokens.count != 8 { continue }
-
-            // Detect the layout by whether token[4] is numeric: numeric means the
-            // legacy two-labels-first form, non-numeric means the documented interleaved form.
-            if isNumeric(tokens[4]) {
-                // Legacy: label1 label2 x1 y1 z1 x2 y2 z2
-                guard !isNumeric(tokens[0]), !isNumeric(tokens[1]),
-                      let x1 = Float(tokens[2]), x1.isFinite,
-                      let y1 = Float(tokens[3]), y1.isFinite,
-                      let z1 = Float(tokens[4]), z1.isFinite,
-                      let x2 = Float(tokens[5]), x2.isFinite,
-                      let y2 = Float(tokens[6]), y2.isFinite,
-                      let z2 = Float(tokens[7]), z2.isFinite else { continue }
-                let label1 = normalizeGamma(String(tokens[0].prefix(64)))
-                let label2 = normalizeGamma(String(tokens[1].prefix(64)))
-                segments.append((KPoint(SIMD3<Float>(x1, y1, z1), label1),
-                                 KPoint(SIMD3<Float>(x2, y2, z2), label2)))
-            } else {
-                // Documented interleaved: label1 kx1 ky1 kz1 label2 kx2 ky2 kz2
-                guard !isNumeric(tokens[0]),
-                      let kx1 = Float(tokens[1]), kx1.isFinite,
-                      let ky1 = Float(tokens[2]), ky1.isFinite,
-                      let kz1 = Float(tokens[3]), kz1.isFinite,
-                      let kx2 = Float(tokens[5]), kx2.isFinite,
-                      let ky2 = Float(tokens[6]), ky2.isFinite,
-                      let kz2 = Float(tokens[7]), kz2.isFinite else { continue }
-                let label1 = normalizeGamma(String(tokens[0].prefix(64)))
-                let label2 = normalizeGamma(String(tokens[4].prefix(64)))
-                segments.append((KPoint(SIMD3<Float>(kx1, ky1, kz1), label1),
-                                 KPoint(SIMD3<Float>(kx2, ky2, kz2), label2)))
+            guard tokens.count == 8 else {
+                throw KPathImportError.malformed(path: path,
+                                                 reason: "kpoint_path row must have 8 tokens (label x y z label x y z): '\(line)'")
             }
+            // Documented interleaved: label1 x1 y1 z1 label2 x2 y2 z2.
+            if !isNumeric(tokens[0]), !isNumeric(tokens[4]),
+               let kx1 = Float(tokens[1]), kx1.isFinite,
+               let ky1 = Float(tokens[2]), ky1.isFinite,
+               let kz1 = Float(tokens[3]), kz1.isFinite,
+               let kx2 = Float(tokens[5]), kx2.isFinite,
+               let ky2 = Float(tokens[6]), ky2.isFinite,
+               let kz2 = Float(tokens[7]), kz2.isFinite {
+                segments.append((KPoint(SIMD3<Float>(kx1, ky1, kz1),
+                                        normalizeGamma(String(tokens[0].prefix(64)))),
+                                 KPoint(SIMD3<Float>(kx2, ky2, kz2),
+                                        normalizeGamma(String(tokens[4].prefix(64))))))
+                continue
+            }
+            // Legacy two-labels-first: label1 label2 x1 y1 z1 x2 y2 z2.
+            if !isNumeric(tokens[0]), !isNumeric(tokens[1]),
+               let x1 = Float(tokens[2]), x1.isFinite,
+               let y1 = Float(tokens[3]), y1.isFinite,
+               let z1 = Float(tokens[4]), z1.isFinite,
+               let x2 = Float(tokens[5]), x2.isFinite,
+               let y2 = Float(tokens[6]), y2.isFinite,
+               let z2 = Float(tokens[7]), z2.isFinite {
+                segments.append((KPoint(SIMD3<Float>(x1, y1, z1),
+                                        normalizeGamma(String(tokens[0].prefix(64)))),
+                                 KPoint(SIMD3<Float>(x2, y2, z2),
+                                        normalizeGamma(String(tokens[1].prefix(64))))))
+                continue
+            }
+            throw KPathImportError.malformed(path: path,
+                                             reason: "kpoint_path row matches neither the documented interleaved form nor the legacy two-labels-first form: '\(line)'")
         }
 
         guard !segments.isEmpty else {
@@ -523,6 +547,28 @@ enum KPathImport {
             return String(line[..<cut]).trimmingCharacters(in: .whitespaces)
         }
         return line
+    }
+
+    /// First whitespace-delimited token after the earliest trailing `!`/`#`
+    /// comment marker on a line (VASP files often carry the k-point label
+    /// there), or nil when the line has no comment marker.
+    private static func trailingCommentLabel(_ line: String) -> String? {
+        var cut: String.Index? = nil
+        for ch in ["!", "#"] {
+            if let r = line.range(of: ch) {
+                if cut == nil || r.lowerBound < cut! { cut = r.lowerBound }
+            }
+        }
+        guard let cut = cut else { return nil }
+        let rest = line[cut...].drop(while: { $0 == "!" || $0 == "#" })
+        return rest.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init)
+    }
+
+    /// Delimiter comparison form: inline comments stripped, then lowercased.
+    /// Wannier90 treats characters after the earliest `!`/`#` as comments, so
+    /// "begin kpoint_path ! comment" compares equal to "begin kpoint_path".
+    private static func delimiterKey(_ line: String) -> String {
+        stripTrailingComment(line).lowercased()
     }
 
     private static func strictPositiveInt(_ s: String) -> Int? {

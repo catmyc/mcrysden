@@ -1,43 +1,32 @@
 # AGENTS.md
 
-## Workflow: Implement-Review-Fix Loop
+## Workflow: Implement -> Review-Fix Loop -> Documentation update
 
-For multi-component features, dispatch independent **Longcat subagents** in parallel, review their combined output, fix findings, and repeat until clean. Use DeepSeek subagents only if Longcat fails mid-task (token-insufficient). Do **not** write `edit`/`write`/`apply_patch` calls yourself for feature work — always use subagents.
+The primary agent plans the parallel implementations, dispatches subagents, and reviews their work combined.
 
-### Subagent Dispatch
+Subagents implement and fix the issues raised from review.
 
-Launch subagents via the `pi` CLI in non-interactive mode. Always use the Longcat model (`longcat/LongCat-2.0` with `--thinking high`). **Never dispatch GPT models** (`openai-codex/*`, `openai/*`) for subagent work unless explicitly instructed to.
+For multi-component features, dispatch independent subagents in parallel, review their combined output, fix findings, and repeat until clean.
 
-```bash
-# Single subagent
-pi --model longcat/LongCat-2.0 --thinking high --no-session \
-  "Specific, file-constrained prompt with exact APIs"
+When user specifies the usage of a specific subagent type, do not use other subagents without asking.
 
-# Parallel subagents (file-disjoint scopes only)
-pi --model longcat/LongCat-2.0 --thinking high --no-session \
-  "Task A: fix X in file1.swift" &
-pi --model longcat/LongCat-2.0 --thinking high --no-session \
-  "Task B: fix Y in file2.swift" &
-wait
-```
+When the reivew-fix loop is clean without issue, udpate documentations and commit. Make smallest version bump. User decides large version bump.
 
-Subagents get full `read`/`bash`/`edit`/`write` tools by default. Give each subagent a crisp, file-constrained prompt with the exact APIs it may depend on. For one-shot code review (no edits), omit file-modifying tools with `--exclude-tools edit,write`.
+### review-fix loop
+The primary agent reviews.
 
-1. **Dispatch** — Break the feature into file-disjoint slices (e.g., model + UI + wiring). Launch Longcat agents concurrently via `Task(tool)`, each with a crisp, file-constrained prompt and the exact APIs it may depend on.
-2. **Review** — When all agents finish, launch a **review subagent** to inspect the combined diff. It reports only actionable findings with severity, file:line, and fix.
-3. **Fix** — Dispatch the findings back to Longcat agents (group related findings into the same agent to minimize context). Apply trivial/mechanical fixes directly if faster.
-4. **Repeat** — Re-run review after each fix round until the reviewer responds exactly `no actionable findings`.
-5. **Verify** — Run `swift build`, `swift test`, and `zsh scripts/smoke.sh`. Commit with a version bump.
-6. **Record** - update documentation at the end of the completed work flow. 
+The subagents fix the issues from the review.
 
+Primary agent sends the issues back to relevant subagent sessions (if any) for fixing.
+
+## Subagent Dispatch
 
 Key rules:
+- Reuse the subagent sessions as much as possible. Send the fix tasks back to relevant subagent sessions if possible.
 - Never dispatch overlapping file scopes to parallel agents.
-- Always prioritize `longcat/LongCat-2.0` with `--thinking high` for subagent work.
-- Never dispatch GPT model series (`openai-codex/*`, `openai/*`) for subagent work unless explicitly instructed.
-- If a Longcat task returns empty, re-read the target files to see if it completed silently, then decide whether to re-dispatch or fix directly.
 - Remove diagnostic/development-only tests after features stabilize.
 - Update `CHANGELOG.md` and `docs/ROADMAP.md` after each commit that implements a roadmap item.
+
 
 ## Platform And Verification
 

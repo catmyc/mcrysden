@@ -2250,9 +2250,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.kPathProvenance = .userEdited
         scene.kPathSignature = nil
         state.importKPath(points: path.points, breaks: path.breaks)
-        // Propagate the imported sampling density; clamp to the UI range 2...200.
-        // kPathSampling has no didSet onChange, so this does not re-enter syncFromState.
-        state.kPathSampling = min(200, max(2, path.pointsPerSegment))
+        // Propagate the imported sampling density only for VASP, which carries an
+        // explicit per-segment count; QE/Wannier90/KPF synthesize 20 and must not
+        // clobber the existing preference. Clamp to the UI range 2...200; kPathSampling
+        // has no didSet onChange, so this does not re-enter syncFromState.
+        if imported.format == .vasp {
+            state.kPathSampling = min(200, max(2, path.pointsPerSegment))
+        }
     }
 
     /// Install the canonical path from the scene's symmetry analysis into the

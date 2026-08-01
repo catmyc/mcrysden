@@ -4,6 +4,20 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.30] — 2026-08-01
+
+### Fixed
+
+- Review hardening for k-path import: strict parsing of official Wannier90 `begin kpoint_path` / `end kpoint_path` blocks, with inline `!`/`#` comments allowed on the delimiters, unterminated blocks and malformed/ambiguous rows rejected, and legacy bare blocks requiring an exact header and stopping at following keywords or scalar assignments; VASP line-mode labels preserved from a bare fourth column or after the first `!`/`#` comment marker; VASP-only sampling propagation so QE/Wannier90/KPF imports preserve an existing state/user sampling preference; CLI/state precedence and undo mirroring coverage; and UTF-8 BOM normalization applied before format detection.
+
+### Tests
+
+- Added 15 review-hardening tests (strict Wannier90 malformed/unterminated/comment cases, VASP suffix labels, BOM normalization, sampling preservation, CLI precedence). Full suite now contains 1262 tests (up from 1247).
+
+### Documentation
+
+- Updated `docs/ROADMAP.md` (v1.1.30, 1262 tests), `docs/SYMMETRY_AND_KPATH.md` (import contract), `CLAUDE.md`, `AGENTS.md`, and the version test.
+
 ## [1.1.29] — 2026-08-01
 
 ### Added

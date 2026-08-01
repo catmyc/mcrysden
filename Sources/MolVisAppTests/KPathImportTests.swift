@@ -101,6 +101,18 @@ final class KPathImportTests: XCTestCase {
         }
     }
 
+    func testDetectFormatBOMNormalized() throws {
+        // A UTF-8 BOM must be stripped before content sniffing in format(of:),
+        // so the first significant line still matches the K_POINTS card.
+        let qeContent = "\u{FEFF}K_POINTS crystal\n2\n0.0 0.0 0.0 1.0\n0.5 0.0 0.0 1.0\n"
+        let qeURL = writeTemp(qeContent, "scf.in")
+        XCTAssertEqual(try KPathImport.format(of: qeURL), .qe)
+
+        let w90Content = "\u{FEFF}kpoint_path\nG 0.0 0.0 0.0 X 0.5 0.0 0.0\n"
+        let w90URL = writeTemp(w90Content, "win")
+        XCTAssertEqual(try KPathImport.format(of: w90URL), .wannier90)
+    }
+
     // MARK: - QE K_POINTS crystal happy path
 
     func testQECrystalHappyPath() throws {
@@ -288,8 +300,8 @@ final class KPathImportTests: XCTestCase {
         XCTAssertTrue(allComponentsEqual(path.points[0].frac, SIMD3(0, 0, 0)))
         XCTAssertTrue(allComponentsEqual(path.points[2].frac, SIMD3(0.5, 0.5, 0)))
         XCTAssertTrue(allComponentsEqual(path.points[3].frac, SIMD3(0.5, 0.5, 0.5)))
-        // Labels empty (stripped as comments).
-        XCTAssertTrue(path.points.allSatisfy { $0.label.isEmpty })
+        // Labels after the "!" comment delimiter are preserved as suffix labels.
+        XCTAssertEqual(path.points.map(\.label), ["G", "X", "M", "L", "G"])
     }
 
     func testVASPPointsPerSegmentClampLow() throws {
@@ -333,6 +345,25 @@ final class KPathImportTests: XCTestCase {
         let path = try KPathImport.parse(text: content, url: url)
         XCTAssertEqual(path.points.count, 2)
         XCTAssertTrue(allComponentsEqual(path.points[0].frac, SIMD3(0, 0, 0)))
+    }
+
+    func testVASPSuffixLabelsPreserved() throws {
+        // Labels carried after ! or # delimiters (as the app's own VASP export
+        // writes them) must survive import; Γ normalizes to G.
+        let content = """
+        title
+        10
+        Line-mode
+        Reciprocal
+        0.0 0.0 0.0 ! G
+        0.5 0.0 0.0 # X
+        0.5 0.5 0.0 !Γ
+        0.0 0.5 0.0 ! M
+        """
+        let url = writeTemp(content, "KPOINTS")
+        let path = try KPathImport.parse(text: content, url: url)
+        XCTAssertEqual(path.points.map(\.label), ["G", "X", "G", "M"])
+        XCTAssertEqual(path.pointsPerSegment, 10)
     }
 
     func testVASPCanonicalWikiTemplate() throws {
@@ -578,9 +609,9 @@ final class KPathImportTests: XCTestCase {
         }
     }
 
-    func testWannier90MalformedTokenCountsSkipped() {
-        // Known behavior: malformed token counts are silently skipped. A block with
-        // ONLY malformed lines → no valid segments → malformed.
+    func testWannier90MalformedRowThrows() {
+        // A row that is not a valid 8-token segment makes the whole file
+        // malformed — bad rows are never silently skipped.
         let content = """
         kpoint_path
         G  X  0.0 0.0
@@ -594,9 +625,8 @@ final class KPathImportTests: XCTestCase {
         }
     }
 
-    func testWannier90MalformedGarbageInBlock() throws {
-        // A garbage line (wrong token count) inside the block is silently skipped;
-        // valid lines before and after it still parse.
+    func testWannier90MalformedRowAfterValidRow() {
+        // A garbage row after a valid row must still error, not be skipped.
         let content = """
         begin kpoint_path
         G 0.0 0.0 0.0 X 0.5 0.0 0.0
@@ -605,9 +635,169 @@ final class KPathImportTests: XCTestCase {
         end kpoint_path
         """
         let url = writeTemp(content, "win")
+        XCTAssertThrowsError(try KPathImport.parse(text: content, url: url)) { err in
+            guard case KPathImportError.malformed = err else {
+                return XCTFail("expected malformed, got \(err)")
+            }
+        }
+    }
+
+    func testWannier90UnterminatedBeginMalformed() {
+        // An explicit begin kpoint_path block must be closed by end kpoint_path.
+        let content = """
+        begin kpoint_path
+        G 0.0 0.0 0.0 X 0.5 0.0 0.0
+        X 0.5 0.0 0.0 M 0.5 0.5 0.0
+        """
+        let url = writeTemp(content, "win")
+        XCTAssertThrowsError(try KPathImport.parse(text: content, url: url)) { err in
+            guard case KPathImportError.malformed = err else {
+                return XCTFail("expected malformed, got \(err)")
+            }
+        }
+    }
+
+    func testWannier90CommentedBeginEnd() throws {
+        // Inline comments on the begin/end delimiters must be ignored when
+        // recognizing the explicit block (Wannier90 comments after !/#).
+        let content = """
+        begin kpoint_path ! explicit block
+        G 0.0 0.0 0.0 X 0.5 0.0 0.0
+        X 0.5 0.0 0.0 M 0.5 0.5 0.0 # inline row comment
+        end kpoint_path # closing delimiter
+        """
+        let url = writeTemp(content, "win")
         let path = try KPathImport.parse(text: content, url: url)
         XCTAssertEqual(path.points.count, 3)   // G,X,M coalesced
         XCTAssertTrue(path.breaks.isEmpty)
+        XCTAssertEqual(path.points.map(\.label), ["G", "X", "M"])
+    }
+
+    func testWannier90CommentedBeginWithoutEndFails() {
+        // A commented begin kpoint_path still opens an explicit block that
+        // must be terminated; a missing end is malformed.
+        let content = """
+        begin kpoint_path ! comment
+        G 0.0 0.0 0.0 X 0.5 0.0 0.0
+        """
+        let url = writeTemp(content, "win")
+        XCTAssertThrowsError(try KPathImport.parse(text: content, url: url)) { err in
+            guard case KPathImportError.malformed = err else {
+                return XCTFail("expected malformed, got \(err)")
+            }
+        }
+    }
+
+    func testWannier90LegacyFallbackRequiresExactHeader() {
+        // The bare-block fallback matches only an exact "kpoint_path" line,
+        // not any line merely containing the phrase.
+        let content = """
+        some header mentioning kpoint_path
+        G  X  0.0 0.0 0.0 0.5 0.0 0.0
+        """
+        let url = writeTemp(content, "win")
+        XCTAssertThrowsError(try KPathImport.parse(text: content, url: url)) { err in
+            guard case KPathImportError.malformed = err else {
+                return XCTFail("expected malformed, got \(err)")
+            }
+        }
+    }
+
+    func testWannier90MixedLayoutsPerRow() throws {
+        // The layout is decided per row by strict attempts: a documented
+        // interleaved row followed by a legacy two-labels-first row, sharing X.
+        let content = """
+        begin kpoint_path
+        G 0.0 0.0 0.0 X 0.5 0.0 0.0
+        X M 0.5 0.0 0.0 0.5 0.5 0.0
+        end kpoint_path
+        """
+        let url = writeTemp(content, "win")
+        let path = try KPathImport.parse(text: content, url: url)
+        XCTAssertEqual(path.points.count, 3)   // G,X,M coalesced
+        XCTAssertTrue(path.breaks.isEmpty)
+        XCTAssertEqual(path.points.map(\.label), ["G", "X", "M"])
+    }
+
+    func testWannier90NumericLabelRejected() {
+        // A numeric token in a label slot makes the row ambiguous for both
+        // layouts; it must be rejected, not silently skipped.
+        let content = """
+        begin kpoint_path
+        G 0.0 0.0 0.0 1 0.5 0.0 0.0
+        end kpoint_path
+        """
+        let url = writeTemp(content, "win")
+        XCTAssertThrowsError(try KPathImport.parse(text: content, url: url)) { err in
+            guard case KPathImportError.malformed = err else {
+                return XCTFail("expected malformed, got \(err)")
+            }
+        }
+    }
+
+    func testWannier90LabelWithDigitDocumented() throws {
+        // A nonnumeric label like "G2" in the documented label slots parses
+        // fine; layout detection must not treat it as a legacy row.
+        let content = """
+        begin kpoint_path
+        G2 0.0 0.0 0.0 X1 0.5 0.0 0.0
+        end kpoint_path
+        """
+        let url = writeTemp(content, "win")
+        let path = try KPathImport.parse(text: content, url: url)
+        XCTAssertEqual(path.points.count, 2)
+        XCTAssertEqual(path.points[0].label, "G2")
+        XCTAssertEqual(path.points[1].label, "X1")
+    }
+
+    func testWannier90BareBlockStopsAtNextKeyword() throws {
+        // A bare legacy block ends at a short all-nonnumeric keyword line
+        // (e.g. the next Wannier90 block header); its rows still parse.
+        let content = """
+        kpoint_path
+        G  X  0.0 0.0 0.0 0.5 0.0 0.0
+        begin projections
+        site 0.0 0.0 0.0
+        """
+        let url = writeTemp(content, "win")
+        let path = try KPathImport.parse(text: content, url: url)
+        XCTAssertEqual(path.points.count, 2)
+        XCTAssertEqual(path.points.map(\.label), ["G", "X"])
+    }
+
+    func testWannier90InlineCommentDocumentedRows() throws {
+        // Wannier90 treats text after ! or # as an inline comment; a commented
+        // 8-token documented row must still parse, and the comment must not
+        // leak into the token count.
+        let content = """
+        begin kpoint_path
+        G 0.0 0.0 0.0 X 0.5 0.0 0.0 ! this is a comment
+        X 0.5 0.0 0.0 M 0.5 0.5 0.0 # another comment
+        end kpoint_path
+        """
+        let url = writeTemp(content, "win")
+        let path = try KPathImport.parse(text: content, url: url)
+        XCTAssertEqual(path.points.count, 3)   // G,X,M coalesced
+        XCTAssertTrue(path.breaks.isEmpty)
+        XCTAssertEqual(path.points.map(\.label), ["G", "X", "M"])
+    }
+
+    func testWannier90BareBlockStopsAtScalarAssignment() throws {
+        // A normal scalar keyword assignment like "bands_plot = true" (or
+        // "bands_plot : true") terminates a bare legacy block; rows before it
+        // parse, unrelated lines after it are not part of the path.
+        let content = """
+        kpoint_path
+        G  X  0.0 0.0 0.0 0.5 0.0 0.0
+        X  M  0.5 0.0 0.0 0.5 0.5 0.0
+        bands_plot = true
+        some unrelated line here
+        """
+        let url = writeTemp(content, "win")
+        let path = try KPathImport.parse(text: content, url: url)
+        XCTAssertEqual(path.points.count, 3)   // G,X,M coalesced
+        XCTAssertTrue(path.breaks.isEmpty)
+        XCTAssertEqual(path.points.map(\.label), ["G", "X", "M"])
     }
 
     // MARK: - KPF happy path

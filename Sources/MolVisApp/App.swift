@@ -264,9 +264,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     /// then — if the state restored a saved frame — re-parse THAT frame and
     /// re-apply the structural transforms. Without this, the saved currentFrame
     /// would be metadata-only and the saved frame's geometry would never show.
-    private static func loadScene(from url: URL, format: ParseFormat?, cliFrame: Int,
-                                  stateURL: URL?, kPathImportURL: URL? = nil,
-                                  kPathSampling: inout Int) throws -> (scene: Scene, camera: Camera?) {
+    static func loadScene(from url: URL, format: ParseFormat?, cliFrame: Int,
+                          stateURL: URL?, kPathImportURL: URL? = nil,
+                          kPathSampling: inout Int) throws -> (scene: Scene, camera: Camera?) {
         if let stateURL, sameFile(url, stateURL) {
             throw CLIError.invalid("input and state alias the same file: \(url.path)")
         }
@@ -394,7 +394,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         scene.kPathBreaks = imported.path.breaks
         scene.kPathProvenance = .userEdited
         scene.kPathSignature = nil
-        kPathSampling = min(200, max(2, imported.path.pointsPerSegment))
+        // Only VASP carries an explicit sampling density; QE/Wannier90/KPF
+        // synthesize the default of 20, so importing them must not clobber a
+        // sampling preference restored from state or set by the user.
+        if imported.format == .vasp {
+            kPathSampling = min(200, max(2, imported.path.pointsPerSegment))
+        }
     }
 
     /// Resolve which file to open at launch. An explicit CLI input always wins;
@@ -1019,7 +1024,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.29"
+    static let appVersion = "1.1.30"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

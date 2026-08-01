@@ -138,9 +138,13 @@ final class KPathImportIntegrationTests: XCTestCase {
         let c = MainWindowController(scene: scene, showWindow: false)
         let s = c.state
 
-        // Capture the seeded route.
-        let original = s.kPathPoints
-        XCTAssertFalse(original.isEmpty, "crystal must seed a default route")
+        // Capture the seeded route (full identity: geometry, breaks, provenance,
+        // and signature).
+        let originalPoints = s.kPathPoints
+        let originalBreaks = s.kPathBreaks
+        let originalProvenance = s.kPathProvenance
+        let originalSignature = s.kPathSignature
+        XCTAssertFalse(originalPoints.isEmpty, "crystal must seed a default route")
 
         let imported = [KPoint(SIMD3(0, 0, 0), "G"), KPoint(SIMD3(0.5, 0.5, 0.5), "L")]
         let kpf = try KPathExport.export(KPath(points: imported, pointsPerSegment: 20), as: .kpf)
@@ -150,9 +154,17 @@ final class KPathImportIntegrationTests: XCTestCase {
         try c.importKPath(from: url)
         XCTAssertEqual(s.kPathPoints.count, imported.count)
 
-        // Undo restores the pre-import route in the sidebar state.
+        // Undo restores the pre-import route in the sidebar state...
         s.undoLast()
-        XCTAssertEqual(s.kPathPoints, original, "undo must restore the pre-import route")
+        XCTAssertEqual(s.kPathPoints, originalPoints, "undo must restore the pre-import route")
+        XCTAssertEqual(s.kPathBreaks, originalBreaks)
+        XCTAssertEqual(s.kPathProvenance, originalProvenance)
+        XCTAssertEqual(s.kPathSignature, originalSignature)
+        // ...and the scene must mirror the restored identity through syncFromState.
+        XCTAssertEqual(c.scene.kPathPoints, originalPoints, "scene must mirror the restored route")
+        XCTAssertEqual(c.scene.kPathBreaks, originalBreaks)
+        XCTAssertEqual(c.scene.kPathProvenance, originalProvenance)
+        XCTAssertEqual(c.scene.kPathSignature, originalSignature)
     }
 
     // MARK: - App.applyKPathImport
@@ -270,6 +282,80 @@ final class KPathImportIntegrationTests: XCTestCase {
         XCTAssertEqual(c.state.kPathSampling, 40, "N=40 passes through unchanged")
     }
 
+    func testControllerImportKPFPreservesSampling() throws {
+        let scene = crystalScene()
+        let c = MainWindowController(scene: scene, showWindow: false)
+        c.state.kPathSampling = 137
+
+        let imported = [KPoint(SIMD3(0, 0, 0), "G"), KPoint(SIMD3(0.5, 0.5, 0.5), "L")]
+        let kpf = try KPathExport.export(KPath(points: imported, pointsPerSegment: 20), as: .kpf)
+        let url = writeTemp(kpf, "route.kpf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try c.importKPath(from: url)
+        XCTAssertEqual(c.state.kPathSampling, 137, "KPF import must preserve the existing sampling")
+    }
+
+    func testApplyKPathImportKPFPreservesSampling() throws {
+        var scene = crystalScene()
+        let imported = [KPoint(SIMD3(0, 0, 0), "G"), KPoint(SIMD3(0.5, 0.5, 0.5), "L")]
+        let kpf = try KPathExport.export(KPath(points: imported, pointsPerSegment: 20), as: .kpf)
+        let url = writeTemp(kpf, "route.kpf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        var kPathSampling = 137
+        try App.applyKPathImport(to: &scene, from: url, kPathSampling: &kPathSampling)
+        XCTAssertEqual(kPathSampling, 137, "KPF import must preserve the existing sampling")
+    }
+
+    // MARK: - CLI state-vs-import precedence
+
+    func testStateRouteAndSamplingLoseToCLIImport() throws {
+        // A companion state file restores a user route (G-L | X, three points with
+        // a break at index 1) and sampling 100; the --kpath import (VASP N=40,
+        // connected G-X) must win on BOTH the route identity and the sampling.
+        // The saved route differs from the imported one in endpoint AND break
+        // topology, so the "import wins" assertion is observable, not vacuous.
+        // Exercises App.loadScene's production ordering (state first, import
+        // last) instead of a test-side mirror.
+        let base = crystalScene()
+        var saved = base
+        saved.kPathPoints = [KPoint(SIMD3(0, 0, 0), "G"),
+                             KPoint(SIMD3(0.5, 0.5, 0.5), "L"),
+                             KPoint(SIMD3(0.5, 0, 0), "X")]
+        saved.kPathBreaks = [1]
+        saved.kPathProvenance = .userEdited
+        saved.kPathSignature = nil
+        let stateURL = tempURL("state.mvis-state")
+        defer { try? FileManager.default.removeItem(at: stateURL) }
+        try StateStore.save(saved, camera: nil, sourceURL: fixture("si110.xsf"),
+                            to: stateURL, kPathSampling: 100)
+
+        let content = """
+        title
+        40
+        Line-mode
+        Reciprocal
+        0.0 0.0 0.0 ! G
+        0.5 0.0 0.0 ! X
+        """
+        let kpathURL = writeTemp(content, "KPOINTS")
+        defer { try? FileManager.default.removeItem(at: kpathURL) }
+
+        var kPathSampling = 20
+        let (scene, _) = try App.loadScene(from: fixture("si110.xsf"), format: nil, cliFrame: -1,
+                                           stateURL: stateURL, kPathImportURL: kpathURL,
+                                           kPathSampling: &kPathSampling)
+
+        XCTAssertEqual(scene.kPathPoints.count, 2, "final route must be the imported G-X, not the saved 3-point route")
+        XCTAssertTrue(allComponentsEqual(scene.kPathPoints[0].frac, SIMD3(0, 0, 0), 1e-3))
+        XCTAssertTrue(allComponentsEqual(scene.kPathPoints[1].frac, SIMD3(0.5, 0, 0), 1e-3))
+        XCTAssertTrue(scene.kPathBreaks.isEmpty, "imported connected route must have no breaks; the saved break must not survive")
+        XCTAssertEqual(scene.kPathProvenance, .userEdited, "imported route must win over the state route")
+        XCTAssertNil(scene.kPathSignature)
+        XCTAssertEqual(kPathSampling, 40, "VASP import sampling must beat the state-restored sampling")
+    }
+
     // MARK: - CLI parseArguments --kpath
 
     func testCLIKPathImportURLSet() throws {
@@ -357,6 +443,11 @@ final class KPathImportIntegrationTests: XCTestCase {
         XCTAssertTrue(allComponentsEqual(parsed.points[0].frac, SIMD3(0, 0, 0), 1e-3))
         XCTAssertTrue(allComponentsEqual(parsed.points[1].frac, SIMD3(0.5, 0, 0), 1e-3))
         XCTAssertTrue(allComponentsEqual(parsed.points[2].frac, SIMD3(0.5, 0.5, 0), 1e-3))
+        // Labels survive the round trip: the writer emits "x y z ! label" suffix
+        // labels, which the importer must recover on re-parse.
+        XCTAssertEqual(parsed.points[0].label, "G")
+        XCTAssertEqual(parsed.points[1].label, "X")
+        XCTAssertEqual(parsed.points[2].label, "M")
     }
 
     func testVASPExportDisconnectedPreservesBreaks() throws {
