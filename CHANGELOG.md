@@ -4,27 +4,13 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
-## [1.1.33] — 2026-08-02
-
 ### Tests
 
-- Reduced the tracked suite from 642 to 98 tests by removing 544 lower-priority cases across 27 test files.
-- Retained focused coverage for scene and format loading, Metal rendering and export, snapshots, state persistence, HPKOT's 29-variant oracle, periodic measurements, and animation-frame lifecycle behavior.
+- Reduced the tracked suite from 1,286 to 98 focused tests, retaining scene and format loading, Metal rendering and export, snapshots, state persistence, HPKOT's 29-variant oracle, periodic measurements, and animation-frame lifecycle coverage.
 
 ### Documentation
 
-- Updated test-suite guidance, roadmap verification counts, and the app version.
-
-## [1.1.32] — 2026-08-02
-
-### Tests
-
-- Pruned 644 redundant, overlapping, and historical regression cases from 25 test files, reducing the tracked suite from 1,286 to 642 tests while retaining coverage across parsers, rendering and snapshots, state/export, symmetry and reciprocal space, k-path interoperability, coordination, atom-table integration, electronic analysis, and application workflows.
-- Removed a test-only safe-array-subscript dependency from `ElectronicAnalysisIntegrationTests` so the retained suite remains self-contained.
-
-### Documentation
-
-- Updated the roadmap, symmetry/k-path verification guide, contributor guidance, and app version for the reduced suite.
+- Updated test-suite guidance and roadmap verification counts without changing the application version.
 
 ## [1.1.31] — 2026-08-01
 

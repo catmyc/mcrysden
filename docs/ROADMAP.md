@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (v1.1.33 focused test suite, 98 tests)**.
+Last updated: **2026-08-02 (focused test suite, 98 tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 98 focused tests as of v1.1.33: scene and format loading, renderer/export, snapshot (FNV-1a pixel hash vs. committed goldens), state persistence, HPKOT's 29-variant oracle, periodic measurements, and animation-frame lifecycle coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 98 focused tests: scene and format loading, renderer/export, snapshot (FNV-1a pixel hash vs. committed goldens), state persistence, HPKOT's 29-variant oracle, periodic measurements, and animation-frame lifecycle coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
