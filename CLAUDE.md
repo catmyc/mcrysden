@@ -36,9 +36,9 @@ XCTest, under `Sources/MolVisAppTests` (not the empty top-level `Tests/`). Acces
 
 - **Unit tests** — Parser, Scene, StateStore, Renderer, Model, ElementTable, and many more.
 - **Snapshot tests** — `SnapshotTests` extends `Snapshotter`, renders a fixed scene+camera to a 64×64 texture, compares an FNV-1a pixel hash against committed goldens in `Sources/MolVisAppTests/Fixtures/golden/`. Regenerate goldens with env var `MCRYSDEN_REGENERATE=1`.
-- **Integration / regression tests** — coordination analysis, reciprocal-space UX, k-path editing, band/DOS parsing, export, state, atom table, periodic geometry, and pathological-input hardening.
+- **Integration / regression tests** — scene and format loading, renderer/export behavior, state persistence, HPKOT oracle validation, periodic measurements, and animation-frame lifecycle behavior.
 
-The tracked suite contains **642 tests** as of v1.1.32. Remove diagnostic/development-only tests after features stabilize; keep only tests that exercise unique production paths.
+The tracked suite contains **98 tests** as of v1.1.33. Keep the suite at no more than 100 focused tests; replace lower-value cases when adding higher-value coverage.
 
 Fixtures live in `Sources/MolVisAppTests/Fixtures/` and are loaded at runtime via `#file`-relative paths. CI runs on `macos-14` (Apple Silicon) via `.github/workflows/ci.yml`.
 

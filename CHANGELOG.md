@@ -4,6 +4,17 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.33] — 2026-08-02
+
+### Tests
+
+- Reduced the tracked suite from 642 to 98 tests by removing 544 lower-priority cases across 27 test files.
+- Retained focused coverage for scene and format loading, Metal rendering and export, snapshots, state persistence, HPKOT's 29-variant oracle, periodic measurements, and animation-frame lifecycle behavior.
+
+### Documentation
+
+- Updated test-suite guidance, roadmap verification counts, and the app version.
+
 ## [1.1.32] — 2026-08-02
 
 ### Tests

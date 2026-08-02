@@ -95,4 +95,4 @@ swift test
 zsh scripts/smoke.sh
 ```
 
-The tracked suite contains 642 tests as of v1.1.32. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.
+The tracked suite contains 98 tests as of v1.1.33. The smoke script performs a release build and a headless export to `/tmp/mcrysden_smoke.png`.
