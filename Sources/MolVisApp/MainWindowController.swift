@@ -2097,6 +2097,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // gates the draw on forceSet + showForces, so writing is unconditional.
         scene.showForces = state.showForces
         scene.forceScale = state.forceScale
+        // MSAA sample count. Validated values only (1,2,4,8); the sidebar picker
+        // can produce nothing else. Written unconditionally; the renderer gates
+        // use on the value being > 1.
+        scene.msaaSampleCount = state.msaaSampleCount
         // Color-plane overlay: written unconditionally; the renderer/visibility
         // gates the draw on `scene.grid2D != nil`.
         scene.showColorPlane = state.showColorPlane

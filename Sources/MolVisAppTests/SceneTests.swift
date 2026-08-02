@@ -313,5 +313,21 @@ final class SceneTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: fhiOutURL) }
         try Data(contentsOf: fixture("fhi_gaas_surface.fhi")).write(to: fhiOutURL)
         XCTAssertEqual(ParseFormat.from(url: fhiOutURL), .fhi)
+
+        // --msaa CLI parsing: accepts 1/2/4/8 (1 = explicit Off override); rejects the rest.
+        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "1"]).msaaSampleCount, 1)
+        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "2"]).msaaSampleCount, 2)
+        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "4"]).msaaSampleCount, 4)
+        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "8"]).msaaSampleCount, 8)
+        XCTAssertNil(try App.parseArguments(["file.xsf"]).msaaSampleCount)
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "3"])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("1, 2, 4, or 8"), "unexpected error: \(error)")
+        }
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa"]))
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "2", "--msaa", "4"]))
+        // Duplicate detection must fire even when the first value is 1 (explicit Off):
+        // a separate seen flag must track the repeat regardless of the stored value.
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "1", "--msaa", "4"]))
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "1", "--msaa", "1"]))
     }
 }

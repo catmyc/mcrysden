@@ -4,6 +4,7 @@ import AppKit
 enum ExportOptionsError: Error, LocalizedError {
     case invalidWidth(Int)
     case invalidHeight(Int)
+    case invalidMSAA(Int)
     case tooManyPixels(Int)
 
     var errorDescription: String? {
@@ -12,6 +13,8 @@ enum ExportOptionsError: Error, LocalizedError {
             return "Width \(w) is out of range (\(ExportOptions.minDimension)–\(ExportOptions.maxDimension))"
         case .invalidHeight(let h):
             return "Height \(h) is out of range (\(ExportOptions.minDimension)–\(ExportOptions.maxDimension))"
+        case .invalidMSAA(let v):
+            return "MSAA \(v)x is not supported; choose Off, 2x, 4x, or 8x"
         case .tooManyPixels(let count):
             return "Export dimensions exceed the maximum pixel count (\(count.formatted()))"
         }
@@ -23,10 +26,22 @@ final class ExportOptions: ObservableObject {
     static let maxDimension = 16_384
     static let defaultDimension = 800
 
+    /// Valid MSAA export-override values for the picker, in display order.
+    /// `nil` = Use Document (no override; export uses Scene.msaaSampleCount, which
+    /// may itself be 1/2/4/8); 1 = force Off; 2/4/8 = override for export only.
+    /// `nil` is NOT "Off": a scene already at 4x stays at 4x unless an explicit
+    /// value is picked. Derived from all cases of `MSAASampleCount`.
+    static let msaaOptions: [Int?] = [nil, 1, 2, 4, 8]
+    static let validMSAAValues: Set<Int> = [1, 2, 4, 8]
+
     @Published var width: Int = ExportOptions.defaultDimension
     @Published var height: Int = ExportOptions.defaultDimension
     @Published var backgroundColor: NSColor = NSColor(deviceRed: 0.063, green: 0.063, blue: 0.078, alpha: 1.0)
     @Published var isTransparent: Bool = false
+    /// MSAA sample-count override for export. `nil` = Use Document (no override;
+    /// export uses Scene.msaaSampleCount, which may differ from Off); 1 = force Off;
+    /// 2/4/8 = override applied at export time WITHOUT changing the document scene.
+    @Published var msaaSampleCount: Int? = nil
 
     convenience init(backgroundHex: String, transparent: Bool) {
         self.init()
@@ -44,6 +59,13 @@ final class ExportOptions: ObservableObject {
         // Total pixel count must not exceed the exporter ceiling.
         guard pixelCount <= 16_000_000 else {
             throw ExportOptionsError.tooManyPixels(pixelCount)
+        }
+        // Only validate when an explicit override is set; nil = Use Document (no
+        // override), which is always valid and needs no check.
+        if let msaa = msaaSampleCount {
+            guard Self.validMSAAValues.contains(msaa) else {
+                throw ExportOptionsError.invalidMSAA(msaa)
+            }
         }
     }
 

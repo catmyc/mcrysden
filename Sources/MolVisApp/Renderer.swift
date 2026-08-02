@@ -31,12 +31,33 @@ enum RenderError: Error { case makeCommandQueue, makeFunction, makeBuffer, makeP
 final class Renderer: NSObject {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
-    private let atomPipeline: MTLRenderPipelineState
-    private let linePipeline: MTLRenderPipelineState
-    private let flat2DPipeline: MTLRenderPipelineState   // unlit screen-space quads (2D atoms)
-    private let polyPipeline: MTLRenderPipelineState     // flat-shaded polyhedron triangles
-    private let gradPipeline: MTLRenderPipelineState     // fullscreen gradient quad
+    private var atomPipeline: MTLRenderPipelineState
+    private var linePipeline: MTLRenderPipelineState
+    private var flat2DPipeline: MTLRenderPipelineState   // unlit screen-space quads (2D atoms)
+    private var polyPipeline: MTLRenderPipelineState     // flat-shaded polyhedron triangles
+    private var gradPipeline: MTLRenderPipelineState     // fullscreen gradient quad
     private let library: MTLLibrary
+
+    /// MSAA sample count for offscreen export rendering. nil → the scene's
+    /// configured `msaaSampleCount` is used (so live rendering honors the
+    /// Appearance-sidebar picker). Set explicitly for an export override.
+    var msaaSampleCount: Int? = nil
+
+    /// Internal seam returning the effective MSAA sample count for the next
+    /// encode: the explicit runtime/export override (`msaaSampleCount`) when
+    /// set, otherwise the scene's configured count, resolved to the highest
+    /// device-supported value <= the request among 8/4/2/1. Exposed so tests can
+    /// prove the override/fallback/cap-1 contracts without rendering.
+    var effectiveMSAACount: Int {
+        resolveMSAACount(msaaSampleCount ?? scene.msaaSampleCount)
+    }
+    private var msaaPipelineCache: [Int: (atom: MTLRenderPipelineState, line: MTLRenderPipelineState,
+                                          flat2D: MTLRenderPipelineState, poly: MTLRenderPipelineState,
+                                          grad: MTLRenderPipelineState)] = [:]
+    private var msaaColorTexture: MTLTexture?
+    private var msaaColorTextureKey: (w: Int, h: Int, samples: Int) = (0, 0, 0)
+    private var msaaDepthTexture: MTLTexture?
+    private var msaaDepthTextureKey: (w: Int, h: Int, samples: Int) = (0, 0, 0)
 
     private let overlayDepthState: MTLDepthStencilState?
     private let depthStencilState: MTLDepthStencilState?
@@ -542,6 +563,19 @@ final class Renderer: NSObject {
             return false
         }
         guard let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
+
+        // Resolve the effective MSAA count: the explicit runtime/export override
+        // (`msaaSampleCount`) when set, otherwise the scene's configured count,
+        // resolved to the highest device-supported value <= the request among
+        // 8/4/2/1. A count of 1 preserves the exact original single-sample path
+        // below; >1 routes through the MSAA resolve path.
+        let effectiveCount = effectiveMSAACount
+        if effectiveCount > 1 {
+            return encodeMSAA(to: commandBuffer, target: target, viewport: viewport,
+                              cam: cam, frameBuffer: frameBuffer, w: w, h: h,
+                              sampleCount: effectiveCount)
+        }
+
         guard ensureDepthTexture(width: w, height: h) else { return false }
 
         // Clear color: explicit override (for exports) takes priority, else derive
@@ -578,6 +612,18 @@ final class Renderer: NSObject {
         guard let depthStencilState else { enc.endEncoding(); return false }
         enc.setDepthStencilState(depthStencilState)
 
+        guard drawScene(enc: enc, frameBuffer: frameBuffer, w: w, h: h, cam: cam) else { enc.endEncoding(); return false }
+
+        enc.endEncoding()
+        return true
+    }
+
+    /// Shared draw sequence for both the single-sample and MSAA paths. Kept in
+    /// one place so the two paths produce identical scene content — only the
+    /// render target, resolve, and pipeline sample counts differ.
+    @discardableResult
+    private func drawScene(enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?,
+                           w: Int, h: Int, cam: Camera) -> Bool {
         // Vertical-gradient backdrop. Suppressed during exports with an explicit
         // clearColorOverride so transparent/custom backgrounds render as configured.
         if scene.backgroundType == .gradient_top && clearColorOverride == nil {
@@ -589,36 +635,185 @@ final class Renderer: NSObject {
         // frame/axes/BZ branches below draw regardless.
         if scene.showStructure {
             if scene.displayMode.is2D {
-                guard drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h) else { enc.endEncoding(); return false }
-                guard drawBonds2D(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+                guard drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h) else { return false }
+                guard drawBonds2D(enc, frameBuffer: frameBuffer) else { return false }
             } else if scene.displayMode == .polyhedral {
-                guard drawPolyhedral(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+                guard drawPolyhedral(enc, frameBuffer: frameBuffer) else { return false }
             } else {
-                guard drawAtoms(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
-                guard drawBonds(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+                guard drawAtoms(enc, frameBuffer: frameBuffer) else { return false }
+                guard drawBonds(enc, frameBuffer: frameBuffer) else { return false }
             }
             if !scene.displayMode.is2D {
-                guard drawForceArrows(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+                guard drawForceArrows(enc, frameBuffer: frameBuffer) else { return false }
             }
         }
 
-        guard drawCell(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+        guard drawCell(enc, frameBuffer: frameBuffer) else { return false }
 
         if scene.showBrillouinZone {
-            guard drawBrillouinZone(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+            guard drawBrillouinZone(enc, frameBuffer: frameBuffer) else { return false }
         }
 
-        guard drawIsosurface(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
-        guard drawFermiSurface(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+        guard drawIsosurface(enc, frameBuffer: frameBuffer) else { return false }
+        guard drawFermiSurface(enc, frameBuffer: frameBuffer) else { return false }
 
         if scene.showAxes {
-            guard drawOrientationGizmo(enc, camera: cam, w: w, h: h) else { enc.endEncoding(); return false }
+            guard drawOrientationGizmo(enc, camera: cam, w: w, h: h) else { return false }
         }
 
-        guard drawMeasurements(enc, frameBuffer: frameBuffer) else { enc.endEncoding(); return false }
+        guard drawMeasurements(enc, frameBuffer: frameBuffer) else { return false }
+        return true
+    }
+
+    /// MSAA render path: render into a private multisample color texture and
+    /// resolve into the caller's single-sample target. The depth texture and
+    /// all pipelines match the effective sample count.
+    @discardableResult
+    private func encodeMSAA(to commandBuffer: MTLCommandBuffer, target: MTLTexture,
+                            viewport: MTLViewport, cam: Camera, frameBuffer: MTLBuffer,
+                            w: Int, h: Int, sampleCount: Int) -> Bool {
+        // Lazily build (and cache) MSAA pipelines for this sample count. Failure
+        // here is an allocation failure — surface it as a failed encode.
+        guard makeMSAAPipelines(sampleCount: sampleCount) else { return false }
+        let pipelines = msaaPipelineCache[sampleCount]!
+
+        // Cache-bounded multisample color + depth attachments keyed by dimensions
+        // and sample count. Allocation failure surfaces as a failed encode.
+        guard let msaaColor = ensureMSAAColorTexture(width: w, height: h, sampleCount: sampleCount) else { return false }
+        guard let msaaDepth = ensureMSAADepthTexture(width: w, height: h, sampleCount: sampleCount) else { return false }
+
+        // Swap the active pipelines to the MSAA variants for the duration of this
+        // encode, then restore the originals. The shared drawScene() references
+        // the ivars directly, so it transparently uses the MSAA pipelines.
+        let saved = (atomPipeline, linePipeline, flat2DPipeline, polyPipeline, gradPipeline)
+        defer { atomPipeline = saved.0; linePipeline = saved.1; flat2DPipeline = saved.2; polyPipeline = saved.3; gradPipeline = saved.4 }
+        atomPipeline = pipelines.atom
+        linePipeline = pipelines.line
+        flat2DPipeline = pipelines.flat2D
+        polyPipeline = pipelines.poly
+        gradPipeline = pipelines.grad
+
+        let clearColor: MTLClearColor
+        if let override = clearColorOverride {
+            clearColor = override
+        } else {
+            clearColor = scene.backgroundType == .gradient_top
+                ? Renderer.MTLClearColorFromString(scene.backgroundBottom)
+                : Renderer.MTLClearColorFromString(scene.background)
+        }
+
+        let desc = MTLRenderPassDescriptor()
+        desc.colorAttachments[0].texture = msaaColor
+        desc.colorAttachments[0].resolveTexture = target
+        desc.colorAttachments[0].loadAction = .clear
+        desc.colorAttachments[0].storeAction = .multisampleResolve
+        desc.colorAttachments[0].clearColor = clearColor
+        desc.depthAttachment.texture = msaaDepth
+        desc.depthAttachment.loadAction = .clear
+        desc.depthAttachment.storeAction = .dontCare
+        desc.depthAttachment.clearDepth = 1.0
+
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return false }
+        enc.setViewport(viewport)
+        enc.setCullMode(.none)
+        guard let depthStencilState else { enc.endEncoding(); return false }
+        enc.setDepthStencilState(depthStencilState)
+
+        guard drawScene(enc: enc, frameBuffer: frameBuffer, w: w, h: h, cam: cam) else { enc.endEncoding(); return false }
 
         enc.endEncoding()
         return true
+    }
+
+    /// Resolve a requested MSAA count to the highest device-supported value
+    /// <= the request among 8/4/2/1. A request <= 1 short-circuits to 1.
+    private func resolveMSAACount(_ requested: Int) -> Int {
+        guard requested > 1 else { return 1 }
+        for count in [8, 4, 2] {
+            if count <= requested && device.supportsTextureSampleCount(count) {
+                return count
+            }
+        }
+        return 1
+    }
+
+    /// Lazily build and cache MSAA pipelines for the given sample count. Returns
+    /// false if any pipeline cannot be created (surfaces as an encode failure).
+    private func makeMSAAPipelines(sampleCount: Int) -> Bool {
+        if msaaPipelineCache[sampleCount] != nil { return true }
+        guard
+            let v = library.makeFunction(name: "v_main"),
+            let f = library.makeFunction(name: "f_main"),
+            let lv = library.makeFunction(name: "lv_main"),
+            let lf = library.makeFunction(name: "lf_main"),
+            let f2v = library.makeFunction(name: "flat2D_v"),
+            let f2f = library.makeFunction(name: "flat2D_f"),
+            let pv = library.makeFunction(name: "poly_v"),
+            let pf = library.makeFunction(name: "poly_f"),
+            let gv = library.makeFunction(name: "grad_v"),
+            let gf = library.makeFunction(name: "grad_f")
+        else { return false }
+
+        func pipeline(vertex: MTLFunction, fragment: MTLFunction, vd: MTLVertexDescriptor) -> MTLRenderPipelineState? {
+            let pd = MTLRenderPipelineDescriptor()
+            pd.vertexFunction = vertex
+            pd.fragmentFunction = fragment
+            pd.vertexDescriptor = vd
+            pd.colorAttachments[0].pixelFormat = .rgba8Unorm
+            pd.rasterSampleCount = sampleCount
+            pd.depthAttachmentPixelFormat = depthPixelFormat
+            return try? device.makeRenderPipelineState(descriptor: pd)
+        }
+
+        guard let atom = pipeline(vertex: v, fragment: f, vd: Renderer.makeAtomVertexDescriptor()),
+              let line = pipeline(vertex: lv, fragment: lf, vd: Renderer.makeLineVertexDescriptor()),
+              let flat2D = pipeline(vertex: f2v, fragment: f2f, vd: Renderer.makeFlat2DVertexDescriptor()),
+              let poly = pipeline(vertex: pv, fragment: pf, vd: Renderer.makePolyVertexDescriptor()),
+              let grad = pipeline(vertex: gv, fragment: gf, vd: Renderer.makeGradVertexDescriptor())
+        else { return false }
+
+        msaaPipelineCache[sampleCount] = (atom: atom, line: line, flat2D: flat2D, poly: poly, grad: grad)
+        return true
+    }
+
+    /// Cache-bounded multisample color attachment (private, type2DMultisample).
+    /// Recreated only when the dimensions or sample count change.
+    private func ensureMSAAColorTexture(width: Int, height: Int, sampleCount: Int) -> MTLTexture? {
+        if msaaColorTextureKey == (width, height, sampleCount), let tex = msaaColorTexture {
+            return tex
+        }
+        let desc = MTLTextureDescriptor()
+        desc.pixelFormat = .rgba8Unorm
+        desc.width = width
+        desc.height = height
+        desc.usage = .renderTarget
+        desc.storageMode = .private
+        desc.textureType = .type2DMultisample
+        desc.sampleCount = sampleCount
+        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+        msaaColorTexture = tex
+        msaaColorTextureKey = (width, height, sampleCount)
+        return tex
+    }
+
+    /// Cache-bounded multisample depth attachment (private, type2DMultisample)
+    /// matching the effective sample count.
+    private func ensureMSAADepthTexture(width: Int, height: Int, sampleCount: Int) -> MTLTexture? {
+        if msaaDepthTextureKey == (width, height, sampleCount), let tex = msaaDepthTexture {
+            return tex
+        }
+        let desc = MTLTextureDescriptor()
+        desc.pixelFormat = depthPixelFormat
+        desc.width = width
+        desc.height = height
+        desc.usage = .renderTarget
+        desc.storageMode = .private
+        desc.textureType = .type2DMultisample
+        desc.sampleCount = sampleCount
+        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+        msaaDepthTexture = tex
+        msaaDepthTextureKey = (width, height, sampleCount)
+        return tex
     }
 
     /// Draw the vertical-gradient backdrop quad (called only when backgroundType

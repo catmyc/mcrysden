@@ -158,6 +158,14 @@ struct SideBar: View {
                 Slider(value: $state.lighting.shininess, in: 1...128) { Text("Shininess: \(Int(state.lighting.shininess))") }
                 Slider(value: $state.lighting.azimuth, in: degRange) { Text("Light Azimuth: \(Int(state.lighting.azimuth))°") }
                 Slider(value: $state.lighting.elevation, in: -90...90) { Text("Light Elevation: \(Int(state.lighting.elevation))°") }
+                // MSAA anti-aliasing. The picker sets the render-target sample
+                // count directly (Off=1, 2x=2, 4x=4, 8x=8 samples).
+                Picker("MSAA", selection: $state.msaaSampleCount) {
+                    ForEach(MSAASampleCount.allCases, id: \.rawValue) {
+                        Text($0.label).tag($0.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
             }
             // --- Isosurface (volumetric scalar field) ---------------------------
             // Shown only when the loaded file carried a DATAGRID/.cube-style 3D

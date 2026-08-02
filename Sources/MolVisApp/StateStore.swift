@@ -43,6 +43,7 @@ enum StateStore {
          payload["showForces"] = scene.showForces
         payload["showColorPlane"] = scene.showColorPlane
         payload["forceScale"] = scene.forceScale
+        payload["msaaSampleCount"] = scene.msaaSampleCount
         payload["atomScale"] = scene.atomScale
         payload["bondRadius"] = scene.bondRadius
         payload["lighting"] = [
@@ -244,6 +245,15 @@ enum StateStore {
         // a negative/zero/giant scale into Metal (reversed or infinite arrow verts).
         if let v = try finiteFloat(obj["forceScale"], field: "forceScale") {
             candidate.forceScale = min(200, max(5, v))
+        }
+        // MSAA sample count. Backward-compatible: a missing key keeps the
+        // Scene default (1 = off). A present value must be a mathematically
+        // integral numeric token in {1,2,4,8}; strings, booleans, nonintegral
+        // numerics (like 1.5), and unsupported integers all reject the whole
+        // load transactionally (candidate is discarded, caller's
+        // scene/camera/bookmarks preserved).
+        if let raw = obj["msaaSampleCount"] {
+            candidate.msaaSampleCount = try strictMSAASampleCount(raw, field: "msaaSampleCount", url: url)
         }
         if let v = try finiteFloat(obj["atomScale"], field: "atomScale") { candidate.atomScale = min(1.0, max(0.05, v)) }
         if let v = try finiteFloat(obj["bondRadius"], field: "bondRadius") {
@@ -577,6 +587,19 @@ enum StateStore {
             throw ParseError.parse(path: url.path, line: 0, reason: "\(field) must be an integer")
         }
         return Int(decimal)
+    }
+
+    /// MSAA sample count: accept any mathematically integral numeric token
+    /// in {1,2,4,8}. Reject strings, booleans, nonintegral numerics (like
+    /// 1.5), and any integer outside the set — all transactionally via
+    /// ParseError (candidate is discarded, caller state preserved).
+    private static func strictMSAASampleCount(_ value: Any, field: String, url: URL) throws -> Int {
+        let intVal = try strictInteger(value, field: field, url: url)
+        guard [1, 2, 4, 8].contains(intVal) else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "\(field) must be 1, 2, 4, or 8; got \(intVal)")
+        }
+        return intVal
     }
 
     private static func finiteJSONFloat(_ value: Any, field: String, url: URL) throws -> Float {

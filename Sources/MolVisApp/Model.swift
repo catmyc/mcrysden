@@ -106,6 +106,21 @@ struct Lighting: Codable {
     var elevation: Float = 45.0
 }
 
+/// UI-side MSAA multiplier for the Appearance sidebar picker. The raw value
+/// IS the Metal sample count; `off` is 1 (no MSAA). `Scene.msaaSampleCount`
+/// carries the raw Int per the integration contract.
+enum MSAASampleCount: Int, CaseIterable {
+    case off = 1, x2 = 2, x4 = 4, x8 = 8
+    var label: String {
+        switch self {
+        case .off: return "Off"
+        case .x2: return "2x"
+        case .x4: return "4x"
+        case .x8: return "8x"
+        }
+    }
+}
+
 struct ColorScheme: Codable { var mode: String = "atomic" }
 
 struct Scene: Codable {
@@ -212,6 +227,10 @@ struct Scene: Codable {
     /// Multiplier converting a force (eV/Å) to an arrow length (Å) so typical
     /// forces (0.01–1 eV/Å) span a few Å and read clearly. Sidebar-adjustable.
     var forceScale: Float = 50.0
+    /// MSAA sample count for the Metal render target. Valid values are 1, 2, 4, 8
+    /// (default 1 = off). Driven by the Appearance sidebar picker; persisted as
+    /// the flat JSON key `msaaSampleCount` in the state file.
+    var msaaSampleCount: Int = 1
     /// The user-edited reciprocal-space k-path: an ordered list of special
     /// k-points (fractional, conventional reciprocal basis) connecting BZ
     /// landmarks. Empty for non-crystal scenes; for crystals it defaults to the

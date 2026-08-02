@@ -212,6 +212,9 @@ final class SideBarState: ObservableObject {
     @Published var showForces: Bool = true { didSet { onChange?() } }
     /// Å-per-(eV/Å) arrow-length multiplier. Synced to scene.forceScale.
     @Published var forceScale: Float = 50.0 { didSet { onChange?() } }
+    /// MSAA sample count for the Metal render target. Bound to the Appearance
+    /// sidebar picker (Off/2x/4x/8x); the raw value IS the sample count.
+    @Published var msaaSampleCount: Int = 1 { didSet { onChange?() } }
     /// Human-readable force/energy/stress readout for the Forces sidebar section,
     /// set by the controller from scene.forceSet on every render. Not @Published:
     /// it changes only when the scene reloads, so a plain assignment suffices.
@@ -341,6 +344,7 @@ final class SideBarState: ObservableObject {
         hasForceSet = (scene.forceSet != nil)
         showForces = scene.showForces
         forceScale = scene.forceScale
+        msaaSampleCount = scene.msaaSampleCount
         onChange = saved
     }
 

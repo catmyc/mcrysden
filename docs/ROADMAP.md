@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (post-v1.1.33: standard crystallographic camera views, camera bookmarks, and adaptive scale indicators released; 32 focused tests; v1.1.32 context: QE tpiba_b export and cubic CRYSCAL expansion)**.
+Last updated: **2026-08-02 (v1.1.34: configurable Metal multisample anti-aliasing; 32 focused tests; v1.1.33 context: standard crystallographic camera views, camera bookmarks, and adaptive scale indicators)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -87,7 +87,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Copy-current-view to clipboard and standard Edit menu (v1.1.21).
 - [x] Collapsible remembered sidebar sections (v1.1.21).
 - [x] File watching and multiple structure windows (v1.1.21).
-- [~] Configurable image dimensions/background/transparency (v1.1.21); explicit anti-aliasing controls remain pending.
+- [x] Configurable image dimensions/background/transparency (v1.1.21) plus persisted live and per-export Off/2x/4x/8x Metal multisample anti-aliasing with CLI override and device-capability fallback (v1.1.34).
 - [x] Command palette (v1.1.21).
 
 ### Reciprocal space and k-paths
@@ -124,8 +124,8 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [~] Structure and isosurfaces already share the Metal render pass; compositing the sibling color-plane view with structure/isosurfaces remains pending.
 - [x] Standard crystallographic `[100]`/`[110]`/`[111]` camera views.
 - [x] Three document-scoped named camera bookmark slots with save, recall, and clear actions; exact validated presentation/projection restoration; disabled recalls for empty slots; and optional `.mvis-state` persistence.
-- [x] Adaptive scale indicators (post-v1.1.32 / Unreleased): persisted opt-in Show Scale with an adaptive 1-2-5 Å/nm bar, orthographic-span and perspective camera-center-plane conventions, orbit/zoom/viewport-stable placement, shared live/raster/raster-backed-vector label compositing, and suppression for graph/color-plane views or invalid geometry.
-- [ ] Multisample anti-aliasing, configurable line widths, transparency, depth cueing, ambient occlusion/soft shadows, and publication presets.
+- [x] Adaptive scale indicators (v1.1.33): persisted opt-in Show Scale with an adaptive 1-2-5 Å/nm bar, orthographic-span and perspective camera-center-plane conventions, orbit/zoom/viewport-stable placement, shared live/raster/raster-backed-vector label compositing, and suppression for graph/color-plane views or invalid geometry.
+- [~] Multisample anti-aliasing is implemented (v1.1.34): persisted live Off/2x/4x/8x control, per-export Use Document/Off/2x/4x/8x override, `--msaa`, shared live/raster/raster-backed-vector resolve path, and safe device fallback. Configurable line widths, scene-object transparency, depth cueing, ambient occlusion/soft shadows, and publication presets remain pending.
 - [ ] Higher-resolution labels and true vector export for cells, BZs, k-paths, and graphs; image backgrounds, printing, and stereo/anaglyph rendering.
 
 ### Animation, conversion, and extensibility

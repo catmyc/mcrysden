@@ -22,6 +22,7 @@ final class StateStoreTests: XCTestCase {
         scene.background = "#112233"
         scene.backgroundBottom = "#445566"
         scene.showScaleIndicator = true
+        scene.msaaSampleCount = 2
         scene.currentFrame = 7
 
         let fields = [
@@ -104,6 +105,7 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(restored.background, "#112233")
         XCTAssertEqual(restored.backgroundBottom, "#445566")
         XCTAssertTrue(restored.showScaleIndicator)
+        XCTAssertEqual(restored.msaaSampleCount, 2)
         XCTAssertEqual(restored.currentFrame, 7)
         XCTAssertEqual(restored.currentOrbital, 1)
         XCTAssertEqual(restored.scalarField?.values.first, 5)
@@ -202,6 +204,7 @@ final class StateStoreTests: XCTestCase {
         XCTAssertTrue(bookmarks.allSatisfy { $0 == nil })
         XCTAssertTrue(scene.showColorPlane, "missing color-plane key keeps the historical default")
         XCTAssertFalse(scene.showScaleIndicator, "missing scale-indicator key keeps its default")
+        XCTAssertEqual(scene.msaaSampleCount, 1, "missing msaaSampleCount key keeps the off default")
         XCTAssertEqual(sampling, 20, "missing k-path sampling uses the KPath default")
         XCTAssertEqual(scene.displayMode, .ballStick)
         XCTAssertEqual(scene.atomScale, 0.35, accuracy: 0.0001)
@@ -312,5 +315,74 @@ final class StateStoreTests: XCTestCase {
             }
             try assertUnchanged()
         }
+
+        // Unsupported msaaSampleCount (not in {1,2,4,8}) must reject with a
+        // useful ParseError and roll back scene/camera/bookmarks.
+        let malformedMSAA: [String: Any] = [
+            "version": 1,
+            "displayMode": "ballStick",
+            "atomScale": 0.9,
+            "msaaSampleCount": 3,
+            "camera": replacementCameraJSON,
+            "cameraBookmarks": [NSNull(), NSNull(), NSNull()],
+        ]
+        try JSONSerialization.data(withJSONObject: malformedMSAA, options: []).write(to: tmp)
+        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
+                                                cameraBookmarks: &bookmarks, from: tmp),
+                             "unsupported msaaSampleCount must reject") { error in
+            guard case let ParseError.parse(path, _, reason) = error else {
+                return XCTFail("expected a malformed-msaa parse error")
+            }
+            XCTAssertTrue(reason.contains("msaaSampleCount"), "reason should mention msaaSampleCount")
+        }
+        try assertUnchanged()
+
+        // Non-numeric msaaSampleCount must also reject.
+        let nonNumericMSAA: [String: Any] = [
+            "version": 1,
+            "displayMode": "ballStick",
+            "msaaSampleCount": "eight",
+        ]
+        try JSONSerialization.data(withJSONObject: nonNumericMSAA, options: []).write(to: tmp)
+        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
+                                                cameraBookmarks: &bookmarks, from: tmp),
+                             "non-numeric msaaSampleCount must reject") { error in
+            guard case ParseError.parse = error else {
+                return XCTFail("expected a non-numeric msaa parse error")
+            }
+        }
+        try assertUnchanged()
+
+        // Boolean msaaSampleCount must also reject.
+        let booleanMSAA: [String: Any] = [
+            "version": 1,
+            "displayMode": "ballStick",
+            "msaaSampleCount": true,
+        ]
+        try JSONSerialization.data(withJSONObject: booleanMSAA, options: []).write(to: tmp)
+        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
+                                                cameraBookmarks: &bookmarks, from: tmp),
+                             "boolean msaaSampleCount must reject") { error in
+            guard case ParseError.parse = error else {
+                return XCTFail("expected a boolean msaa parse error")
+            }
+        }
+        try assertUnchanged()
+
+        // Nonintegral msaaSampleCount must also reject.
+        let nonintegralMSAA: [String: Any] = [
+            "version": 1,
+            "displayMode": "ballStick",
+            "msaaSampleCount": 1.5,
+        ]
+        try JSONSerialization.data(withJSONObject: nonintegralMSAA, options: []).write(to: tmp)
+        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
+                                                cameraBookmarks: &bookmarks, from: tmp),
+                             "nonintegral msaaSampleCount must reject") { error in
+            guard case ParseError.parse = error else {
+                return XCTFail("expected a nonintegral msaa parse error")
+            }
+        }
+        try assertUnchanged()
     }
 }

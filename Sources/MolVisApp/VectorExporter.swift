@@ -89,6 +89,7 @@ enum RasterExporter {
         renderer.coordinationNumbers = options.coordinationNumbers
         renderer.showCoordinationColors = options.showCoordinationColors
         renderer.selectedKPathNode = options.selectedKPathNode
+        renderer.msaaSampleCount = options.msaaSampleCount ?? scene.msaaSampleCount
         if let bg = background {
             renderer.clearColorOverride = MTLClearColorMake(bg.r, bg.g, bg.b, bg.a)
         }

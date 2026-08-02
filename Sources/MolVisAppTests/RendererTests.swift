@@ -203,9 +203,50 @@ final class RendererTests: XCTestCase {
     }
 
     func testHeadlessPngExport() throws {
+        // Effective-count seam: scene value drives the live count when no
+        // override is set; override takes precedence; count 1 stays 1; a
+        // request above the device cap falls back to a supported count <= it.
+        //
+        // The resolved count is device-dependent (the device may not support 4
+        // or 8), so we compute the expected value from the device rather than
+        // hardcoding a specific sample count.
+        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
+        let renderer = try Renderer(device: device)
+        var scene = Scene()
+
+        func highestSupported(_ req: Int) -> Int {
+            [8, 4, 2].first { $0 <= req && device.supportsTextureSampleCount($0) } ?? 1
+        }
+
+        scene.msaaSampleCount = 4
+        renderer.scene = scene
+        renderer.msaaSampleCount = nil
+        XCTAssertEqual(renderer.effectiveMSAACount, highestSupported(4),
+                       "scene value must drive effective live count to highest supported <= request")
+
+        renderer.msaaSampleCount = 4
+        scene.msaaSampleCount = 2
+        renderer.scene = scene
+        XCTAssertEqual(renderer.effectiveMSAACount, highestSupported(4),
+                       "explicit override must take precedence over scene value")
+
+        scene.msaaSampleCount = 1
+        renderer.scene = scene
+        renderer.msaaSampleCount = nil
+        XCTAssertEqual(renderer.effectiveMSAACount, 1,
+                       "count 1 must remain 1")
+
+        renderer.msaaSampleCount = 8
+        let capped = renderer.effectiveMSAACount
+        XCTAssertLessThanOrEqual(capped, 8, "effective count must not exceed request")
+        XCTAssertTrue([1, 2, 4, 8].contains(capped),
+                      "effective count must be a supported sample count")
+        XCTAssertEqual(capped, highestSupported(8),
+                       "effective count must be highest supported <= request")
+
         let fixtureDirectory = URL(fileURLWithPath: #file).deletingLastPathComponent()
         let fixture = fixtureDirectory.appendingPathComponent("Fixtures/si110.xsf")
-        var scene = Scene(loaded: try Parser.load(fixture))
+        scene = Scene(loaded: try Parser.load(fixture))
         scene.background = "#000000"
         scene.showAxes = false
         scene.showCellFrame = false
@@ -217,6 +258,17 @@ final class RendererTests: XCTestCase {
         XCTAssertGreaterThan(try output.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
         XCTAssertGreaterThan(foregroundPixels(image), 0,
                              "exported PNG must contain foreground pixels")
+
+        // MSAA export: an explicit sample count override must render a valid
+        // frame with foreground pixels through the multisample-resolve path.
+        let msaaOutput = FileManager.default.temporaryDirectory
+            .appendingPathComponent("renderer-msaa-\(UUID().uuidString).png")
+        let msaaImage = try PngExporter.export(scene: scene, camera: nil, to: msaaOutput,
+                                               size: CGSize(width: 400, height: 400),
+                                               options: RenderExportOptions(msaaSampleCount: 4))
+        XCTAssertGreaterThan(try msaaOutput.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
+        XCTAssertGreaterThan(foregroundPixels(msaaImage), 0,
+                             "MSAA-exported PNG must contain foreground pixels")
     }
 
     // The three vector writers share the raster-backed render path, but each has

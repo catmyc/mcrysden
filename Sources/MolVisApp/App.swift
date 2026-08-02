@@ -58,6 +58,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var kPathImportURL: URL?
         var format: ParseFormat?
         var frame = -1
+        /// MSAA sample-count override. nil = flag omitted (use scene/default);
+        /// 1/2/4/8 = explicit override applied in GUI and export.
+        var msaaSampleCount: Int? = nil
+        /// Whether --msaa was seen at all. Used to reject duplicate --msaa
+        /// flags regardless of the first value.
+        var msaaSeen = false
         var help = false
     }
 
@@ -172,6 +178,18 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 }
                 index += 1
                 options.frame = frame
+            } else if !optionsEnded && argument == "--msaa" {
+                // A separate seen flag tracks duplicates: --msaa is now always stored
+                // (1 is an explicit Off override), so msaaSeen still guards repeats.
+                guard !options.msaaSeen, index + 1 < args.count,
+                      let value = Int(args[index + 1]), [1, 2, 4, 8].contains(value) else {
+                    throw CLIError.invalid("--msaa requires a value of 1, 2, 4, or 8")
+                }
+                options.msaaSeen = true
+                index += 1
+                // 1 is an explicit Off override: store it so it overrides a scene
+                // default (e.g. 4x from a loaded state). nil means the flag was omitted.
+                options.msaaSampleCount = value
             } else if !optionsEnded, let info = formatTable.first(where: { $0.flag == argument }) {
                 guard forced == nil else { throw CLIError.invalid("multiple force-format flags are not allowed") }
                 forced = info.format
@@ -479,7 +497,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     kPathSampling: &kPathSampling
                 )
                 let exportSize = CGSize(width: 800, height: 800)
-                try Self.exportScene(scene, camera: camera, to: outURL, size: exportSize)
+                // Carry the explicit --msaa override into the export's render options so
+                // it applies to the exported image without mutating the document scene.
+                // nil (flag omitted) leaves the scene default; any value (including 1)
+                // forces that sample count.
+                let renderOptions = RenderExportOptions(msaaSampleCount: options.msaaSampleCount)
+                try Self.exportScene(scene, camera: camera, to: outURL, size: exportSize,
+                                     options: renderOptions)
             } catch {
                 print("[mcrysden] export failed: \(error)")
                 exit(EXIT_FAILURE)
@@ -495,7 +519,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 // loadScene honors a saved animation frame by re-parsing it (the
                 // saved frame becomes geometry, not just metadata).
                 var kPathSampling = 20
-                let (scene, camera, cameraBookmarks) = try Self.loadScene(
+                var (scene, camera, cameraBookmarks) = try Self.loadScene(
                     from: inURL,
                     format: options.format,
                     cliFrame: options.frame,
@@ -503,6 +527,14 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     kPathImportURL: options.kPathImportURL,
                     kPathSampling: &kPathSampling
                 )
+                // Apply a --msaa override to the document scene in GUI mode. The
+                // sidebar picker (Appearance > MSAA) writes the same field, so a CLI
+                // override simply sets the initial value the user would otherwise pick
+                // by hand. All explicit values (including 1 = Off) override a loaded
+                // state's setting; nil (flag omitted) leaves the scene default intact.
+                if let msaa = options.msaaSampleCount {
+                    scene.msaaSampleCount = msaa
+                }
                 let wc = MainWindowController(scene: Scene())
                 windowRegistry.add(wc)
                 wc.loadFile(
@@ -882,6 +914,16 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
         let isTransparent = exportOptions?.isTransparent ?? false
         let graphBackground = Self.color(from: effectiveBackground)
+        // Derive effective render options so the export panel's MSAA picker actually
+        // reaches the renderer. An explicit exportOptions.msaaSampleCount override
+        // (including 1 = force Off) wins; when nil (Use Document) we preserve the
+        // incoming options.msaaSampleCount so the scene's own value — or a CLI
+        // --msaa override already baked into options — still applies. Without this,
+        // the export panel's MSAA selection is silently dropped on the render path.
+        var effectiveOptions = options
+        if let msaa = exportOptions?.msaaSampleCount {
+            effectiveOptions.msaaSampleCount = msaa
+        }
         if let dos = scene.densityOfStates {
             return try exportGraph(DOSGrapherView(frame: NSRect(origin: .zero, size: size)), configure: {
                 $0.densityOfStates = dos
@@ -912,17 +954,17 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
         switch url.pathExtension.lowercased() {
         case "pdf", "svg":
-            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: options,
+            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: effectiveOptions,
                                               background: effectiveBackground)
         case "eps", "ps":
             // EPS/PS have no alpha support: reject transparency and flatten.
             if exportOptions?.isTransparent == true {
                 throw CLIError.invalid("transparent export is not supported for \(url.pathExtension.uppercased()); use PNG or PDF instead")
             }
-            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: options,
+            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: effectiveOptions,
                                               background: effectiveBackground)
         case "png":
-            return try PngExporter.export(scene: scene, camera: camera, to: url, size: size, options: options,
+            return try PngExporter.export(scene: scene, camera: camera, to: url, size: size, options: effectiveOptions,
                                            background: Self.color(from: effectiveBackground),
                                            transparent: exportOptions?.isTransparent ?? false)
         default:
@@ -1053,7 +1095,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.33"
+    static let appVersion = "1.1.34"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -1077,6 +1119,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         For animated files (AXSF ANIMSTEPS, QE .pwo ionic steps, Orca opt cycles),
         open a specific frame with --frame N (0-based frame index).
         Export format is chosen by extension: .png (raster) or .pdf/.svg/.eps/.ps (raster-backed containers).
+        Control multisampled antialiasing with --msaa 1|2|4|8 (1 = explicit Off override; omit to use scene default).
         """)
     }
 }

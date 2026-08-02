@@ -11,6 +11,7 @@ struct RenderExportOptions {
     var coordinationNumbers: [Int] = []
     var showCoordinationColors: Bool = false
     var selectedKPathNode: Int? = nil
+    var msaaSampleCount: Int? = nil
 }
 
 enum PngExporter {
@@ -39,6 +40,7 @@ enum PngExporter {
         renderer.coordinationNumbers = options.coordinationNumbers
         renderer.showCoordinationColors = options.showCoordinationColors
         renderer.selectedKPathNode = options.selectedKPathNode
+        renderer.msaaSampleCount = options.msaaSampleCount ?? scene.msaaSampleCount
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm
         desc.width = w; desc.height = h

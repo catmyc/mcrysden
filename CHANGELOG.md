@@ -2,6 +2,12 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.34] — 2026-08-02
+
+### Added
+
+- Configurable Metal multisample anti-aliasing with persisted live Off/2x/4x/8x controls, per-export Use Document/Off/2x/4x/8x overrides, and `--msaa 1|2|4|8`. Live, PNG, and raster-backed PDF/SVG/EPS/PS rendering share the same multisample-resolve path, with safe fallback to the highest supported device sample count.
+
 ## [1.1.33] — 2026-08-02
 
 ### Added
