@@ -4,24 +4,40 @@ import XCTest
 
 final class AnimationControllerTests: XCTestCase {
     @MainActor
-    func testQERelaxFrameChangeDoesNotReenterReload() throws {
-        let url = URL(fileURLWithPath: #file)
+    func testReloadFrameIsNonReentrantAndMutatesOnce() throws {
+        let relaxURL = URL(fileURLWithPath: #file)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Assets/si_relax.out")
-        let initial = Scene(loaded: try Parser.load(url, as: nil, frameIndex: 0))
-        let controller = MainWindowController(scene: Scene(), showWindow: false)
-        controller.loadFile(initial, from: url, format: nil, frameIndex: 0)
+        let relaxInitial = Scene(loaded: try Parser.load(relaxURL, as: nil, frameIndex: 0))
+        let relaxController = MainWindowController(scene: Scene(), showWindow: false)
+        relaxController.loadFile(relaxInitial, from: relaxURL, format: nil, frameIndex: 0)
 
-        XCTAssertEqual(controller.state.frameCount, 2)
-        controller.state.frameIndex = 1
-        XCTAssertEqual(controller.scene.currentFrame, 1)
-        XCTAssertEqual(controller.state.frameIndex, 1)
+        // QE relaxation frames must scrub without re-entering reloadFrame.
+        XCTAssertEqual(relaxController.state.frameCount, 2)
+        relaxController.state.frameIndex = 1
+        XCTAssertEqual(relaxController.scene.currentFrame, 1)
+        XCTAssertEqual(relaxController.state.frameIndex, 1)
+        relaxController.state.frameIndex = 0
+        XCTAssertEqual(relaxController.scene.currentFrame, 0)
+        XCTAssertEqual(relaxController.state.frameIndex, 0)
 
-        controller.state.frameIndex = 0
-        XCTAssertEqual(controller.scene.currentFrame, 0)
-        XCTAssertEqual(controller.state.frameIndex, 0)
+        // The held reload transaction must also perform only one scene mutation
+        // for an AXSF field frame and return cleanly to the no-field frame.
+        let gridURL = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_grid.axsf")
+        let gridController = MainWindowController(scene: Scene(), showWindow: false)
+        gridController.loadFile(try Scene(loaded: Parser.load(gridURL, as: nil, frameIndex: 0)),
+                                from: gridURL, format: nil, frameIndex: 0)
+        XCTAssertEqual(gridController.state.frameCount, 2)
+        gridController.state.frameIndex = 1
+        XCTAssertEqual(gridController.scene.currentFrame, 1)
+        XCTAssertEqual(gridController.state.frameIndex, 1)
+        gridController.state.frameIndex = 0
+        XCTAssertEqual(gridController.scene.currentFrame, 0)
+        XCTAssertEqual(gridController.state.frameIndex, 0)
     }
 
     // MARK: - Per-frame metadata gates + orbital/iso selection must track the
@@ -31,11 +47,11 @@ final class AnimationControllerTests: XCTestCase {
     // the prior frame's values.
 
     @MainActor
-    func testReloadFrameSyncsPerFrameMetadataAcrossFieldPresenceChange() throws {
+    func testReloadFrameSynchronizesMetadataAndFieldPresence() throws {
         let url = URL(fileURLWithPath: #file)
             .deletingLastPathComponent()
             .appendingPathComponent("Fixtures/si.anim_grid.axsf")
-        // Fixture: grid lives on frame 1 (range [0, 1.4]); frame 0 has no grid.
+        // Fixture: scalar grid lives on frame 1 (range [0, 1.4]); frame 0 has none.
         XCTAssertNil(try Parser.load(url, as: nil, frameIndex: 0).scalarField)
         XCTAssertNotNil(try Parser.load(url, as: nil, frameIndex: 1).scalarField)
 
@@ -44,16 +60,12 @@ final class AnimationControllerTests: XCTestCase {
                             from: url, format: nil, frameIndex: 0)
         XCTAssertEqual(controller.state.frameCount, 2)
         XCTAssertEqual(controller.state.frameIndex, 0)
-        // loadFile initial sync establishes baseline off-grid state. Force the
-        // hasScalarField gate ON to simulate a stale value left over from a prior
-        // grid frame (the bug-mode scenario) — the reload to the grid frame must
-        // then refresh metadata correctly.
+        // Simulate a stale gate from a prior grid frame; reload must refresh all
+        // per-frame metadata when stepping onto and back off the field frame.
         controller.state.hasScalarField = true
         XCTAssertFalse((try Parser.load(url, as: nil, frameIndex: 0).scalarField != nil),
                        "baseline frame parses with no grid")
 
-        // Step onto the grid frame: triggers reloadFrame; fix must set the gate ON
-        // and refresh isoRange to the loaded field's actual bounds.
         controller.state.frameIndex = 1
         XCTAssertEqual(controller.scene.currentFrame, 1)
         XCTAssertNotNil(controller.scene.scalarField)
@@ -62,17 +74,40 @@ final class AnimationControllerTests: XCTestCase {
         XCTAssertEqual(controller.state.isoRange.upperBound, 1.4, accuracy: 1e-4)
         XCTAssertEqual(controller.state.isoLevel, controller.scene.isoLevel, accuracy: 1e-4)
 
-        // Step back to the no-grid frame: gate must CLEAR (bug-mode: it stayed ON)
-        // and the (now-inert) isoRange slider must reset to neutral so its
-        // previous frame's bounds don't leak into a future grid frame.
         controller.state.frameIndex = 0
         XCTAssertEqual(controller.scene.currentFrame, 0)
         XCTAssertNil(controller.scene.scalarField)
         XCTAssertFalse(controller.state.hasScalarField, "stepped off grid -> gate OFF")
-        // The no-field frame must clear stale slider bounds back to the neutral
-        // default so they don't leak into a future grid frame.
         XCTAssertEqual(controller.state.isoRange.lowerBound, 0.0, accuracy: 1e-4)
         XCTAssertEqual(controller.state.isoRange.upperBound, 1.0, accuracy: 1e-4)
+
+        // The same field-presence transaction must refresh the 2D color plane,
+        // its labels/contours/spans, and sibling visibility.
+        let planeURL = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/si.anim_grid2d.axsf")
+        XCTAssertNil(try Parser.load(planeURL, as: nil, frameIndex: 0).grid2D)
+        XCTAssertNotNil(try Parser.load(planeURL, as: nil, frameIndex: 1).grid2D)
+
+        let planeController = MainWindowController(scene: Scene(), showWindow: false)
+        planeController.loadFile(try Scene(loaded: Parser.load(planeURL, as: nil, frameIndex: 0)),
+                                 from: planeURL, format: nil, frameIndex: 0)
+        XCTAssertEqual(planeController.state.frameCount, 2)
+
+        planeController.state.frameIndex = 1
+        XCTAssertEqual(planeController.scene.currentFrame, 1)
+        XCTAssertNotNil(planeController.colorPlane.grid, "grid data must be pushed onto the plane")
+        XCTAssertEqual(planeController.colorPlane.zLabel, "density")
+        XCTAssertFalse(planeController.colorPlane.contourLevels.isEmpty, "contours must be refreshed")
+        XCTAssertEqual(planeController.colorPlane.physicalSpan.count, 2)
+        XCTAssertFalse(planeController.colorPlane.isHidden, "plane must be visible on a grid frame")
+        XCTAssertTrue(planeController.canvas.isHidden, "canvas must be hidden while the plane shows")
+
+        planeController.state.frameIndex = 0
+        XCTAssertEqual(planeController.scene.currentFrame, 0)
+        XCTAssertNil(planeController.colorPlane.grid, "grid data must be cleared off the plane")
+        XCTAssertTrue(planeController.colorPlane.isHidden, "plane must hide on a no-grid frame")
+        XCTAssertFalse(planeController.canvas.isHidden, "canvas must be restored when the plane hides")
     }
 
     // MARK: - Multi-orbital selection and iso clamp must agree on the selected orbital
@@ -148,68 +183,4 @@ final class AnimationControllerTests: XCTestCase {
                        "single-field clamp bounds the iso level")
     }
 
-    // MARK: - No unintended scene mutation during the reloadFrame-held transaction.
-    // Reloading must not re-trigger a second Frame parse; frameCount stays "2" and
-    // state.frameIndex lands exactly where the user scrubbed. The earlier SIGSEGV
-    // test (patch crash) lives across the full-suite run that previously stack-
-    // overflowed; here we assert the final, steady state.
-
-    @MainActor
-    func testReloadFrameDoesNotMutateSceneMoreThanOnce() throws {
-        let url = URL(fileURLWithPath: #file)
-            .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/si.anim_grid.axsf")
-        let controller = MainWindowController(scene: Scene(), showWindow: false)
-        controller.loadFile(try Scene(loaded: Parser.load(url, as: nil, frameIndex: 0)),
-                            from: url, format: nil, frameIndex: 0)
-
-        // The reload transaction must land exactly; no parse storm, no
-        // stack overflow. Final steady state: display is on frame 1 (grid present).
-        controller.state.frameIndex = 1
-        XCTAssertEqual(controller.scene.currentFrame, 1)
-        XCTAssertEqual(controller.state.frameIndex, 1)
-        // And stepping back cleanly returns to the no-field frame (steady).
-        controller.state.frameIndex = 0
-        XCTAssertEqual(controller.scene.currentFrame, 0)
-        XCTAssertEqual(controller.state.frameIndex, 0)
-    }
-
-    // MARK: - Color-plane overlay must refresh its data/labels/contours and layer
-    // visibility when a reloaded frame changes grid2D presence. Before the fix,
-    // reloadFrame never touched ColorPlaneView nor called updateContentVisibility,
-    // so scrubbing onto a grid frame left a stale (or hidden) plane.
-
-    @MainActor
-    func testReloadFrameRefreshesColorPlaneOnGridPresenceChange() throws {
-        let url = URL(fileURLWithPath: #file)
-            .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/si.anim_grid2d.axsf")
-        // Fixture: frame 0 has no 2D grid; frame 1 carries a 3x3 DATAGRID_2D
-        // "density" with range [0, 4] and two span vectors.
-        XCTAssertNil(try Parser.load(url, as: nil, frameIndex: 0).grid2D)
-        XCTAssertNotNil(try Parser.load(url, as: nil, frameIndex: 1).grid2D)
-
-        let controller = MainWindowController(scene: Scene(), showWindow: false)
-        controller.loadFile(try Scene(loaded: Parser.load(url, as: nil, frameIndex: 0)),
-                            from: url, format: nil, frameIndex: 0)
-        XCTAssertEqual(controller.state.frameCount, 2)
-
-        // Step onto the grid frame. The color plane must receive the new grid's
-        // data, label, contours and span, and become visible (canvas hidden).
-        controller.state.frameIndex = 1
-        XCTAssertEqual(controller.scene.currentFrame, 1)
-        XCTAssertNotNil(controller.colorPlane.grid, "grid data must be pushed onto the plane")
-        XCTAssertEqual(controller.colorPlane.zLabel, "density")
-        XCTAssertFalse(controller.colorPlane.contourLevels.isEmpty, "contours must be refreshed")
-        XCTAssertEqual(controller.colorPlane.physicalSpan.count, 2)
-        XCTAssertFalse(controller.colorPlane.isHidden, "plane must be visible on a grid frame")
-        XCTAssertTrue(controller.canvas.isHidden, "canvas must be hidden while the plane shows")
-
-        // Step back to the no-grid frame. The plane must clear its data and hide.
-        controller.state.frameIndex = 0
-        XCTAssertEqual(controller.scene.currentFrame, 0)
-        XCTAssertNil(controller.colorPlane.grid, "grid data must be cleared off the plane")
-        XCTAssertTrue(controller.colorPlane.isHidden, "plane must hide on a no-grid frame")
-        XCTAssertFalse(controller.canvas.isHidden, "canvas must be restored when the plane hides")
-    }
 }

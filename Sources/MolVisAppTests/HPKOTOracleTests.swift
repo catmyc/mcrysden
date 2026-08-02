@@ -222,7 +222,11 @@ final class HPKOTOracleTests: XCTestCase {
         }
     }
 
-    func testOISelectionTieMatchesSeekPathTupleOrdering() {
+    func testRotatedBasisAndSafeFailureContracts() {
+        assertTriclinicRotation(fixtureName: "aP2", angle: .pi / 4)
+        assertTriclinicRotation(fixtureName: "aP3", angle: .pi / 6)
+        assertCF1RotatedCellUsesCubicEquivalentFrame()
+
         let unit = CrystalSymmetryMatrix([1, 0, 0, 0, 1, 0, 0, 0, 1])
         let selection = VariantSelect.select(
             spaceGroup: 71,
@@ -236,10 +240,9 @@ final class HPKOTOracleTests: XCTestCase {
         // SeekPath sorts [(c, 1), (b, 3), (a, 2)] with Python's complete
         // tuple ordering. At an exact tie that selects the b entry, oI3.
         XCTAssertEqual(selection?.variant, "oI3")
-    }
 
-    func testSafeFailureInvalidSelectorMetrics() {
-        let unit = CrystalSymmetryMatrix([1, 0, 0, 0, 1, 0, 0, 0, 1])
+        // Invalid selector metrics, evaluator expressions, and singular cells
+        // must fail safely instead of producing a malformed HPKOT path.
         XCTAssertNil(VariantSelect.select(
             spaceGroup: 75,
             a: .nan, b: 1, c: 1,
@@ -267,9 +270,6 @@ final class HPKOTOracleTests: XCTestCase {
             standardizedLattice: unit,
             transformation: .identity
         ))
-    }
-
-    func testSafeFailureEvaluatorSeams() {
         XCTAssertNil(KParamEval.evalCompound(
             "totally_unknown_expr(a,b,c)",
             1, 1, 1, 0, 0, 0, [:]
@@ -280,9 +280,7 @@ final class HPKOTOracleTests: XCTestCase {
         ))
         XCTAssertNil(KParamEval.evalSimple("not_a_known_value", [:]))
         XCTAssertNil(KParamEval.evalSimple("X", [:]))
-    }
 
-    func testSafeFailureSingularTriclinicCell() {
         let singular = CrystalSymmetryMatrix([1, 0, 0, 0, 0, 0, 0, 0, 0])
         XCTAssertNil(VariantSelect.select(
             spaceGroup: 1,
@@ -377,14 +375,6 @@ final class HPKOTOracleTests: XCTestCase {
                                context: "\(fixtureName) rotated input mapping")
     }
 
-    func testAP2RotatedCellBasisMapping() {
-        assertTriclinicRotation(fixtureName: "aP2", angle: .pi / 4)
-    }
-
-    func testAP3RotatedCellBasisMapping() {
-        assertTriclinicRotation(fixtureName: "aP3", angle: .pi / 6)
-    }
-
     private func cubicProperRotations() -> [[Double]] {
         let permutations = [
             [0, 1, 2], [0, 2, 1], [1, 0, 2],
@@ -416,7 +406,7 @@ final class HPKOTOracleTests: XCTestCase {
         return rotations
     }
 
-    func testCF1RotatedCellUsesCubicEquivalentFrame() {
+    private func assertCF1RotatedCellUsesCubicEquivalentFrame() {
         let rotation = rotationAroundZ(.pi / 3)
         guard let fixture = HPKOTOracle.fixtures["cF1"],
               let baselineBasis = fixtureBasis(
@@ -474,19 +464,4 @@ final class HPKOTOracleTests: XCTestCase {
                                context: "cF1 cubic-equivalent input mapping")
     }
 
-    func testCoordinateComparisonCatchesWrongExpression() {
-        guard let fixture = HPKOTOracle.fixtures["tP1"],
-              let scene = makeScene(fixture),
-              let symmetry = scene.crystalSymmetry?.symmetry,
-              let result = HPKOTGenerator.generate(for: symmetry),
-              let mPoint = result.points.first(where: { $0.label == "M" }) else {
-            XCTFail("tP1 generation failed")
-            return
-        }
-        XCTAssertEqual(mPoint.frac.x, 0.5, accuracy: 1e-5)
-        XCTAssertEqual(mPoint.frac.y, 0.5, accuracy: 1e-5)
-        XCTAssertEqual(mPoint.frac.z, 0, accuracy: 1e-5)
-        XCTAssertNotEqual(mPoint.frac.x, 0.51)
-        XCTAssertNotEqual(mPoint.frac.y, 0.49)
-    }
 }

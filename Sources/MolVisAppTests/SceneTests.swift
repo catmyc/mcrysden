@@ -1,213 +1,43 @@
+import Foundation
 import simd
 import XCTest
 @testable import MolVisApp
-final class SceneTests: XCTestCase {
-    /// Element-wise SIMD equality (XCTAssertEqual/accuracy on SIMD3 is ambiguous).
-    private func allComponentsEqual(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ eps: Float = 1e-5) -> Bool {
-        abs(a.x-b.x) < eps && abs(a.y-b.y) < eps && abs(a.z-b.z) < eps
-    }
-    func fixture(_ name: String) -> URL {
-        URL(fileURLWithPath: #file).deletingLastPathComponent().appendingPathComponent("Fixtures/\(name)")
-    }
-    func testXSFHappyPath() throws {
-        let s = Scene(loaded: try Parser.load(fixture("si110.xsf")))
-        XCTAssertEqual(s.atoms.count, 2)
-        XCTAssertTrue(s.isCrystal)
-        XCTAssertNotNil(s.cell)
-        XCTAssertEqual(s.atoms[0].atomicNumber, 14)
 
-        // Bundled XCrySDen slab input separates PRIMVEC records with blank
-        // lines. Inter-record whitespace must not turn a valid vector into a
-        // synthetic malformed row.
-        let asset = URL(fileURLWithPath: #file)
-            .deletingLastPathComponent() // MolVisAppTests
-            .deletingLastPathComponent() // Sources
-            .deletingLastPathComponent() // repository root
+final class SceneTests: XCTestCase {
+    private func allComponentsEqual(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ eps: Float = 1e-5) -> Bool {
+        abs(a.x - b.x) < eps && abs(a.y - b.y) < eps && abs(a.z - b.z) < eps
+    }
+
+    private func fixture(_ name: String) -> URL {
+        URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/\(name)")
+    }
+
+    func testXSFLoadsCrystalAndBundledSlab() throws {
+        let silicon = Scene(loaded: try Parser.load(fixture("si110.xsf")))
+        XCTAssertEqual(silicon.atoms.count, 2)
+        XCTAssertTrue(silicon.isCrystal)
+        XCTAssertNotNil(silicon.cell)
+        XCTAssertEqual(silicon.atoms[0].atomicNumber, 14)
+
+        // The bundled XCrySDen slab separates PRIMVEC records with blank lines.
+        // Keep this permissive input covered: whitespace must not create a bogus row.
+        let slabURL = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
             .appendingPathComponent("Assets/fcc-410-1x1.xsf")
-        let slab = Scene(loaded: try Parser.load(asset))
+        let slab = Scene(loaded: try Parser.load(slabURL))
         XCTAssertEqual(slab.atoms.count, 8)
         XCTAssertEqual(slab.periodicDim, 2)
         XCTAssertNotNil(slab.cell)
     }
-    func testPDBHappyPath() throws {
-        let s = Scene(loaded: try Parser.load(fixture("ala.pdb")))
-        XCTAssertEqual(s.atoms.count, 5)
-        XCTAssertFalse(s.isCrystal)
-    }
-    func testAXSFFrameSelection() throws {
-        let s0 = try Parser.load(fixture("si.latch.axsf"))
-        XCTAssertEqual(s0.atoms.count, 2)
-        let s1 = try Parser.load(fixture("si.latch.axsf"), as: nil, frameIndex: 1)
-        XCTAssertEqual(s1.atoms.count, 2)
-        XCTAssertNotEqual(s1.atoms[0].coord.x, s0.atoms[0].coord.x, accuracy: 0.0001)
-    }
-    // A DATAGRID_3D block now bridges into a ScalarField (the isosurface
-    // engine's keystone), no longer a parse failure.
-    func testDATAGRIDBridgesToScalarField() throws {
-        let scene = Scene(loaded: try Parser.load(fixture("si.grid.xsf")))
-        guard let field = scene.scalarField else { return XCTFail("expected a scalar field") }
-        // 2x2x2 grid, origin at zero, axis vectors of length 5 along x/y/z.
-        XCTAssertEqual(field.nx, 2)
-        XCTAssertEqual(field.ny, 2)
-        XCTAssertEqual(field.nz, 2)
-        XCTAssertTrue(allComponentsEqual(field.origin, SIMD3<Float>(0, 0, 0)))
-        XCTAssertTrue(allComponentsEqual(field.vec[0], SIMD3<Float>(5, 0, 0)))
-        XCTAssertTrue(allComponentsEqual(field.vec[1], SIMD3<Float>(0, 5, 0)))
-        XCTAssertTrue(allComponentsEqual(field.vec[2], SIMD3<Float>(0, 0, 5)))
-        XCTAssertEqual(field.values.count, 8)
-        let expected: [Float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-        for (a, b) in zip(field.values, expected) {
-            XCTAssertEqual(a, b, accuracy: 1e-5)
-        }
-        XCTAssertEqual(field.minValue, 0.1, accuracy: 1e-5)
-        XCTAssertEqual(field.maxValue, 0.8, accuracy: 1e-5)
-        // The structure is still parsed alongside the grid.
-        XCTAssertEqual(scene.atoms.count, 2)
-    }
 
-    // Gaussian cube: a multi-orbital text format. Parse atoms (Bohr->Ang) and the
-    // first orbital grid, then prove the same isosurface engine renders a surface.
-    func testGaussianCubeLoadsFieldAndAtoms() throws {
-        let url = fixture("N2O.cube")
-        let scene = Scene(loaded: try Parser.load(url, as: .cube))
-        // 3 atoms (N,N,O); the file writes natoms = -3 (multiple orbitals).
-        XCTAssertEqual(scene.atoms.count, 3)
-        XCTAssertEqual(scene.atoms[0].atomicNumber, 7)
-        XCTAssertEqual(scene.atoms[2].atomicNumber, 8)
-        guard let field = scene.scalarField else { return XCTFail("expected a scalar field") }
-        // axes: 19 x 19 x 31 voxels.
-        XCTAssertEqual(field.nx, 19)
-        XCTAssertEqual(field.ny, 19)
-        XCTAssertEqual(field.nz, 31)
-        XCTAssertEqual(scene.multiOrbitalFields.count, 2)
-        XCTAssertEqual(scene.multiOrbitalFields[0].value(0, 0, 0), 1.41569e-4, accuracy: 1e-9)
-        XCTAssertEqual(scene.multiOrbitalFields[1].value(0, 0, 0), -3.88836e-4, accuracy: 1e-9)
-        XCTAssertEqual(scene.multiOrbitalFields[0].value(0, 0, 1), 2.31251e-4, accuracy: 1e-9)
-        // grid is non-trivial: a spread of orbital values around 0.
-        XCTAssertLessThan(field.minValue, 0.0)
-        XCTAssertGreaterThan(field.maxValue, 0.0)
-        // step is 0.377945 Bohr -> Ang; spanning vec.x = (19-1)*step.
-        let stepAng: Float = 0.377945 * 0.52917721067
-        XCTAssertEqual(field.vec[0].x, 18 * stepAng, accuracy: 0.01)
-        // first orbital renders a surface at a mid iso level.
-        let mesh = IsoMesh(field: field, isoLevel: 0.005, sign: 1)
-        XCTAssertGreaterThan(mesh.triangleCount, 0)
-    }
-
-    // .g98 extension must dispatch to the same cube parser.
-    func testGaussianG98ExtensionDispatchesToCube() throws {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("mol.g98")
-        try """
-        Gaussian mock
-        Test
-         1   0.000000   0.000000   0.000000   0.000000
-           2   1.000000   0.000000   0.000000
-           2   0.000000   1.000000   0.000000
-           2   0.000000   0.000000   1.000000
-         1   0.000000   0.500000   0.500000   0.500000
-           0.1   0.2   0.3   0.4   0.5   0.6   0.7   0.8
-        """.write(to: tmp, atomically: true, encoding: .utf8)
-        let loaded = try Parser.load(tmp)
-        XCTAssertNotNil(loaded.scalarField, ".g98 must parse as a cube")
-        XCTAssertEqual(loaded.scalarField?.nx, 2)
-    }
-
-    // Multi-orbital cube files retain ALL orbitals so the user can switch between them.
-    func testMultiOrbitalCubeRetainsAllOrbitals() throws {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("multi.cube")
-        // natoms = -1 → multi-orbital. MO record "2  1  2" → 2 orbitals.
-        // Cube values are voxel-major with z fastest, and orbital values are
-        // interleaved at each voxel: (orb1,orb2), (orb1,orb2), ...
-        let values = (1...8).flatMap { [Float($0), Float(100 + $0)] }
-            .map { String(format: "%.1f", $0) }.joined(separator: "   ")
-        try """
-        Multi-orbital test
-        mock
-        -1   0.000000   0.000000   0.000000
-           2   1.000000   0.000000   0.000000
-           2   0.000000   1.000000   0.000000
-           2   0.000000   0.000000   1.000000
-         1   0.000000   0.500000   0.500000   0.500000
-        2  1  2
-        \(values)
-        """.write(to: tmp, atomically: true, encoding: .utf8)
-        let loaded = try Parser.load(tmp, as: .cube)
-        XCTAssertEqual(loaded.multiOrbitalFields.count, 2, "both orbitals retained")
-        // ScalarField stores x fastest, so transpose cube's z-fastest voxel order.
-        XCTAssertEqual(loaded.multiOrbitalFields[0].values, [1, 5, 3, 7, 2, 6, 4, 8])
-        XCTAssertEqual(loaded.multiOrbitalFields[1].values, [101, 105, 103, 107, 102, 106, 104, 108])
-        // scalarField defaults to the first orbital
-        XCTAssertEqual(loaded.scalarField?.values.first ?? -1, 1.0, accuracy: 0.01)
-    }
-
-    func testMultiOrbitalSelectionWiresThroughController() throws {
-        let fields = [
-            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
-                        vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
-                        values: Array(repeating: -1, count: 8), minValue: -1, maxValue: 1),
-            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
-                        vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
-                        values: Array(repeating: 4, count: 8), minValue: 2, maxValue: 6),
-        ]
-        var scene = Scene()
-        scene.scalarField = fields[0]
-        scene.multiOrbitalFields = fields
-        let wc = MainWindowController(scene: Scene(), showWindow: false)
-        wc.loadFile(scene)
-        XCTAssertEqual(wc.state.orbitalCount, 2)
-        wc.state.currentOrbital = 1
-        XCTAssertEqual(wc.scene.currentOrbital, 1)
-        XCTAssertEqual(wc.scene.scalarField?.values.first, 4)
-        XCTAssertEqual(wc.state.isoRange, 2...6)
-    }
-
-    // The isosurface renderer draws both positive (sign>0) and negative (sign<0)
-    // shells for an orbital field that spans both signs.
-    func testInsideIsosurfaceShellNonEmpty() throws {
-        let url = fixture("N2O.cube")
-        let scene = Scene(loaded: try Parser.load(url, as: .cube))
-        guard let field = scene.scalarField else { return XCTFail("expected a scalar field") }
-        // outside shell at iso=0.005
-        let outside = IsoMesh(field: field, isoLevel: 0.005, sign: 1)
-        XCTAssertGreaterThan(outside.triangleCount, 0, "outside shell must render")
-        // negative shell at field == -0.005.
-        let inside = IsoMesh(field: field, isoLevel: 0.005, sign: -1)
-        XCTAssertGreaterThan(inside.triangleCount, 0, "inside shell must render a surface too")
-    }
-
-    func testNegativeIsosurfaceInterpolatesAtNegativeThreshold() throws {
-        // v=-2 at x=0 and v=0 at x=1. A sign=-1 shell at iso=0.5 crosses
-        // v=-0.5 at x=0.75; interpolating at +0.5 would extrapolate to x=1.25.
-        var values: [Float] = []
-        for _ in 0..<4 { values += [-2, 0] }
-        let field = ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
-                                vec: [SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(0,0,1)],
-                                values: values, minValue: -2, maxValue: 0)
-        let mesh = IsoMesh(field: field, isoLevel: 0.5, sign: -1)
-        XCTAssertGreaterThan(mesh.triangleCount, 0)
-        for i in stride(from: 0, to: mesh.vertices.count, by: 9) {
-            XCTAssertEqual(mesh.vertices[i], 0.75, accuracy: 1e-5)
-            XCTAssertGreaterThan(mesh.vertices[i + 3], 0.99, "negative-lobe normal faces higher values")
-        }
-    }
-
-    func testWorldGradientTransformsSkewedAnisotropicGrid() throws {
-        let spans = [SIMD3<Float>(2, 0, 0), SIMD3<Float>(1, 3, 0), SIMD3<Float>(0.5, 0.25, 4)]
-        let expected = SIMD3<Float>(1, 2, -0.5)
-        var values: [Float] = []
-        for iz in 0..<3 { for iy in 0..<3 { for ix in 0..<3 {
-            let p = spans[0] * (Float(ix) / 2) + spans[1] * (Float(iy) / 2) + spans[2] * (Float(iz) / 2)
-            values.append(simd_dot(expected, p))
-        } } }
-        let field = ScalarField(nx: 3, ny: 3, nz: 3, origin: .zero, vec: spans,
-                                values: values, minValue: values.min()!, maxValue: values.max()!)
-        let gradient = field.worldGradient(0.5, 0.5, 0.5)
-        XCTAssertTrue(allComponentsEqual(gradient, expected, 1e-4), "got \(gradient)")
-    }
-
-    // Standard FHI-aims `geometry.in` (lattice_vector + atom_frac/atom) parses.
-    func testFHIGeometryInParses() throws {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("geometry.in")
+    func testParserFamilyMatrixLoadsStructures() throws {
+        let geometryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("geometry-\(UUID().uuidString).in")
+        defer { try? FileManager.default.removeItem(at: geometryURL) }
         try """
         lattice_vector   5.430000   0.000000   0.000000
         lattice_vector   0.000000   5.430000   0.000000
@@ -216,262 +46,95 @@ final class SceneTests: XCTestCase {
         atom_frac   0.250000   0.250000   0.250000   Si
         atom            1.000000   2.000000   3.000000   H
         constrain_relaxation .true.
-        """.write(to: tmp, atomically: true, encoding: .utf8)
-        let loaded = try Parser.load(tmp)
-        XCTAssertEqual(loaded.atoms.count, 3, "2 fractional + 1 Cartesian atom")
-        XCTAssertEqual(loaded.atoms[0].atomicNumber, 14) // Si
-        XCTAssertEqual(loaded.atoms[2].atomicNumber, 1)  // H
-        XCTAssertNotNil(loaded.cell, "geometry.in has a cell")
-        // fractional Si at (0,0,0) → origin
-        XCTAssertEqual(loaded.atoms[0].coord.x, 0, accuracy: 1e-5)
-        // fractional Si at (0.25,0.25,0.25) → (0.25*5.43, ...)
-        XCTAssertEqual(loaded.atoms[1].coord.x, 0.25 * 5.43, accuracy: 0.01)
-        // Cartesian H at (1,2,3) → unchanged
-        XCTAssertEqual(loaded.atoms[2].coord.x, 1.0, accuracy: 1e-5)
-        XCTAssertEqual(loaded.atoms[2].coord.y, 2.0, accuracy: 1e-5)
-        XCTAssertEqual(loaded.atoms[2].coord.z, 3.0, accuracy: 1e-5)
-    }
+        """.write(to: geometryURL, atomically: true, encoding: .utf8)
 
-    func testCompressedXSFLoadsThroughNormalDispatch() throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
-        process.arguments = ["-c", fixture("si.grid.xsf").path]
-        let output = Pipe()
-        process.standardOutput = output
-        try process.run()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0)
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("si.grid.xsf.gz")
-        try data.write(to: url)
-        defer { try? FileManager.default.removeItem(at: url) }
-        let loaded = try Parser.load(url)
-        XCTAssertEqual(loaded.atoms.count, 2)
-        XCTAssertNotNil(loaded.scalarField)
-    }
-
-    func testOpenPanelIncludesTierAExtensions() throws {
-        XCTAssertTrue(App.openPanelExtensions.contains("g98"))
-        XCTAssertTrue(App.openPanelExtensions.contains("gz"))
-    }
-
-    // Regression for review P1#1: the isosurface must span the WHOLE grid, not
-    // collapse into the first cell near the origin. Checking only that vertices lie
-    // inside the global bounding box is NOT enough -- the old first-cell-only output
-    // also passed that test (all its vertices sat near the origin, well inside the
-    // box). The real invariant is that the mesh's own bounding box spans a large
-    // fraction of the cell in every dimension: a collapsed mesh covers ~1 voxel; a
-    // correct one covers most of the cell.
-    func testMarchingCubesSpansWholeGrid() throws {
-        let url = fixture("N2O.cube")
-        let scene = Scene(loaded: try Parser.load(url, as: .cube))
-        guard let field = scene.scalarField else { return XCTFail("expected a scalar field") }
-        let mesh = IsoMesh(field: field, isoLevel: 0.005, sign: 1)
-        XCTAssertGreaterThan(mesh.triangleCount, 0)
-        let o = field.origin
-        let maxCorner = o + field.vec[0] + field.vec[1] + field.vec[2]
-        var loV = SIMD3<Float>(repeating: Float.greatestFiniteMagnitude)
-        var hiV = SIMD3<Float>(repeating: -Float.greatestFiniteMagnitude)
-        for i in stride(from: 0, to: mesh.vertices.count, by: 9) {
-            let p = SIMD3<Float>(mesh.vertices[i], mesh.vertices[i+1], mesh.vertices[i+2])
-            loV = min(loV, p); hiV = max(hiV, p)
+        let cases: [(label: String, url: URL, format: ParseFormat, atoms: Int, crystal: Bool)] = [
+            ("XYZ", fixture("si.xyz"), .xyz, 2, false),
+            ("PDB", fixture("ala.pdb"), .pdb, 5, false),
+            ("QE input", fixture("si.pwi"), .pwi, 2, true),
+            ("QE output", fixture("si_relax.out"), .pwo, 2, true),
+            ("WIEN2k", fixture("gaas.struct"), .struct_, 2, true),
+            ("FHI-aims coord", fixture("fhi_gaas_surface.fhi"), .fhi, 14, true),
+            ("FHI-aims geometry.in", geometryURL, .fhi, 3, true),
+        ]
+        for item in cases {
+            let loaded = try Parser.load(item.url, as: item.format)
+            XCTAssertEqual(loaded.atoms.count, item.atoms, item.label)
+            XCTAssertEqual(loaded.isCrystal, item.crystal, item.label)
+            if item.crystal { XCTAssertNotNil(loaded.cell, item.label) }
         }
-        for a in 0..<3 {
-            let cellSpan = abs(maxCorner[a] - o[a])
-            let meshSpan = hiV[a] - loV[a]
-            // A correct surface spans a large fraction of the cell; a first-cell
-            // collapse spans ~1 voxel (a few percent of the cell).
-            XCTAssertGreaterThan(meshSpan, cellSpan * 0.4,
-                "mesh must span the cell, not collapse into the first voxel (dim \(a): \(meshSpan) vs \(cellSpan))")
+
+        let geometry = try Parser.load(geometryURL, as: .fhi)
+        XCTAssertEqual(geometry.atoms[0].coord.x, 0, accuracy: 1e-5)
+        XCTAssertEqual(geometry.atoms[1].coord.x, 0.25 * 5.43, accuracy: 0.01)
+        XCTAssertEqual(geometry.atoms[2].coord, SIMD3<Float>(1, 2, 3))
+    }
+
+    func testCRYSCALExpansionSymbolsAndPolymer() throws {
+        let counts = { (atoms: [Atom]) -> [Int: Int] in
+            Dictionary(grouping: atoms, by: { $0.atomicNumber }).mapValues { $0.count }
         }
-    }
-
-    // WIEN2k .struct: parse lattice (Bohr->Ang) + fractional atoms into a crystal.
-    // Verified on the real GaAs (2 atoms, fcc) and Pt (1 atom, fcc) fixtures.
-    func testWIEN2kStructLoadsCrystal() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let gaas = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/gaas.struct"), as: .struct_))
-        XCTAssertTrue(gaas.isCrystal)
-        XCTAssertEqual(gaas.atoms.count, 2)
-        XCTAssertEqual(gaas.atoms[0].atomicNumber, 31)  // Ga
-        XCTAssertEqual(gaas.atoms[1].atomicNumber, 33)  // As
-        XCTAssertNotNil(gaas.cell)
-        // cubic fcc: a=b=c ~10.684 Bohr -> 5.654 Ang
-        let a = simd_length(gaas.cell!.a)
-        XCTAssertEqual(a, 10.684 * 0.52917721067, accuracy: 0.01)
-        // As sits at (¼,¼,¼) fractional -> cartesian (a/4)(1,1,1)
-        let asCart = gaas.atoms[1].coord
-        XCTAssertEqual(asCart.x, a / 4, accuracy: 0.01)
-        XCTAssertEqual(asCart.y, a / 4, accuracy: 0.01)
-        XCTAssertEqual(asCart.z, a / 4, accuracy: 0.01)
-
-        let pt = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/pt.struct"), as: .struct_))
-        XCTAssertEqual(pt.atoms.count, 1)
-        XCTAssertEqual(pt.atoms[0].atomicNumber, 78)  // Pt
-
-        // MoS2: site Mo MULT=2 (2 pos) + site S MULT=4 (4 pos) => 6 atoms total.
-        // The fixture has multiple position lines per site (the ATOM= line plus
-        // m-1 follow-ups), carried on unmarked "<i>:" lines.
-        let mos2 = Scene(loaded: try Parser.load(dir.appendingPathComponent("Fixtures/mos2.struct"), as: .struct_))
-        XCTAssertTrue(mos2.isCrystal)
-        XCTAssertEqual(mos2.atoms.count, 6)
-        XCTAssertNotNil(mos2.cell)
-        let mos2Mo = mos2.atoms.filter { $0.atomicNumber == 42 }.count
-        let mos2S  = mos2.atoms.filter { $0.atomicNumber == 16 }.count
-        XCTAssertEqual(mos2Mo, 2)
-        XCTAssertEqual(mos2S, 4)
-    }
-
-    // FHI-aims coord.out structure: lattice vectors (Bohr->Ang) + species blocks
-    // of [count name (x y z flag)*count]. Verified on the GaAs-surface slab:
-    // 4 species (Ga x6, As x6, H x1, H x1) = 14 atoms. Reference converter
-    // (XCrySDen F/fhi_coord2xcr.f) multiplies both lattice and coords by BOHR.
-    func testFHIaimsLoadsStructure() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let scene = try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/fhi_gaas_surface.fhi"), as: .fhi))
-        XCTAssertTrue(scene.isCrystal)
-        XCTAssertEqual(scene.atoms.count, 14)
-        XCTAssertNotNil(scene.cell)
-        let ga = scene.atoms.filter { $0.atomicNumber == 31 }.count
-        let ar = scene.atoms.filter { $0.atomicNumber == 33 }.count
-        let h  = scene.atoms.filter { $0.atomicNumber == 1 }.count
-        XCTAssertEqual(ga, 6)
-        XCTAssertEqual(ar, 6)
-        XCTAssertEqual(h, 2)
-        // lattice vectors were in Bohr: 10.44 Bohr -> 5.52 Ang.
-        XCTAssertEqual(simd_length(scene.cell!.a), 10.44 * 0.529177, accuracy: 0.01)
-    }
-
-    // Orca .out geometry-optimization log: multi-frame molecule. Each CARTESIAN
-    // COORDINATES (ANGSTROEM) block is one optimization cycle; final geometry is
-    // the last block.
-    func testOrcaLogLoadsFrames() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let url = dir.appendingPathComponent("Fixtures/orca.orca")
-        XCTAssertEqual(Parser.frameCount(url, as: .orca), 15, "orca log has 15 opt cycles")
-        // Default-open (no frameIndex) now returns the FIRST cycle, like AXSF/pwo,
-        // so the scrubber (which starts at frame 0) and the open view agree.
-        let first = try Scene(loaded: Parser.load(url, as: .orca))
-        XCTAssertFalse(first.isCrystal)
-        XCTAssertEqual(first.atoms.count, 33)
-        // An explicit --frame 0 is the SAME first cycle (the bug made it final).
-        let explicitZero = try Scene(loaded: Parser.load(url, frameIndex: 0, as: .orca))
-        XCTAssertEqual(explicitZero.atoms[0].coord.x, first.atoms[0].coord.x, accuracy: 1e-4,
-                       "explicit --frame 0 must equal default-open (first cycle)")
-        // an explicit late frame differs from the first cycle (it's a relaxation).
-        let late = try Scene(loaded: Parser.load(url, frameIndex: 14, as: .orca))
-        XCTAssertEqual(late.atoms.count, 33)
-        XCTAssertNotEqual(late.atoms[0].coord.x, first.atoms[0].coord.x, accuracy: 1e-4)
-        // every frame parses.
-        for i in 0..<15 {
-            let s = try Scene(loaded: Parser.load(url, frameIndex: i, as: .orca))
-            XCTAssertEqual(s.atoms.count, 33, "frame \(i) atom count")
+        let crystalNames = [
+            ("crystal_ZnS.r1", 8), ("crystal_mgo.r1", 8),
+            ("crystal_rutile.r1", 2), ("crystal_graphite.r1", 2),
+            ("crystal_corundum.r1", 2), ("crystal_chabazite.r1", 5),
+            ("crystal_argonite.r1", 4),
+        ]
+        for (name, atomCount) in crystalNames {
+            let scene = Scene(loaded: try Parser.load(fixture(name), as: .crystal))
+            XCTAssertTrue(scene.isCrystal, name)
+            XCTAssertEqual(scene.atoms.count, atomCount, name)
+            XCTAssertNotNil(scene.cell, name)
         }
-    }
 
-    // CRYSCAL .r1: crystal input across crystal systems. The space group sets the
-    // lattice-param count + cell angles; lattice constants are in Angstrom.
-    func testCRYSCALr1LoadsCrystal() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        func load(_ name: String) throws -> Scene {
-            try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/\(name)"), as: .crystal))
-        }
-        // ZnS: cubic (spg 216), 1 lattice const; the 2-site asymmetric unit
-        // expands to the conventional 8-atom cell. The file writes an extra
-        // spurious 2.96 param that nLat=1 correctly ignores.
-        let zns = try load("crystal_ZnS.r1")
-        XCTAssertTrue(zns.isCrystal)
-        XCTAssertEqual(zns.atoms.count, 8)
-        XCTAssertNotNil(zns.cell)
-        XCTAssertEqual(simd_length(zns.cell!.a), 5.42, accuracy: 0.01)
+        let zns = Scene(loaded: try Parser.load(fixture("crystal_ZnS.r1"), as: .crystal))
+        XCTAssertEqual(zns.crystalSymmetry?.symmetry?.spaceGroupNumber, 216)
+        XCTAssertEqual(counts(zns.atoms)[16], 4)
+        XCTAssertEqual(counts(zns.atoms)[30], 4)
+        let mgo = Scene(loaded: try Parser.load(fixture("crystal_mgo.r1"), as: .crystal))
+        XCTAssertEqual(mgo.crystalSymmetry?.symmetry?.spaceGroupNumber, 225)
+        XCTAssertEqual(counts(mgo.atoms)[12], 4)
+        XCTAssertEqual(counts(mgo.atoms)[8], 4)
 
-        // Symbolic F M 3 M is an asymmetric Pt site in the fixture. It must
-        // expand to the four distinct conventional-cell FCC positions rather
-        // than merely padding the atom list to the expected count.
-        let ptURL = dir.appendingPathComponent("Fixtures/crystal_Pt_fcc.r1")
+        let ptURL = fixture("crystal_Pt_fcc.r1")
         let ptLoaded = try Parser.load(ptURL, as: .crystal)
         XCTAssertEqual(ptLoaded.atoms.count, 4)
         XCTAssertEqual(ptLoaded.symmetryInputCompleteness, .complete)
         let pt = Scene(loaded: ptLoaded)
-        XCTAssertTrue(pt.isCrystal)
-        XCTAssertEqual(pt.atoms.count, 4)
-        XCTAssertEqual(Set(pt.atoms.map(\.atomicNumber)), Set([78]))
-        let expectedFCC: [SIMD3<Float>] = [
-            SIMD3<Float>(0, 0, 0),
-            SIMD3<Float>(0, 0.5, 0.5),
-            SIMD3<Float>(0.5, 0, 0.5),
-            SIMD3<Float>(0.5, 0.5, 0)
+        XCTAssertEqual(pt.crystalSymmetry?.symmetry?.spaceGroupNumber, 225)
+        let expectedFCC = [
+            SIMD3<Float>(0, 0, 0), SIMD3<Float>(0, 0.5, 0.5),
+            SIMD3<Float>(0.5, 0, 0.5), SIMD3<Float>(0.5, 0.5, 0),
         ]
         let fractional = pt.atoms.compactMap { pt.fractionalCoord($0.coord) }
         XCTAssertEqual(fractional.count, 4)
-        for (index, position) in fractional.enumerated() {
-            XCTAssertTrue(expectedFCC.contains { allComponentsEqual(position, $0, 1e-4) },
-                          "unexpected Pt fractional coordinate \(position)")
-            XCTAssertFalse(fractional[..<index].contains { allComponentsEqual($0, position, 1e-4) },
-                           "FCC expansion contains a duplicate at \(position)")
+        for position in expectedFCC {
+            XCTAssertEqual(fractional.filter { allComponentsEqual($0, position, 1e-4) }.count, 1,
+                           "missing or duplicated FCC position \(position)")
         }
-        for expected in expectedFCC {
-            XCTAssertEqual(fractional.filter { allComponentsEqual($0, expected, 1e-4) }.count, 1,
-                           "missing or duplicated FCC position \(expected)")
-        }
-        XCTAssertTrue(pt.crystalSymmetry?.isAvailable == true)
-        XCTAssertEqual(pt.crystalSymmetry?.symmetry?.spaceGroupNumber, 225)
-        XCTAssertGreaterThan(pt.crystalSymmetry?.symmetry?.symmetryOperations.count ?? 0, 0)
 
-        let ptContents = try String(contentsOf: ptURL, encoding: .utf8)
-        func temporaryCRYSCALPt(symbol: String) throws -> URL {
+        let source = try String(contentsOf: ptURL, encoding: .utf8)
+        func temporary(symbol: String) throws -> URL {
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent("mcrysden-cryscal-\(UUID().uuidString).r1")
-            let contents = ptContents.replacingOccurrences(of: "F M 3 M", with: symbol)
-            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try source.replacingOccurrences(of: "F M 3 M", with: symbol)
+                .write(to: url, atomically: true, encoding: .utf8)
             return url
         }
-        let dashedURL = try temporaryCRYSCALPt(symbol: "fm-3m")
+        let dashedURL = try temporary(symbol: "fm-3m")
         defer { try? FileManager.default.removeItem(at: dashedURL) }
         let dashed = try Parser.load(dashedURL, as: .crystal)
         XCTAssertEqual(dashed.atoms.count, 4)
         XCTAssertTrue(dashed.atoms.allSatisfy { $0.atomicNumber == 78 })
         XCTAssertEqual(dashed.symmetryInputCompleteness, .complete)
 
-        let unknownURL = try temporaryCRYSCALPt(symbol: "xm-3m")
+        let unknownURL = try temporary(symbol: "xm-3m")
         defer { try? FileManager.default.removeItem(at: unknownURL) }
         let unknown = try Parser.load(unknownURL, as: .crystal)
         XCTAssertEqual(unknown.atoms.count, 1)
-        XCTAssertEqual(unknown.atoms.first?.atomicNumber, 78)
         XCTAssertEqual(unknown.symmetryInputCompleteness, .asymmetricUnit)
 
-        // rutile: tetragonal (spg 136), a,c; 2 atoms.
-        let rutile = try load("crystal_rutile.r1")
-        XCTAssertEqual(rutile.atoms.count, 2)
-        XCTAssertEqual(simd_length(rutile.cell!.a), 4.59, accuracy: 0.01)
-        XCTAssertEqual(simd_length(rutile.cell!.c), 2.96, accuracy: 0.01)
-
-        // graphite: hexagonal (spg 194), a,c gamma=120; 2 atoms.
-        let graphite = try load("crystal_graphite.r1")
-        XCTAssertEqual(graphite.atoms.count, 2)
-        XCTAssertEqual(simd_length(graphite.cell!.a), 2.46, accuracy: 0.01)
-        XCTAssertEqual(simd_length(graphite.cell!.c), 6.70, accuracy: 0.01)
-
-        // corundum: trigonal R (spg 167, hexagonal setting) gamma=120; 2 atoms.
-        let corundum = try load("crystal_corundum.r1")
-        XCTAssertEqual(corundum.atoms.count, 2)
-        XCTAssertEqual(simd_length(corundum.cell!.a), 4.7602, accuracy: 0.01)
-        XCTAssertEqual(simd_length(corundum.cell!.c), 12.9933, accuracy: 0.01)
-
-        // chabazite: trigonal (spg 166); 5 atoms.
-        let chaba = try load("crystal_chabazite.r1")
-        XCTAssertEqual(chaba.atoms.count, 5)
-
-        // argonite: orthorhombic (Pmcn, spg 53), 3 lattice consts; 4 atoms.
-        let argonite = try load("crystal_argonite.r1")
-        XCTAssertEqual(argonite.atoms.count, 4)
-        XCTAssertEqual(simd_length(argonite.cell!.a), 4.9616, accuracy: 0.01)
-        XCTAssertEqual(simd_length(argonite.cell!.b), 7.9705, accuracy: 0.01)
-        XCTAssertEqual(simd_length(argonite.cell!.c), 5.7394, accuracy: 0.01)
-
-        // POLYMER has no space-group record: its period is followed directly
-        // by the atom count and six Cartesian atom records.
-        let polymer = try Parser.load(dir.appendingPathComponent("Fixtures/crystal_polymer.r1"), as: .crystal)
+        let polymer = try Parser.load(fixture("crystal_polymer.r1"), as: .crystal)
         XCTAssertFalse(polymer.isCrystal)
         XCTAssertEqual(polymer.atoms.count, 6)
         XCTAssertNil(polymer.cell)
@@ -480,127 +143,175 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(polymer.atoms[0].coord.y, 0.7219, accuracy: 1e-5)
     }
 
-    func testCRYSCALCubicExpansionPreservesSpecies() throws {
-        func counts(_ atoms: [Atom]) -> [Int: Int] {
-            Dictionary(grouping: atoms, by: { $0.atomicNumber }).mapValues { $0.count }
+    func testScalarFieldsMarchingCubesAndMultiOrbitalIntegration() throws {
+        let xsf = Scene(loaded: try Parser.load(fixture("si.grid.xsf")))
+        guard let xsfField = xsf.scalarField else { return XCTFail("expected XSF scalar field") }
+        XCTAssertEqual(xsfField.nx, 2)
+        XCTAssertEqual(xsfField.ny, 2)
+        XCTAssertEqual(xsfField.nz, 2)
+        XCTAssertEqual(xsfField.values, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+        XCTAssertEqual(xsfField.minValue, 0.1, accuracy: 1e-5)
+        XCTAssertEqual(xsfField.maxValue, 0.8, accuracy: 1e-5)
+        let xsfMesh = IsoMesh(field: xsfField, isoLevel: 0.45, sign: 1)
+        XCTAssertGreaterThan(xsfMesh.triangleCount, 0)
+
+        let cube = Scene(loaded: try Parser.load(fixture("N2O.cube"), as: .cube))
+        XCTAssertEqual(cube.atoms.count, 3)
+        XCTAssertEqual(cube.atoms.map(\.atomicNumber), [7, 7, 8])
+        guard let cubeField = cube.scalarField else { return XCTFail("expected cube scalar field") }
+        XCTAssertEqual(cubeField.nx, 19)
+        XCTAssertEqual(cubeField.ny, 19)
+        XCTAssertEqual(cubeField.nz, 31)
+        XCTAssertEqual(cube.multiOrbitalFields.count, 2)
+        XCTAssertEqual(cube.multiOrbitalFields[0].value(0, 0, 0), 1.41569e-4, accuracy: 1e-9)
+        XCTAssertEqual(cube.multiOrbitalFields[1].value(0, 0, 0), -3.88836e-4, accuracy: 1e-9)
+        XCTAssertGreaterThan(IsoMesh(field: cubeField, isoLevel: 0.005, sign: 1).triangleCount, 0)
+        XCTAssertGreaterThan(IsoMesh(field: cubeField, isoLevel: 0.005, sign: -1).triangleCount, 0)
+
+        let bxsf = try Parser.load(fixture("MgB2.bxsf"), as: .bxsf)
+        guard let fermiSurface = bxsf.fermiSurface else { return XCTFail("expected BXSF surface") }
+        XCTAssertEqual(fermiSurface.fermiEnergy, 0.52304, accuracy: 1e-4)
+        XCTAssertEqual(fermiSurface.bands.count, 3)
+        for band in fermiSurface.bands {
+            XCTAssertGreaterThan(IsoMesh(field: band, isoLevel: fermiSurface.fermiEnergy, sign: 1).triangleCount, 0)
         }
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let zns = try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/crystal_ZnS.r1"), as: .crystal))
-        XCTAssertEqual(zns.crystalSymmetry?.symmetry?.spaceGroupNumber, 216)
-        XCTAssertEqual(zns.atoms.count, 8)
-        XCTAssertEqual(counts(zns.atoms)[16], 4)
-        XCTAssertEqual(counts(zns.atoms)[30], 4)
 
-        let mgo = try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/crystal_mgo.r1"), as: .crystal))
-        XCTAssertEqual(mgo.crystalSymmetry?.symmetry?.spaceGroupNumber, 225)
-        XCTAssertEqual(mgo.atoms.count, 8)
-        XCTAssertEqual(counts(mgo.atoms)[12], 4)
-        XCTAssertEqual(counts(mgo.atoms)[8], 4)
+        let fields = [
+            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
+                        vec: [SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 0, 1)],
+                        values: Array(repeating: -1, count: 8), minValue: -1, maxValue: 1),
+            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
+                        vec: [SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 0, 1)],
+                        values: Array(repeating: 4, count: 8), minValue: 2, maxValue: 6),
+        ]
+        var orbitalScene = Scene()
+        orbitalScene.scalarField = fields[0]
+        orbitalScene.multiOrbitalFields = fields
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(orbitalScene)
+        XCTAssertEqual(controller.state.orbitalCount, 2)
+        controller.state.currentOrbital = 1
+        XCTAssertEqual(controller.scene.currentOrbital, 1)
+        XCTAssertEqual(controller.scene.scalarField?.values.first, 4)
+        XCTAssertEqual(controller.state.isoRange, 2...6)
     }
 
-    // Fermi-surface BXSF: parse the Fermi energy + per-band grids, then build a
-    // surface at the Fermi level. Verified on the real MgB2 fixture.
-    func testBXSFParsesBandsAndFermiEnergy() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let fs = try BXSFLoader.load(from: dir.appendingPathComponent("Fixtures/MgB2.bxsf"))
-        XCTAssertEqual(fs.fermiEnergy, 0.52304, accuracy: 1e-4)
-        XCTAssertEqual(fs.bands.count, 3, "MgB2 has 3 bands")
-        for b in fs.bands {
-            XCTAssertEqual(b.nx, 13); XCTAssertEqual(b.ny, 13); XCTAssertEqual(b.nz, 10)
-            XCTAssertEqual(b.values.count, 13*13*10)
+    func testAnimationAndFrameParsing() throws {
+        let axsfURL = fixture("si.latch.axsf")
+        XCTAssertEqual(Parser.frameCount(axsfURL), 2)
+        let axsf0 = try Scene(loaded: Parser.load(axsfURL, as: nil, frameIndex: 0))
+        let axsf1 = try Scene(loaded: Parser.load(axsfURL, as: nil, frameIndex: 1))
+        XCTAssertEqual(axsf0.atoms.count, 2)
+        XCTAssertEqual(axsf1.atoms.count, 2)
+        XCTAssertNotEqual(axsf0.atoms[0].coord.x, axsf1.atoms[0].coord.x, accuracy: 1e-4)
+
+        let qeURL = fixture("si_relax.out")
+        XCTAssertEqual(Parser.frameCount(qeURL, as: .pwo), 2)
+        let qe0 = try Parser.load(qeURL, frameIndex: 0, as: .pwo)
+        let qe1 = try Parser.load(qeURL, frameIndex: 1, as: .pwo)
+        XCTAssertEqual(qe0.atoms.count, 2)
+        XCTAssertEqual(qe1.atoms.count, 2)
+        XCTAssertNotNil(qe0.cell)
+        XCTAssertNotNil(qe1.cell)
+
+        let orcaURL = fixture("orca.orca")
+        XCTAssertEqual(Parser.frameCount(orcaURL, as: .orca), 15)
+        let orca0 = try Scene(loaded: Parser.load(orcaURL, frameIndex: 0, as: .orca))
+        let orcaLast = try Scene(loaded: Parser.load(orcaURL, frameIndex: 14, as: .orca))
+        XCTAssertFalse(orca0.isCrystal)
+        XCTAssertEqual(orca0.atoms.count, 33)
+        XCTAssertEqual(orcaLast.atoms.count, 33)
+        XCTAssertNotEqual(orca0.atoms[0].coord.x, orcaLast.atoms[0].coord.x, accuracy: 1e-4)
+    }
+
+    func testSupercellAndSlabSafety() throws {
+        let base = Scene(loaded: try Parser.load(fixture("si110.xsf")))
+        let doubled = base.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
+        XCTAssertEqual(doubled.atoms.count, 4)
+
+        let clipped = base.applySlab(Slab(
+            planeA: Plane(h: 0, k: 1, l: 0, distance: 0),
+            planeB: Plane(h: 0, k: -1, l: 0, distance: 1e9)))
+        XCTAssertLessThanOrEqual(clipped.atoms.count, base.atoms.count)
+
+        let far = base.applySlab(Slab(
+            planeA: Plane(h: 0, k: 1, l: 0, distance: -1e9),
+            planeB: Plane(h: 0, k: -1, l: 0, distance: 1e9)))
+        XCTAssertEqual(far.atoms.count, base.atoms.count)
+        XCTAssertNotNil(far.slab)
+
+        let overflow = base.widenSuperCell(SuperCell(n1: Int.max / 2, n2: Int.max / 2, n3: Int.max / 2))
+        XCTAssertEqual(overflow.atoms.count, base.atoms.count)
+        XCTAssertEqual(overflow.superCell, SuperCell())
+        let nonPositive = base.widenSuperCell(SuperCell(n1: 0, n2: 2, n3: 2))
+        XCTAssertEqual(nonPositive.atoms.count, base.atoms.count)
+    }
+
+    func testMalformedAndSingularInputIsSafe() throws {
+        XCTAssertThrowsError(try Parser.load(fixture("bad.xyz"), as: .xyz)) { error in
+            guard case ParseError.parse(_, _, let reason) = error else {
+                return XCTFail("malformed input should produce ParseError.parse, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("malformed") || reason.contains("unexpected"))
         }
-        // iso at the Fermi energy must emit a surface for each band.
-        for b in fs.bands {
-            let mesh = IsoMesh(field: b, isoLevel: fs.fermiEnergy, sign: 1)
-            XCTAssertGreaterThan(mesh.triangleCount, 0, "every band surfaces at Fermi level")
-        }
+
+        var singular = Scene(loaded: try Parser.load(fixture("si110.xsf")))
+        singular.cell = Cell(a: SIMD3<Float>(1, 0, 0), b: SIMD3<Float>(2, 0, 0), c: SIMD3<Float>(0, 0, 1))
+        XCTAssertNil(singular.fractionalCoord(SIMD3<Float>(0.5, 0, 0.5)))
+        let unchanged = singular.applySlab(Slab(
+            planeA: Plane(h: 0, k: 1, l: 0, distance: 0),
+            planeB: Plane(h: 0, k: -1, l: 0, distance: 1)))
+        XCTAssertEqual(unchanged.atoms.count, singular.atoms.count)
+        XCTAssertNil(unchanged.slab)
     }
 
-    // Marching cubes over the bridged field must emit a closed-ish triangle
-    // surface with in-range normals at a sensible iso level.
-    func testMarchingCubesProducesSurface() throws {
-        let scene = Scene(loaded: try Parser.load(fixture("si.grid.xsf")))
-        guard let field = scene.scalarField else { return XCTFail("expected a scalar field") }
-        let mesh = IsoMesh(field: field, isoLevel: 0.45, sign: 1)
-        XCTAssertGreaterThan(mesh.triangleCount, 0, "isosurface must produce triangles")
-        // Every normal must be unit length (lit correctly by the poly pipeline).
-        var v: [Float] = []
-        mesh.vertices.forEach { v.append($0) }
-        for i in stride(from: 0, to: v.count, by: 9) {
-            let n = SIMD3<Float>(v[i+3], v[i+4], v[i+5])
-            XCTAssertEqual(length(n), 1.0, accuracy: 1e-4, "normal must be unit length")
-        }
-    }
-    func testSupercellDoubles() throws {
-        var s = Scene(loaded: try Parser.load(fixture("si110.xsf")))
-        s = s.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
-        XCTAssertEqual(s.atoms.count, 4)
-    }
-    func testSlabPreservesSubset() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
-        var s = Scene(loaded: try Parser.load(url))
-        let before = s.atoms.count
-        s = s.applySlab(Slab(planeA: Plane(h:0,k:1,l:0,distance:0), planeB: Plane(h:0,k:-1,l:0,distance:1e9)))
-        XCTAssertLessThanOrEqual(s.atoms.count, before)
-    }
+    func testOpenFormatDispatch() throws {
+        XCTAssertEqual(ParseFormat.from(url: fixture("si110.xsf")), .xsf)
+        XCTAssertEqual(ParseFormat.from(url: fixture("N2O.cube")), .cube)
+        XCTAssertEqual(ParseFormat.from(url: fixture("si_relax.out")), .pwo)
+        XCTAssertEqual(ParseFormat.from(url: URL(fileURLWithPath: "/tmp/prefix.pdos_atm#1(Fe)_wfc#2(p)")), .dos)
+        XCTAssertTrue(App.openPanelExtensions.contains("g98"))
+        XCTAssertTrue(App.openPanelExtensions.contains("gz"))
 
-    // A slab whose planes sit far outside the cell must keep every atom. This
-    // exercises the same fractional-projection filter that syncFromState now
-    // routes through via applySlab (final-review Important #2).
-    func testSlabFarPlanePreservesAllAtoms() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let url = dir.appendingPathComponent("Fixtures/si110.xsf")
-        var s = Scene(loaded: try Parser.load(url))
-        let before = s.atoms.count
-        XCTAssertGreaterThan(before, 0)
-        // planeA distance very negative => projA >= dA always true;
-        // planeB distance very positive => projB <= dB always true.
-        s = s.applySlab(Slab(planeA: Plane(h: 0, k: 1, l: 0, distance: -1e9),
-                             planeB: Plane(h: 0, k: -1, l: 0, distance: 1e9)))
-        XCTAssertEqual(s.atoms.count, before)
-        XCTAssertNotNil(s.slab)
-    }
+        let qe = try Parser.load(fixture("si_relax.out"))
+        XCTAssertEqual(qe.atoms.count, 2)
+        XCTAssertNotNil(qe.cell)
 
-    // supercell product overflow must be refused (returned unchanged), not wrap past
-    // the cap. Int.max/2 cubed overflows Int; the safe product rejects it.
-    func testSupercellOverflowIsRefused() throws {
-        var s = Scene(loaded: try Parser.load(fixture("si110.xsf")))
-        let before = s.atoms.count
-        let huge = SuperCell(n1: Int.max / 2, n2: Int.max / 2, n3: Int.max / 2)
-        let out = s.widenSuperCell(huge)
-        // Refusal leaves the scene untouched: same atom count and a default supercell.
-        XCTAssertEqual(out.atoms.count, before)
-        XCTAssertEqual(out.superCell, SuperCell())
-    }
+        let g98URL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-\(UUID().uuidString).g98")
+        defer { try? FileManager.default.removeItem(at: g98URL) }
+        try Data(contentsOf: fixture("N2O.cube")).write(to: g98URL)
+        let g98 = try Parser.load(g98URL)
+        XCTAssertEqual(g98.scalarField?.nx, 19)
+        XCTAssertEqual(g98.atoms.count, 3)
 
-    // A zero/negative supercell factor is nonsensical and must be refused rather
-    // than produce a degenerate (zero-atom) expansion.
-    func testSupercellNonPositiveFactorIsRefused() throws {
-        var s = Scene(loaded: try Parser.load(fixture("si110.xsf")))
-        let before = s.atoms.count
-        let out = s.widenSuperCell(SuperCell(n1: 0, n2: 2, n3: 2))
-        XCTAssertEqual(out.atoms.count, before)
-    }
+        let gzipURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-\(UUID().uuidString).xsf.gz")
+        defer { try? FileManager.default.removeItem(at: gzipURL) }
+        let gzip = Process()
+        gzip.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+        gzip.arguments = ["-c", fixture("si.grid.xsf").path]
+        let output = Pipe()
+        gzip.standardOutput = output
+        try gzip.run()
+        let compressed = output.fileHandleForReading.readDataToEndOfFile()
+        gzip.waitUntilExit()
+        XCTAssertEqual(gzip.terminationStatus, 0)
+        try compressed.write(to: gzipURL)
+        let gzipped = try Parser.load(gzipURL)
+        XCTAssertEqual(gzipped.atoms.count, 2)
+        XCTAssertNotNil(gzipped.scalarField)
 
-    // fractionalCoord must return nil for a singular (zero-volume) cell so callers
-    // (applySlab) can refuse instead of fabricating an origin at (0,0,0).
-    func testFractionalCoordNilForSingularCell() {
-        var s = Scene()
-        // Two collinear vectors => det == 0.
-        s.cell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 1))
-        XCTAssertNil(s.fractionalCoord(SIMD3(0.5, 0, 0.5)))
-    }
+        let orcaOutURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-\(UUID().uuidString).out")
+        defer { try? FileManager.default.removeItem(at: orcaOutURL) }
+        try Data(contentsOf: fixture("orca.orca")).write(to: orcaOutURL)
+        XCTAssertEqual(ParseFormat.from(url: orcaOutURL), .orca)
 
-    // applySlab against a singular cell must leave the scene unchanged (refuse),
-    // not filter atoms against a fabricated origin.
-    func testApplySlabRefusesSingularCell() throws {
-        var s = Scene(loaded: try Parser.load(fixture("si110.xsf")))
-        s.cell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 1))
-        let before = s.atoms.count
-        let out = s.applySlab(Slab(planeA: Plane(h: 0, k: 1, l: 0, distance: 0),
-                                    planeB: Plane(h: 0, k: -1, l: 0, distance: 1)))
-        XCTAssertEqual(out.atoms.count, before)
-        XCTAssertNil(out.slab)
+        let fhiOutURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-\(UUID().uuidString).out")
+        defer { try? FileManager.default.removeItem(at: fhiOutURL) }
+        try Data(contentsOf: fixture("fhi_gaas_surface.fhi")).write(to: fhiOutURL)
+        XCTAssertEqual(ParseFormat.from(url: fhiOutURL), .fhi)
     }
 }

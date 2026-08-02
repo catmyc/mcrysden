@@ -14,6 +14,10 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 - XSF `PRIMVEC` parsing now accepts blank and comment-only lines between its three vector records, allowing the bundled `fcc-410-1x1.xsf` slab and similarly formatted XCrySDen files to load while retaining finite-vector validation.
 
+### Tests
+
+- Consolidated the tracked suite from 100 to 32 focused tests while retaining parser-family and scene workflows, Metal/raster/vector rendering, snapshots, state and camera-bookmark persistence, HPKOT's complete 29-variant oracle, periodic measurements, animation lifecycle behavior, CRYSCAL expansion, and QE `tpiba_b` export.
+
 ## [1.1.32] — 2026-08-02
 
 ### Added

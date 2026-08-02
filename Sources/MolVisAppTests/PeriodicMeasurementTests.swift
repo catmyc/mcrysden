@@ -19,93 +19,101 @@ final class PeriodicMeasurementTests: XCTestCase {
         return best
     }
 
-    // Pair spanning an orthogonal boundary: the minimum image wraps across
-    // the cell edge, so the measured distance is much shorter than direct.
-    func testOrthogonalBoundaryWraps() {
-        let cell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10))
-        let atoms = [
-            Atom(coord: SIMD3(0.5, 5, 5), atomicNumber: 1, label: "H"),
-            Atom(coord: SIMD3(9.5, 5, 5), atomicNumber: 1, label: "H"),
-        ]
-        let direct = length(atoms[1].coord - atoms[0].coord)
-        XCTAssertEqual(direct, 9.0, accuracy: 1e-5)
-        let result = Scene.computeMeasurement(mode: .distance, atoms: atoms, selected: [0, 1],
-                                              cell: cell, periodicDim: 3)
-        XCTAssertNotNil(result)
-        XCTAssertEqual(result!.value, 1.0, accuracy: 1e-4)
-    }
-
-    // Skew (non-orthogonal) cell: validate against explicit enumeration of all
-    // 27 neighboring images. The nearest image is not axis-aligned.
-    func testSkewCellMatchesBruteForce() {
-        let cell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(3, 4, 0), c: SIMD3(0, 0, 10))
-        let atoms = [
-            Atom(coord: .zero, atomicNumber: 1, label: "H"),
-            Atom(coord: SIMD3(4.9, 0.1, 0), atomicNumber: 1, label: "H"),
-        ]
-        let expected = bruteForceMinImage(from: atoms[0].coord, to: atoms[1].coord,
-                                          cell: cell, periodicDim: 3)
-        let result = Scene.computeMeasurement(mode: .distance, atoms: atoms, selected: [0, 1],
-                                              cell: cell, periodicDim: 3)
-        XCTAssertNotNil(result)
-        XCTAssertEqual(result!.value, expected, accuracy: 1e-4)
-        // Sanity: the minimum image is far shorter than the direct distance.
-        XCTAssertLessThan(result!.value, length(atoms[1].coord - atoms[0].coord) / 2)
-    }
-
-    // 2D periodicity wraps x and y but leaves z unwrapped. A tall cell in z
-    // with atoms near opposite z faces must NOT wrap that separation.
-    func test2DPeriodicityDoesNotWrapZ() {
-        let cell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 100))
-        let atoms = [
-            Atom(coord: SIMD3(0.5, 5, 10), atomicNumber: 1, label: "H"),
-            Atom(coord: SIMD3(9.5, 5, 90), atomicNumber: 1, label: "H"),
-        ]
-        let result = Scene.computeMeasurement(mode: .distance, atoms: atoms, selected: [0, 1],
-                                              cell: cell, periodicDim: 2)
-        XCTAssertNotNil(result)
-        // x wraps (1.0), z does not (80.0): sqrt(1^2 + 80^2).
-        let expected = sqrtf(1.0 + 80.0 * 80.0)
-        XCTAssertEqual(result!.value, expected, accuracy: 1e-3)
-    }
-
-    // Molecule (no cell): direct Cartesian distance, unchanged behavior.
-    func testMoleculeDirectDistance() {
-        let atoms = [
+    func testMoleculeOrthogonalAndTwoDimensionalDistanceBehavior() {
+        // Molecules use direct Cartesian distance when no periodic cell exists.
+        let moleculeAtoms = [
             Atom(coord: .zero, atomicNumber: 1, label: "H"),
             Atom(coord: SIMD3(3, 4, 0), atomicNumber: 1, label: "H"),
         ]
-        let result = Scene.computeMeasurement(mode: .distance, atoms: atoms, selected: [0, 1])
-        XCTAssertNotNil(result)
-        XCTAssertEqual(result!.value, 5.0, accuracy: 1e-5)
-        XCTAssertTrue(result!.summary.contains("Å"))
+        let moleculeResult = Scene.computeMeasurement(mode: .distance,
+                                                      atoms: moleculeAtoms,
+                                                      selected: [0, 1])
+        XCTAssertNotNil(moleculeResult)
+        XCTAssertEqual(moleculeResult!.value, 5.0, accuracy: 1e-5)
+        XCTAssertTrue(moleculeResult!.summary.contains("Å"))
+
+        // An orthogonal boundary pair must use the shorter wrapped distance.
+        let orthogonalCell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10))
+        let orthogonalAtoms = [
+            Atom(coord: SIMD3(0.5, 5, 5), atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3(9.5, 5, 5), atomicNumber: 1, label: "H"),
+        ]
+        let direct = length(orthogonalAtoms[1].coord - orthogonalAtoms[0].coord)
+        XCTAssertEqual(direct, 9.0, accuracy: 1e-5)
+        let orthogonalResult = Scene.computeMeasurement(mode: .distance,
+                                                         atoms: orthogonalAtoms,
+                                                         selected: [0, 1],
+                                                         cell: orthogonalCell,
+                                                         periodicDim: 3)
+        XCTAssertNotNil(orthogonalResult)
+        XCTAssertEqual(orthogonalResult!.value, 1.0, accuracy: 1e-4)
+
+        // Two-dimensional periodicity wraps x/y but leaves z unwrapped.
+        let twoDimensionalCell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 100))
+        let twoDimensionalAtoms = [
+            Atom(coord: SIMD3(0.5, 5, 10), atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3(9.5, 5, 90), atomicNumber: 1, label: "H"),
+        ]
+        let twoDimensionalResult = Scene.computeMeasurement(mode: .distance,
+                                                            atoms: twoDimensionalAtoms,
+                                                            selected: [0, 1],
+                                                            cell: twoDimensionalCell,
+                                                            periodicDim: 2)
+        XCTAssertNotNil(twoDimensionalResult)
+        // x wraps (1.0), z does not (80.0): sqrt(1^2 + 80^2).
+        let expected = sqrtf(1.0 + 80.0 * 80.0)
+        XCTAssertEqual(twoDimensionalResult!.value, expected, accuracy: 1e-3)
     }
 
-    // Invalid periodic geometry (singular cell) must yield nil, not a
-    // fabricated distance.
-    func testInvalidPeriodicGeometryReturnsNil() {
-        // b parallel to a => zero volume.
-        let cell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 1))
-        let atoms = [
+    func testSkewInvalidAndAngleMeasurementBehavior() {
+        // A skew cell is checked against explicit enumeration of all 27 images.
+        let skewCell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(3, 4, 0), c: SIMD3(0, 0, 10))
+        let skewAtoms = [
+            Atom(coord: .zero, atomicNumber: 1, label: "H"),
+            Atom(coord: SIMD3(4.9, 0.1, 0), atomicNumber: 1, label: "H"),
+        ]
+        let expected = bruteForceMinImage(from: skewAtoms[0].coord,
+                                          to: skewAtoms[1].coord,
+                                          cell: skewCell,
+                                          periodicDim: 3)
+        let skewResult = Scene.computeMeasurement(mode: .distance,
+                                                  atoms: skewAtoms,
+                                                  selected: [0, 1],
+                                                  cell: skewCell,
+                                                  periodicDim: 3)
+        XCTAssertNotNil(skewResult)
+        XCTAssertEqual(skewResult!.value, expected, accuracy: 1e-4)
+        XCTAssertLessThan(skewResult!.value,
+                          length(skewAtoms[1].coord - skewAtoms[0].coord) / 2)
+
+        // A singular periodic cell must fail rather than fabricate a distance.
+        let singularCell = Cell(a: SIMD3(1, 0, 0), b: SIMD3(2, 0, 0), c: SIMD3(0, 0, 1))
+        let singularAtoms = [
             Atom(coord: .zero, atomicNumber: 1, label: "H"),
             Atom(coord: SIMD3(0.5, 0.5, 0), atomicNumber: 1, label: "H"),
         ]
-        let result = Scene.computeMeasurement(mode: .distance, atoms: atoms, selected: [0, 1],
-                                              cell: cell, periodicDim: 3)
-        XCTAssertNil(result)
-    }
+        let invalidResult = Scene.computeMeasurement(mode: .distance,
+                                                     atoms: singularAtoms,
+                                                     selected: [0, 1],
+                                                     cell: singularCell,
+                                                     periodicDim: 3)
+        XCTAssertNil(invalidResult)
 
-    // Angle behavior is unchanged: computed from direct vectors regardless of
-    // cell. Passing a cell must not alter the angle.
-    func testAngleBehaviorUnchanged() {
-        let atoms = [
+        // Angles remain direct-vector measurements even when a cell is supplied.
+        let angleAtoms = [
             Atom(coord: SIMD3(1, 0, 0), atomicNumber: 1, label: "H"),
             Atom(coord: .zero, atomicNumber: 1, label: "H"),
             Atom(coord: SIMD3(0, 1, 0), atomicNumber: 1, label: "H"),
         ]
-        let plain = Scene.computeMeasurement(mode: .angle, atoms: atoms, selected: [0, 1, 2])
-        let withCell = Scene.computeMeasurement(mode: .angle, atoms: atoms, selected: [0, 1, 2],
-                                                cell: Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10)),
+        let plain = Scene.computeMeasurement(mode: .angle,
+                                             atoms: angleAtoms,
+                                             selected: [0, 1, 2])
+        let withCell = Scene.computeMeasurement(mode: .angle,
+                                                atoms: angleAtoms,
+                                                selected: [0, 1, 2],
+                                                cell: Cell(a: SIMD3(10, 0, 0),
+                                                           b: SIMD3(0, 10, 0),
+                                                           c: SIMD3(0, 0, 10)),
                                                 periodicDim: 3)
         XCTAssertNotNil(plain)
         XCTAssertNotNil(withCell)

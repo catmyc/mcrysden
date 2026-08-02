@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (post-v1.1.32 / Unreleased: camera bookmarks + standard crystallographic views + adaptive scale indicators; v1.1.32 context: QE tpiba_b export, cubic CRYSCAL expansion, 100 focused tests retained)**.
+Last updated: **2026-08-02 (post-v1.1.32 / Unreleased: camera bookmarks + standard crystallographic views + adaptive scale indicators; 32 focused tests; v1.1.32 context: QE tpiba_b export and cubic CRYSCAL expansion)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 100 focused tests: scene and format loading, renderer/export, snapshot (FNV-1a pixel hash vs. committed goldens), state persistence, HPKOT's 29-variant oracle, periodic measurements, animation-frame lifecycle, CRYSCAL cubic expansion, and QE `tpiba_b` export coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 32 focused tests: consolidated parser-family and scene workflows, renderer/raster/vector export, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements, animation-frame lifecycle, CRYSCAL cubic expansion, and QE `tpiba_b` export coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
