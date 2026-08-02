@@ -10,7 +10,7 @@ For multi-component features, dispatch independent subagents in parallel, review
 
 When user specifies the usage of a specific subagent type, do not use other subagents without asking.
 
-When the reivew-fix loop is clean without issue, udpate documentations and commit. Make smallest version bump. User decides large version bump.
+When the review-fix loop is clean without issue, update documentation and commit. Make the smallest version bump unless the user requests no version bump. The user decides large version bumps.
 
 ### review-fix loop
 The primary agent reviews.
@@ -21,9 +21,37 @@ Primary agent sends the issues back to relevant subagent sessions (if any) for f
 
 ## Subagent Dispatch
 
+Pi has no built-in subagent primitive. Launch isolated subagents as `pi` CLI subprocesses. Use `openai-codex/gpt-5.6-luna` with `max` reasoning unless the user requests another model.
+
+### Subprocess invocation
+
+For a one-shot implementation agent:
+
+```bash
+pi --mode json -p \
+  --model openai-codex/gpt-5.6-luna \
+  --thinking max \
+  --tools read,bash,edit,write \
+  --no-extensions --no-skills --no-prompt-templates \
+  "Implement the narrowly scoped task. Do not delegate further. ..." \
+  > /tmp/pi-subagent-name.jsonl \
+  2> /tmp/pi-subagent-name.err
+```
+
+- Run independent agents concurrently from one shell command with background jobs (`&`) followed by `wait`; do not launch independent jobs sequentially.
+- Give every agent a narrow task, explicit file scope, acceptance criteria, verification commands, and an instruction not to delegate further.
+- Keep project context files enabled for implementation work so subagents receive repository invariants. Use `--no-context-files` only for isolated capability probes.
+- Use an explicit tool allowlist. Analysis/review agents should normally receive only `read,grep,find,ls` (and `bash` when tests or git inspection are required).
+- `--mode json` produces JSONL suitable for capturing tool progress, final output, model identity, and failures. Check the process exit status and stderr before accepting a result.
+- Confirm the selected runtime when needed by having the child print `$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL`; the expected value is `openai-codex|gpt-5.6-luna|max`.
+
+For a subagent that must receive later review fixes, omit `--no-session`, give it a dedicated `--session-dir`, capture the session id from the JSONL `session` event, and resume it with `--session <id>`. Do not use `--continue` for parallel agents because it can select the wrong session.
+
 Key rules:
-- Reuse the subagent sessions as much as possible. Send the fix tasks back to relevant subagent sessions if possible.
-- Never dispatch overlapping file scopes to parallel agents.
+- Reuse subagent sessions as much as possible. Send fix tasks back to the relevant implementation session.
+- Never dispatch overlapping file scopes to parallel agents. Parallel editing is allowed only for disjoint files.
+- The primary agent owns integration, reviews combined changes, and runs final repository-wide verification.
+- Never assume subprocess success from output alone; require exit code zero, inspect the final assistant event, and review `git diff`.
 - Remove diagnostic/development-only tests after features stabilize.
 - Update `CHANGELOG.md` and `docs/ROADMAP.md` after each commit that implements a roadmap item.
 
@@ -77,7 +105,7 @@ Key rules:
 | `SideBarState.swift` | `ObservableObject` state: all `@Published` fields, route editing |
 | `Renderer.swift` | Metal renderer: atoms, bonds, cell, axes, BZ, isosurfaces, k-path |
 | `Renderer2D.swift` | Metal 2D primitives |
-| `KPath.swift` | k-path interpolation, QE/KPF/VASP export |
+| `KPath.swift` | k-path interpolation; QE crystal/crystal_b/tpiba_b, Wannier90, KPF, and VASP export |
 | `CrystalSymmetry.swift` | Spglib analysis: space group, Wyckoff, standardized cells |
 | `HPKOT.swift` | SeekPath 2.1 canonical paths for all 29 Bravais variants |
 | `StateStore.swift` | `.mvis-state` JSON serialization |
@@ -97,7 +125,7 @@ Key rules:
   MCRYSDEN_REGENERATE=1 swift test --filter SnapshotTests
   ```
   Review the changed hashes, then rerun snapshots without the environment variable.
-- The tracked suite contains 98 tests. Keep no more than 100 focused tests; replace lower-value cases when adding higher-value coverage.
+- The tracked suite contains 100 tests. Keep no more than 100 focused tests; replace a lower-value case before adding new coverage.
 - Parser failures must become `ParseError` with a useful path/reason; malformed user files must not trap. C parsers report details through thread-local `molenv_last_error`.
 
 ## References

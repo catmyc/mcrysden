@@ -94,6 +94,17 @@ const char *molenv_spglib_last_error(void);
 MolEnvSpglibStatus molenv_spglib_niggli_reduce(double lattice_rows[9],
                                                double symprec);
 
+/* Copy the conventional-coordinate operations for one numeric cubic space
+   group (International Tables numbers 195 through 230) into caller-owned
+   flat buffers. No spglib-owned pointer escapes this call. `rotations` has
+   `max_operations * 9` entries and `translations` has `max_operations * 3`;
+   both are required when max_operations is positive. */
+MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
+                                                   int32_t rotations[],
+                                                   double translations[],
+                                                   int32_t max_operations,
+                                                   int32_t *out_operations);
+
 #ifdef __cplusplus
 }
 #endif

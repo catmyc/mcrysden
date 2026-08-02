@@ -2272,6 +2272,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// to the user via an alert sheet.
     private func exportKPath(_ path: KPath, _ format: KPathExportFormat) {
         guard !path.points.isEmpty else { return }
+        // Capture the active cell when the save action starts. tpiba_b is a
+        // Cartesian reciprocal export, so it must not accidentally use a cell
+        // from a later-loaded scene if the save sheet remains open.
+        let activeCell = scene.cell
         let panel = NSSavePanel()
         panel.nameFieldStringValue = format.defaultFilename
         panel.allowedContentTypes = format == .vasp ? [] : [.plainText]
@@ -2279,7 +2283,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         panel.beginSheetModal(for: window) { result in
             guard result == .OK, let url = panel.url else { return }
             do {
-                let text = try KPathExport.export(path, as: format)
+                let text = try KPathExport.export(path, as: format, cell: activeCell)
                 try text.write(to: url, atomically: true, encoding: .utf8)
             } catch {
                 print("[mcrysden] k-path export failed: \(error)")

@@ -2,6 +2,7 @@ import Foundation
 import simd
 
 import MolEnvParse
+import MolEnvSpglib
 
 enum ParseError: Error, CustomStringConvertible {
     case parse(path: String, line: Int, reason: String)
@@ -58,7 +59,8 @@ internal func gunzipData(_ url: URL) throws -> Data {
 /// analysis. The C parser records per-file completeness (complete, asymmetric
 /// unit, or unknown) in `MolEnvScene.symmetry_completeness`; CIF files may
 /// report any of the three. CRYSCAL files commonly contain only an asymmetric
-/// unit and their expansion remains deferred.
+/// unit; numeric cubic CRYSTAL groups are expanded during loading, while the
+/// remaining CRYSCAL scopes stay incomplete.
 enum SymmetryInputCompleteness: Equatable {
     case complete
     case asymmetricUnit
@@ -103,6 +105,19 @@ struct LoadedScene {
     var grid2D: Grid2D?
     var multiOrbitalFields: [ScalarField] = []
     var symmetryInputCompleteness: SymmetryInputCompleteness = .complete
+}
+
+private struct CRYSCALFractionalSite {
+    let fractional: SIMD3<Double>
+    let atomicNumber: Int
+    let label: String
+}
+
+private struct CRYSCALDedupKey: Hashable {
+    let atomicNumber: Int
+    let x: Int64
+    let y: Int64
+    let z: Int64
 }
 
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
@@ -663,42 +678,66 @@ enum Parser {
         return out
     }
 
-    // CRYSCAL .r1 (XCRYSDEN's native input). Three sub-formats share a header:
-    //   <title>
-    //   CRYSTAL | POLYMER | SLAB
-    //   <i> <j> <k>
-    //   <space group: integer number OR symbol "F M 3 M"/"P M C N" ...>
-    //   <lattice constants: 1..6, in Angstrom — count set by crystal system>
-    //   <natoms>
-    //   <Z> <xf> <yf> <zf>          (natoms lines, fractional for CRYSTAL/SLAB,
-    //   EXPT | SUPERCELL | COORPRT | STOP | END     Cartesian for POLYMER)
+    // CRYSCAL .r1 (XCRYSDEN's native input). CRYSTAL and SLAB use:
+    //   <title>, kind, <i> <j> <k>, <space group>, lattice constants, <natoms>
+    // POLYMER has no space-group record: kind, dimensionality, one period/lattice
+    // value, <natoms>. Atom coordinates are fractional for CRYSTAL/SLAB and
+    // Cartesian for POLYMER; trailing EXPT/SUPERCELL/COORPRT/STOP/END records
+    // are outside the atom block.
     // The space group -> crystal system -> lattice-param count + cell angles are the
     // standard crystallographic mapping. Lattice constants are already in Angstrom.
     private static func loadCRYSCALr1(_ url: URL) throws -> LoadedScene {
         let raw = try String(contentsOf: url, encoding: .utf8)
         let lines = raw.components(separatedBy: "\n")
-        enum E: Error { case malformed(String) }
         func tok(_ s: String) -> [String] {
-            s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            s.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\r" }).map(String.init)
+        }
+        // `idx` and the line indices passed below are zero-based; ParseError's
+        // public line convention is one-based.
+        func failure(_ zeroBasedLine: Int, _ reason: String) -> ParseError {
+            ParseError.parse(path: url.path, line: max(1, zeroBasedLine + 1), reason: reason)
         }
         var idx = 0
-        func next() -> String? { guard idx < lines.count else { return nil }; defer { idx += 1 }; return lines[idx] }
-
-        _ = next()                                     // title
-        guard let kind = next()?.trimmingCharacters(in: .whitespaces).uppercased() else {
-            throw E.malformed("no record kind")
+        func next() -> String? {
+            guard idx < lines.count else { return nil }
+            defer { idx += 1 }
+            return lines[idx]
         }
-        _ = next()                                     // <i> <j> <k>
 
-        // space group: integer number or a symbol like "F M 3 M".
-        let spgTok = tok(next() ?? "")
+        guard next() != nil else { throw failure(0, "empty CRYSCAL file") } // title
+        guard let kindLine = next() else { throw failure(idx, "missing CRYSCAL record kind") }
+        let kindLineIndex = idx - 1
+        let kind = kindLine.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard kind == "CRYSTAL" || kind == "POLYMER" || kind == "SLAB" else {
+            throw failure(kindLineIndex, "unsupported CRYSCAL record kind '\(kindLine.trimmingCharacters(in: .whitespacesAndNewlines))'")
+        }
+        guard next() != nil else { throw failure(idx, "missing CRYSCAL dimensionality record") }
+        let isPolymer = kind == "POLYMER"
+        let spaceGroupLine = idx
+        let spgTok: [String]
+        if isPolymer {
+            // POLYMER has no space-group record: its next line is the
+            // one-dimensional lattice/period value. CRYSTAL and SLAB retain
+            // the space-group record layout used below.
+            spgTok = []
+        } else {
+            guard let spaceGroupText = next() else { throw failure(idx, "missing CRYSCAL space group") }
+            spgTok = tok(spaceGroupText)
+            guard !spgTok.isEmpty else { throw failure(spaceGroupLine, "empty CRYSCAL space group") }
+        }
+
+        // CRYSCAL's numeric group is deliberately kept separate from the symbol
+        // used to infer the lattice setting. Expansion is supported only for a
+        // numeric 195...230 declaration; symbolic names remain incomplete.
+        let numericSpaceGroup = spgTok.count == 1 ? Int(spgTok[0]) : nil
         let spgNumber: Int = {
-            if spgTok.count == 1, let n = Int(spgTok[0]) { return n }
-            // symbol form: map the few that appear in the fixtures
+            if let numericSpaceGroup { return numericSpaceGroup }
             let sym = spgTok.joined().uppercased()
-            if sym == "FM3M" { return 225 }            // cubic
-            if sym == "PMCN" { return 53 }             // orthorhombic
-            return 0
+            switch sym {
+            case "FM3M": return 225
+            case "PMCN": return 53
+            default: return 0
+            }
         }()
 
         // crystal system -> lattice-param count + cell angles, per the standard
@@ -717,24 +756,32 @@ enum Parser {
             case 16...74:   return .orthorhombic
             case 3...15:    return .mono
             case 1...2:     return .tri
-            default: return spgNumber == 53 ? .orthorhombic : .cubic
+            default: return .cubic
             }
         }()
-        // how many numbers the lattice-parameter line carries for this system
-        let nLat: Int = { switch system {
+        let nLat: Int = {
+            switch system {
             case .cubic: return 1
             case .tetragonal, .trigonal, .hexagonal: return 2
             case .orthorhombic: return 3
             case .mono: return 4                 // a, b, c, beta
             case .tri: return 6                  // a, b, c, alpha, beta, gamma
-        }}()
+            }
+        }()
 
-        // lattice constants across possibly several lines — take the first nLat floats.
+        // Lattice constants may span several lines. Reject non-finite values
+        // before Cell.fromLattice can turn them into its zero-cell sentinel.
         var lats: [Float] = []
         while lats.count < nLat, let line = next() {
-            for t in tok(line) { if let v = Float(t) { lats.append(v); if lats.count == nLat { break } } }
+            for t in tok(line) {
+                if let value = Float(t) {
+                    guard value.isFinite else { throw failure(idx - 1, "non-finite CRYSCAL lattice constant") }
+                    lats.append(value)
+                    if lats.count == nLat { break }
+                }
+            }
         }
-        guard lats.count == nLat else { throw E.malformed("bad lattice constants") }
+        guard lats.count == nLat else { throw failure(idx, "bad CRYSCAL lattice constants") }
 
         let cell: Cell = {
             switch system {
@@ -744,52 +791,227 @@ enum Parser {
                 let gamma: Float = (system == .hexagonal) ? 120 : 90
                 return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[1], alpha: 90, beta: 90, gamma: gamma)
             case .trigonal:
-                // hexagonal setting: a=b, gamma=120 (the form the fixtures use).
                 return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[1], alpha: 90, beta: 90, gamma: 120)
             case .orthorhombic:
                 return Cell.fromLattice(a: lats[0], b: lats[1], c: lats[2], alpha: 90, beta: 90, gamma: 90)
             case .mono:
-                // standard setting: unique axis b, beta = lats[3]; a,b,c = lats[0..3].
                 return Cell.fromLattice(a: lats[0], b: lats[1], c: lats[2], alpha: 90, beta: lats[3], gamma: 90)
             case .tri:
                 return Cell.fromLattice(a: lats[0], b: lats[1], c: lats[2], alpha: lats[3], beta: lats[4], gamma: lats[5])
             }
         }()
-
-        // natoms, then atom lines. CRYSTAL/SLAB coords are fractional; POLYMER are Cartesian.
-        let isPolymer = (kind == "POLYMER")
-        let natoms = max(0, Int(tok(next() ?? "").first ?? "") ?? 0)
-        var atoms: [Atom] = []
-        guard natoms > 0 else {
-            throw ParseError.parse(path: url.path, line: idx, reason: "no atoms in CRYSCAL file")
+        let cellValues = [cell.a.x, cell.a.y, cell.a.z,
+                          cell.b.x, cell.b.y, cell.b.z,
+                          cell.c.x, cell.c.y, cell.c.z].map(Double.init)
+        guard cellValues.allSatisfy(\.isFinite) else {
+            throw failure(idx, "CRYSCAL cell is non-finite or singular")
         }
-        var read = 0
-        for _ in 0..<natoms {
+        let cellScale = cellValues.map(abs).max() ?? 0
+        guard cellScale.isFinite, cellScale > 0 else {
+            throw failure(idx, "CRYSCAL cell is non-finite or singular")
+        }
+        let cellA = SIMD3<Double>(Double(cell.a.x), Double(cell.a.y), Double(cell.a.z))
+        let cellB = SIMD3<Double>(Double(cell.b.x), Double(cell.b.y), Double(cell.b.z))
+        let cellC = SIMD3<Double>(Double(cell.c.x), Double(cell.c.y), Double(cell.c.z))
+        let normalizedA = cellA / cellScale
+        let normalizedB = cellB / cellScale
+        let normalizedC = cellC / cellScale
+        let normalizedVolume = simd_dot(normalizedA, simd_cross(normalizedB, normalizedC))
+        guard normalizedVolume.isFinite, abs(normalizedVolume) > 1e-12 else {
+            throw failure(idx, "CRYSCAL cell is non-finite or singular")
+        }
+
+        // natoms, then atom lines. CRYSTAL/SLAB coordinates are fractional;
+        // POLYMER coordinates are Cartesian and are never symmetry-expanded.
+        let atomCountLine = idx
+        guard let atomCountText = next(), let atomCountToken = tok(atomCountText).first else {
+            throw failure(atomCountLine, "missing CRYSCAL atom count")
+        }
+        guard let natoms = Int(atomCountToken) else {
+            throw failure(atomCountLine, "CRYSCAL atom count is out of range")
+        }
+        guard natoms > 0 else { throw failure(atomCountLine, "no atoms in CRYSCAL file") }
+        let inputAtomCap = 4096
+        let expansionAtomCap = 500_000
+        guard natoms <= inputAtomCap else {
+            throw failure(atomCountLine, "CRYSCAL atom count \(natoms) exceeds input cap \(inputAtomCap)")
+        }
+
+        var atoms: [Atom] = []
+        atoms.reserveCapacity(natoms)
+        var fractionalSites: [CRYSCALFractionalSite] = []
+        fractionalSites.reserveCapacity(natoms)
+        for atomIndex in 0..<natoms {
+            let atomLine = idx
             guard let line = next() else {
-                throw ParseError.parse(path: url.path, line: idx, reason: "truncated CRYSCAL atom block")
+                throw failure(atomLine, "truncated CRYSCAL atom block at atom \(atomIndex + 1)/\(natoms)")
             }
             let t = tok(line)
-            guard t.count >= 4, let Z = Int(t[0]) else { continue }
-            guard let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else { continue }
-            let sym = Table.id(Z)
-            if isPolymer {
-                atoms.append(Atom(coord: SIMD3<Float>(x, y, z), atomicNumber: Z, label: sym))
-            } else {
-                atoms.append(Atom(coord: cell.cartesian(SIMD3<Float>(x, y, z)), atomicNumber: Z, label: sym))
+            guard t.count >= 4 else {
+                throw failure(atomLine, "malformed CRYSCAL atom \(atomIndex + 1): expected Z x y z")
             }
-            read += 1
-            if isPolymer {
-                // polymer atom lines occasionally carry extra integers (bonding) — ignore
+            guard let atomicNumber = Int(t[0]), atomicNumber > 0 else {
+                throw failure(atomLine, "invalid CRYSCAL atomic number '\(t[0])'")
+            }
+            guard let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]),
+                  x.isFinite, y.isFinite, z.isFinite else {
+                throw failure(atomLine, "non-finite or invalid CRYSCAL atom coordinates")
+            }
+            let label = Table.id(atomicNumber)
+            let position = SIMD3<Float>(x, y, z)
+            let cartesian = isPolymer ? position : cell.cartesian(position)
+            guard cartesian.x.isFinite, cartesian.y.isFinite, cartesian.z.isFinite else {
+                throw failure(atomLine, "CRYSCAL atom \(atomIndex + 1) produces non-finite Cartesian coordinates")
+            }
+            atoms.append(Atom(coord: cartesian, atomicNumber: atomicNumber, label: label))
+            if !isPolymer {
+                fractionalSites.append(CRYSCALFractionalSite(
+                    fractional: SIMD3<Double>(Double(x), Double(y), Double(z)),
+                    atomicNumber: atomicNumber,
+                    label: label
+                ))
             }
         }
-        guard read == natoms else {
-            throw ParseError.parse(path: url.path, line: idx, reason: "CRYSCAL atom count mismatch (\(read)/\(natoms))")
+
+        var completeness: SymmetryInputCompleteness = .asymmetricUnit
+        let supportsExpansion = kind == "CRYSTAL" &&
+            numericSpaceGroup.map { (195...230).contains($0) } == true
+        if supportsExpansion, let numericSpaceGroup {
+            let maxOperations = 192
+            var rotations = [Int32](repeating: 0, count: maxOperations * 9)
+            var translations = [Double](repeating: 0, count: maxOperations * 3)
+            var operationCount: Int32 = 0
+            let status = rotations.withUnsafeMutableBufferPointer { rotationBuffer in
+                translations.withUnsafeMutableBufferPointer { translationBuffer in
+                    molenv_spglib_cubic_operations(
+                        Int32(numericSpaceGroup), rotationBuffer.baseAddress,
+                        translationBuffer.baseAddress, Int32(maxOperations), &operationCount
+                    )
+                }
+            }
+            guard status == MOLENV_SPGLIB_OK else {
+                let detail = String(cString: molenv_spglib_last_error())
+                throw failure(spaceGroupLine,
+                              "CRYSCAL space-group \(numericSpaceGroup) expansion failed: \(detail.isEmpty ? "status \(status)" : detail)")
+            }
+            let operationTotal = Int(operationCount)
+            guard operationTotal > 0, operationTotal <= maxOperations else {
+                throw failure(spaceGroupLine, "CRYSCAL space-group \(numericSpaceGroup) returned an invalid operation count")
+            }
+            let potential = natoms.multipliedReportingOverflow(by: operationTotal)
+            guard !potential.overflow else {
+                throw failure(spaceGroupLine, "CRYSCAL symmetry expansion atom-count multiplication overflowed")
+            }
+            guard potential.partialValue <= expansionAtomCap else {
+                throw failure(spaceGroupLine,
+                              "CRYSCAL symmetry expansion may produce \(potential.partialValue) atoms, exceeding cap \(expansionAtomCap)")
+            }
+
+            // The database operations are exact affine operations, but the input
+            // coordinates are Float-backed. Quantized buckets plus a periodic
+            // coordinate check make equivalent sites robust to those roundoff
+            // differences while keeping expansion bounded and non-quadratic.
+            let binsPerAxis: Int64 = 10_000_000
+            let dedupTolerance = 1e-7
+            func wrap(_ value: Double) -> Double? {
+                guard value.isFinite else { return nil }
+                var result = value - value.rounded(.down)
+                guard result.isFinite else { return nil }
+                if result < 0 { result += 1 }
+                if result >= 1 { result = 0 }
+                return result == 0 ? 0 : result
+            }
+            func bin(_ value: Double) -> Int64 {
+                Int64((value * Double(binsPerAxis)).rounded(.down))
+            }
+            func periodicBin(_ value: Int64) -> Int64 {
+                let remainder = value % binsPerAxis
+                return remainder < 0 ? remainder + binsPerAxis : remainder
+            }
+            func periodicDifference(_ lhs: Double, _ rhs: Double) -> Double {
+                let distance = abs(lhs - rhs)
+                return min(distance, 1 - distance)
+            }
+
+            var expandedAtoms: [Atom] = []
+            expandedAtoms.reserveCapacity(potential.partialValue)
+            var buckets: [CRYSCALDedupKey: [SIMD3<Double>]] = [:]
+            buckets.reserveCapacity(potential.partialValue)
+            for site in fractionalSites {
+                for operation in 0..<operationTotal {
+                    let r = operation * 9
+                    let t = operation * 3
+                    let transformed = SIMD3<Double>(
+                        Double(rotations[r]) * site.fractional.x +
+                            Double(rotations[r + 1]) * site.fractional.y +
+                            Double(rotations[r + 2]) * site.fractional.z + translations[t],
+                        Double(rotations[r + 3]) * site.fractional.x +
+                            Double(rotations[r + 4]) * site.fractional.y +
+                            Double(rotations[r + 5]) * site.fractional.z + translations[t + 1],
+                        Double(rotations[r + 6]) * site.fractional.x +
+                            Double(rotations[r + 7]) * site.fractional.y +
+                            Double(rotations[r + 8]) * site.fractional.z + translations[t + 2]
+                    )
+                    guard transformed.x.isFinite, transformed.y.isFinite, transformed.z.isFinite,
+                          let fx = wrap(transformed.x), let fy = wrap(transformed.y),
+                          let fz = wrap(transformed.z) else {
+                        throw failure(spaceGroupLine,
+                                      "CRYSCAL space-group \(numericSpaceGroup) produced a non-finite fractional position")
+                    }
+                    let baseKey = CRYSCALDedupKey(atomicNumber: site.atomicNumber,
+                                                   x: bin(fx), y: bin(fy), z: bin(fz))
+                    var duplicate = false
+                    for dx in -1...1 {
+                        for dy in -1...1 {
+                            for dz in -1...1 {
+                                let key = CRYSCALDedupKey(
+                                    atomicNumber: site.atomicNumber,
+                                    x: periodicBin(baseKey.x + Int64(dx)),
+                                    y: periodicBin(baseKey.y + Int64(dy)),
+                                    z: periodicBin(baseKey.z + Int64(dz))
+                                )
+                                guard let candidates = buckets[key] else { continue }
+                                for existing in candidates {
+                                    if periodicDifference(fx, existing.x) <= dedupTolerance &&
+                                        periodicDifference(fy, existing.y) <= dedupTolerance &&
+                                        periodicDifference(fz, existing.z) <= dedupTolerance {
+                                        duplicate = true
+                                        break
+                                    }
+                                }
+                                if duplicate { break }
+                            }
+                            if duplicate { break }
+                        }
+                        if duplicate { break }
+                    }
+                    if !duplicate {
+                        let cartesian = cell.cartesian(SIMD3<Float>(Float(fx), Float(fy), Float(fz)))
+                        guard cartesian.x.isFinite, cartesian.y.isFinite, cartesian.z.isFinite else {
+                            throw failure(spaceGroupLine,
+                                          "CRYSCAL symmetry expansion produced a non-finite Cartesian position")
+                        }
+                        guard expandedAtoms.count < expansionAtomCap else {
+                            throw failure(spaceGroupLine, "CRYSCAL symmetry expansion exceeded atom cap \(expansionAtomCap)")
+                        }
+                        expandedAtoms.append(Atom(coord: cartesian,
+                                                  atomicNumber: site.atomicNumber,
+                                                  label: site.label))
+                        buckets[baseKey, default: []].append(SIMD3(fx, fy, fz))
+                    }
+                }
+            }
+            guard !expandedAtoms.isEmpty else {
+                throw failure(spaceGroupLine, "CRYSCAL symmetry expansion produced no atoms")
+            }
+            atoms = expandedAtoms
+            completeness = .complete
         }
 
         var out = LoadedScene()
         out.title = url.lastPathComponent
         out.atoms = atoms
-        out.symmetryInputCompleteness = .asymmetricUnit
+        out.symmetryInputCompleteness = completeness
         out.isCrystal = !isPolymer
         if !isPolymer { out.cell = cell }
         return out

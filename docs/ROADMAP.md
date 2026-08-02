@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (focused test suite, 98 tests)**.
+Last updated: **2026-08-02 (QE tpiba_b export, cubic CRYSCAL expansion, 100 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 98 focused tests: scene and format loading, renderer/export, snapshot (FNV-1a pixel hash vs. committed goldens), state persistence, HPKOT's 29-variant oracle, periodic measurements, and animation-frame lifecycle coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 100 focused tests: scene and format loading, renderer/export, snapshot (FNV-1a pixel hash vs. committed goldens), state persistence, HPKOT's 29-variant oracle, periodic measurements, animation-frame lifecycle, CRYSCAL cubic expansion, and QE `tpiba_b` export coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
@@ -97,11 +97,11 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Export VASP `KPOINTS` (line-mode, endpoint-pair encoding, blank-line segment separation).
 - [x] K-path-editor cumulative reciprocal distance display, candidate hover tooltips, viewport node labels, and automatic BZ framing (v1.1.25). Band plots already use cumulative reciprocal distance.
 - [x] Import k-paths from QE `K_POINTS crystal`, VASP line-mode `KPOINTS`, Wannier90 `kpoint_path`, and XCrySDen `.kpf` (v1.1.29): format sniffing, endpoint coalescing with break reconstruction, VASP-only sampling-density propagation (QE/Wannier90/KPF preserve the existing state/user preference), 1,024-node/16 MB bounds, provenance-safe user-edited routes, GUI Import panel, and CLI `--kpath`. Review hardening in v1.1.30: strict official Wannier90 begin/end parsing with inline comments, VASP label preservation, and BOM normalization.
-- [~] Export Wannier90 `kpoint_path` and QE `K_POINTS crystal_b` card-body forms (v1.1.31), with official weight-0 break jumps and w=n−1 subdivisions for crystal_b and sanitized/generated stable labels for Wannier90. `tpiba_b` export remains pending.
+- [x] Export Wannier90 `kpoint_path` and QE `K_POINTS crystal_b`/`tpiba_b` card-body forms. Both QE band cards use official weight-0 break jumps and w=n−1 subdivisions; `tpiba_b` converts through the active cell using the documented `alat = |cell.a|` convention.
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
 
 ### Crystal input completeness
-- [~] CIF declared-operation asymmetric-unit expansion is complete in v1.1.22 with periodic dedup/species mapping and downstream symmetry/k-path availability; CRYSCAL expansion remains pending.
+- [~] CIF declared-operation asymmetric-unit expansion is complete in v1.1.22. CRYSCAL numeric cubic `CRYSTAL` groups 195–230 now expand through spglib database operations with periodic dedup/species mapping and downstream symmetry/k-path availability; symbolic, non-cubic, `SLAB`, and `POLYMER` expansion remains pending.
 
 ### Structure information and analysis
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).

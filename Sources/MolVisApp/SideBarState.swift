@@ -211,9 +211,10 @@ final class SideBarState: ObservableObject {
     /// Export the given k-path in the requested format (the controller presents
     /// a save panel and writes the text). `.qe` => QE K_POINTS crystal;
     /// `.qeCrystalB` => QE K_POINTS crystal_b band-path rows, one special point
-    /// per line with a per-line subdivision weight; `.wannier90` => Wannier90
-    /// kpoint_path block; `.kpf` => XCrySDen native k-path file; `.vasp` =>
-    /// VASP line-mode KPOINTS.
+    /// per line with a per-line subdivision weight; `.qeTpibaB` => QE
+    /// K_POINTS tpiba_b rows converted through the active cell; `.wannier90` =>
+    /// Wannier90 kpoint_path block; `.kpf` => XCrySDen native k-path file;
+    /// `.vasp` => VASP line-mode KPOINTS.
     var onExportKPath: ((KPath, KPathExportFormat) -> Void)?
     /// Import a k-path from a file (the controller presents an open panel and
     /// parses the chosen route). Imported routes are marked user-edited exactly

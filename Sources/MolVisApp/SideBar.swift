@@ -538,10 +538,11 @@ struct SideBar: View {
         HStack {
             exportButton("QE (.pwscf)", .qe)
             exportButton("QE crystal_b", .qeCrystalB)
-            exportButton("Wannier90", .wannier90)
+            exportButton("QE tpiba_b", .qeTpibaB)
         }
         .buttonStyle(.bordered).font(.caption)
         HStack {
+            exportButton("Wannier90", .wannier90)
             exportButton("kpf", .kpf)
             exportButton("VASP", .vasp)
         }

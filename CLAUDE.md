@@ -38,7 +38,7 @@ XCTest, under `Sources/MolVisAppTests` (not the empty top-level `Tests/`). Acces
 - **Snapshot tests** — `SnapshotTests` extends `Snapshotter`, renders a fixed scene+camera to a 64×64 texture, compares an FNV-1a pixel hash against committed goldens in `Sources/MolVisAppTests/Fixtures/golden/`. Regenerate goldens with env var `MCRYSDEN_REGENERATE=1`.
 - **Integration / regression tests** — scene and format loading, renderer/export behavior, state persistence, HPKOT oracle validation, periodic measurements, and animation-frame lifecycle behavior.
 
-The tracked suite contains **98 tests**. Keep the suite at no more than 100 focused tests; replace lower-value cases when adding higher-value coverage.
+The tracked suite contains **100 tests**. Keep the suite at no more than 100 focused tests; replace a lower-value case before adding new coverage.
 
 Fixtures live in `Sources/MolVisAppTests/Fixtures/` and are loaded at runtime via `#file`-relative paths. CI runs on `macos-14` (Apple Silicon) via `.github/workflows/ci.yml`.
 
@@ -107,7 +107,7 @@ Graph views (`BandGrapherView`, `DOSGrapherView`, `ColorPlaneView`) are viewport
 | `BrillouinZone.swift` | BZ polyhedron construction, caching, centering detection |
 | `CrystalSymmetry.swift` | Spglib analysis: space group, Wyckoff, standardized cells |
 | `HPKOT.swift` | SeekPath 2.1 canonical paths for all 29 Bravais variants |
-| `KPath.swift` | k-path interpolation, QE/KPF/VASP export |
+| `KPath.swift` | k-path interpolation; QE crystal/crystal_b/tpiba_b, Wannier90, KPF, and VASP export |
 | `CanonicalPathGenerator.swift` | High-symmetry path generation |
 | `BandStructure.swift` | QE band structure + uniform-mesh detection |
 | `BandAnalysis.swift` | Band-analysis engine: VBM/CBM, gap, metallicity, effective masses |

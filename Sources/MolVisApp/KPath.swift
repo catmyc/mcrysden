@@ -385,6 +385,7 @@ enum CubicLattice { case fcc, bcc, sc }
 enum KPathExportFormat: String {
     case qe = "qe"
     case qeCrystalB = "qe-crystal-b"
+    case qeTpibaB = "qe-tpiba-b"
     case kpf = "kpf"
     case vasp = "vasp"
     case wannier90 = "wannier90"
@@ -394,6 +395,7 @@ enum KPathExportFormat: String {
         switch self {
         case .qe: return "kpath.qe"
         case .qeCrystalB: return "kpath.crystal_b"
+        case .qeTpibaB: return "kpath.tpiba_b"
         case .kpf: return "kpath.kpf"
         case .vasp: return "KPOINTS"
         case .wannier90: return "kpath.win"
@@ -471,7 +473,10 @@ enum KPathExport {
         case tooFewPoints
         case tooManyPoints(Int)
         case nonFiniteRoute
+        case unrepresentableRoute
         case orphanSingleton
+        case missingCell
+        case invalidCell
 
         var errorDescription: String? {
             switch self {
@@ -485,8 +490,14 @@ enum KPathExport {
                 return "Export requires at most \(KPathExport.maxRoutePoints) route points; got \(count)."
             case .nonFiniteRoute:
                 return "Export requires all k-point coordinates to be finite."
+            case .unrepresentableRoute:
+                return "QE tpiba_b export cannot represent the converted route coordinates."
             case .orphanSingleton:
                 return "Wannier90 kpoint_path export requires every route point to belong to an edge (no orphan singleton nodes)."
+            case .missingCell:
+                return "QE tpiba_b export requires an active crystal cell."
+            case .invalidCell:
+                return "QE tpiba_b export requires a finite, non-degenerate active cell."
             }
         }
     }
@@ -501,7 +512,7 @@ enum KPathExport {
         switch format {
         case .qe:
             return !path.points.isEmpty
-        case .qeCrystalB:
+        case .qeCrystalB, .qeTpibaB:
             return path.points.count >= 2
         case .kpf:
             return path.points.count >= 2 && !path.hasDisconnectedSegments
@@ -526,6 +537,10 @@ enum KPathExport {
             return "QE crystal_b export requires at least two k-points (one line)."
         case .qeCrystalB:
             return "Export explicit QE K_POINTS crystal_b card data"
+        case .qeTpibaB where path.points.count < 2:
+            return "QE tpiba_b export requires at least two k-points (one line); convention: alat = |cell.a|."
+        case .qeTpibaB:
+            return "Export explicit QE K_POINTS tpiba_b card data (Cartesian 2pi/alat; alat = |cell.a|)"
         case .kpf where path.points.count < 2:
             return "KPF export requires at least two route points."
         case .kpf where path.hasDisconnectedSegments:
@@ -648,14 +663,17 @@ enum KPathExport {
     /// line: the text must be pasted or written immediately after a
     /// `K_POINTS crystal_b` card line (the UI save writes the body as-is).
     /// Uses POSIX locale.
-    static func qeKPointsCrystalB(_ path: KPath) throws -> String {
+    /// Validate a QE line-path and calculate the per-edge subdivision weights
+    /// shared by `crystal_b` and `tpiba_b`. Keeping this in one helper makes the
+    /// two cards differ only in their coordinate convention, never in sampling
+    /// or break handling.
+    private static func qeBandRouteData(_ path: KPath) throws -> (points: [KPoint], weights: [Int]) {
         let pts = path.points
         guard pts.count >= 2 else { throw ExportError.tooFewPoints }
         guard pts.count <= KPathExport.maxRoutePoints else { throw ExportError.tooManyPoints(pts.count) }
         guard pts.allSatisfy({ $0.frac.x.isFinite && $0.frac.y.isFinite && $0.frac.z.isFinite }) else {
             throw ExportError.nonFiniteRoute
         }
-        let posixLocale = Locale(identifier: "en_US_POSIX")
         let perSeg = min(200, max(2, path.pointsPerSegment))
 
         // Desired endpoint-inclusive samples per edge in Double math (Float
@@ -671,9 +689,11 @@ enum KPathExport {
                 let dy = Double(q.y) - Double(p.y)
                 let dz = Double(q.z) - Double(p.z)
                 let d = sqrt(dx * dx + dy * dy + dz * dz)
+                guard d.isFinite else { throw ExportError.nonFiniteRoute }
                 lengths.append(d)
                 componentLength += d
             }
+            guard componentLength.isFinite else { throw ExportError.nonFiniteRoute }
             for (offset, d) in lengths.enumerated() {
                 let apportioned: Double
                 if componentLength > 0 {
@@ -681,16 +701,123 @@ enum KPathExport {
                 } else {
                     apportioned = 2
                 }
+                guard apportioned.isFinite else { throw ExportError.nonFiniteRoute }
                 let samples = min(200.0, max(2.0, apportioned.rounded()))
                 weights[range.lowerBound + offset] = Int(samples) - 1
             }
         }
+        return (points: pts, weights: weights)
+    }
 
-        var lines = ["\(pts.count)"]
-        for (i, kp) in pts.enumerated() {
-            let w = (i < pts.count - 1) ? weights[i] : 0
+    static func qeKPointsCrystalB(_ path: KPath) throws -> String {
+        let data = try qeBandRouteData(path)
+        let posixLocale = Locale(identifier: "en_US_POSIX")
+        var lines = ["\(data.points.count)"]
+        for (i, kp) in data.points.enumerated() {
+            let w = (i < data.points.count - 1) ? data.weights[i] : 0
             lines.append(String(format: "%.6f %.6f %.6f %d", locale: posixLocale,
                                 arguments: [kp.frac.x, kp.frac.y, kp.frac.z, w]))
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Validate the active direct cell and return its conventional reciprocal
+    /// basis together with QE's `alat`. The convention is deliberately stable:
+    /// `alat = length(cell.a)`, irrespective of cell shape or which parser
+    /// supplied the active cell.
+    private static func qeTpibaBasis(for cell: Cell) throws -> (reciprocal: (a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>), alat: Double) {
+        let directValues = [cell.a.x, cell.a.y, cell.a.z,
+                            cell.b.x, cell.b.y, cell.b.z,
+                            cell.c.x, cell.c.y, cell.c.z]
+        guard directValues.allSatisfy({ $0.isFinite }) else { throw ExportError.invalidCell }
+        let directScale = directValues.reduce(0.0) { max($0, abs(Double($1))) }
+        guard directScale.isFinite, directScale > 0 else { throw ExportError.invalidCell }
+
+        // Normalize before testing the determinant, matching Cell's reciprocal
+        // construction and keeping the validity check scale-safe.
+        let directA = SIMD3<Double>(Double(cell.a.x) / directScale,
+                                    Double(cell.a.y) / directScale,
+                                    Double(cell.a.z) / directScale)
+        let directB = SIMD3<Double>(Double(cell.b.x) / directScale,
+                                    Double(cell.b.y) / directScale,
+                                    Double(cell.b.z) / directScale)
+        let directC = SIMD3<Double>(Double(cell.c.x) / directScale,
+                                    Double(cell.c.y) / directScale,
+                                    Double(cell.c.z) / directScale)
+        let normalizedVolume = dot(directA, cross(directB, directC))
+        guard normalizedVolume.isFinite, abs(normalizedVolume) > 1e-12 else {
+            throw ExportError.invalidCell
+        }
+
+        // QE's tpiba unit is 2pi/alat. Use Double for the norm and conversion
+        // so the explicit `length(cell.a)` convention does not depend on Float
+        // overflow or intermediate rounding.
+        let alat = sqrt(Double(cell.a.x) * Double(cell.a.x)
+                        + Double(cell.a.y) * Double(cell.a.y)
+                        + Double(cell.a.z) * Double(cell.a.z))
+        guard alat.isFinite, alat > 0 else { throw ExportError.invalidCell }
+
+        let reciprocal = cell.reciprocalVectors
+        let reciprocalValues = [reciprocal.a.x, reciprocal.a.y, reciprocal.a.z,
+                                reciprocal.b.x, reciprocal.b.y, reciprocal.b.z,
+                                reciprocal.c.x, reciprocal.c.y, reciprocal.c.z]
+        guard reciprocalValues.allSatisfy({ $0.isFinite }) else { throw ExportError.invalidCell }
+        let reciprocalScale = reciprocalValues.reduce(0.0) { max($0, abs(Double($1))) }
+        guard reciprocalScale.isFinite, reciprocalScale > 0 else { throw ExportError.invalidCell }
+        let reciprocalA = SIMD3<Double>(Double(reciprocal.a.x) / reciprocalScale,
+                                        Double(reciprocal.a.y) / reciprocalScale,
+                                        Double(reciprocal.a.z) / reciprocalScale)
+        let reciprocalB = SIMD3<Double>(Double(reciprocal.b.x) / reciprocalScale,
+                                        Double(reciprocal.b.y) / reciprocalScale,
+                                        Double(reciprocal.b.z) / reciprocalScale)
+        let reciprocalC = SIMD3<Double>(Double(reciprocal.c.x) / reciprocalScale,
+                                        Double(reciprocal.c.y) / reciprocalScale,
+                                        Double(reciprocal.c.z) / reciprocalScale)
+        let reciprocalVolume = dot(reciprocalA, cross(reciprocalB, reciprocalC))
+        guard reciprocalVolume.isFinite, abs(reciprocalVolume) > 1e-12 else {
+            throw ExportError.invalidCell
+        }
+        return (reciprocal: reciprocal, alat: alat)
+    }
+
+    /// Convert a conventional reciprocal-fraction route node to Cartesian QE
+    /// `tpiba_b` coordinates: Cartesian reciprocal `1/Å` coordinates are scaled
+    /// by `alat / 2pi`, yielding the dimensionless units `2pi/alat`.
+    static func qeKPointsTpibaB(_ path: KPath, cell: Cell) throws -> String {
+        let data = try qeBandRouteData(path)
+        let basis = try qeTpibaBasis(for: cell)
+        let unitScale = basis.alat / (2.0 * Double.pi)
+        guard unitScale.isFinite, unitScale > 0 else { throw ExportError.invalidCell }
+
+        let coordinates = try data.points.map { point -> SIMD3<Float> in
+            let frac = point.frac
+            let cartesian = SIMD3<Double>(
+                Double(basis.reciprocal.a.x) * Double(frac.x)
+                    + Double(basis.reciprocal.b.x) * Double(frac.y)
+                    + Double(basis.reciprocal.c.x) * Double(frac.z),
+                Double(basis.reciprocal.a.y) * Double(frac.x)
+                    + Double(basis.reciprocal.b.y) * Double(frac.y)
+                    + Double(basis.reciprocal.c.y) * Double(frac.z),
+                Double(basis.reciprocal.a.z) * Double(frac.x)
+                    + Double(basis.reciprocal.b.z) * Double(frac.y)
+                    + Double(basis.reciprocal.c.z) * Double(frac.z))
+            let tpiba = cartesian * unitScale
+            guard tpiba.x.isFinite, tpiba.y.isFinite, tpiba.z.isFinite else {
+                throw ExportError.unrepresentableRoute
+            }
+            let result = SIMD3<Float>(Float(tpiba.x), Float(tpiba.y), Float(tpiba.z))
+            guard result.x.isFinite, result.y.isFinite, result.z.isFinite else {
+                throw ExportError.unrepresentableRoute
+            }
+            return result
+        }
+
+        let posixLocale = Locale(identifier: "en_US_POSIX")
+        var lines = ["\(data.points.count)"]
+        for (i, point) in coordinates.enumerated() {
+            let w = (i < coordinates.count - 1) ? data.weights[i] : 0
+            lines.append(String(format: "%.6f %.6f %.6f %d", locale: posixLocale,
+                                arguments: [point.x, point.y, point.z, w]))
         }
         return lines.joined(separator: "\n") + "\n"
     }
@@ -759,14 +886,19 @@ enum KPathExport {
     }
 
     /// Export text for the given UI format: `.qe` => QE K_POINTS crystal card
-    /// body, `.qeCrystalB` => QE K_POINTS crystal_b card body, `.kpf` =>
-    /// XCrySDen native k-path file, `.vasp` => VASP line-mode KPOINTS,
-    /// `.wannier90` => Wannier90 kpoint_path block. Formats that cannot
-    /// represent the path (e.g. KPF with breaks) throw a precise ExportError.
-    static func export(_ path: KPath, as format: KPathExportFormat) throws -> String {
+    /// body, `.qeCrystalB` => QE K_POINTS crystal_b card body,
+    /// `.qeTpibaB` => QE K_POINTS tpiba_b card body (requires `cell`),
+    /// `.kpf` => XCrySDen native k-path file, `.vasp` => VASP line-mode
+    /// KPOINTS, and `.wannier90` => Wannier90 kpoint_path block. Formats that
+    /// cannot represent the path (e.g. KPF with breaks) throw a precise
+    /// ExportError.
+    static func export(_ path: KPath, as format: KPathExportFormat, cell: Cell? = nil) throws -> String {
         switch format {
         case .qe: return qeKPointsCrystal(path)
         case .qeCrystalB: return try qeKPointsCrystalB(path)
+        case .qeTpibaB:
+            guard let cell else { throw ExportError.missingCell }
+            return try qeKPointsTpibaB(path, cell: cell)
         case .kpf: return try xcrysdnenKPF(path)
         case .vasp: return try vaspKPoints(path)
         case .wannier90: return try wannier90KPointPath(path)

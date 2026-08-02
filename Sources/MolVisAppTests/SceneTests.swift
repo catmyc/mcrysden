@@ -363,11 +363,12 @@ final class SceneTests: XCTestCase {
         func load(_ name: String) throws -> Scene {
             try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/\(name)"), as: .crystal))
         }
-        // ZnS: cubic (spg 216), 1 lattice const; 2 atoms. The file writes an extra
+        // ZnS: cubic (spg 216), 1 lattice const; the 2-site asymmetric unit
+        // expands to the conventional 8-atom cell. The file writes an extra
         // spurious 2.96 param that nLat=1 correctly ignores.
         let zns = try load("crystal_ZnS.r1")
         XCTAssertTrue(zns.isCrystal)
-        XCTAssertEqual(zns.atoms.count, 2)
+        XCTAssertEqual(zns.atoms.count, 8)
         XCTAssertNotNil(zns.cell)
         XCTAssertEqual(simd_length(zns.cell!.a), 5.42, accuracy: 0.01)
 
@@ -399,6 +400,40 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(simd_length(argonite.cell!.a), 4.9616, accuracy: 0.01)
         XCTAssertEqual(simd_length(argonite.cell!.b), 7.9705, accuracy: 0.01)
         XCTAssertEqual(simd_length(argonite.cell!.c), 5.7394, accuracy: 0.01)
+
+        // POLYMER has no space-group record: its period is followed directly
+        // by the atom count and six Cartesian atom records.
+        let polymer = try Parser.load(dir.appendingPathComponent("Fixtures/crystal_polymer.r1"), as: .crystal)
+        XCTAssertFalse(polymer.isCrystal)
+        XCTAssertEqual(polymer.atoms.count, 6)
+        XCTAssertNil(polymer.cell)
+        XCTAssertEqual(polymer.symmetryInputCompleteness, .asymmetricUnit)
+        XCTAssertEqual(polymer.atoms[0].coord.x, 0.5, accuracy: 1e-5)
+        XCTAssertEqual(polymer.atoms[0].coord.y, 0.7219, accuracy: 1e-5)
+    }
+
+    func testCRYSCALCubicExpansionPreservesSpecies() throws {
+        func counts(_ atoms: [Atom]) -> [Int: Int] {
+            Dictionary(grouping: atoms, by: { $0.atomicNumber }).mapValues { $0.count }
+        }
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let zns = try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/crystal_ZnS.r1"), as: .crystal))
+        XCTAssertEqual(zns.crystalSymmetry?.symmetry?.spaceGroupNumber, 216)
+        XCTAssertEqual(zns.atoms.count, 8)
+        XCTAssertEqual(counts(zns.atoms)[16], 4)
+        XCTAssertEqual(counts(zns.atoms)[30], 4)
+
+        let mgo = try Scene(loaded: Parser.load(dir.appendingPathComponent("Fixtures/crystal_mgo.r1"), as: .crystal))
+        XCTAssertEqual(mgo.crystalSymmetry?.symmetry?.spaceGroupNumber, 225)
+        XCTAssertEqual(mgo.atoms.count, 8)
+        XCTAssertEqual(counts(mgo.atoms)[12], 4)
+        XCTAssertEqual(counts(mgo.atoms)[8], 4)
+
+        let symbolicLoaded = try Parser.load(dir.appendingPathComponent("Fixtures/crystal_Pt_fcc.r1"), as: .crystal)
+        XCTAssertEqual(symbolicLoaded.symmetryInputCompleteness, .asymmetricUnit)
+        let symbolic = Scene(loaded: symbolicLoaded)
+        XCTAssertNil(symbolic.crystalSymmetry?.symmetry)
+        XCTAssertTrue(symbolic.crystalSymmetry?.unavailableReason?.isAsymmetricUnitInput == true)
     }
 
     // Fermi-surface BXSF: parse the Fermi energy + per-band grids, then build a

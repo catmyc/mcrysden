@@ -529,6 +529,78 @@ MolEnvSpglibStatus molenv_spglib_analyze(const double lattice_rows[9],
     return MOLENV_SPGLIB_OK;
 }
 
+MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
+                                                   int32_t rotations[],
+                                                   double translations[],
+                                                   int32_t max_operations,
+                                                   int32_t *out_operations) {
+    int hall_number = 0;
+    int database_rotations[192][3][3];
+    double database_translations[192][3];
+    int operation_count;
+    int hall;
+    int i;
+    int j;
+
+    molenv_spglib_error[0] = '\0';
+    if (out_operations == NULL) {
+        set_error("missing cubic-operation output count");
+        return MOLENV_SPGLIB_INVALID_ARGUMENT;
+    }
+    *out_operations = 0;
+    if (spacegroup_number < 195 || spacegroup_number > 230) {
+        set_error("cubic operation lookup requires space-group number 195 through 230");
+        return MOLENV_SPGLIB_INVALID_ARGUMENT;
+    }
+    if (max_operations <= 0 || max_operations > 192 || rotations == NULL ||
+        translations == NULL) {
+        set_error("invalid cubic-operation output buffers");
+        return MOLENV_SPGLIB_INVALID_ARGUMENT;
+    }
+
+    /* The first Hall setting is the canonical conventional setting for each
+       numeric cubic group. Some groups have a second setting; CRYSCAL gives
+       only the numeric group, so selecting the lowest Hall number is the
+       deterministic International-Tables setting. */
+    for (hall = 1; hall <= 530; hall++) {
+        SpglibSpacegroupType type = spg_get_spacegroup_type(hall);
+        if (type.number == spacegroup_number) {
+            hall_number = hall;
+            break;
+        }
+    }
+    if (hall_number == 0) {
+        set_error("numeric cubic space group is absent from the spglib database");
+        return MOLENV_SPGLIB_SEARCH_FAILED;
+    }
+
+    operation_count = spg_get_symmetry_from_database(database_rotations,
+                                                       database_translations,
+                                                       hall_number);
+    if (operation_count <= 0 || operation_count > 192) {
+        set_error("spglib returned an invalid cubic operation count");
+        return MOLENV_SPGLIB_SEARCH_FAILED;
+    }
+    if (operation_count > max_operations) {
+        set_error("cubic operation output capacity is too small");
+        return MOLENV_SPGLIB_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < operation_count; i++) {
+        for (j = 0; j < 9; j++) {
+            rotations[i * 9 + j] = (int32_t)database_rotations[i][j / 3][j % 3];
+        }
+        for (j = 0; j < 3; j++) {
+            if (!isfinite(database_translations[i][j])) {
+                set_error("spglib returned a non-finite cubic operation translation");
+                return MOLENV_SPGLIB_SEARCH_FAILED;
+            }
+            translations[i * 3 + j] = database_translations[i][j];
+        }
+    }
+    *out_operations = (int32_t)operation_count;
+    return MOLENV_SPGLIB_OK;
+}
+
 MolEnvSpglibStatus molenv_spglib_niggli_reduce(double lattice_rows[9],
                                                double symprec) {
     double lattice[3][3];

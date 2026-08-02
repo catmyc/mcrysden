@@ -130,9 +130,12 @@ enum KPathImport {
         switch mode {
         case "", "crystal":
             break
-        case "automatic", "tpiba_b":
+        case "automatic":
             throw KPathImportError.notAPath(path: path,
-                                            reason: "uniform k-grid (automatic/tpiba_b), not a band path — use K_POINTS crystal")
+                                            reason: "uniform k-grid (automatic), not a band path — use K_POINTS crystal")
+        case "tpiba_b":
+            throw KPathImportError.notAPath(path: path,
+                                            reason: "K_POINTS tpiba_b is an unsupported Cartesian band path without active cell/alat context — use K_POINTS crystal coordinates")
         default:
             throw KPathImportError.notAPath(path: path,
                                             reason: "K_POINTS mode '\(mode)' is not a band path; use crystal, KPF, VASP, or Wannier90 kpoint_path")
