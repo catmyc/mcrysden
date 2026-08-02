@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (post-v1.1.32 / Unreleased: camera bookmarks + standard crystallographic views + adaptive scale indicators; 32 focused tests; v1.1.32 context: QE tpiba_b export and cubic CRYSCAL expansion)**.
+Last updated: **2026-08-02 (post-v1.1.33: standard crystallographic camera views, camera bookmarks, and adaptive scale indicators released; 32 focused tests; v1.1.32 context: QE tpiba_b export and cubic CRYSCAL expansion)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
