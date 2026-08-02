@@ -6,7 +6,11 @@ This document records the implemented symmetry and high-symmetry-path contract. 
 
 `CrystalSymmetryAnalyzer` analyzes complete, three-dimensional periodic structures with a finite, nonsingular cell and at least one atom. The default and currently used `symprec` is `1e-5` Å; callers may request values from `1e-8` through `1e-1` Å. Analysis is synchronous and is capped at 4,096 input atoms, 4,096 operations, and 400,000 standardized-conventional atoms.
 
-Known asymmetric-unit-only inputs are not silently treated as complete crystals. CIF declared-operation inputs and numeric cubic CRYSCAL `CRYSTAL` groups 195–230 are expanded to complete cells during parsing; CRYSCAL symbolic/non-cubic, `SLAB`, and `POLYMER` inputs remain incomplete and report symmetry as unavailable. Invalid cells, coordinates, types, tolerances, and oversized structures likewise produce an unavailable reason instead of a partial result or retry at a different tolerance.
+Known asymmetric-unit-only inputs are not silently treated as complete crystals. CIF declared-operation inputs and numeric or unambiguous symbolic cubic CRYSCAL `CRYSTAL` groups 195–230 are expanded to complete cells during parsing. Unknown, ambiguous, or non-cubic symbolic inputs are never guessed and remain incomplete; non-cubic numeric groups, `SLAB`, and `POLYMER` inputs likewise remain incomplete and report symmetry as unavailable.
+
+CRYSCAL symbolic space-group matching uses a database-backed normalized Hermann–Mauguin (HM) lookup: case, whitespace, `-`, `_`, and `/` are ignored before comparison. A symbol is accepted for expansion only when it resolves unambiguously to one cubic group in 195–230. Numeric group numbers and successfully resolved symbolic numbers use the same database operation lookup, which deterministically selects the lowest Hall number when multiple Hall settings exist.
+
+Invalid cells, coordinates, types, tolerances, and oversized structures likewise produce an unavailable reason instead of a partial result or retry at a different tolerance.
 
 The vendored spglib 2.7.0 sources live in `Sources/SpglibCore`. `Sources/MolEnvSpglib` is the allocation-safe project façade: it copies results into project-owned values and releases spglib allocations before returning to Swift. It exposes no retained spglib pointers.
 

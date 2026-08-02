@@ -59,8 +59,8 @@ internal func gunzipData(_ url: URL) throws -> Data {
 /// analysis. The C parser records per-file completeness (complete, asymmetric
 /// unit, or unknown) in `MolEnvScene.symmetry_completeness`; CIF files may
 /// report any of the three. CRYSCAL files commonly contain only an asymmetric
-/// unit; numeric cubic CRYSTAL groups are expanded during loading, while the
-/// remaining CRYSCAL scopes stay incomplete.
+/// unit; numeric and unambiguous symbolic cubic CRYSTAL groups are expanded
+/// during loading, while the remaining CRYSCAL scopes stay incomplete.
 enum SymmetryInputCompleteness: Equatable {
     case complete
     case asymmetricUnit
@@ -726,19 +726,30 @@ enum Parser {
             guard !spgTok.isEmpty else { throw failure(spaceGroupLine, "empty CRYSCAL space group") }
         }
 
-        // CRYSCAL's numeric group is deliberately kept separate from the symbol
-        // used to infer the lattice setting. Expansion is supported only for a
-        // numeric 195...230 declaration; symbolic names remain incomplete.
+        // Keep the numeric declaration separate from the original symbol used
+        // for lattice-system inference. The C façade compares symbolic aliases
+        // against spglib's full database and returns a number only for a unique
+        // cubic match; zero means unknown, non-cubic, or ambiguous.
         let numericSpaceGroup = spgTok.count == 1 ? Int(spgTok[0]) : nil
-        let spgNumber: Int = {
-            if let numericSpaceGroup { return numericSpaceGroup }
+        let symbolicCubicSpaceGroup: Int? = {
+            guard numericSpaceGroup == nil, !spgTok.isEmpty else { return nil }
+            let symbol = spgTok.joined(separator: " ")
+            var resolved: Int32 = 0
+            let status = symbol.withCString { pointer in
+                molenv_spglib_cubic_spacegroup_number(pointer, &resolved)
+            }
+            guard status == MOLENV_SPGLIB_OK else { return nil }
+            let number = Int(resolved)
+            return (195...230).contains(number) ? number : nil
+        }()
+        let originalSymbolSpaceGroup: Int? = {
             let sym = spgTok.joined().uppercased()
             switch sym {
-            case "FM3M": return 225
             case "PMCN": return 53
-            default: return 0
+            default: return nil
             }
         }()
+        let spgNumber: Int = numericSpaceGroup ?? symbolicCubicSpaceGroup ?? originalSymbolSpaceGroup ?? 0
 
         // crystal system -> lattice-param count + cell angles, per the standard
         // crystallographic convention (International Tables) that CRYSCAL's r1 line
@@ -874,9 +885,10 @@ enum Parser {
         }
 
         var completeness: SymmetryInputCompleteness = .asymmetricUnit
+        let candidateExpansionSpaceGroup = numericSpaceGroup ?? symbolicCubicSpaceGroup
         let supportsExpansion = kind == "CRYSTAL" &&
-            numericSpaceGroup.map { (195...230).contains($0) } == true
-        if supportsExpansion, let numericSpaceGroup {
+            candidateExpansionSpaceGroup.map { (195...230).contains($0) } == true
+        if supportsExpansion, let expansionSpaceGroup = candidateExpansionSpaceGroup {
             let maxOperations = 192
             var rotations = [Int32](repeating: 0, count: maxOperations * 9)
             var translations = [Double](repeating: 0, count: maxOperations * 3)
@@ -884,7 +896,7 @@ enum Parser {
             let status = rotations.withUnsafeMutableBufferPointer { rotationBuffer in
                 translations.withUnsafeMutableBufferPointer { translationBuffer in
                     molenv_spglib_cubic_operations(
-                        Int32(numericSpaceGroup), rotationBuffer.baseAddress,
+                        Int32(expansionSpaceGroup), rotationBuffer.baseAddress,
                         translationBuffer.baseAddress, Int32(maxOperations), &operationCount
                     )
                 }
@@ -892,11 +904,11 @@ enum Parser {
             guard status == MOLENV_SPGLIB_OK else {
                 let detail = String(cString: molenv_spglib_last_error())
                 throw failure(spaceGroupLine,
-                              "CRYSCAL space-group \(numericSpaceGroup) expansion failed: \(detail.isEmpty ? "status \(status)" : detail)")
+                              "CRYSCAL space-group \(expansionSpaceGroup) expansion failed: \(detail.isEmpty ? "status \(status)" : detail)")
             }
             let operationTotal = Int(operationCount)
             guard operationTotal > 0, operationTotal <= maxOperations else {
-                throw failure(spaceGroupLine, "CRYSCAL space-group \(numericSpaceGroup) returned an invalid operation count")
+                throw failure(spaceGroupLine, "CRYSCAL space-group \(expansionSpaceGroup) returned an invalid operation count")
             }
             let potential = natoms.multipliedReportingOverflow(by: operationTotal)
             guard !potential.overflow else {
@@ -956,7 +968,7 @@ enum Parser {
                           let fx = wrap(transformed.x), let fy = wrap(transformed.y),
                           let fz = wrap(transformed.z) else {
                         throw failure(spaceGroupLine,
-                                      "CRYSCAL space-group \(numericSpaceGroup) produced a non-finite fractional position")
+                                      "CRYSCAL space-group \(expansionSpaceGroup) produced a non-finite fractional position")
                     }
                     let baseKey = CRYSCALDedupKey(atomicNumber: site.atomicNumber,
                                                    x: bin(fx), y: bin(fy), z: bin(fz))

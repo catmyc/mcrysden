@@ -94,6 +94,15 @@ const char *molenv_spglib_last_error(void);
 MolEnvSpglibStatus molenv_spglib_niggli_reduce(double lattice_rows[9],
                                                double symprec);
 
+/* Resolve an International Hermann–Mauguin symbol to a unique cubic space
+   group (International Tables numbers 195 through 230). Case, whitespace,
+   minus signs, slash punctuation, and screw-axis underscores are normalized
+   only while comparing against spglib's database aliases. A successful call
+   leaves `out_spacegroup_number` as zero when the symbol is unknown,
+   non-cubic, or ambiguous; no guess is made. */
+MolEnvSpglibStatus molenv_spglib_cubic_spacegroup_number(const char *symbol,
+                                                          int32_t *out_spacegroup_number);
+
 /* Copy the conventional-coordinate operations for one numeric cubic space
    group (International Tables numbers 195 through 230) into caller-owned
    flat buffers. No spglib-owned pointer escapes this call. `rotations` has

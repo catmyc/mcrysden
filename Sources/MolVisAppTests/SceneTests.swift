@@ -372,6 +372,61 @@ final class SceneTests: XCTestCase {
         XCTAssertNotNil(zns.cell)
         XCTAssertEqual(simd_length(zns.cell!.a), 5.42, accuracy: 0.01)
 
+        // Symbolic F M 3 M is an asymmetric Pt site in the fixture. It must
+        // expand to the four distinct conventional-cell FCC positions rather
+        // than merely padding the atom list to the expected count.
+        let ptURL = dir.appendingPathComponent("Fixtures/crystal_Pt_fcc.r1")
+        let ptLoaded = try Parser.load(ptURL, as: .crystal)
+        XCTAssertEqual(ptLoaded.atoms.count, 4)
+        XCTAssertEqual(ptLoaded.symmetryInputCompleteness, .complete)
+        let pt = Scene(loaded: ptLoaded)
+        XCTAssertTrue(pt.isCrystal)
+        XCTAssertEqual(pt.atoms.count, 4)
+        XCTAssertEqual(Set(pt.atoms.map(\.atomicNumber)), Set([78]))
+        let expectedFCC: [SIMD3<Float>] = [
+            SIMD3<Float>(0, 0, 0),
+            SIMD3<Float>(0, 0.5, 0.5),
+            SIMD3<Float>(0.5, 0, 0.5),
+            SIMD3<Float>(0.5, 0.5, 0)
+        ]
+        let fractional = pt.atoms.compactMap { pt.fractionalCoord($0.coord) }
+        XCTAssertEqual(fractional.count, 4)
+        for (index, position) in fractional.enumerated() {
+            XCTAssertTrue(expectedFCC.contains { allComponentsEqual(position, $0, 1e-4) },
+                          "unexpected Pt fractional coordinate \(position)")
+            XCTAssertFalse(fractional[..<index].contains { allComponentsEqual($0, position, 1e-4) },
+                           "FCC expansion contains a duplicate at \(position)")
+        }
+        for expected in expectedFCC {
+            XCTAssertEqual(fractional.filter { allComponentsEqual($0, expected, 1e-4) }.count, 1,
+                           "missing or duplicated FCC position \(expected)")
+        }
+        XCTAssertTrue(pt.crystalSymmetry?.isAvailable == true)
+        XCTAssertEqual(pt.crystalSymmetry?.symmetry?.spaceGroupNumber, 225)
+        XCTAssertGreaterThan(pt.crystalSymmetry?.symmetry?.symmetryOperations.count ?? 0, 0)
+
+        let ptContents = try String(contentsOf: ptURL, encoding: .utf8)
+        func temporaryCRYSCALPt(symbol: String) throws -> URL {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mcrysden-cryscal-\(UUID().uuidString).r1")
+            let contents = ptContents.replacingOccurrences(of: "F M 3 M", with: symbol)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        }
+        let dashedURL = try temporaryCRYSCALPt(symbol: "fm-3m")
+        defer { try? FileManager.default.removeItem(at: dashedURL) }
+        let dashed = try Parser.load(dashedURL, as: .crystal)
+        XCTAssertEqual(dashed.atoms.count, 4)
+        XCTAssertTrue(dashed.atoms.allSatisfy { $0.atomicNumber == 78 })
+        XCTAssertEqual(dashed.symmetryInputCompleteness, .complete)
+
+        let unknownURL = try temporaryCRYSCALPt(symbol: "xm-3m")
+        defer { try? FileManager.default.removeItem(at: unknownURL) }
+        let unknown = try Parser.load(unknownURL, as: .crystal)
+        XCTAssertEqual(unknown.atoms.count, 1)
+        XCTAssertEqual(unknown.atoms.first?.atomicNumber, 78)
+        XCTAssertEqual(unknown.symmetryInputCompleteness, .asymmetricUnit)
+
         // rutile: tetragonal (spg 136), a,c; 2 atoms.
         let rutile = try load("crystal_rutile.r1")
         XCTAssertEqual(rutile.atoms.count, 2)
@@ -428,12 +483,6 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(mgo.atoms.count, 8)
         XCTAssertEqual(counts(mgo.atoms)[12], 4)
         XCTAssertEqual(counts(mgo.atoms)[8], 4)
-
-        let symbolicLoaded = try Parser.load(dir.appendingPathComponent("Fixtures/crystal_Pt_fcc.r1"), as: .crystal)
-        XCTAssertEqual(symbolicLoaded.symmetryInputCompleteness, .asymmetricUnit)
-        let symbolic = Scene(loaded: symbolicLoaded)
-        XCTAssertNil(symbolic.crystalSymmetry?.symmetry)
-        XCTAssertTrue(symbolic.crystalSymmetry?.unavailableReason?.isAsymmetricUnitInput == true)
     }
 
     // Fermi-surface BXSF: parse the Fermi energy + per-band grids, then build a

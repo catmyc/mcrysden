@@ -13,6 +13,10 @@
 #define MOLENV_SPGLIB_MAX_ATOMS 4096
 #define MOLENV_SPGLIB_MAX_STANDARD_ATOMS 400000
 #define MOLENV_SPGLIB_MAX_OPERATIONS 4096
+#define MOLENV_SPGLIB_FIRST_CUBIC_SPACEGROUP 195
+#define MOLENV_SPGLIB_LAST_CUBIC_SPACEGROUP 230
+#define MOLENV_SPGLIB_LAST_HALL_NUMBER 530
+#define MOLENV_SPGLIB_NORMALIZED_SYMBOL_CAPACITY 64
 /* Spglib's symprec is a Cartesian distance in Angstroms. Keep synchronous
    analysis inside a practical range and never retry with a changed value. */
 #define MOLENV_SPGLIB_MIN_SYMPREC 1e-8
@@ -529,6 +533,102 @@ MolEnvSpglibStatus molenv_spglib_analyze(const double lattice_rows[9],
     return MOLENV_SPGLIB_OK;
 }
 
+/* CRYSCAL commonly writes short Hermann–Mauguin symbols with spaces and
+   omits punctuation such as the minus sign in `F M 3 M` for Fm-3m. Only the
+   punctuation that is conventional in these symbols is ignored; every other
+   non-ASCII character is rejected. The database comparison below decides
+   whether the resulting alias is unique, rather than inferring a group from
+   its letter/digit pattern. */
+static int normalize_international_symbol(const char *source,
+                                          char destination[MOLENV_SPGLIB_NORMALIZED_SYMBOL_CAPACITY]) {
+    size_t output_length = 0;
+    size_t i;
+    int has_symbol_character = 0;
+
+    if (source == NULL) return 0;
+    for (i = 0; source[i] != '\0'; i++) {
+        unsigned char character = (unsigned char)source[i];
+        if (character == ' ' || character == '\t' || character == '\r' ||
+            character == '\n' || character == '\f' || character == '\v' ||
+            character == '-' || character == '_' || character == '/') {
+            continue;
+        }
+        if (character >= 'a' && character <= 'z') {
+            character = (unsigned char)(character - ('a' - 'A'));
+        } else if (!((character >= 'A' && character <= 'Z') ||
+                     (character >= '0' && character <= '9'))) {
+            return 0;
+        }
+        if (output_length + 1 >= MOLENV_SPGLIB_NORMALIZED_SYMBOL_CAPACITY) {
+            return 0;
+        }
+        destination[output_length++] = (char)character;
+        has_symbol_character = 1;
+    }
+    if (!has_symbol_character) return 0;
+    destination[output_length] = '\0';
+    return 1;
+}
+
+static int normalized_symbol_matches(const char *normalized_input,
+                                     const char *candidate) {
+    char normalized_candidate[MOLENV_SPGLIB_NORMALIZED_SYMBOL_CAPACITY];
+    return normalize_international_symbol(candidate, normalized_candidate) &&
+           strcmp(normalized_input, normalized_candidate) == 0;
+}
+
+MolEnvSpglibStatus molenv_spglib_cubic_spacegroup_number(const char *symbol,
+                                                          int32_t *out_spacegroup_number) {
+    char normalized_symbol[MOLENV_SPGLIB_NORMALIZED_SYMBOL_CAPACITY];
+    int matched_spacegroup = 0;
+    int ambiguous = 0;
+    int hall;
+
+    molenv_spglib_error[0] = '\0';
+    if (out_spacegroup_number == NULL) {
+        set_error("missing cubic space-group output number");
+        return MOLENV_SPGLIB_INVALID_ARGUMENT;
+    }
+    *out_spacegroup_number = 0;
+    /* Unknown or malformed symbols intentionally resolve to zero without an
+       error: the CRYSCAL caller must leave such input symmetry-incomplete. */
+    if (!normalize_international_symbol(symbol, normalized_symbol)) {
+        return MOLENV_SPGLIB_OK;
+    }
+
+    /* Search every Hall setting and every international-symbol spelling in the
+       vendored database. Multiple settings for one group are harmless; an
+       alias that reaches different international numbers is not accepted.
+       The caller subsequently asks cubic_operations for the number, which
+       deliberately selects the same lowest-Hall conventional setting used for
+       numeric CRYSCAL groups. */
+    for (hall = 1; hall <= MOLENV_SPGLIB_LAST_HALL_NUMBER; hall++) {
+        SpglibSpacegroupType type = spg_get_spacegroup_type(hall);
+        const char *candidates[3] = {
+            type.international_short,
+            type.international,
+            type.international_full
+        };
+        int candidate_index;
+        if (type.number <= 0) continue;
+        for (candidate_index = 0; candidate_index < 3; candidate_index++) {
+            if (!normalized_symbol_matches(normalized_symbol, candidates[candidate_index])) {
+                continue;
+            }
+            if (matched_spacegroup == 0) {
+                matched_spacegroup = type.number;
+            } else if (matched_spacegroup != type.number) {
+                ambiguous = 1;
+            }
+        }
+    }
+    if (!ambiguous && matched_spacegroup >= MOLENV_SPGLIB_FIRST_CUBIC_SPACEGROUP &&
+        matched_spacegroup <= MOLENV_SPGLIB_LAST_CUBIC_SPACEGROUP) {
+        *out_spacegroup_number = (int32_t)matched_spacegroup;
+    }
+    return MOLENV_SPGLIB_OK;
+}
+
 MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
                                                    int32_t rotations[],
                                                    double translations[],
@@ -548,7 +648,8 @@ MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
         return MOLENV_SPGLIB_INVALID_ARGUMENT;
     }
     *out_operations = 0;
-    if (spacegroup_number < 195 || spacegroup_number > 230) {
+    if (spacegroup_number < MOLENV_SPGLIB_FIRST_CUBIC_SPACEGROUP ||
+        spacegroup_number > MOLENV_SPGLIB_LAST_CUBIC_SPACEGROUP) {
         set_error("cubic operation lookup requires space-group number 195 through 230");
         return MOLENV_SPGLIB_INVALID_ARGUMENT;
     }
@@ -562,7 +663,7 @@ MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
        numeric cubic group. Some groups have a second setting; CRYSCAL gives
        only the numeric group, so selecting the lowest Hall number is the
        deterministic International-Tables setting. */
-    for (hall = 1; hall <= 530; hall++) {
+    for (hall = 1; hall <= MOLENV_SPGLIB_LAST_HALL_NUMBER; hall++) {
         SpglibSpacegroupType type = spg_get_spacegroup_type(hall);
         if (type.number == spacegroup_number) {
             hall_number = hall;

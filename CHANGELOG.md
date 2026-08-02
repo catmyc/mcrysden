@@ -7,7 +7,7 @@ All notable changes to mcrysden will be documented in this file. The format is b
 ### Added
 
 - QE `K_POINTS tpiba_b` card-body export with the same sampling and weight-0 break semantics as `crystal_b`. Route points are converted through the active reciprocal cell into Cartesian `2π/alat` units using the explicit convention `alat = |cell.a|`; missing, singular, non-finite, and unrepresentable inputs fail descriptively. The sidebar exposes a dedicated save action and filename.
-- CRYSCAL numeric cubic `CRYSTAL` asymmetric-unit expansion for space groups 195–230 using caller-owned operations copied synchronously from spglib. Expansion wraps and periodic-deduplicates sites by species, enforces input/operation/atom bounds, and enables downstream symmetry and canonical k-path analysis. Symbolic, non-cubic, `SLAB`, and `POLYMER` inputs remain incomplete.
+- CRYSCAL numeric and unambiguous symbolic cubic `CRYSTAL` asymmetric-unit expansion for space groups 195–230 now uses caller-owned operations copied synchronously from the spglib database; symbolic Hermann–Mauguin names resolve through a normalized HM lookup. Expansion wraps and periodic-deduplicates sites by species, enforces input/operation/atom bounds, and enables downstream symmetry and canonical k-path analysis. Unknown, ambiguous, or non-cubic symbolic inputs are never guessed and remain incomplete; non-cubic numeric groups, `SLAB`, and `POLYMER` inputs remain incomplete.
 
 ### Fixed
 

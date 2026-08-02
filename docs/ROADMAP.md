@@ -101,7 +101,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
 
 ### Crystal input completeness
-- [~] CIF declared-operation asymmetric-unit expansion is complete in v1.1.22. CRYSCAL numeric cubic `CRYSTAL` groups 195–230 now expand through spglib database operations with periodic dedup/species mapping and downstream symmetry/k-path availability; symbolic, non-cubic, `SLAB`, and `POLYMER` expansion remains pending.
+- [~] CIF declared-operation asymmetric-unit expansion is complete in v1.1.22. CRYSCAL numeric and unambiguous symbolic cubic `CRYSTAL` groups 195–230 now expand through spglib's database-backed operations, with symbolic names resolved by a normalized Hermann–Mauguin lookup, periodic dedup/species mapping, and downstream symmetry/k-path availability; ambiguous/unknown symbols remain incomplete by design, while the pending expansion scope is limited to non-cubic `CRYSTAL` groups, `SLAB`, and `POLYMER`.
 
 ### Structure information and analysis
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
