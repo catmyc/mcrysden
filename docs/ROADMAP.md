@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (QE tpiba_b export, cubic CRYSCAL expansion, 100 focused tests)**.
+Last updated: **2026-08-02 (v1.1.32: QE tpiba_b export, cubic CRYSCAL expansion, 100 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-## Implemented foundation (through v1.1.28)
+## Implemented foundation (through v1.1.32)
 
 ### File formats
 - [x] XSF (structure + `DATAGRID_3D`/`2D`, including `.xsf.gz`), AXSF animation

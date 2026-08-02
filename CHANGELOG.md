@@ -4,6 +4,8 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.32] — 2026-08-02
+
 ### Added
 
 - QE `K_POINTS tpiba_b` card-body export with the same sampling and weight-0 break semantics as `crystal_b`. Route points are converted through the active reciprocal cell into Cartesian `2π/alat` units using the explicit convention `alat = |cell.a|`; missing, singular, non-finite, and unrepresentable inputs fail descriptively. The sidebar exposes a dedicated save action and filename.
@@ -19,7 +21,7 @@ All notable changes to mcrysden will be documented in this file. The format is b
 
 ### Documentation
 
-- Updated test-suite guidance, roadmap status, and symmetry/k-path interoperability documentation without changing the application version.
+- Updated test-suite guidance, roadmap status, and symmetry/k-path interoperability documentation for v1.1.32.
 
 ## [1.1.31] — 2026-08-01
 
