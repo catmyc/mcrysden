@@ -88,6 +88,14 @@ struct SideBar: View {
         Section {
             Button("Reset View") { state.onResetView?() }
                 .buttonStyle(.borderedProminent)
+            HStack(spacing: 4) {
+                Text("Standard")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                standardCrystalViewButton(StandardCrystalView.view100.label, .view100)
+                standardCrystalViewButton(StandardCrystalView.view110.label, .view110)
+                standardCrystalViewButton(StandardCrystalView.view111.label, .view111)
+            }
         }
             CollapsibleSection(title: "Display", isExpanded: $displayExpanded) {
                 Picker("Mode", selection: $state.displayMode) {
@@ -549,6 +557,19 @@ struct SideBar: View {
         .buttonStyle(.bordered).font(.caption)
         Stepper("Samples per segment \(state.kPathSampling)",
                 value: $state.kPathSampling, in: 2...200)
+    }
+
+    /// One standard crystallographic orientation action. All three buttons share
+    /// the same runtime availability because they require the same valid cell,
+    /// 3D display, and non-editing prerequisites.
+    private func standardCrystalViewButton(_ title: String, _ view: StandardCrystalView) -> some View {
+        Button(title) { state.onStandardCrystalView?(view) }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .font(.caption)
+            .disabled(!state.standardCrystalViewAvailable)
+            .help(state.standardCrystalViewHelp)
+            .accessibilityLabel("Standard crystallographic view \(title)")
     }
 
     /// One k-path export action. Disabled with an explanatory tooltip when the

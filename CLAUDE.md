@@ -85,7 +85,7 @@ Graph views (`BandGrapherView`, `DOSGrapherView`, `ColorPlaneView`) are viewport
 | `Model.swift` | `Scene`, `Atom`, `Cell`, `Camera`, display enums |
 | `ElementTable.swift` | CPK colors, covalent/vdw radii, atomic masses |
 | `Geometry.swift` | Mesh generators (spheres, cylinders, polyhedron faces) |
-| `Camera.swift` | Matrix math |
+| `Camera.swift` | Matrix math, validated crystallographic orientation math |
 | `Renderer.swift` | Metal renderer: atoms, bonds, cell, axes, BZ, isosurfaces, k-path; contains embedded shader source |
 | `Renderer2D.swift` | Metal 2D primitives |
 | `MetalView.swift` | MTKView + responder events → camera; `NSTrackingArea` hover |

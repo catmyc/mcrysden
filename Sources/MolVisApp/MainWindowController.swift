@@ -367,6 +367,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         window.delegate = self
         state.onChange = { [weak self] in self?.syncFromState() }
         state.onResetView = { [weak self] in self?.resetView() }
+        state.onStandardCrystalView = { [weak self] view in
+            self?.alignToStandardCrystalView(view)
+        }
         state.onExportKPath = { [weak self] path, format in
             guard let self else { return }
             self.exportKPath(self.kPathForExport(path), format)
@@ -1598,6 +1601,64 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         setNeedsRender()
     }
 
+    /// Recompute the runtime-only standard-view availability. The reciprocal
+    /// editing flag includes the short transition in which the sidebar has already
+    /// changed but the controller has not yet committed `lastEditKPathOnBZ`.
+    private func refreshStandardCrystalViewAvailability() {
+        state.refreshStandardCrystalViewAvailability(
+            cell: scene.cell,
+            reciprocalEditing: state.editKPathOnBZ || lastEditKPathOnBZ)
+    }
+
+    /// Align the camera to a standard crystallographic direction. Validation is
+    /// performed before touching the live camera, and alignment happens on a copy,
+    /// so every rejected action leaves the camera byte-for-byte unchanged.
+    @discardableResult
+    func alignToStandardCrystalView(_ view: StandardCrystalView) -> Bool {
+        guard !state.editKPathOnBZ, !lastEditKPathOnBZ,
+              !state.displayMode.is2D, !scene.displayMode.is2D,
+              let cell = scene.cell,
+              Camera.standardCrystalViewUnavailableReason(cell: cell) == nil else {
+            refreshStandardCrystalViewAvailability()
+            return false
+        }
+
+        let original = camera
+        var aligned = original
+        do {
+            try aligned.align(to: view, cell: cell)
+        } catch {
+            // Alignment is transactional: the live camera has not been touched,
+            // and the failed copy is discarded.
+            refreshStandardCrystalViewAvailability()
+            return false
+        }
+        // `align` is an orientation operation. Keep these presentation fields
+        // explicit here as a defensive contract at the controller boundary.
+        aligned.center = original.center
+        aligned.distance = original.distance
+        aligned.perspective = original.perspective
+
+        clearTransientViewHighlights()
+        camera = aligned
+        scene.camera = camera
+        refreshStandardCrystalViewAvailability()
+        setNeedsRender()
+        return true
+    }
+
+    /// Clear camera/editor overlays that represent a transient viewport focus.
+    /// A standard-view change is a view reset for this purpose: route-node
+    /// selection must not remain highlighted after the camera moves.
+    private func clearTransientViewHighlights() {
+        clearReciprocalHover()
+        canvas.invalidateReciprocalAccessibilityFocus()
+        state.notifyViewReset()
+        selectedRouteNodeIndex = nil
+        renderer?.selectedKPathNode = nil
+        renderer2D?.selectedKPathNode = nil
+    }
+
     /// Reset the view: reframe the camera on the structure (center on the
     /// centroid, distance fit to the bounding sphere, rotation cleared) — the
     /// same framing a freshly-opened file gets (spec §6).
@@ -1607,16 +1668,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// for "reframe only", and other tests depend on resetView() not touching
     /// appearance state. Reset lighting/background separately via the sidebar.
     func resetView() {
-        clearReciprocalHover()
+        clearTransientViewHighlights()
         camera.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-        // A view reset is a natural clearing point for the transient node highlight;
-        // the route is unchanged, so this only drops the render toggle, not appearance.
-        // Bumping viewResetGeneration signals the SideBar to clear its local selected
-        // node/editor too, keeping the sidebar selection in sync with the renderer.
-        state.notifyViewReset()
-        selectedRouteNodeIndex = nil
-        renderer?.selectedKPathNode = nil
-        renderer2D?.selectedKPathNode = nil
         applyCameraForNewSceneIfNeeded()
         // applyCameraForNewSceneIfNeeded() replaces the camera with
         // scene.defaultCamera(), whose projection defaults to orthographic — restore
@@ -1699,6 +1752,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             state.orthographic = reciprocalStructureOrthographic ?? !savedCamera.perspective
         }
         scene.camera = camera
+        refreshStandardCrystalViewAvailability()
         reciprocalStructureCamera = nil
         reciprocalStructureDisplayMode = nil
         reciprocalStructureShowBZ = nil
@@ -1741,6 +1795,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
         let enteringReciprocalEdit = state.editKPathOnBZ && !lastEditKPathOnBZ
         let exitingReciprocalEdit = !state.editKPathOnBZ && lastEditKPathOnBZ
+        let standardCrystalViewAvailabilityNeedsRefresh =
+            enteringReciprocalEdit || exitingReciprocalEdit
+            || state.displayMode != scene.displayMode
         if enteringReciprocalEdit {
             // Capture the complete pre-editor presentation before any validation
             // or 2D->3D transition, so every failure uses the same rejection path.
@@ -1969,6 +2026,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             reciprocalStructureDisplayMode = nil
             reciprocalStructureShowBZ = nil
             reciprocalStructureOrthographic = nil
+        }
+        if standardCrystalViewAvailabilityNeedsRefresh {
+            refreshStandardCrystalViewAvailability()
         }
         // background clear color (solid top color today; gradient rendering is
         // pending on the shader work).
@@ -2619,6 +2679,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             camera.perspective = !restoredOrthographic
             scene.camera = camera
         }
+        refreshStandardCrystalViewAvailability()
         // Refresh the color-plane overlay when the reloaded frame changes grid2D
         // presence or data, mirroring loadFile so the plane's data/labels/contours
         // stay consistent across frame reloads.

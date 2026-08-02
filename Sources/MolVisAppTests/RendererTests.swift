@@ -359,6 +359,144 @@ final class RendererTests: XCTestCase {
 
         XCTAssertNotEqual(pixelHash(before), pixelHash(after),
                           "rotating the gizmo must update its geometry and lighting")
+
+        // Standard crystallographic views are camera math, not a pixel contract:
+        // use a deliberately skew direct cell so [uvw] cannot be mistaken for a
+        // Cartesian direction or a reciprocal-lattice normal.
+        let cell = Cell(a: SIMD3<Float>(4.2, 0.3, -0.2),
+                        b: SIMD3<Float>(0.9, 3.7, 0.6),
+                        c: SIMD3<Float>(0.4, 1.1, 5.1))
+        let views: [(StandardCrystalView, SIMD3<Float>)] = [
+            (.view100, cell.a),
+            (.view110, cell.a + cell.b),
+            (.view111, cell.a + cell.b + cell.c),
+        ]
+        var baseline = Camera()
+        baseline.center = SIMD3<Float>(1.25, -2.5, 0.75)
+        baseline.distance = 13.25
+        baseline.perspective = true
+        baseline.rotation = simd_quatf(angle: 0.37,
+                                       axis: simd_normalize(SIMD3<Float>(1.0, 2.0, -0.5)))
+
+        for (view, directDirection) in views {
+            var aligned = baseline
+            XCTAssertNoThrow(try aligned.align(to: view, cell: cell))
+
+            // Camera.eyePosition() is the camera's +Z ray. It must point from
+            // the center along the positive direct-lattice [uvw] direction.
+            let eyeDirection = simd_normalize(aligned.eyePosition() - aligned.center)
+            let expectedDirection = simd_normalize(directDirection)
+            XCTAssertEqual(eyeDirection.x, expectedDirection.x, accuracy: 1e-5)
+            XCTAssertEqual(eyeDirection.y, expectedDirection.y, accuracy: 1e-5)
+            XCTAssertEqual(eyeDirection.z, expectedDirection.z, accuracy: 1e-5)
+
+            let q = aligned.rotation.vector
+            XCTAssertTrue(q.x.isFinite && q.y.isFinite && q.z.isFinite && q.w.isFinite)
+            XCTAssertEqual(simd_length(q), 1, accuracy: 1e-5,
+                           "\(view.label) must produce a normalized rotation")
+
+            // Repeated alignment from the same starting camera must be bitwise
+            // deterministic, including the roll chosen from direct-cell axes.
+            var repeated = baseline
+            XCTAssertNoThrow(try repeated.align(to: view, cell: cell))
+            XCTAssertEqual(repeated.rotation.vector, aligned.rotation.vector,
+                           "\(view.label) alignment must be deterministic")
+
+            // Alignment changes only orientation; framing and projection are
+            // preserved exactly rather than recomputed or reset.
+            XCTAssertEqual(aligned.center, baseline.center)
+            XCTAssertEqual(aligned.distance, baseline.distance)
+            XCTAssertEqual(aligned.perspective, baseline.perspective)
+        }
+
+        // A large spread of finite axis lengths must remain a valid cell: the
+        // singularity check is angular/scale-safe, not a raw-volume threshold.
+        let anisotropic = Cell(a: SIMD3<Float>(0.001, 0, 0),
+                               b: SIMD3<Float>(0, 1_000, 0),
+                               c: SIMD3<Float>(0, 0, 1_000_000))
+        XCTAssertNil(Camera.standardCrystalViewUnavailableReason(cell: anisotropic))
+        var anisotropicCamera = baseline
+        XCTAssertNoThrow(try anisotropicCamera.align(to: .view100, cell: anisotropic))
+        let anisotropicEye = simd_normalize(anisotropicCamera.eyePosition() - anisotropicCamera.center)
+        let anisotropicExpected = simd_normalize(anisotropic.a)
+        XCTAssertEqual(anisotropicEye.x, anisotropicExpected.x, accuracy: 1e-5)
+        XCTAssertEqual(anisotropicEye.y, anisotropicExpected.y, accuracy: 1e-5)
+        XCTAssertEqual(anisotropicEye.z, anisotropicExpected.z, accuracy: 1e-5)
+
+        let singular = Cell(a: SIMD3<Float>(1, 0, 0),
+                            b: SIMD3<Float>(2, 0, 0),
+                            c: SIMD3<Float>(0, 0, 1))
+        let nonfinite = Cell(a: SIMD3<Float>(1, 0, 0),
+                             b: SIMD3<Float>(0, 1, 0),
+                             c: SIMD3<Float>(.infinity, 0, 1))
+        XCTAssertNil(Camera.standardCrystalViewUnavailableReason(cell: cell))
+        XCTAssertNotNil(Camera.standardCrystalViewUnavailableReason(cell: nil))
+        XCTAssertNotNil(Camera.standardCrystalViewUnavailableReason(cell: singular))
+        XCTAssertNotNil(Camera.standardCrystalViewUnavailableReason(cell: nonfinite))
+
+        for invalidCell in [singular, nonfinite] {
+            var unchanged = baseline
+            let before = unchanged
+            XCTAssertThrowsError(try unchanged.align(to: .view100, cell: invalidCell))
+            XCTAssertEqual(unchanged.center, before.center)
+            XCTAssertEqual(unchanged.distance, before.distance)
+            XCTAssertEqual(unchanged.perspective, before.perspective)
+            XCTAssertEqual(unchanged.rotation.vector, before.rotation.vector,
+                           "failed alignment must not mutate the camera")
+        }
+
+        // Exercise the controller boundary once for a cell-less scene: the
+        // standard-view action must revalidate instead of mutating its camera.
+        let unavailableController = MainWindowController(scene: Scene(), showWindow: false)
+        XCTAssertFalse(unavailableController.state.standardCrystalViewAvailable)
+        XCTAssertTrue(unavailableController.state.standardCrystalViewHelp.localizedCaseInsensitiveContains("cell"))
+        let unavailableCamera = unavailableController.camera
+        XCTAssertNotNil(unavailableController.state.onStandardCrystalView)
+        unavailableController.state.onStandardCrystalView?(.view100)
+        XCTAssertEqual(unavailableController.camera.center, unavailableCamera.center)
+        XCTAssertEqual(unavailableController.camera.distance, unavailableCamera.distance)
+        XCTAssertEqual(unavailableController.camera.perspective, unavailableCamera.perspective)
+        XCTAssertEqual(unavailableController.camera.rotation.vector, unavailableCamera.rotation.vector,
+                       "unavailable controller action must not mutate the camera")
+
+        // A valid-cell Scene must make the controller action available and must
+        // preserve the live camera's framing and projection exactly.
+        var validScene = Scene()
+        validScene.isCrystal = true
+        validScene.cell = cell
+        let validController = MainWindowController(scene: validScene, showWindow: false)
+        var configuredCamera = baseline
+        validController.camera = configuredCamera
+        XCTAssertTrue(validController.state.standardCrystalViewAvailable)
+        XCTAssertTrue(validController.alignToStandardCrystalView(.view110))
+        configuredCamera = validController.camera
+        XCTAssertEqual(configuredCamera.center, baseline.center)
+        XCTAssertEqual(configuredCamera.distance, baseline.distance)
+        XCTAssertEqual(configuredCamera.perspective, baseline.perspective)
+        let controllerEye = simd_normalize(configuredCamera.eyePosition() - configuredCamera.center)
+        let controllerExpected = simd_normalize(cell.a + cell.b)
+        XCTAssertEqual(controllerEye.x, controllerExpected.x, accuracy: 1e-5)
+        XCTAssertEqual(controllerEye.y, controllerExpected.y, accuracy: 1e-5)
+        XCTAssertEqual(controllerEye.z, controllerExpected.z, accuracy: 1e-5)
+
+        validController.state.displayMode = .line2D
+        XCTAssertFalse(validController.state.standardCrystalViewAvailable)
+        XCTAssertTrue(validController.state.standardCrystalViewHelp.localizedCaseInsensitiveContains("2D"))
+        let twoDCamera = validController.camera
+        XCTAssertFalse(validController.alignToStandardCrystalView(.view100))
+        XCTAssertEqual(validController.camera.center, twoDCamera.center)
+        XCTAssertEqual(validController.camera.distance, twoDCamera.distance)
+        XCTAssertEqual(validController.camera.perspective, twoDCamera.perspective)
+        XCTAssertEqual(validController.camera.rotation.vector, twoDCamera.rotation.vector,
+                       "2D-disabled action must not mutate the camera")
+
+        validController.state.displayMode = .ballStick
+        XCTAssertTrue(validController.state.standardCrystalViewAvailable)
+        validController.state.refreshStandardCrystalViewAvailability(cell: cell, reciprocalEditing: true)
+        XCTAssertFalse(validController.state.standardCrystalViewAvailable)
+        XCTAssertTrue(validController.state.standardCrystalViewHelp.localizedCaseInsensitiveContains("reciprocal"))
+        validController.state.refreshStandardCrystalViewAvailability(cell: cell, reciprocalEditing: false)
+        XCTAssertTrue(validController.state.standardCrystalViewAvailable)
     }
 
     // The Renderer today clears with a single solid color and ignores

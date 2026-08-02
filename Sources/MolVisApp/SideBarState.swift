@@ -12,6 +12,13 @@ private struct KPathUndoSnapshot {
 
 final class SideBarState: ObservableObject {
     @Published var displayMode: DisplayMode = .ballStick { didSet { onChange?() } }
+    /// Runtime-only availability for the standard crystallographic orientation
+    /// buttons. This is deliberately not a Scene field or a persisted setting.
+    @Published private(set) var standardCrystalViewAvailable = false
+    /// Help text for the standard crystallographic orientation buttons. When the
+    /// buttons are disabled this explains the current prerequisite that failed.
+    @Published private(set) var standardCrystalViewHelp =
+        "Standard crystallographic views require a valid unit cell."
     @Published var atomScale: Float = 0.35 { didSet { onChange?() } }
     @Published var bondRadius: Float = 0.10 { didSet { onChange?() } }
     @Published var showCellFrame: Bool = true { didSet { onChange?() } }
@@ -208,6 +215,9 @@ final class SideBarState: ObservableObject {
     var onChange: (() -> Void)?
     /// Invoked when the user taps "Reset View" in the sidebar.
     var onResetView: (() -> Void)?
+    /// Invoked when the user chooses one of the standard crystallographic
+    /// orientations in the Display section.
+    var onStandardCrystalView: ((StandardCrystalView) -> Void)?
     /// Export the given k-path in the requested format (the controller presents
     /// a save panel and writes the text). `.qe` => QE K_POINTS crystal;
     /// `.qeCrystalB` => QE K_POINTS crystal_b band-path rows, one special point
@@ -254,6 +264,8 @@ final class SideBarState: ObservableObject {
         showBrillouinZone = scene.showBrillouinZone
         isCrystal = scene.isCrystal
         crystalSymmetry = scene.crystalSymmetry
+        refreshStandardCrystalViewAvailability(cell: scene.cell,
+                                               reciprocalEditing: false)
         // Structural summary (nil for an empty viewer). Computed here so both
         // init and loadFile populate it through syncFromScene — a controller
         // constructed directly with a non-empty scene must show its summary too.
@@ -313,6 +325,42 @@ final class SideBarState: ObservableObject {
         showForces = scene.showForces
         forceScale = scene.forceScale
         onChange = saved
+    }
+
+    /// Refresh the runtime-only availability and help text for the standard
+    /// crystallographic orientation buttons. `reciprocalEditing` is supplied by
+    /// the controller because that mode is transient and is not a Scene field.
+    /// The assignments are intentionally free of `onChange` notifications: these
+    /// values describe UI availability and must never feed back into scene sync.
+    func refreshStandardCrystalViewAvailability(cell: Cell?, reciprocalEditing: Bool) {
+        let help: String
+        let available: Bool
+
+        if reciprocalEditing {
+            available = false
+            help = "Standard crystallographic views are unavailable while editing the reciprocal-space k-path."
+        } else if displayMode.is2D {
+            available = false
+            help = "Standard crystallographic views are unavailable in 2D display mode."
+        } else if let cell {
+            if let reason = Camera.standardCrystalViewUnavailableReason(cell: cell) {
+                available = false
+                help = reason
+            } else {
+                available = true
+                help = "Align the camera to a standard crystallographic direction."
+            }
+        } else {
+            available = false
+            help = "Standard crystallographic views require a valid unit cell."
+        }
+
+        if standardCrystalViewAvailable != available {
+            standardCrystalViewAvailable = available
+        }
+        if standardCrystalViewHelp != help {
+            standardCrystalViewHelp = help
+        }
     }
 
     /// Clear the transient reciprocal-editor failure for a new scene or frame.
