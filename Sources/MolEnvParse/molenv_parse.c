@@ -410,8 +410,15 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
         }
         if (strcmp(tok,"PRIMVEC")==0) {
             for (int r=0;r<3;r++) {
-                if (!fgets(line,sizeof(line),fp)) { set_error(path,*ln,"unexpected end in PRIMVEC"); return -1; }
-                (*ln)++;
+                /* XSF files in the wild may separate vector records with blank
+                   or comment-only lines. Treat those as inter-record whitespace
+                   while still requiring exactly three finite numeric vectors. */
+                while (1) {
+                    if (!fgets(line,sizeof(line),fp)) { set_error(path,*ln,"unexpected end in PRIMVEC"); return -1; }
+                    (*ln)++;
+                    if (first_tok(line,tok,sizeof(tok))==0 || tok[0]=='#') continue;
+                    break;
+                }
                 double a,b,c;
                 if (sscanf(line,"%lf %lf %lf",&a,&b,&c)<3) { set_error(path,*ln,"malformed PRIMVEC row"); return -1; }
                 if (!in_float_range(a) || !in_float_range(b) || !in_float_range(c)) { set_error(path,*ln,"non-finite PRIMVEC row"); return -1; }

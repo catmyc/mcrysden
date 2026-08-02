@@ -15,6 +15,19 @@ final class SceneTests: XCTestCase {
         XCTAssertTrue(s.isCrystal)
         XCTAssertNotNil(s.cell)
         XCTAssertEqual(s.atoms[0].atomicNumber, 14)
+
+        // Bundled XCrySDen slab input separates PRIMVEC records with blank
+        // lines. Inter-record whitespace must not turn a valid vector into a
+        // synthetic malformed row.
+        let asset = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent() // MolVisAppTests
+            .deletingLastPathComponent() // Sources
+            .deletingLastPathComponent() // repository root
+            .appendingPathComponent("Assets/fcc-410-1x1.xsf")
+        let slab = Scene(loaded: try Parser.load(asset))
+        XCTAssertEqual(slab.atoms.count, 8)
+        XCTAssertEqual(slab.periodicDim, 2)
+        XCTAssertNotNil(slab.cell)
     }
     func testPDBHappyPath() throws {
         let s = Scene(loaded: try Parser.load(fixture("ala.pdb")))
