@@ -103,6 +103,7 @@ struct SideBar: View {
                     ForEach(DisplayMode.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
                 .pickerStyle(.menu)
+                Toggle("Show Scale", isOn: $state.showScaleIndicator)
             }
             // --- Structure Summary ----------------------------------------------
             // Compact readout of the loaded structure. Hidden entirely for an

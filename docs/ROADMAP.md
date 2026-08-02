@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (post-v1.1.32 / Unreleased: camera bookmarks + standard crystallographic views; v1.1.32 context: QE tpiba_b export, cubic CRYSCAL expansion, 100 focused tests retained)**.
+Last updated: **2026-08-02 (post-v1.1.32 / Unreleased: camera bookmarks + standard crystallographic views + adaptive scale indicators; v1.1.32 context: QE tpiba_b export, cubic CRYSCAL expansion, 100 focused tests retained)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -124,7 +124,8 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [~] Structure and isosurfaces already share the Metal render pass; compositing the sibling color-plane view with structure/isosurfaces remains pending.
 - [x] Standard crystallographic `[100]`/`[110]`/`[111]` camera views.
 - [x] Three document-scoped named camera bookmark slots with save, recall, and clear actions; exact validated presentation/projection restoration; disabled recalls for empty slots; and optional `.mvis-state` persistence.
-- [ ] Multisample anti-aliasing, configurable line widths, transparency, depth cueing, ambient occlusion/soft shadows, scale indicators, and publication presets.
+- [x] Adaptive scale indicators (post-v1.1.32 / Unreleased): persisted opt-in Show Scale with an adaptive 1-2-5 Å/nm bar, orthographic-span and perspective camera-center-plane conventions, orbit/zoom/viewport-stable placement, shared live/raster/raster-backed-vector label compositing, and suppression for graph/color-plane views or invalid geometry.
+- [ ] Multisample anti-aliasing, configurable line widths, transparency, depth cueing, ambient occlusion/soft shadows, and publication presets.
 - [ ] Higher-resolution labels and true vector export for cells, BZs, k-paths, and graphs; image backgrounds, printing, and stereo/anaglyph rendering.
 
 ### Animation, conversion, and extensibility

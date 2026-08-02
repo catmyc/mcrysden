@@ -31,6 +31,9 @@ final class SideBarState: ObservableObject {
     @Published var showCellFrame: Bool = true { didSet { onChange?() } }
     @Published var showAxes: Bool = true { didSet { onChange?() } }
     @Published var showLabels: Bool = false { didSet { onChange?() } }
+    /// Show the scale indicator overlay. Synced to scene.showScaleIndicator in
+    /// syncFromScene(); the controller mirrors changes back into the Scene.
+    @Published var showScaleIndicator: Bool = false { didSet { onChange?() } }
     /// True when the loaded scene is a crystal (has a cell). Drives which
     /// crystal-only controls (Brillouin zone, k-path) are shown.
     @Published var isCrystal: Bool = false { didSet { onChange?() } }
@@ -274,6 +277,7 @@ final class SideBarState: ObservableObject {
         showCellFrame = scene.showCellFrame
         showAxes = scene.showAxes
         showLabels = scene.showLabels
+        showScaleIndicator = scene.showScaleIndicator
         showBrillouinZone = scene.showBrillouinZone
         isCrystal = scene.isCrystal
         crystalSymmetry = scene.crystalSymmetry

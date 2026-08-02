@@ -277,6 +277,7 @@ final class StateStoreTests: XCTestCase {
         s.backgroundType = .gradient_top
         s.background = "#112233"
         s.backgroundBottom = "#445566"
+        s.showScaleIndicator = true
         s.currentFrame = 7
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("t_appear.mvis-state")
         try StateStore.save(s, camera: nil, sourceURL: url, to: tmp)
@@ -292,6 +293,7 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(s2.backgroundType, .gradient_top)
         XCTAssertEqual(s2.background, "#112233")
         XCTAssertEqual(s2.backgroundBottom, "#445566")
+        XCTAssertTrue(s2.showScaleIndicator)
         XCTAssertEqual(s2.currentFrame, 7)
     }
 
@@ -358,6 +360,7 @@ final class StateStoreTests: XCTestCase {
         var camera: Camera?
         try StateStore.load(into: &scene, camera: &camera, from: tmp)
         XCTAssertTrue(scene.showColorPlane)
+        XCTAssertFalse(scene.showScaleIndicator)
     }
 
     /// The per-segment k-path sampling preference must round-trip through the flat

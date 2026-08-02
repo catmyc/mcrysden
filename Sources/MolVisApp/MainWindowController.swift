@@ -1287,6 +1287,34 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             }
         }
 
+        // Scale indicators are viewport labels rather than scene geometry. Build
+        // them from the same validated camera/viewport used for atom/route labels
+        // so the live overlay and export projection stay identical. The canvas
+        // visibility check deliberately suppresses this layer for graph views.
+        if scene.showScaleIndicator, !canvas.isHidden,
+           let indicator = ScaleIndicator.make(camera: camera, viewport: viewport) {
+            let pixelWidth = CGFloat(indicator.pixelWidth)
+            let text = indicator.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if indicator.lengthAngstrom.isFinite, indicator.lengthAngstrom > 0,
+               pixelWidth.isFinite, pixelWidth > 0,
+               !text.isEmpty {
+                let raw = LabelOverlayView.Label(
+                    symbol: text,
+                    x: 0,
+                    y: 0,
+                    style: .scaleIndicator,
+                    barWidth: pixelWidth,
+                    usesLightForeground: scaleIndicatorUsesLightForeground())
+                if let placed = positionedScaleIndicatorLabel(raw,
+                                                               in: NSRect(x: 0, y: 0,
+                                                                          width: CGFloat(viewport.x),
+                                                                          height: CGFloat(viewport.y)),
+                                                               avoidOrientationGizmo: scene.showAxes) {
+                    labels.append(placed)
+                }
+            }
+        }
+
         let routeVisible = !canvas.isHidden && scene.isCrystal && scene.showBrillouinZone
         if routeVisible, !scene.kPathPoints.isEmpty {
             synchronizeRouteLabelMeasurementCache()
@@ -1333,6 +1361,79 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         return labels
     }
 
+    /// Select a light or dark scale foreground from the color visible at the
+    /// bottom of the active viewport. A gradient uses its bottom stop; a solid
+    /// background uses the ordinary scene background.
+    private func scaleIndicatorUsesLightForeground() -> Bool {
+        let hex = scene.backgroundType == .gradient_top
+            ? scene.backgroundBottom
+            : scene.background
+        var value = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("#") { value.removeFirst() }
+        guard value.count == 6, let rgb = UInt32(value, radix: 16) else {
+            // The renderer's invalid-hex fallback is black, so prefer white.
+            return true
+        }
+        let red = Double((rgb >> 16) & 0xFF) / 255.0
+        let green = Double((rgb >> 8) & 0xFF) / 255.0
+        let blue = Double(rgb & 0xFF) / 255.0
+        let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        return luminance < 0.5
+    }
+
+    /// Position a scale label at the bottom-left while keeping its complete
+    /// text/bar/tick rectangle inside the viewport. The orientation gizmo's
+    /// bottom-right footprint gets a small exclusion gap when axes are shown.
+    private func positionedScaleIndicatorLabel(
+        _ label: LabelOverlayView.Label,
+        in bounds: NSRect,
+        avoidOrientationGizmo: Bool
+    ) -> LabelOverlayView.Label? {
+        guard label.style == .scaleIndicator,
+              bounds.minX.isFinite, bounds.minY.isFinite,
+              bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0 else { return nil }
+        let margin: CGFloat = 12
+        let rect = LabelOverlayView.drawingRect(for: label)
+        guard rect.minX.isFinite, rect.minY.isFinite,
+              rect.width.isFinite, rect.height.isFinite,
+              rect.width > 0, rect.height > 0,
+              rect.width <= bounds.width - 2 * margin,
+              rect.height <= bounds.height - 2 * margin else { return nil }
+
+        var target = NSRect(x: bounds.minX + margin,
+                            y: bounds.maxY - margin - rect.height,
+                            width: rect.width,
+                            height: rect.height)
+
+        if avoidOrientationGizmo {
+            let gizmoSize = max(72, min(bounds.width, bounds.height) * 0.16)
+            let gizmoMargin: CGFloat = 14
+            let gizmo = NSRect(x: bounds.maxX - gizmoSize - gizmoMargin,
+                               y: bounds.maxY - gizmoSize - gizmoMargin,
+                               width: gizmoSize,
+                               height: gizmoSize)
+            let gap: CGFloat = 8
+            if target.insetBy(dx: -gap, dy: -gap).intersects(gizmo) {
+                let liftedMinY = gizmo.minY - gap - rect.height
+                guard liftedMinY >= bounds.minY + margin else { return nil }
+                target.origin.y = liftedMinY
+            }
+        }
+
+        guard target.minX >= bounds.minX,
+              target.maxX <= bounds.maxX,
+              target.minY >= bounds.minY,
+              target.maxY <= bounds.maxY else { return nil }
+        return LabelOverlayView.Label(
+            symbol: label.symbol,
+            x: label.x + target.minX - rect.minX,
+            y: label.y + target.minY - rect.minY,
+            style: label.style,
+            barWidth: label.barWidth,
+            usesLightForeground: label.usesLightForeground)
+    }
+
     /// Shift a persistent route label's complete drawing rectangle into the
     /// viewport when it fits. The label origin remains node-relative unless a
     /// viewport edge requires a correction; oversized labels are anchored at
@@ -1364,7 +1465,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         return LabelOverlayView.Label(symbol: label.symbol,
                                       x: label.x + targetX - rect.minX,
                                       y: label.y + targetY - rect.minY,
-                                      style: label.style)
+                                      style: label.style,
+                                      barWidth: label.barWidth,
+                                      usesLightForeground: label.usesLightForeground)
     }
 
     private func measuredRouteLabelSize(text: String,
@@ -1958,6 +2061,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.showCellFrame = state.showCellFrame
         scene.showAxes = state.showAxes
         scene.showLabels = state.showLabels
+        scene.showScaleIndicator = state.showScaleIndicator
         // User controls push state -> scene so the renderer reads the new value.
         // (showBrillouinZone is the renderer's source of truth via scene.* .)
         scene.showBrillouinZone = state.showBrillouinZone
@@ -2623,6 +2727,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showCellFrame = scene.showCellFrame
         next.showAxes = scene.showAxes
         next.showLabels = scene.showLabels
+        next.showScaleIndicator = scene.showScaleIndicator
         next.showStructure = scene.showStructure
         next.showBrillouinZone = restoredShowBZ
         // The freshly parsed scene already owns the right generated route for

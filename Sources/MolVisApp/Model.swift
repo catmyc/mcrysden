@@ -160,6 +160,8 @@ struct Scene: Codable {
     var showCellFrame: Bool = true
     var showAxes: Bool = true
     var showLabels: Bool = false
+    /// Show the scale indicator overlay. Defaults off to preserve existing visuals.
+    @DefaultFalse var showScaleIndicator: Bool = false
     /// Hide the atomic structure (atoms/bonds/polyhedra), keeping the cell
     /// frame, axes and Brillouin-zone overlay. Lets the user focus on the BZ.
     var showStructure: Bool = true
@@ -288,6 +290,39 @@ extension KeyedDecodingContainer {
 
 extension KeyedEncodingContainer {
     mutating func encode(_ value: DefaultTrue, forKey key: Key) throws {
+        try encode(value.wrappedValue, forKey: key)
+    }
+}
+
+/// A Bool scene field that defaults to `false` when its key is absent from the
+/// decoded JSON. This keeps older serialized Scene documents decodable while
+/// preserving the scale indicator's off-by-default behavior.
+@propertyWrapper
+struct DefaultFalse: Codable {
+    var wrappedValue: Bool
+
+    init() { wrappedValue = false }
+    init(wrappedValue: Bool = false) { self.wrappedValue = wrappedValue }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        wrappedValue = (try? c.decode(Bool.self)) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(wrappedValue)
+    }
+}
+
+extension KeyedDecodingContainer {
+    func decode(_ type: DefaultFalse.Type, forKey key: Key) throws -> DefaultFalse {
+        try decodeIfPresent(Bool.self, forKey: key).map(DefaultFalse.init) ?? DefaultFalse()
+    }
+}
+
+extension KeyedEncodingContainer {
+    mutating func encode(_ value: DefaultFalse, forKey key: Key) throws {
         try encode(value.wrappedValue, forKey: key)
     }
 }

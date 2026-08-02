@@ -342,6 +342,115 @@ final class RendererTests: XCTestCase {
         // and integer sampling prevent exact equality).
         let ratio = Float(max(1,near)) / Float(max(1,far))
         XCTAssertEqual(ratio, 1.0, accuracy: 0.5, "gizmo size should not track zoom (near=\(near), far=\(far))")
+
+        let scaleViewport = SIMD2<Float>(800, 1000)
+        func indicator(distance: Float, perspective: Bool = false,
+                       viewport: SIMD2<Float> = scaleViewport,
+                       targetPixelWidth: CGFloat = 100) throws -> ScaleIndicator {
+            var camera = Camera()
+            camera.distance = distance
+            camera.perspective = perspective
+            return try XCTUnwrap(ScaleIndicator.make(camera: camera,
+                                                     viewport: viewport,
+                                                     targetPixelWidth: targetPixelWidth))
+        }
+
+        // The adaptive sequence must retain the conventional 1-2-5 progression,
+        // while keeping the selected bar close to the requested pixel size.
+        for (distance, length, text) in [(Float(5), 1.0, "1 Å"),
+                                         (Float(10), 2.0, "2 Å"),
+                                         (Float(25), 5.0, "5 Å")] {
+            let scale = try indicator(distance: distance)
+            XCTAssertEqual(scale.lengthAngstrom, length, accuracy: 1e-12)
+            XCTAssertEqual(scale.text, text)
+            XCTAssertEqual(scale.pixelWidth, 100, accuracy: 1e-5)
+        }
+        let nanometer = try indicator(distance: 50)
+        XCTAssertEqual(nanometer.lengthAngstrom, 10, accuracy: 1e-12)
+        XCTAssertEqual(nanometer.text, "1 nm")
+
+        // Orthographic height is the same vertical span used by Camera's
+        // projection. Perspective uses the frustum span at the camera-center
+        // plane, not the near plane or a camera-orbit-dependent world point.
+        let ortho = try indicator(distance: 20)
+        let orthoSpan = 2.0 * Double(max(1.0, 20.0))
+        let orthoPixels = Double(ortho.lengthAngstrom) / orthoSpan * Double(scaleViewport.y)
+        XCTAssertEqual(Double(ortho.pixelWidth), orthoPixels, accuracy: 1e-5)
+
+        let perspective = try indicator(distance: 20, perspective: true)
+        let perspectiveSpan = 2.0 * 20.0 * tan(Double.pi / 8.0)
+        let perspectivePixels = Double(perspective.lengthAngstrom) / perspectiveSpan
+            * Double(scaleViewport.y)
+        XCTAssertEqual(Double(perspective.pixelWidth), perspectivePixels, accuracy: 1e-5)
+
+        var orbitedCamera = Camera()
+        orbitedCamera.distance = 20
+        orbitedCamera.perspective = true
+        orbitedCamera.center = SIMD3<Float>(4, -3, 2)
+        orbitedCamera.rotation = simd_quatf(angle: 0.83,
+                                             axis: simd_normalize(SIMD3<Float>(1, 2, -1)))
+        XCTAssertEqual(try XCTUnwrap(ScaleIndicator.make(camera: orbitedCamera,
+                                                         viewport: scaleViewport,
+                                                         targetPixelWidth: 100)), perspective,
+                       "orbiting must not change the camera-center scale")
+
+        let zoomedOut = try indicator(distance: 20, viewport: SIMD2<Float>(800, 400),
+                                       targetPixelWidth: 110)
+        let zoomedIn = try indicator(distance: 10, viewport: SIMD2<Float>(800, 400),
+                                     targetPixelWidth: 110)
+        XCTAssertGreaterThan(zoomedOut.lengthAngstrom, zoomedIn.lengthAngstrom,
+                             "zoom must change the world length represented by the bar")
+        let tallerViewport = try indicator(distance: 10, viewport: SIMD2<Float>(800, 800),
+                                           targetPixelWidth: 110)
+        XCTAssertLessThan(tallerViewport.lengthAngstrom, zoomedIn.lengthAngstrom,
+                          "viewport height must affect the selected world length")
+
+        var invalidCamera = Camera()
+        invalidCamera.distance = 0
+        XCTAssertNil(ScaleIndicator.make(camera: invalidCamera, viewport: scaleViewport))
+        XCTAssertNil(ScaleIndicator.make(camera: Camera(), viewport: SIMD2<Float>(800, 0)))
+
+        // The scale style is part of the shared overlay/export path. Start from
+        // a black raster so any valid scale text/bar necessarily changes pixels.
+        let labelWidth = 220, labelHeight = 100
+        var baseBytes = [UInt8](repeating: 0, count: labelWidth * labelHeight * 4)
+        let baseContext = try XCTUnwrap(CGContext(data: &baseBytes,
+                                                   width: labelWidth, height: labelHeight,
+                                                   bitsPerComponent: 8,
+                                                   bytesPerRow: labelWidth * 4,
+                                                   space: CGColorSpaceCreateDeviceRGB(),
+                                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let baseImage = try XCTUnwrap(baseContext.makeImage())
+        let scaleLabel = LabelOverlayView.Label(symbol: nanometer.text, x: 12, y: 64,
+                                                style: .scaleIndicator,
+                                                barWidth: nanometer.pixelWidth)
+        let composited = try PngExporter.composite(labels: [scaleLabel], onto: baseImage)
+        XCTAssertNotEqual(pixelHash(baseImage), pixelHash(composited),
+                          "scale label compositing must draw text and its bar")
+        let malformedScaleLabel = LabelOverlayView.Label(symbol: nanometer.text, x: 12, y: 64,
+                                                         style: .scaleIndicator,
+                                                         barWidth: CGFloat.greatestFiniteMagnitude)
+        let malformedComposited = try PngExporter.composite(labels: [malformedScaleLabel],
+                                                            onto: baseImage)
+        XCTAssertEqual(pixelHash(baseImage), pixelHash(malformedComposited),
+                       "an enormous finite scale bar width must be ignored safely")
+
+        // Export labels are derived only for the visible Metal canvas; graph-only
+        // views (or an explicitly hidden canvas) must not leak stale scale labels.
+        guard MTLCreateSystemDefaultDevice() != nil else { return }
+        var exportScene = Scene()
+        exportScene.background = "#000000"
+        exportScene.showAxes = false
+        exportScene.showCellFrame = false
+        exportScene.showScaleIndicator = true
+        let controller = MainWindowController(scene: exportScene, showWindow: false)
+        guard controller.renderer != nil else { return }
+        controller.canvas.isHidden = false
+        let visibleOptions = try controller.exportRenderOptions(for: CGSize(width: 320, height: 240))
+        XCTAssertTrue(visibleOptions.labels.contains { $0.style == .scaleIndicator })
+        controller.canvas.isHidden = true
+        let hiddenOptions = try controller.exportRenderOptions(for: CGSize(width: 320, height: 240))
+        XCTAssertFalse(hiddenOptions.labels.contains { $0.style == .scaleIndicator })
     }
 
     func testOrientationGizmoRespondsToCameraRotation() throws {
@@ -644,6 +753,22 @@ final class RendererTests: XCTestCase {
         let w = tex.width, h = tex.height
         var px = [UInt8](repeating: 0, count: w * h * 4)
         tex.getBytes(&px, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        return px.reduce(into: UInt64(0xcbf29ce484222325)) { hash, byte in
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+    }
+
+    private func pixelHash(_ image: CGImage) -> UInt64 {
+        let w = image.width, h = image.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        guard let context = CGContext(data: &px, width: w, height: h,
+                                      bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return 0
+        }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         return px.reduce(into: UInt64(0xcbf29ce484222325)) { hash, byte in
             hash ^= UInt64(byte)
             hash = hash &* 0x100000001b3

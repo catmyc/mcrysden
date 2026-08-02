@@ -33,6 +33,7 @@ enum StateStore {
         payload["showCellFrame"] = scene.showCellFrame
         payload["showAxes"] = scene.showAxes
         payload["showLabels"] = scene.showLabels
+        payload["showScaleIndicator"] = scene.showScaleIndicator
         payload["showBrillouinZone"] = scene.showBrillouinZone
         payload["showStructure"] = scene.showStructure
         payload["showIsoSurface"] = scene.showIsoSurface
@@ -213,6 +214,9 @@ enum StateStore {
         if let v = obj["showCellFrame"] as? Bool { candidate.showCellFrame = v }
         if let v = obj["showAxes"] as? Bool { candidate.showAxes = v }
         if let v = obj["showLabels"] as? Bool { candidate.showLabels = v }
+        // Optional for backward compatibility; Scene defaults this to false when
+        // an older state file does not contain the key.
+        if let v = obj["showScaleIndicator"] as? Bool { candidate.showScaleIndicator = v }
         if let v = obj["showBrillouinZone"] as? Bool { candidate.showBrillouinZone = v }
         if let v = obj["showStructure"] as? Bool { candidate.showStructure = v }
         if let v = obj["showIsoSurface"] as? Bool { candidate.showIsoSurface = v }

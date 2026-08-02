@@ -100,11 +100,13 @@ Key rules:
 | `Parser.swift` | C-to-Swift bridge, format detection, all loaders |
 | `Model.swift` | `Scene`, `Atom`, `Cell`, `Camera`, display enums |
 | `Scene+Init.swift` | `LoadedScene` → `Scene` conversion, supercell/slab |
-| `MainWindowController.swift` | Window, sidebar, viewport, playback, state sync |
+| `MainWindowController.swift` | Window, sidebar, viewport, playback, state sync, adaptive scale-indicator placement/export |
 | `SideBar.swift` | SwiftUI sidebar: display, k-path, supercell, slab, animation, structure summary |
 | `SideBarState.swift` | `ObservableObject` state: all `@Published` fields, route editing |
 | `Renderer.swift` | Metal renderer: atoms, bonds, cell, axes, BZ, isosurfaces, k-path |
 | `Renderer2D.swift` | Metal 2D primitives |
+| `LabelOverlayView.swift` | Shared AppKit label/scale-bar compositing for live and raster-backed export |
+| `ScaleIndicator.swift` | Adaptive 1-2-5 Å/nm scale from validated camera/viewport geometry |
 | `KPath.swift` | k-path interpolation; QE crystal/crystal_b/tpiba_b, Wannier90, KPF, and VASP export |
 | `CrystalSymmetry.swift` | Spglib analysis: space group, Wyckoff, standardized cells |
 | `HPKOT.swift` | SeekPath 2.1 canonical paths for all 29 Bravais variants |

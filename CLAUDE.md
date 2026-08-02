@@ -89,7 +89,7 @@ Graph views (`BandGrapherView`, `DOSGrapherView`, `ColorPlaneView`) are viewport
 | `Renderer.swift` | Metal renderer: atoms, bonds, cell, axes, BZ, isosurfaces, k-path; contains embedded shader source |
 | `Renderer2D.swift` | Metal 2D primitives |
 | `MetalView.swift` | MTKView + responder events → camera; `NSTrackingArea` hover |
-| `MainWindowController.swift` | Window, sidebar, viewport, playback, state sync, coordination, measurements |
+| `MainWindowController.swift` | Window, sidebar, viewport, playback, state sync, coordination, measurements, adaptive scale-indicator placement/export |
 | `SideBar.swift` | SwiftUI sidebar: display, k-path, supercell, slab, animation, structure summary, atom table, coordination |
 | `SideBarState.swift` | `ObservableObject`: all `@Published` fields; `onChange` fires synchronously from `didSet` |
 | `StateStore.swift` | `.mvis-state` JSON serialization, including optional validated camera/bookmark persistence |
@@ -99,8 +99,9 @@ Graph views (`BandGrapherView`, `DOSGrapherView`, `ColorPlaneView`) are viewport
 | `StructureSummary.swift` | Lattice, composition, density, symmetry data model |
 | `AtomTableView.swift` | Virtualized read-only atom table (Cartesian/fractional, filtering, linked selection) |
 | `ReadoutView.swift` | Bottom-docked selection/measurement readout panel |
-| `LabelOverlayView.swift` | AppKit element-label overlay (atom/routeNode/tooltip styles) |
+| `LabelOverlayView.swift` | AppKit label overlay, including scale-bar compositing shared by live and raster-backed export |
 | `CommandPaletteView.swift` | Searchable command palette |
+| `ScaleIndicator.swift` | Adaptive 1-2-5 Å/nm scale selection from validated camera/viewport geometry |
 | `CoordinationAnalysis.swift` | Periodic image-aware coordination shells/CN, neighbor readout |
 | `PeriodicGeometry.swift` | Skew-cell-safe minimum-image displacement, periodic measurements |
 | `Reciprocal.swift` | Reciprocal lattice, scale-safe Double math, G-star enumeration |
