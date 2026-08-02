@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (post-v1.1.32 / Unreleased: standard crystallographic camera views; v1.1.32 context: QE tpiba_b export, cubic CRYSCAL expansion, 100 focused tests)**.
+Last updated: **2026-08-02 (post-v1.1.32 / Unreleased: camera bookmarks + standard crystallographic views; v1.1.32 context: QE tpiba_b export, cubic CRYSCAL expansion, 100 focused tests retained)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -123,7 +123,8 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [~] Paired positive/negative orbital lobes and fixed color-plane contours are implemented; arbitrary 3D-grid slices/clipping planes, multiple independent isovalues, region integration, and configurable colormaps/contour levels remain pending.
 - [~] Structure and isosurfaces already share the Metal render pass; compositing the sibling color-plane view with structure/isosurfaces remains pending.
 - [x] Standard crystallographic `[100]`/`[110]`/`[111]` camera views.
-- [ ] Multisample anti-aliasing, configurable line widths, transparency, depth cueing, ambient occlusion/soft shadows, camera bookmarks, scale indicators, and publication presets.
+- [x] Three document-scoped named camera bookmark slots with save, recall, and clear actions; exact validated presentation/projection restoration; disabled recalls for empty slots; and optional `.mvis-state` persistence.
+- [ ] Multisample anti-aliasing, configurable line widths, transparency, depth cueing, ambient occlusion/soft shadows, scale indicators, and publication presets.
 - [ ] Higher-resolution labels and true vector export for cells, BZs, k-paths, and graphs; image backgrounds, printing, and stereo/anaglyph rendering.
 
 ### Animation, conversion, and extensibility

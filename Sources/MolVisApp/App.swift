@@ -264,9 +264,14 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     /// then — if the state restored a saved frame — re-parse THAT frame and
     /// re-apply the structural transforms. Without this, the saved currentFrame
     /// would be metadata-only and the saved frame's geometry would never show.
-    static func loadScene(from url: URL, format: ParseFormat?, cliFrame: Int,
-                          stateURL: URL?, kPathImportURL: URL? = nil,
-                          kPathSampling: inout Int) throws -> (scene: Scene, camera: Camera?) {
+    static func loadScene(
+        from url: URL,
+        format: ParseFormat?,
+        cliFrame: Int,
+        stateURL: URL?,
+        kPathImportURL: URL? = nil,
+        kPathSampling: inout Int
+    ) throws -> (scene: Scene, camera: Camera?, cameraBookmarks: [CameraBookmark?]) {
         if let stateURL, sameFile(url, stateURL) {
             throw CLIError.invalid("input and state alias the same file: \(url.path)")
         }
@@ -282,8 +287,17 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var scene = Scene(loaded: try Parser.load(url, as: format, frameIndex: cliFrame))
         scene.currentFrame = loadedFrame
         var camera: Camera? = nil
+        var cameraBookmarks = Array<CameraBookmark?>(
+            repeating: nil,
+            count: CameraBookmark.slotCount
+        )
         if let stateURL {
-            kPathSampling = try StateStore.load(into: &scene, camera: &camera, from: stateURL)
+            kPathSampling = try StateStore.load(
+                into: &scene,
+                camera: &camera,
+                cameraBookmarks: &cameraBookmarks,
+                from: stateURL
+            )
         }
         // Resolve the displayed frame (clamp a saved frame + reparse it) via the shared
         // helper so the GUI path and the frame-state tests run IDENTICAL logic.
@@ -294,7 +308,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         if let kPathImportURL {
             try applyKPathImport(to: &scene, from: kPathImportURL, kPathSampling: &kPathSampling)
         }
-        return (scene, camera)
+        return (scene, camera, cameraBookmarks)
     }
 
     /// Resolve which animation frame a scene (just loaded, and optionally state-restored)
@@ -456,10 +470,14 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             do {
                 try Self.validateExportDestination(outURL, input: inURL, state: options.stateURL)
                 var kPathSampling = 20
-                let (scene, camera) = try Self.loadScene(from: inURL, format: options.format,
-                                                         cliFrame: options.frame, stateURL: options.stateURL,
-                                                         kPathImportURL: options.kPathImportURL,
-                                                         kPathSampling: &kPathSampling)
+                let (scene, camera, _) = try Self.loadScene(
+                    from: inURL,
+                    format: options.format,
+                    cliFrame: options.frame,
+                    stateURL: options.stateURL,
+                    kPathImportURL: options.kPathImportURL,
+                    kPathSampling: &kPathSampling
+                )
                 let exportSize = CGSize(width: 800, height: 800)
                 try Self.exportScene(scene, camera: camera, to: outURL, size: exportSize)
             } catch {
@@ -477,18 +495,29 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 // loadScene honors a saved animation frame by re-parsing it (the
                 // saved frame becomes geometry, not just metadata).
                 var kPathSampling = 20
-                let (scene, camera) = try Self.loadScene(from: inURL, format: options.format,
-                                                         cliFrame: options.frame, stateURL: options.stateURL,
-                                                         kPathImportURL: options.kPathImportURL,
-                                                         kPathSampling: &kPathSampling)
+                let (scene, camera, cameraBookmarks) = try Self.loadScene(
+                    from: inURL,
+                    format: options.format,
+                    cliFrame: options.frame,
+                    stateURL: options.stateURL,
+                    kPathImportURL: options.kPathImportURL,
+                    kPathSampling: &kPathSampling
+                )
                 let wc = MainWindowController(scene: Scene())
                 windowRegistry.add(wc)
-                wc.loadFile(scene, from: inURL, format: options.format, frameIndex: scene.currentFrame)
+                wc.loadFile(
+                    scene,
+                    from: inURL,
+                    format: options.format,
+                    frameIndex: scene.currentFrame,
+                    cameraBookmarks: cameraBookmarks
+                )
                 // kPathSampling is a UI-only preference, not a scene field, so it is not
                 // restored by syncFromScene; apply the value decoded from state here.
                 wc.state.kPathSampling = kPathSampling
                 if let camera {
                     wc.camera = camera
+                    wc.scene.camera = camera
                     // Sync the orthographic toggle from the RESTORED camera (not the
                     // scene.camera that syncFromScene already mirrored), else the
                     // next sidebar sync re-syncs projection from a stale flag.

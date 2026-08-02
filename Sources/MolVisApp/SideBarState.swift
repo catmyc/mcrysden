@@ -19,6 +19,13 @@ final class SideBarState: ObservableObject {
     /// buttons are disabled this explains the current prerequisite that failed.
     @Published private(set) var standardCrystalViewHelp =
         "Standard crystallographic views require a valid unit cell."
+    /// Runtime-only names and occupancy for the document-scoped camera bookmark
+    /// controls. These values are deliberately not scene fields, UserDefaults
+    /// settings, or Codable state; MainWindowController owns the bookmark cameras.
+    @Published var cameraBookmarkNames: [String] =
+        (0..<CameraBookmark.slotCount).map { "View \($0 + 1)" }
+    @Published private(set) var cameraBookmarkAvailability: [Bool] =
+        Array(repeating: false, count: CameraBookmark.slotCount)
     @Published var atomScale: Float = 0.35 { didSet { onChange?() } }
     @Published var bondRadius: Float = 0.10 { didSet { onChange?() } }
     @Published var showCellFrame: Bool = true { didSet { onChange?() } }
@@ -218,6 +225,12 @@ final class SideBarState: ObservableObject {
     /// Invoked when the user chooses one of the standard crystallographic
     /// orientations in the Display section.
     var onStandardCrystalView: ((StandardCrystalView) -> Void)?
+    /// Camera bookmark actions are wired by MainWindowController. Slot indices
+    /// are validated again by the controller because SwiftUI callbacks can outlive
+    /// the row that created them.
+    var onSaveCameraBookmark: ((Int) -> Void)?
+    var onRecallCameraBookmark: ((Int) -> Void)?
+    var onClearCameraBookmark: ((Int) -> Void)?
     /// Export the given k-path in the requested format (the controller presents
     /// a save panel and writes the text). `.qe` => QE K_POINTS crystal;
     /// `.qeCrystalB` => QE K_POINTS crystal_b band-path rows, one special point
@@ -325,6 +338,64 @@ final class SideBarState: ObservableObject {
         showForces = scene.showForces
         forceScale = scene.forceScale
         onChange = saved
+    }
+
+    /// Replace the runtime-only camera-bookmark occupancy and names when a
+    /// document is installed. A short/malformed input is padded or truncated to
+    /// exactly CameraBookmark.slotCount slots. Empty slots receive their stable
+    /// default name; occupied slots use the persisted bookmark name.
+    func syncCameraBookmarkSlots(_ bookmarks: [CameraBookmark?]) {
+        var names = cameraBookmarkNames
+        if names.count != CameraBookmark.slotCount {
+            names = (0..<CameraBookmark.slotCount).map { "View \($0 + 1)" }
+        }
+        var availability = Array(repeating: false, count: CameraBookmark.slotCount)
+        for index in 0..<CameraBookmark.slotCount {
+            let bookmark = bookmarks.indices.contains(index) ? bookmarks[index] : nil
+            availability[index] = bookmark != nil
+            names[index] = bookmark.map { String($0.name.prefix(32)) } ?? "View \(index + 1)"
+        }
+        cameraBookmarkNames = names
+        cameraBookmarkAvailability = availability
+    }
+
+    /// Bounds-safe accessors used by the sidebar's dynamic rows. Bookmark names
+    /// are UI-only, so editing one never invokes the scene synchronization hook.
+    func cameraBookmarkName(at index: Int) -> String {
+        guard cameraBookmarkNames.indices.contains(index) else { return "" }
+        return cameraBookmarkNames[index]
+    }
+
+    func setCameraBookmarkName(at index: Int, to name: String) {
+        guard cameraBookmarkNames.indices.contains(index) else { return }
+        let bounded = String(name.prefix(32))
+        guard cameraBookmarkNames[index] != bounded else { return }
+        var names = cameraBookmarkNames
+        names[index] = bounded
+        cameraBookmarkNames = names
+    }
+
+    /// Return the name used when saving a slot. Blank names fall back to the
+    /// stable default without changing the text field until a save succeeds.
+    func cameraBookmarkSaveName(at index: Int) -> String? {
+        guard cameraBookmarkNames.indices.contains(index) else { return nil }
+        let trimmed = cameraBookmarkNames[index].trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "View \(index + 1)" : String(trimmed.prefix(32))
+    }
+
+    /// Bounds-safe occupancy read used by the sidebar to disable empty slots.
+    func cameraBookmarkIsAvailable(at index: Int) -> Bool {
+        guard cameraBookmarkAvailability.indices.contains(index) else { return false }
+        return cameraBookmarkAvailability[index]
+    }
+
+    /// Update one slot's runtime occupancy without touching its displayed name.
+    /// Clear therefore retains a user's name for the next save.
+    func setCameraBookmarkOccupied(at index: Int, _ occupied: Bool) {
+        guard cameraBookmarkAvailability.indices.contains(index) else { return }
+        var availability = cameraBookmarkAvailability
+        availability[index] = occupied
+        cameraBookmarkAvailability = availability
     }
 
     /// Refresh the runtime-only availability and help text for the standard

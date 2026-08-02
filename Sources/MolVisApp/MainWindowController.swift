@@ -161,6 +161,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             canvas.invalidateReciprocalAccessibilityFocus()
         }
     }
+    /// Exactly three optional camera views owned by this document window. These
+    /// are runtime state, not Scene fields: they cannot leak through Scene Codable
+    /// or UserDefaults and are replaced only when a document is installed.
+    internal private(set) var cameraBookmarks: [CameraBookmark?] =
+        Array(repeating: nil, count: CameraBookmark.slotCount)
     /// Test-only seam: when true, renderer creation is forced to fail so the graceful
     /// Metal-unavailable path is exercisable without a real GPU-less machine.
     internal static var forceRendererFailure = false
@@ -304,6 +309,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // before installing onChange, because every @Published assignment is
         // synchronous and would otherwise feed default state back into it.
         state.syncFromScene(scene)
+        state.syncCameraBookmarkSlots(cameraBookmarks)
         sidebar = NSHostingView(rootView: SideBar(state: state))
         canvas = MetalView(frame: .zero, device: device)
         canvas.autoresizingMask = [.width, .height]
@@ -369,6 +375,15 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onResetView = { [weak self] in self?.resetView() }
         state.onStandardCrystalView = { [weak self] view in
             self?.alignToStandardCrystalView(view)
+        }
+        state.onSaveCameraBookmark = { [weak self] slot in
+            self?.saveCameraBookmark(at: slot)
+        }
+        state.onRecallCameraBookmark = { [weak self] slot in
+            self?.recallCameraBookmark(at: slot)
+        }
+        state.onClearCameraBookmark = { [weak self] slot in
+            self?.clearCameraBookmark(at: slot)
         }
         state.onExportKPath = { [weak self] path, format in
             guard let self else { return }
@@ -470,14 +485,30 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // structure is loaded; it isn't needed on the empty opening frame.
     }
 
+    /// Install exactly the supported number of document-scoped bookmark slots.
+    /// StateStore normally supplies three entries, but malformed/legacy callers
+    /// are padded or truncated here so no later action can index outside bounds.
+    private func installCameraBookmarks(_ bookmarks: [CameraBookmark?]) {
+        var installed = Array<CameraBookmark?>(repeating: nil, count: CameraBookmark.slotCount)
+        for index in installed.indices where bookmarks.indices.contains(index) {
+            installed[index] = bookmarks[index]
+        }
+        cameraBookmarks = installed
+        state.syncCameraBookmarkSlots(installed)
+    }
+
     /// Apply a freshly-loaded scene: reframe the camera ONCE (spec §6 — the
     /// camera resets on file open) and sync the sidebar so the next sidebar
     /// change does not clobber the loaded state with defaults. Records the
     /// source URL/format so AXSF animation can re-parse individual frames, and
     /// populates the animation controls (frameCount > 1 => show playback).
-    func loadFile(_ scene: Scene, from url: URL? = nil, format: ParseFormat? = nil, frameIndex: Int = 0) {
+    /// A normal structure load passes no bookmarks and therefore starts empty;
+    /// App passes restored slots when opening a companion `.mvis-state` file.
+    func loadFile(_ scene: Scene, from url: URL? = nil, format: ParseFormat? = nil,
+                  frameIndex: Int = 0, cameraBookmarks: [CameraBookmark?] = []) {
         loadGeneration += 1   // cancel any pending background drop loads
         clearReciprocalFocusForSceneReplacement()
+        installCameraBookmarks(cameraBookmarks)
         self.scene = scene
         self.sourceURL = url
         self.forcedFormat = format
@@ -1594,6 +1625,62 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         setNeedsRender()
     }
 
+    private func cameraBookmarkSlotIsValid(_ slot: Int) -> Bool {
+        cameraBookmarks.indices.contains(slot) && slot < CameraBookmark.slotCount
+    }
+
+    /// Save the current live camera into one document slot. Validate before
+    /// replacing anything so a malformed camera cannot destroy a good bookmark.
+    @discardableResult
+    internal func saveCameraBookmark(at slot: Int) -> Bool {
+        guard cameraBookmarkSlotIsValid(slot),
+              let name = state.cameraBookmarkSaveName(at: slot) else { return false }
+        guard let validated = try? Camera.validated(camera) else { return false }
+        cameraBookmarks[slot] = CameraBookmark(name: name, camera: validated)
+        state.setCameraBookmarkName(at: slot, to: name)
+        state.setCameraBookmarkOccupied(at: slot, true)
+        return true
+    }
+
+    /// Recall a bookmark transactionally. Validation is performed on a local
+    /// copy; failure returns before touching the live camera or sidebar state.
+    /// The validated stored presentation is installed only after validation so
+    /// recall does not accidentally reframe, align, or alter saved fields.
+    @discardableResult
+    internal func recallCameraBookmark(at slot: Int) -> Bool {
+        guard cameraBookmarkSlotIsValid(slot), let bookmark = cameraBookmarks[slot] else {
+            return false
+        }
+        let candidate = bookmark.camera
+        guard let validated = try? Camera.validated(candidate) else { return false }
+
+        clearTransientViewHighlights()
+        camera = validated
+        // orthographic is a UI mirror, not a second source of camera truth. Fence
+        // its synchronous didSet callback so recalling a slot cannot recurse back
+        // through syncFromState or overwrite the just-restored camera.
+        let wasSyncingState = isSyncingState
+        isSyncingState = true
+        state.orthographic = !validated.perspective
+        isSyncingState = wasSyncingState
+        scene.camera = validated
+        setNeedsRender()
+        return true
+    }
+
+    /// Empty a document bookmark slot while retaining the displayed name for a
+    /// predictable next save. Invalid indices are harmless no-ops.
+    internal func clearCameraBookmark(at slot: Int) {
+        guard cameraBookmarkSlotIsValid(slot) else { return }
+        cameraBookmarks[slot] = nil
+        // Keep a meaningful edited name for the next save; a blank/whitespace
+        // draft falls back to the stable slot default instead.
+        if let name = state.cameraBookmarkSaveName(at: slot) {
+            state.setCameraBookmarkName(at: slot, to: name)
+        }
+        state.setCameraBookmarkOccupied(at: slot, false)
+    }
+
     func applyCameraForNewSceneIfNeeded() {
         // The scene owns the canonical default-framing rule (atoms AND grid); use it
         // so the window, PNG export and vector export all agree on framing.
@@ -2387,7 +2474,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// view-state to `url` via StateStore. Wired to AppDelegate save actions.
     @MainActor
     internal func saveState(to url: URL) throws {
-        try StateStore.save(scene, camera: camera, sourceURL: sourceURL, to: url, kPathSampling: state.kPathSampling)
+        try StateStore.save(scene, camera: camera, sourceURL: sourceURL, to: url,
+                            kPathSampling: state.kPathSampling,
+                            cameraBookmarks: cameraBookmarks)
     }
 
     /// The loaded source is needed by file actions to protect it from overwrite.

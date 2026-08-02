@@ -7,6 +7,7 @@ All notable changes to mcrysden will be documented in this file. The format is b
 ### Added
 
 - Standard crystallographic camera views: sidebar `[100]`, `[110]`, and `[111]` actions use active direct-lattice directions `u*a+v*b+w*c`, with deterministic roll while preserving framing and projection; actions are unavailable with descriptive help for missing or invalid cells, 2D display, or reciprocal k-path editing.
+- Camera bookmarks: three document-scoped named slots with save, recall, and clear actions; exact validated presentation/projection restoration; disabled recalls for empty slots; and backward-compatible optional `.mvis-state` persistence.
 
 ## [1.1.32] — 2026-08-02
 

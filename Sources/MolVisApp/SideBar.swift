@@ -96,6 +96,7 @@ struct SideBar: View {
                 standardCrystalViewButton(StandardCrystalView.view110.label, .view110)
                 standardCrystalViewButton(StandardCrystalView.view111.label, .view111)
             }
+            cameraBookmarkContent
         }
             CollapsibleSection(title: "Display", isExpanded: $displayExpanded) {
                 Picker("Mode", selection: $state.displayMode) {
@@ -312,6 +313,58 @@ struct SideBar: View {
                     }
                 }
             }
+    }
+
+    // MARK: - Camera bookmarks
+
+    /// The three document-scoped camera slots live beside the standard-view
+    /// controls. Names are runtime-only bindings; the controller owns the
+    /// optional CameraBookmark values and handles all slot bounds checks.
+    @ViewBuilder
+    private var cameraBookmarkContent: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Camera Bookmarks")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            ForEach(0..<CameraBookmark.slotCount, id: \.self) { index in
+                HStack(spacing: 3) {
+                    TextField("View \(index + 1)", text: Binding(
+                        get: { state.cameraBookmarkName(at: index) },
+                        set: { state.setCameraBookmarkName(at: index, to: $0) }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 48)
+                    Button(action: { state.onSaveCameraBookmark?(index) }) {
+                        Image(systemName: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel("Save camera bookmark \(index + 1)")
+                    .help("Save the current camera in slot \(index + 1).")
+                    Button(action: { state.onRecallCameraBookmark?(index) }) {
+                        Image(systemName: "arrow.uturn.backward")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!state.cameraBookmarkIsAvailable(at: index))
+                    .accessibilityLabel("Recall camera bookmark \(index + 1)")
+                    .help(state.cameraBookmarkIsAvailable(at: index)
+                        ? "Recall the camera saved in slot \(index + 1)."
+                        : "Slot \(index + 1) is empty; save a camera before recalling it.")
+                    Button(action: { state.onClearCameraBookmark?(index) }) {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!state.cameraBookmarkIsAvailable(at: index))
+                    .accessibilityLabel("Clear camera bookmark \(index + 1)")
+                    .help(state.cameraBookmarkIsAvailable(at: index)
+                        ? "Clear slot \(index + 1); keep its name for the next save."
+                        : "Slot \(index + 1) is empty; save a camera before clearing it.")
+                }
+                .font(.caption)
+            }
+        }
     }
 
     // MARK: - k-path coordinate editor helpers

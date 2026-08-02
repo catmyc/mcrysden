@@ -14,7 +14,9 @@ enum StateStore {
     /// Persist the view-state. `sourceURL` is the loaded structure file (saved as
     /// `source`); pass nil only if the scene has no source (e.g. an empty
     /// viewer) — on reload the structure would need to be re-opened manually.
-    static func save(_ scene: Scene, camera: Camera?, sourceURL: URL?, to url: URL, kPathSampling: Int = 20) throws {
+    static func save(_ scene: Scene, camera: Camera?, sourceURL: URL?, to url: URL,
+                     kPathSampling: Int = 20,
+                     cameraBookmarks: [CameraBookmark?] = []) throws {
         var payload: [String: Any] = ["version": 1]
         if let src = sourceURL { payload["source"] = src.path }
         payload["displayMode"] = scene.displayMode.rawValue
@@ -85,6 +87,9 @@ enum StateStore {
         if let camera {
             payload["camera"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(camera))
         }
+        // New saves normalize even an empty input to the fixed three-slot
+        // representation. The key remains optional when reading legacy files.
+        payload["cameraBookmarks"] = try encodeCameraBookmarks(cameraBookmarks, url: url)
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url, options: .atomic)
     }
@@ -95,6 +100,23 @@ enum StateStore {
     /// ParseError and leaves both scene and camera unchanged.
     @discardableResult
     static func load(into scene: inout Scene, camera: inout Camera?, from url: URL) throws -> Int {
+        var ignoredBookmarks: [CameraBookmark?] = []
+        return try loadState(into: &scene, camera: &camera,
+                             cameraBookmarks: &ignoredBookmarks, from: url)
+    }
+
+    /// Apply a saved view-state and restore the fixed camera-bookmark slots.
+    /// The caller's scene, camera, and bookmarks are committed together only
+    /// after the entire state file has been validated.
+    @discardableResult
+    static func load(into scene: inout Scene, camera: inout Camera?,
+                     cameraBookmarks: inout [CameraBookmark?], from url: URL) throws -> Int {
+        try loadState(into: &scene, camera: &camera,
+                      cameraBookmarks: &cameraBookmarks, from: url)
+    }
+
+    private static func loadState(into scene: inout Scene, camera: inout Camera?,
+                                  cameraBookmarks: inout [CameraBookmark?], from url: URL) throws -> Int {
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -339,13 +361,120 @@ enum StateStore {
         } else {
             candidateCamera = nil
         }
+        // Camera bookmarks are optional for backward compatibility. A missing
+        // key is the same as three empty slots; a present array is normalized
+        // to the same fixed-size representation before the transaction commits.
+        let candidateCameraBookmarks: [CameraBookmark?]
+        if let rawBookmarks = obj["cameraBookmarks"] {
+            candidateCameraBookmarks = try parseCameraBookmarks(rawBookmarks, url: url)
+        } else {
+            candidateCameraBookmarks = Array(repeating: nil, count: CameraBookmark.slotCount)
+        }
         scene = candidate
         camera = candidateCamera
+        cameraBookmarks = candidateCameraBookmarks
         // Per-segment k-path sampling density. Old state files lack the key and
         // fall back to the KPath default of 20. Clamp to UI bounds 2...200 so a
         // malformed or extreme saved value cannot steer the stepper or export.
         let raw = obj["kPathSampling"] as? Int
         return raw.map { min(200, max(2, $0)) } ?? 20
+    }
+
+    private static func encodeCameraBookmarks(_ bookmarks: [CameraBookmark?], url: URL) throws -> [Any] {
+        guard bookmarks.count <= CameraBookmark.slotCount else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "cameraBookmarks has \(bookmarks.count) slots; maximum is \(CameraBookmark.slotCount)")
+        }
+
+        var encoded: [Any] = []
+        encoded.reserveCapacity(CameraBookmark.slotCount)
+        for index in 0..<CameraBookmark.slotCount {
+            guard index < bookmarks.count, let bookmark = bookmarks[index] else {
+                encoded.append(NSNull())
+                continue
+            }
+            let name = try normalizedBookmarkName(bookmark.name, index: index, url: url)
+            let camera: Camera
+            do {
+                camera = try Camera.validated(bookmark.camera)
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "cameraBookmarks[\(index)].camera is invalid: \(error)")
+            }
+            let normalized = CameraBookmark(name: name, camera: camera)
+            do {
+                encoded.append(try JSONSerialization.jsonObject(with: JSONEncoder().encode(normalized)))
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "cameraBookmarks[\(index)] could not be encoded: \(error)")
+            }
+        }
+        return encoded
+    }
+
+    private static func parseCameraBookmarks(_ value: Any, url: URL) throws -> [CameraBookmark?] {
+        guard let rawBookmarks = value as? [Any] else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "cameraBookmarks must be an array")
+        }
+        guard rawBookmarks.count <= CameraBookmark.slotCount else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "cameraBookmarks has \(rawBookmarks.count) slots; maximum is \(CameraBookmark.slotCount)")
+        }
+
+        let decoder = JSONDecoder()
+        var parsed = Array<CameraBookmark?>(repeating: nil, count: CameraBookmark.slotCount)
+        for index in rawBookmarks.indices {
+            let rawBookmark = rawBookmarks[index]
+            if rawBookmark is NSNull { continue }
+            guard rawBookmark is [String: Any] else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "cameraBookmarks[\(index)] must be an object or null")
+            }
+
+            let bookmarkData: Data
+            do {
+                bookmarkData = try JSONSerialization.data(withJSONObject: rawBookmark, options: [])
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "cameraBookmarks[\(index)] is not valid JSON: \(error)")
+            }
+
+            let decoded: CameraBookmark
+            do {
+                decoded = try decoder.decode(CameraBookmark.self, from: bookmarkData)
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0, reason:
+                                       "malformed cameraBookmarks[\(index)]: \(error)")
+            }
+
+            let name = try normalizedBookmarkName(decoded.name, index: index, url: url)
+            let camera: Camera
+            do {
+                // Do not place the decoded camera into the result until this
+                // validation has produced a finite camera with a normalized
+                // quaternion.
+                camera = try Camera.validated(decoded.camera)
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "cameraBookmarks[\(index)].camera is invalid: \(error)")
+            }
+            parsed[index] = CameraBookmark(name: name, camera: camera)
+        }
+        return parsed
+    }
+
+    private static func normalizedBookmarkName(_ name: String, index: Int, url: URL) throws -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "cameraBookmarks[\(index)].name must be non-empty after trimming")
+        }
+        guard trimmed.count <= 32 else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "cameraBookmarks[\(index)].name exceeds 32 characters")
+        }
+        return trimmed
     }
 
     private static func parseKPathPoints(_ value: Any, url: URL) throws -> [KPoint] {

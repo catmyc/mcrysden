@@ -108,7 +108,7 @@ Key rules:
 | `KPath.swift` | k-path interpolation; QE crystal/crystal_b/tpiba_b, Wannier90, KPF, and VASP export |
 | `CrystalSymmetry.swift` | Spglib analysis: space group, Wyckoff, standardized cells |
 | `HPKOT.swift` | SeekPath 2.1 canonical paths for all 29 Bravais variants |
-| `StateStore.swift` | `.mvis-state` JSON serialization |
+| `StateStore.swift` | `.mvis-state` JSON serialization, including optional validated camera/bookmark persistence |
 | `StructureSummary.swift` | Lattice, composition, density, symmetry data model |
 | `ElementTable.swift` | CPK colors, covalent/vdw radii, atomic masses |
 | `CoordinationAnalysis.swift` | Periodic image-aware coordination shells/CN, neighbor readout |

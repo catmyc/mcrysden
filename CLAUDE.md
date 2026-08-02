@@ -92,7 +92,7 @@ Graph views (`BandGrapherView`, `DOSGrapherView`, `ColorPlaneView`) are viewport
 | `MainWindowController.swift` | Window, sidebar, viewport, playback, state sync, coordination, measurements |
 | `SideBar.swift` | SwiftUI sidebar: display, k-path, supercell, slab, animation, structure summary, atom table, coordination |
 | `SideBarState.swift` | `ObservableObject`: all `@Published` fields; `onChange` fires synchronously from `didSet` |
-| `StateStore.swift` | `.mvis-state` JSON serialization |
+| `StateStore.swift` | `.mvis-state` JSON serialization, including optional validated camera/bookmark persistence |
 | `PngExporter.swift` | Headless offscreen PNG export |
 | `VectorExporter.swift` | Raster-backed PDF/SVG/EPS/PS export |
 | `ExportOptions.swift` / `ExportOptionsView.swift` | Configurable export dimensions, background, transparency |
