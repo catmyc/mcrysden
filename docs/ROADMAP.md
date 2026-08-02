@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-01 (v1.1.31 Wannier90 kpoint_path and QE crystal_b export interoperability, 1286 tests)**.
+Last updated: **2026-08-02 (v1.1.32 test-suite consolidation, 642 tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 1286 tracked tests as of v1.1.31: unit, snapshot (FNV-1a pixel hash vs. committed goldens), model-layer cache, parser-hardening, renderer-safety, export, state, coordination-analysis, reciprocal-ux, electronic-structure analysis/presentation, grapher-interaction, k-path-import, k-path-export-interop, and pathological-input regression tests. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 642 tracked tests as of v1.1.32 after consolidating redundant and overlapping cases: parser, renderer, snapshot (FNV-1a pixel hash vs. committed goldens), export/state, symmetry, reciprocal-space UX, k-path interoperability, coordination integration, atom-table integration, electronic analysis, and application-workflow coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.

@@ -38,7 +38,7 @@ final class ElectronicAnalysisIntegrationTests: XCTestCase {
         fermi: Float? = nil
     ) -> DensityOfStates {
         let series = seriesValues.enumerated().map { index, values in
-            let label = labels?[safe: index] ?? "Series \(index + 1)"
+            let label = labels.flatMap { $0.indices.contains(index) ? $0[index] : nil } ?? "Series \(index + 1)"
             return DOSSeries(label: label, values: values)
         }
         return DensityOfStates(energies: energies, series: series, fermiEnergy: fermi)
