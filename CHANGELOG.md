@@ -2,6 +2,19 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.37] — 2026-08-03
+
+### Fixed
+
+- Hardened first-shell polyhedron metrics: fixed shell-tolerance chaining, coplanar-facet volume overcounting, hull-edge angle selection, oversized-shell reporting, finite-input handling, scale-aware tolerances, and cancellable background lifecycle.
+- Made structure comparison responsive and bounded with arbitrary periodic-image ranges for skew/translated cells, singular-cell rejection, complete no-match semantics, streamed/capped candidate work, cancellation, asynchronous reference loading, and stale-result invalidation after geometry changes.
+- Propagated comparison displacement arrows into PNG and raster-backed vector exports and enabled them in 2D display modes; hardened comparison CSV escaping and source/target indexing.
+- Hardened coordinate/region filters against malformed structured terms, empty region fields, and overflow, and bounded/clamped bond-distance labels with explicit Å units and hidden-structure behavior.
+
+### Tests
+
+- Kept exactly 32 focused tests while adding consolidated regressions for polyhedron shells/hulls, comparator bounds and cancellation, filter overflow, CSV escaping, comparison lifecycle/export propagation, 2D arrows, and bond-label bounds.
+
 ## [1.1.36] — 2026-08-03
 
 ### Added

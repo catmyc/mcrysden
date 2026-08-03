@@ -214,12 +214,24 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private(set) var polyhedronMetrics: [PolyhedronMetrics]? = nil
     private var polyhedronWorkItem: DispatchWorkItem?
     private var polyhedronGeneration = 0
+    /// Lock-backed cancellation token for polyhedron analysis, owned
+    /// independently from the coordination token so polyhedron restarts
+    /// cannot interfere with coordination and vice-versa.
+    private var polyhedronCancellationToken: CoordinationCancellationToken?
     /// Test seam mirroring `coordinationAnalysisDidUpdate`.
     internal var polyhedronAnalysisDidUpdate: (() -> Void)?
     /// Runtime-only two-structure comparison: the reference structure loaded by
     /// the user and the last computed result. Never persisted.
     private(set) var comparisonResult: StructureComparisonResult?
     private(set) var comparisonReferenceTitle: String?
+    /// Monotonic generation + cancellation token for the async comparison
+    /// workflow. Every new request (open-panel, programmatic) bumps the
+    /// generation and cancels the prior token so a stale completion after a
+    /// clear / new request / window close / geometry change can never install.
+    private var comparisonGeneration = 0
+    private var comparisonCancellationToken: CoordinationCancellationToken?
+    /// The background comparison work item, tracked so it can be cancelled.
+    private var comparisonWorkItem: DispatchWorkItem?
     /// Distribution analysis is derived on a background work item so the main
     /// thread is not blocked by the O(27·n²) RDF enumeration or the
     /// O(n·k²) bond-angle sweep.
@@ -309,6 +321,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     deinit {
         cancelCoordinationRequest()
+        cancelPolyhedronRequest()
+        // Cancellation-only teardown: do not mutate published UI state or the
+        // installed result from deinit (no alive view/window to render into).
+        cancelComparisonRequestOnly()
     }
 
     // MARK: - File watching
@@ -579,7 +595,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // A new document invalidates any two-structure comparison: the reference
         // was matched against the previous atom ordering. Drop readouts, panel
         // content, and displacement arrows before installing the new scene.
-        clearComparison()
+        // loadFile renders later, so suppress the invalidation render.
+        invalidateComparisonRequest(render: false)
         self.scene = scene
         self.sourceURL = url
         self.forcedFormat = format
@@ -977,6 +994,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// the structure summary, BZ-dependent geometry, coordination analysis,
     /// distribution analysis, the atom table, and the renderer.
     private func runCoordinateEditLifecycle() {
+        // A coordinate change invalidates the two-structure comparison: the
+        // source atom ordering shifted. The edit path renders later, so
+        // suppress the invalidation render to avoid a double draw.
+        invalidateComparisonRequest(render: false)
         // Structure summary reflects the new geometry.
         state.structureSummary = StructureSummary(scene, symmetry: scene.crystalSymmetry)
         // The k-path sidebar mirror must agree with the scene's route (which
@@ -1062,7 +1083,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     }
 
     /// Present an open panel to choose a reference structure, then load it and
-    /// compare it against the currently displayed atoms.
+    /// compare it against the currently displayed atoms off the main thread.
+    /// The synchronous `loadComparisonReference(from:)` seam is preserved for
+    /// tests and programmatic use sites.
     func chooseComparisonReference() {
         let panel = NSOpenPanel()
         panel.title = "Choose Reference Structure"
@@ -1075,29 +1098,123 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         panel.beginSheetModal(for: window) { [weak self] result in
             guard let self, result == .OK, let url = panel.url else { return }
-            do {
-                try self.loadComparisonReference(from: url)
-            } catch {
-                print("[mcrysden] comparison load failed: \(error)")
-                self.presentComparisonError(error, url: url)
-            }
+            self.startComparison(from: url)
         }
     }
 
-    /// Load a reference structure from `url`, compare it against the current
-    /// scene, and install the result (readouts, panel, displacement arrows).
+    /// Parse + compare off the main thread with generation/cancellation
+    /// guarding. A stale completion after a clear / new request / window close
+    /// / geometry change never installs. Uses `LoadedScene.atoms` directly —
+    /// no `Scene` or symmetry analysis is constructed for the reference.
+    ///
+    /// All mutable controller state (generation, token identity) is captured
+    /// as local lets BEFORE the background block, and the main-thread
+    /// completion checks only against those captures — never reading
+    /// mutable state off-main.
+    private func startComparison(from url: URL) {
+        // Cancel any prior work and clear stale arrows/result before showing
+        // the Calculating state. Suppress the geometry-path render (a fresh
+        // result will render on install), but request ONE immediate render so
+        // the previously drawn arrows/readouts are erased right away instead
+        // of persisting on screen for the duration of the parse/compare.
+        invalidateComparisonRequest(render: false)
+        comparisonGeneration += 1
+        let generation = comparisonGeneration
+        let token = CoordinationCancellationToken()
+        comparisonCancellationToken = token
+        state.comparisonCalculating = true
+        state.comparisonStatusText = "Calculating…"
+        setNeedsRender()
+
+        let sourceAtoms = scene.atoms
+        // Use the effective widened coordination cell so a supercell
+        // expansion matches against the displayed periodic images rather than
+        // the base cell.
+        let sourceCell = effectiveCoordinationCell(for: scene)
+        let periodicDim = scene.periodicDim
+        let title = url.lastPathComponent
+
+        let work = DispatchWorkItem {
+            // Background work reads ONLY captured locals — never self or
+            // mutable instance state. No strong reference to the controller.
+            guard !token.isCancelled() else { return }
+            do {
+                let loaded = try Parser.load(url)
+                let targetAtoms = loaded.atoms
+                guard !targetAtoms.isEmpty else {
+                    throw ParseError.parse(path: url.path, line: 0,
+                                           reason: "reference file contains no atoms")
+                }
+                guard let result = StructureComparator.compare(
+                    source: sourceAtoms, target: targetAtoms,
+                    sourceCell: sourceCell, periodicDim: periodicDim,
+                    isCancelled: { token.isCancelled() }) else {
+                    throw ParseError.parse(path: url.path, line: 0,
+                                           reason: "comparison failed: invalid geometry or limits exceeded")
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    guard !token.isCancelled(),
+                          self.comparisonGeneration == generation else { return }
+                    self.installComparison(result, referenceTitle: title)
+                    self.state.comparisonCalculating = false
+                    self.comparisonCancellationToken = nil
+                    self.comparisonWorkItem = nil
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    guard !token.isCancelled(),
+                          self.comparisonGeneration == generation else { return }
+                    self.state.comparisonCalculating = false
+                    self.comparisonCancellationToken = nil
+                    self.comparisonWorkItem = nil
+                    self.state.comparisonStatusText = ""
+                    self.presentComparisonError(error, url: url)
+                }
+            }
+        }
+        comparisonWorkItem = work
+        DispatchQueue.global(qos: .userInitiated).async(execute: work)
+    }
+
+    /// Cancel any in-flight async comparison and bump the generation so its
+    /// stale completion cannot install. Cancellation-only: does not touch
+    /// published UI state or the installed result. Used only from `deinit`;
+    /// the synchronous load seam now uses `invalidateComparisonRequest`.
+    private func cancelComparisonRequestOnly() {
+        comparisonGeneration += 1
+        comparisonCancellationToken?.cancel()
+        comparisonCancellationToken = nil
+        comparisonWorkItem?.cancel()
+        comparisonWorkItem = nil
+    }
+
+    /// Synchronous seam: load a reference structure from `url`, compare it
+    /// against the currently displayed atoms, and install the result. Uses
+    /// `LoadedScene.atoms` directly (no `Scene`/symmetry construction) and
+    /// the effective widened coordination cell so supercell expansions match
+    /// against the displayed periodic images. Preserved for tests and
+    /// programmatic use sites; the open-panel user path goes through
+    /// `startComparison` (async).
+    ///
+    /// Supersedes any in-flight async request: the full render-suppressed
+    /// invalidation clears comparisonCalculating, status text, arrows, and
+    /// the panel placeholder before parsing, so a superseded async request
+    /// cannot leave the UI in a disabled Calculating state or overwrite this
+    /// synchronous result.
     func loadComparisonReference(from url: URL) throws {
+        invalidateComparisonRequest(render: false)
         let loaded = try Parser.load(url)
-        let reference = Scene(loaded: loaded)
-        guard !reference.atoms.isEmpty else {
+        let targetAtoms = loaded.atoms
+        guard !targetAtoms.isEmpty else {
             throw ParseError.parse(path: url.path, line: 0,
                                    reason: "reference file contains no atoms")
         }
-        let sourceAtoms = scene.atoms
-        let result = StructureComparator.compare(source: sourceAtoms,
-                                                 target: reference.atoms,
-                                                 sourceCell: scene.cell,
-                                                 periodicDim: scene.periodicDim)
+        let result = StructureComparator.compare(
+            source: scene.atoms, target: targetAtoms,
+            sourceCell: effectiveCoordinationCell(for: scene),
+            periodicDim: scene.periodicDim)
         guard let result else {
             throw ParseError.parse(path: url.path, line: 0,
                                    reason: "comparison failed: invalid geometry or limits exceeded")
@@ -1157,25 +1274,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         setNeedsRender()
     }
 
-    /// Clear the active comparison (readouts, panel content, arrows).
+    /// User Clear action: cancel any in-flight comparison immediately, drop
+    /// the installed result/arrows/readouts, and render once. Always enabled
+    /// (including while `comparisonCalculating`) so the user can abort a
+    /// long-running compare.
     func clearComparison() {
-        comparisonResult = nil
-        comparisonReferenceTitle = nil
-        state.comparisonStatusText = ""
-        state.showComparisonArrows = false
-        renderer?.displacementArrows = []
-        renderer?.showDisplacementArrows = false
-        if let window = comparisonWindow, window.isVisible {
-            comparisonPanel.update(referenceTitle: "—",
-                                   result: StructureComparisonResult(
-                                       matches: [], unmatchedSourceIndices: [],
-                                       unmatchedTargetIndices: [],
-                                       rmsDisplacement: nil, meanDisplacement: nil,
-                                       maxDisplacement: nil, perElement: [],
-                                       maxMatchDistance: StructureComparator.defaultMaxMatchDistance,
-                                       isComplete: true))
-        }
-        setNeedsRender()
+        invalidateComparisonRequest(render: true)
     }
 
     /// Rebuild the renderer's displacement arrows from the active comparison
@@ -1196,44 +1300,91 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
     }
 
-    /// Present a save panel and write the comparison as CSV: one row per
-    /// matched pair (source index, element, dx, dy, dz, distance) plus summary
-    /// lines. Unmatched atoms are listed at the end.
+    /// Pure helper that builds the comparison CSV text. Never interpolates
+    /// user-controlled labels/titles into a String(format:) format string —
+    /// every user field is escaped via csvEscape and concatenated. `sourceAtoms`
+    /// is the snapshot captured BEFORE the save-panel completion so a concurrent
+    /// geometry change cannot reorder atoms under us mid-write.
+    static func comparisonCSV(for result: StructureComparisonResult,
+                              referenceTitle: String?,
+                              sourceAtoms: [Atom]) -> String {
+        var lines: [String] = []
+        // Sanitize the reference title for the comment line: collapse line
+        // breaks so a malicious title cannot inject CSV header/row lines.
+        let sanitizedTitle = (referenceTitle ?? "").replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        if !sanitizedTitle.isEmpty {
+            lines.append("# Reference: " + sanitizedTitle)
+        }
+        if let rms = result.rmsDisplacement {
+            lines.append(String(format: "# RMSD: %.4f Å", rms))
+        }
+        lines.append(String(format: "# Cutoff: %.4f Å; matched: %d",
+                            result.maxMatchDistance, result.matchedPairCount))
+        lines.append("source_index,target_index,element,label,dx,dy,dz,distance_angstrom")
+        for match in result.matches {
+            guard match.sourceIndex >= 0, match.sourceIndex < sourceAtoms.count else { continue }
+            let atom = sourceAtoms[match.sourceIndex]
+            let symbol = csvEscape(ElementTable.symbol(atom.atomicNumber))
+            let label = csvEscape(atom.label)
+            lines.append(String(format: "%d,%d,", match.sourceIndex + 1, match.targetIndex + 1)
+                            + symbol + "," + label + ","
+                            + String(format: "%.6f,%.6f,%.6f,%.6f",
+                                     match.displacement.x, match.displacement.y,
+                                     match.displacement.z, match.distance))
+        }
+        lines.append("# Unmatched source atoms: "
+            + result.unmatchedSourceIndices.map { String($0 + 1) }.joined(separator: ","))
+        lines.append("# Unmatched reference atoms: "
+            + result.unmatchedTargetIndices.map { String($0 + 1) }.joined(separator: ","))
+        return lines.joined(separator: "\n")
+    }
+
+    /// RFC 4180 field escaping: wrap in double quotes and double any embedded
+    /// quotes when the field contains a comma, quote, or newline. Empty
+    /// fields are emitted as two consecutive delimiters (bare empty).
+    static func csvEscape(_ field: String) -> String {
+        if field.contains(",") || field.contains("\"") || field.contains("\n") || field.contains("\r") {
+            return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+        }
+        return field
+    }
+
+    /// Present a save panel and write the comparison as CSV. Snapshots the
+    /// source atoms before the panel completes so a concurrent geometry change
+    /// cannot reorder atoms under us. Surfaces write errors to the user.
     func exportComparisonCSV() {
         guard let result = comparisonResult else { return }
+        // Snapshot before the modal so the completion closure sees a
+        // consistent atom ordering even if the scene changes while the panel
+        // is open.
+        let sourceAtoms = scene.atoms
+        let referenceTitle = comparisonReferenceTitle
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "comparison.csv"
         panel.allowedContentTypes = [.commaSeparatedText]
         panel.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .OK, let url = panel.url else { return }
-            var lines: [String] = []
-            if let title = self.comparisonReferenceTitle {
-                lines.append("# Reference: \(title)")
-            }
-            if let rms = result.rmsDisplacement {
-                lines.append(String(format: "# RMSD: %.4f Å", rms))
-            }
-            lines.append("# Cutoff: \(result.maxMatchDistance) Å; matched: \(result.matchedPairCount)")
-            lines.append("source_index,element,dx,dy,dz,distance_angstrom")
-            for match in result.matches {
-                guard match.sourceIndex >= 0,
-                      match.sourceIndex < self.scene.atoms.count else { continue }
-                let atom = self.scene.atoms[match.sourceIndex]
-                let symbol = atom.label.isEmpty
-                    ? ElementTable.symbol(atom.atomicNumber) : atom.label
-                lines.append(String(
-                    format: "%d,\(symbol),%.6f,%.6f,%.6f,%.6f",
-                    match.sourceIndex + 1, match.displacement.x, match.displacement.y,
-                    match.displacement.z, match.distance))
-            }
-            lines.append("# Unmatched source atoms: "
-                + result.unmatchedSourceIndices.map { "\($0 + 1)" }.joined(separator: ","))
-            lines.append("# Unmatched reference atoms: "
-                + result.unmatchedTargetIndices.map { "\($0 + 1)" }.joined(separator: ","))
-            let text = lines.joined(separator: "\n")
+            let text = Self.comparisonCSV(for: result, referenceTitle: referenceTitle,
+                                          sourceAtoms: sourceAtoms)
             do { try text.write(to: url, atomically: true, encoding: .utf8) }
-            catch { print("[mcrysden] comparison CSV export failed: \(error)") }
+            catch {
+                print("[mcrysden] comparison CSV export failed: \(error)")
+                self.presentExportWriteError(error, kind: "Comparison")
+            }
         }
+    }
+
+    /// Present a generic file-write failure as an alert sheet on the main window.
+    private func presentExportWriteError(_ error: Error, kind: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "\(kind) Export Failed"
+        alert.informativeText = (error as? LocalizedError)?.errorDescription
+            ?? error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
     }
 
     /// Present the comparison load failure as an alert sheet on the main window.
@@ -1407,9 +1558,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         stopFileWatching()
         stopPlayback()
         cancelCoordinationRequest()
+        cancelPolyhedronRequest()
+        invalidateComparisonRequest(render: false)
         coordinationGeneration += 1
         distributionGeneration += 1
-        polyhedronGeneration += 1
         state.isPlaying = false
         infoWindow.orderOut(nil)
     }
@@ -1834,6 +1986,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             clearReciprocalHover()
             canvas.invalidateReciprocalAccessibilityFocus()
         }
+        // A direct slab drag changes the displayed atom set, invalidating
+        // any installed two-structure comparison. This path renders later, so
+        // suppress the invalidation render.
+        invalidateComparisonRequest(render: false)
         coordinationGeometryDidChange()
         refreshAtomTable()
         setNeedsRender()
@@ -1970,20 +2126,29 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     /// Generate bond-distance labels for the given scene/camera/viewport.
     /// Each displayed bond contributes one label at its projected midpoint,
-    /// offset above the bond, formatted in Å. Bonds whose endpoints or
-    /// midpoint project outside the viewport are skipped; the total is bounded
-    /// by `maxLabels` for readability. Deterministic (bond order), so live and
-    /// export compositing stay identical.
+    /// formatted with an explicit Å unit. Labels are translated to fit inside
+    /// the viewport edges (skipped if they cannot fit). Bond labels are hidden
+    /// when the structure itself is hidden so they do not float over an empty
+    /// cell frame / axes. The total is bounded by `maxLabels`.
     static func bondDistanceLabels(scene: Scene, camera: Camera,
                                    viewport: SIMD2<Float>,
-                                   maxLabels: Int = 200) -> [LabelOverlayView.Label] {
+                                   maxLabels: Int = 200,
+                                   maxInspectedBonds: Int = 10_000) -> [LabelOverlayView.Label] {
         guard maxLabels > 0 else { return [] }
+        guard maxInspectedBonds > 0 else { return [] }
+        guard scene.showStructure else { return [] }
         let atoms = scene.atoms
         guard !atoms.isEmpty, !scene.bonds.isEmpty else { return [] }
+        guard viewport.x.isFinite, viewport.y.isFinite, viewport.x > 0, viewport.y > 0 else { return [] }
 
         var labels: [LabelOverlayView.Label] = []
         labels.reserveCapacity(min(scene.bonds.count, maxLabels))
-        for bond in scene.bonds {
+        let bounds = NSRect(x: 0, y: 0, width: CGFloat(viewport.x), height: CGFloat(viewport.y))
+        // scene.bonds.prefix is itself overflow-safe: it stops at the cap even
+        // when every inspected bond is invalid or offscreen, so an ordinary
+        // supercell (thousands of bonds) cannot spin in the inner loop.
+        let inspectLimit = min(scene.bonds.count, maxInspectedBonds)
+        for bond in scene.bonds.prefix(inspectLimit) {
             guard labels.count < maxLabels else { break }
             guard bond.i >= 0, bond.i < atoms.count,
                   bond.j >= 0, bond.j < atoms.count else { continue }
@@ -1996,21 +2161,24 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             guard let screen = projectPoint(midpoint, camera: camera, viewport: viewport) else {
                 continue
             }
-            let text = String(format: "%.2f", distance)
+            let text = String(format: "%.2f Å", distance)
             let label = LabelOverlayView.Label(symbol: text,
                                                x: screen.x - 12, y: screen.y - 12,
                                                style: .bondDistance)
-            // Keep the complete chip inside the viewport when it fits.
             let rect = LabelOverlayView.drawingRect(for: label)
-            if rect.maxX > CGFloat(viewport.x) {
-                let shifted = LabelOverlayView.Label(symbol: text,
-                                                     x: screen.x - rect.width - 6,
-                                                     y: screen.y - 12,
-                                                     style: .bondDistance)
-                labels.append(shifted)
-            } else {
-                labels.append(label)
-            }
+            // Skip the label entirely if it cannot fit on screen.
+            guard rect.width <= bounds.width, rect.height <= bounds.height else { continue }
+            // Translate the complete drawing rect inside every viewport edge.
+            // Clamp the rect's origin within bounds, then derive the label
+            // origin from the clamped rect (label.x/y is the text origin,
+            // which sits at rect.origin + padding).
+            let clampedX = min(max(rect.minX, bounds.minX), bounds.maxX - rect.width)
+            let clampedY = min(max(rect.minY, bounds.minY), bounds.maxY - rect.height)
+            let dx = clampedX - rect.minX
+            let dy = clampedY - rect.minY
+            labels.append(LabelOverlayView.Label(symbol: text,
+                                                 x: label.x + dx, y: label.y + dy,
+                                                 style: .bondDistance))
         }
         return labels
     }
@@ -2853,6 +3021,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         syncCoordinationState(geometryChanged: superCellChanged || slabChanged)
         if superCellChanged || slabChanged {
+            // Supercell/slab changes alter the displayed atom ordering and
+            // invalidate any installed two-structure comparison. This path
+            // renders later, so suppress the invalidation render.
+            invalidateComparisonRequest(render: false)
             refreshAtomTable()
         }
         // Reframe when crossing the 2D↔3D boundary — after supercell/slab
@@ -2982,6 +3154,65 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationDebounceCancellation = nil
         distributionWorkItem?.cancel()
         distributionWorkItem = nil
+    }
+
+    /// Cancel any in-flight comparison, clear the installed result + arrows,
+    /// and reset the calculating flag. Coordination enable/scale changes go
+    /// through `cancelCoordinationRequest` and must NOT touch this — the two
+    /// lifecycles are independent. `render` controls whether a single
+    /// setNeedsRender is issued (user Clear) or suppressed (geometry paths
+    /// that render later anyway). The generation is bumped on every call so a
+    /// stale background completion can never install.
+    ///
+    /// Always resets the auxiliary comparisonPanel placeholder (even for
+    /// render-suppressed geometry invalidations) so the panel never shows
+    /// stale metrics after a coordinate/supercell/slab/frame change. The
+    /// `showComparisonArrows` reset is wrapped in the `isSyncingState` guard
+    /// so its `didSet` → `onChange` → `syncFromState` fires into the early
+    /// return instead of triggering a nested sync/render.
+    private func invalidateComparisonRequest(render: Bool) {
+        comparisonGeneration += 1
+        comparisonCancellationToken?.cancel()
+        comparisonCancellationToken = nil
+        comparisonWorkItem?.cancel()
+        comparisonWorkItem = nil
+        comparisonResult = nil
+        comparisonReferenceTitle = nil
+        state.comparisonStatusText = ""
+        state.comparisonCalculating = false
+        renderer?.displacementArrows = []
+        renderer?.showDisplacementArrows = false
+        // Always reset the arrow-toggle default. Wrap in isSyncingState so the
+        // published didSet callback returns early in syncFromState instead of
+        // triggering a nested sync/render.
+        let wasSyncingState = isSyncingState
+        isSyncingState = true
+        state.showComparisonArrows = false
+        isSyncingState = wasSyncingState
+        // Always refresh the auxiliary panel placeholder so it never shows
+        // stale metrics, regardless of whether this invalidation renders.
+        if let window = comparisonWindow, window.isVisible {
+            comparisonPanel.update(referenceTitle: "—",
+                                   result: StructureComparisonResult(
+                                       matches: [], unmatchedSourceIndices: [],
+                                       unmatchedTargetIndices: [],
+                                       rmsDisplacement: nil, meanDisplacement: nil,
+                                       maxDisplacement: nil, perElement: [],
+                                       maxMatchDistance: StructureComparator.defaultMaxMatchDistance,
+                                       isComplete: true))
+        }
+        if render {
+            setNeedsRender()
+        }
+    }
+
+    /// Cancel any in-flight polyhedron analysis, bump its generation so the
+    /// stale completion is discarded, and clear the token. Independent of the
+    /// coordination token so polyhedron cancellation cannot disturb coordination.
+    private func cancelPolyhedronRequest() {
+        polyhedronGeneration += 1
+        polyhedronCancellationToken?.cancel()
+        polyhedronCancellationToken = nil
         polyhedronWorkItem?.cancel()
         polyhedronWorkItem = nil
     }
@@ -2997,8 +3228,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // A restart supersedes any previous polyhedron metrics derived from the
         // old coordination result; clear them so the readouts never show stale
         // values while the new analysis is in flight.
-        polyhedronGeneration += 1
-        polyhedronWorkItem = nil
+        cancelPolyhedronRequest()
         clearPolyhedronMetrics()
         state.coordinationAnalysisAvailable = false
         state.coordinationStatusText = scene.atoms.isEmpty ? "Unavailable" : "Calculating…"
@@ -3156,26 +3386,38 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // shell (≤ 24 neighbors) and 4,096 atoms, so it must never run on the
         // main thread. Stale results from superseded requests are discarded via
         // the generation token, exactly like the distribution analysis.
-        polyhedronWorkItem?.cancel()
-        polyhedronGeneration += 1
+        cancelPolyhedronRequest()
         let polyGeneration = polyhedronGeneration
+        let polyToken = CoordinationCancellationToken()
+        polyhedronCancellationToken = polyToken
         let polyAtoms = scene.atoms
         let polyResult = result
-        let polyWork = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            guard self.polyhedronGeneration == polyGeneration else { return }
+        // Capture the token locally; the background work reads only this
+        // capture (never polyhedronGeneration) and never retains self.
+        let polyTokenLocal = polyToken
+        let polyWork = DispatchWorkItem {
             let metrics = PolyhedronAnalyzer.analyze(
                 analysis: polyResult, atoms: polyAtoms,
-                isCancelled: { [weak self] in
-                    guard let self else { return true }
-                    return self.polyhedronGeneration != polyGeneration
-                })
+                isCancelled: { polyTokenLocal.isCancelled() })
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 guard self.polyhedronGeneration == polyGeneration else { return }
                 self.polyhedronWorkItem = nil
+                self.polyhedronCancellationToken = nil
                 guard let metrics, metrics.count == self.scene.atoms.count else {
-                    self.clearPolyhedronMetrics()
+                    // Analysis returned nil (over-cap or current nil): show an
+                    // explicit unavailable reason so the metrics-table button
+                    // stays reachable.
+                    self.polyhedronMetrics = nil
+                    let reason: String
+                    if polyAtoms.count > PolyhedronAnalyzer.maxAtoms {
+                        reason = "structure exceeds the \(PolyhedronAnalyzer.maxAtoms)-atom cap"
+                    } else {
+                        reason = "coordination analysis produced no result"
+                    }
+                    self.state.polyhedronSummaryText = "Polyhedron metrics unavailable: " + reason + "."
+                    self.updatePolyhedronTable()
+                    self.polyhedronAnalysisDidUpdate?()
                     return
                 }
                 self.polyhedronMetrics = metrics
@@ -3195,8 +3437,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationCancellationToken = nil
         coordinationWorkItem = nil
         distributionGeneration += 1
-        polyhedronGeneration += 1
-        polyhedronWorkItem = nil
+        cancelPolyhedronRequest()
         coordinationAnalysis = nil
         distributionAnalysis = nil
         state.distributionAnalysis = nil
@@ -3213,7 +3454,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         cancelCoordinationRequest()
         coordinationGeneration += 1
         distributionGeneration += 1
-        polyhedronGeneration += 1
+        cancelPolyhedronRequest()
         coordinationAnalysis = nil
         distributionAnalysis = nil
         state.distributionAnalysis = nil
@@ -3235,25 +3476,39 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
     }
 
-    /// Human-readable one-line summary of the per-atom polyhedron metrics.
+    /// Human-readable summary of the per-atom polyhedron metrics. Means are
+    /// computed in Double with finite guards. When a completed analysis yields
+    /// a non-empty metrics array but no atom has an available first-shell
+    /// polyhedra, an explicit message is returned so the metrics-table button
+    /// remains reachable rather than showing a blank section.
     private static func polyhedronSummary(metrics: [PolyhedronMetrics]) -> String {
         let volumes = metrics.compactMap { $0.volume }
         let distortions = metrics.compactMap { $0.bondLengthDistortion }
         let angles = metrics.compactMap { $0.angleDeviation }
         var parts: [String] = []
         if !volumes.isEmpty {
-            let mean = volumes.reduce(0, +) / Float(volumes.count)
-            parts.append(String(format: "Mean polyhedron volume: %.3f Å³", mean))
+            let mean = volumes.reduce(0.0) { Double($0) + Double($1) } / Double(volumes.count)
+            if mean.isFinite {
+                parts.append(String(format: "Mean polyhedron volume: %.3f Å³", mean))
+            }
         }
         if !distortions.isEmpty {
-            let mean = distortions.reduce(0, +) / Float(distortions.count)
-            parts.append(String(format: "Mean bond-length distortion: %.4f", mean))
+            let mean = distortions.reduce(0.0) { Double($0) + Double($1) } / Double(distortions.count)
+            if mean.isFinite {
+                parts.append(String(format: "Mean bond-length distortion: %.4f", mean))
+            }
         }
         if !angles.isEmpty {
-            let mean = angles.reduce(0, +) / Float(angles.count)
-            parts.append(String(format: "Mean angle deviation: %.2f°", mean))
+            let mean = angles.reduce(0.0) { Double($0) + Double($1) } / Double(angles.count)
+            if mean.isFinite {
+                parts.append(String(format: "Mean angle deviation: %.2f°", mean))
+            }
         }
-        return parts.isEmpty ? "" : parts.joined(separator: "\n")
+        if parts.isEmpty {
+            // Completed analysis but no available first-shell polyhedra.
+            return "No first-shell polyhedra available for these atoms."
+        }
+        return parts.joined(separator: "\n")
     }
 
     private func cellsEqual(_ lhs: Cell?, _ rhs: Cell?) -> Bool {
@@ -3420,13 +3675,43 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 return index >= 0 && index < renderedCount ? index : nil
             }
             : nil
+        // Displacement arrows export only when the Metal canvas is visible,
+        // a comparison result is installed, and the user has toggled arrows
+        // on — and only when the computed arrow list is actually nonempty.
+        let arrows: [(start: SIMD3<Float>, vector: SIMD3<Float>)]
+        let showArrows: Bool
+        if metalCanvasVisible && state.showComparisonArrows && comparisonResult != nil {
+            let computed = currentDisplacementArrows()
+            arrows = computed
+            showArrows = !computed.isEmpty
+        } else {
+            arrows = []
+            showArrows = false
+        }
         return RenderExportOptions(labels: labels,
                                    showBZLandmarks: metalCanvasVisible && state.editKPathOnBZ && scene.isCrystal,
                                    coordinationNumbers: exportCoordinationNumbers,
                                    showCoordinationColors: metalCanvasVisible
                                        && !exportCoordinationNumbers.isEmpty
                                        && state.showCoordinationColors,
-                                   selectedKPathNode: selectedRouteNode)
+                                   selectedKPathNode: selectedRouteNode,
+                                   displacementArrows: arrows,
+                                   showDisplacementArrows: showArrows)
+    }
+
+    /// Build the renderer's displacement arrows from the active comparison and
+    /// the current scene atom positions, independent of any live renderer.
+    /// Mirrors `updateDisplacementArrows()` so export can compute arrows even
+    /// when the live renderer is unavailable.
+    private func currentDisplacementArrows() -> [(start: SIMD3<Float>, vector: SIMD3<Float>)] {
+        guard let result = comparisonResult else { return [] }
+        let atoms = scene.atoms
+        return result.matches.compactMap { match in
+            guard match.sourceIndex >= 0, match.sourceIndex < atoms.count else { return nil }
+            let start = atoms[match.sourceIndex].coord
+            guard start.isFinite, match.displacement.isFinite else { return nil }
+            return (start: start, vector: match.displacement)
+        }
     }
 
     /// Build export options with labels projected for the requested output size,
@@ -3698,6 +3983,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             colorPlane.grid = nil
         }
         updateContentVisibility()
+        // A frame reload replaces the displayed atom ordering, invalidating any
+        // installed two-structure comparison. This path renders later, so
+        // suppress the invalidation render.
+        invalidateComparisonRequest(render: false)
         coordinationGeometryDidChange()
         refreshAtomTable()
         setNeedsRender()

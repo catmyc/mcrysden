@@ -12,6 +12,11 @@ struct RenderExportOptions {
     var showCoordinationColors: Bool = false
     var selectedKPathNode: Int? = nil
     var msaaSampleCount: Int? = nil
+    /// Runtime-only comparison displacement arrows. Populated only for the
+    /// visible Metal canvas; headless/vector defaults remain empty so the
+    /// unused path is unchanged.
+    var displacementArrows: [(start: SIMD3<Float>, vector: SIMD3<Float>)] = []
+    var showDisplacementArrows: Bool = false
 }
 
 enum PngExporter {
@@ -41,6 +46,8 @@ enum PngExporter {
         renderer.showCoordinationColors = options.showCoordinationColors
         renderer.selectedKPathNode = options.selectedKPathNode
         renderer.msaaSampleCount = options.msaaSampleCount ?? scene.msaaSampleCount
+        renderer.displacementArrows = options.displacementArrows
+        renderer.showDisplacementArrows = options.showDisplacementArrows
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba8Unorm
         desc.width = w; desc.height = h

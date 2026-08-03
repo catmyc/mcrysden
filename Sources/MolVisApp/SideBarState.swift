@@ -107,6 +107,11 @@ final class SideBarState: ObservableObject {
     /// Draw the comparison displacement arrows in the viewport. Runtime-only
     /// (the comparison reference itself is never persisted).
     @Published var showComparisonArrows: Bool = false { didSet { onChange?() } }
+    /// True while a two-structure comparison is being computed off the main
+    /// thread. The sidebar disables the arrow toggle and export button during
+    /// this window so the user cannot act on a result that does not yet exist.
+    /// Not a scene field and not persisted.
+    @Published var comparisonCalculating: Bool = false
     // --- Electronic-structure graph interaction ---------------------------------
     // View-only state driving the band/DOS grapher views. None of these are scene
     // fields, so they do not participate in state-file persistence. The controller

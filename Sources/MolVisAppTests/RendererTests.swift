@@ -486,6 +486,80 @@ final class RendererTests: XCTestCase {
         XCTAssertGreaterThan(try msaaOutput.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1000)
         XCTAssertGreaterThan(foregroundPixels(msaaImage), 0,
                              "MSAA-exported PNG must contain foreground pixels")
+
+        // Displacement-arrow export regression: enabling displacement arrows
+        // through RenderExportOptions must alter the rendered PNG pixels. A
+        // scene with a large enough footprint lets the arrows add visible
+        // geometry that the raster path composites into the output.
+        scene.showAxes = false
+        scene.showCellFrame = true
+        scene.atoms = [
+            Atom(coord: SIMD3(-3, 0, 0), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(3, 0, 0), atomicNumber: 6, label: "C"),
+        ]
+        let noArrowsOutput = FileManager.default.temporaryDirectory
+            .appendingPathComponent("renderer-noarrows-\(UUID().uuidString).png")
+        let noArrowsImage = try PngExporter.export(scene: scene, camera: nil, to: noArrowsOutput,
+                                                   size: CGSize(width: 400, height: 400))
+        let noArrowsHash = pixelHash(noArrowsImage)
+        let arrowsOutput = FileManager.default.temporaryDirectory
+            .appendingPathComponent("renderer-arrows-\(UUID().uuidString).png")
+        let arrowsImage = try PngExporter.export(scene: scene, camera: nil, to: arrowsOutput,
+                                                size: CGSize(width: 400, height: 400),
+                                                options: RenderExportOptions(
+                                                    displacementArrows: [
+                                                        (start: SIMD3(-3, 0, 0), vector: SIMD3<Float>(0, 2, 0)),
+                                                        (start: SIMD3(3, 0, 0), vector: SIMD3<Float>(0, 2, 0)),
+                                                    ],
+                                                    showDisplacementArrows: true))
+        let arrowsHash = pixelHash(arrowsImage)
+        XCTAssertNotEqual(noArrowsHash, arrowsHash,
+                          "enabling displacement arrows must alter the exported PNG")
+
+        // 2D displacement-arrow regression: arrows must also render in 2D
+        // display modes (still gated by showStructure), producing a pixel
+        // difference versus arrows off.
+        var twoDScene = Scene()
+        twoDScene.showAxes = false
+        twoDScene.showCellFrame = false
+        twoDScene.showStructure = true
+        twoDScene.displayMode = .line2D
+        twoDScene.background = "#000000"
+        twoDScene.atoms = [
+            Atom(coord: SIMD3(-3, 0, 0), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(3, 0, 0), atomicNumber: 6, label: "C"),
+        ]
+        twoDScene.cell = Cell(a: SIMD3(8, 0, 0), b: SIMD3(0, 8, 0), c: SIMD3(0, 0, 8))
+        let twoDArrows = [(start: SIMD3<Float>(-3, 0, 0), vector: SIMD3<Float>(0, 2, 0)),
+                          (start: SIMD3<Float>(3, 0, 0), vector: SIMD3<Float>(0, 2, 0))]
+        let twoDNoArrowsImage = try PngExporter.export(scene: twoDScene, camera: nil,
+            to: FileManager.default.temporaryDirectory.appendingPathComponent("renderer-2d-noarrows-\(UUID().uuidString).png"),
+            size: CGSize(width: 400, height: 400))
+        let twoDNoArrowsHash = pixelHash(twoDNoArrowsImage)
+        let twoDWithArrowsImage = try PngExporter.export(scene: twoDScene, camera: nil,
+            to: FileManager.default.temporaryDirectory.appendingPathComponent("renderer-2d-arrows-\(UUID().uuidString).png"),
+            size: CGSize(width: 400, height: 400),
+            options: RenderExportOptions(
+                displacementArrows: twoDArrows,
+                showDisplacementArrows: true))
+        let twoDWithArrowsHash = pixelHash(twoDWithArrowsImage)
+        XCTAssertNotEqual(twoDNoArrowsHash, twoDWithArrowsHash,
+                          "displacement arrows must alter the 2D exported PNG")
+        // Hidden structure must suppress arrows even when the toggle is on:
+        // a hidden scene with arrows-on must match a hidden scene with
+        // arrows-off (same scene, only the toggle differs).
+        twoDScene.showStructure = false
+        let twoDHiddenWithArrowsImage = try PngExporter.export(scene: twoDScene, camera: nil,
+            to: FileManager.default.temporaryDirectory.appendingPathComponent("renderer-2d-hidden-on-\(UUID().uuidString).png"),
+            size: CGSize(width: 400, height: 400),
+            options: RenderExportOptions(
+                displacementArrows: twoDArrows,
+                showDisplacementArrows: true))
+        let twoDHiddenNoArrowsImage = try PngExporter.export(scene: twoDScene, camera: nil,
+            to: FileManager.default.temporaryDirectory.appendingPathComponent("renderer-2d-hidden-off-\(UUID().uuidString).png"),
+            size: CGSize(width: 400, height: 400))
+        XCTAssertEqual(pixelHash(twoDHiddenWithArrowsImage), pixelHash(twoDHiddenNoArrowsImage),
+                       "hidden structure must suppress displacement arrows")
     }
 
     // The three vector writers share the raster-backed render path, but each has

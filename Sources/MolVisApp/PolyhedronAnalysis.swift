@@ -38,6 +38,48 @@ struct PolyhedronMetrics: Equatable {
     }
 }
 
+/// Canonicalized plane key for grouping coplanar hull faces. The normal is
+/// oriented so its first non-zero component is positive, and the offset is
+/// adjusted accordingly, so (n, d) and (-n, -d) map to the same key.
+///
+/// Components are rounded Doubles (not scaled-to-Int) so the conversion is
+/// provably nontrapping for any finite input: Double overflow yields infinity
+/// rather than a trap, and finite coordinates never overflow the scale.
+private struct HullPlane: Hashable {
+    let nx, ny, nz: Double
+    let offset: Double
+
+    init(normal: SIMD3<Double>, offset: Double) {
+        let flip = normal.x < -1e-12
+            || (normal.x.magnitude < 1e-12 && normal.y < -1e-12)
+            || (normal.x.magnitude < 1e-12 && normal.y.magnitude < 1e-12 && normal.z < -1e-12)
+        let cn = flip ? -normal : normal
+        let co = flip ? -offset : offset
+        // Round to 1e-6 precision. Double arithmetic never traps: overflow
+        // produces infinity, and finite unit-vector components times 1e6 are
+        // far below Double.greatestFiniteMagnitude.
+        let scale = 1_000_000.0
+        self.nx = (cn.x * scale).rounded() / scale
+        self.ny = (cn.y * scale).rounded() / scale
+        self.nz = (cn.z * scale).rounded() / scale
+        self.offset = (co * scale).rounded() / scale
+    }
+}
+
+/// A convex-hull face: the participating vertex indices, the 2D-hull polygon
+/// (indices into `vertexIndices`), and the outward unit normal.
+private struct HullFace {
+    let vertexIndices: [Int]
+    let hullIndices: [Int]
+    let outwardNormal: SIMD3<Double>
+}
+
+/// Ordered pair for edge deduplication.
+private struct IntPair: Hashable {
+    let a: Int
+    let b: Int
+}
+
 enum PolyhedronAnalyzer {
     /// Analysis bound mirroring the coordination analyzer's documented 4,096
     /// base-atom cap. Larger inputs yield nil (unavailable), never partial data.
@@ -67,7 +109,8 @@ enum PolyhedronAnalyzer {
         for index in atoms.indices {
             guard !cancelled(isCancelled) else { return nil }
             let shell = firstShell(of: index, analysis: analysis, atoms: atoms)
-            result.append(metrics(for: atoms[index].coord, shell: shell))
+            result.append(metrics(for: atoms[index].coord, shell: shell,
+                                  isCancelled: isCancelled))
         }
         guard !cancelled(isCancelled) else { return nil }
         return result
@@ -76,6 +119,19 @@ enum PolyhedronAnalyzer {
     /// The first coordination shell of `atomIndex` as absolute neighbor
     /// positions (source position + minimum-image displacement). Degenerate
     /// or non-finite entries are dropped.
+    ///
+    /// Only the first distance shell is ever returned: every candidate
+    /// distance is compared against the fixed first-neighbor distance, so
+    /// tolerance chaining cannot absorb later shells. Once a neighbor's
+    /// distance jumps beyond `shellTolerance` from the reference, the
+    /// enumeration stops unconditionally — the boundary is checked before
+    /// displacement validation and without a group-nonempty gate, so a
+    /// valid-distance record beyond the shell always terminates enumeration.
+    /// Malformed records (non-finite or negative distance/displacement) are
+    /// skipped safely without poisoning grouping.
+    /// The actual neighbor count is preserved; `metrics(for:shell:)` enforces
+    /// `maxNeighborsPerAtom` and reports the atom's metrics unavailable when
+    /// the shell is too large, rather than fabricating a truncated CN.
     static func firstShell(of atomIndex: Int, analysis: CoordinationAnalysis,
                            atoms: [Atom]) -> [SIMD3<Float>] {
         guard atomIndex >= 0, atomIndex < atoms.count,
@@ -83,36 +139,59 @@ enum PolyhedronAnalyzer {
         let neighbors = analysis.neighbors(of: atomIndex)
         guard !neighbors.isEmpty else { return [] }
 
-        var positions: [SIMD3<Float>] = []
-        positions.reserveCapacity(neighbors.count)
+        // Fixate the first neighbor's distance as the shell reference.
+        // Validate it so a malformed first record cannot poison grouping.
+        let referenceDistance = neighbors[0].distance
+        guard referenceDistance.isFinite, referenceDistance >= 0 else { return [] }
+
         var group: [SIMD3<Float>] = []
-        var previousDistance = neighbors[0].distance
+        group.reserveCapacity(neighbors.count)
 
         for neighbor in neighbors {
-            if !group.isEmpty && abs(neighbor.distance - previousDistance) > shellTolerance {
-                positions.append(contentsOf: group.prefix(maxNeighborsPerAtom))
-                group.removeAll(keepingCapacity: true)
+            // Validate the distance first; a malformed distance record is
+            // skipped rather than poisoning the shell grouping.
+            guard neighbor.distance.isFinite, neighbor.distance >= 0 else { continue }
+
+            // Boundary check: compare against the fixated reference distance
+            // and break unconditionally before validating displacement or
+            // appending. No group-nonempty gate — an out-of-shell distance
+            // terminates the sorted first shell regardless of whether prior
+            // records were skipped or had invalid displacements.
+            if abs(neighbor.distance - referenceDistance) > shellTolerance {
+                break
             }
+
+            // Now validate displacement; skip records with malformed
+            // displacements without terminating the shell.
+            guard neighbor.displacement.isFinite else { continue }
+
             let position = atoms[atomIndex].coord + neighbor.displacement
-            if position.isFinite, group.count < maxNeighborsPerAtom {
+            if position.isFinite {
                 group.append(position)
             }
-            previousDistance = neighbor.distance
         }
-        if !group.isEmpty {
-            positions.append(contentsOf: group.prefix(maxNeighborsPerAtom))
-        }
-        return positions
+
+        return group
     }
 
-    static func metrics(for center: SIMD3<Float>, shell: [SIMD3<Float>]) -> PolyhedronMetrics {
+    static func metrics(for center: SIMD3<Float>, shell: [SIMD3<Float>],
+                        isCancelled: (() -> Bool)? = nil) -> PolyhedronMetrics {
+        let count = shell.count
         guard center.isFinite else {
-            return PolyhedronMetrics(neighborCount: 0, volume: nil,
+            return PolyhedronMetrics(neighborCount: count, volume: nil,
                                      bondLengthDistortion: nil, angleDeviation: nil,
                                      idealAngle: nil, volumeRatio: nil)
         }
-        let count = shell.count
         guard count >= 2 else {
+            return PolyhedronMetrics(neighborCount: count, volume: nil,
+                                     bondLengthDistortion: nil, angleDeviation: nil,
+                                     idealAngle: nil, volumeRatio: nil)
+        }
+
+        // Enforce the per-atom cap: preserve the real count but make all
+        // derived fields unavailable rather than entering expensive hull
+        // work or fabricating a truncated coordination number.
+        guard count <= maxNeighborsPerAtom else {
             return PolyhedronMetrics(neighborCount: count, volume: nil,
                                      bondLengthDistortion: nil, angleDeviation: nil,
                                      idealAngle: nil, volumeRatio: nil)
@@ -142,23 +221,61 @@ enum PolyhedronAnalyzer {
             return value.isFinite ? value : nil
         }()
 
-        // Angles at the central atom between every pair of neighbors.
+        // Convex hull of the vertex set (3D hull only). The hull computation
+        // is the expensive step; cancellation checkpoints live inside it.
+        let doubleShell = shell.map { $0.double }
+        var centroid = SIMD3<Double>.zero
+        for p in doubleShell { centroid += p }
+        centroid /= Double(count)
+
+        let faces: [HullFace]? = count >= 4
+            ? computeHullFaces(of: doubleShell, centroid: centroid, isCancelled: isCancelled)
+            : nil
+
+        // A nil return from computeHullFaces means the work was cancelled;
+        // report the atom's metrics unavailable rather than partial.
+        guard !cancelled(isCancelled) else {
+            return PolyhedronMetrics(neighborCount: count, volume: nil,
+                                     bondLengthDistortion: nil, angleDeviation: nil,
+                                     idealAngle: nil, volumeRatio: nil)
+        }
+
+        // Volume from the triangulated hull faces.
+        let volume: Float?
+        if let faces, !faces.isEmpty {
+            volume = hullVolumeFromFaces(faces, points: doubleShell)
+        } else {
+            volume = nil
+        }
+
+        // Angle deviation uses the actual convex-hull edge pairs: for CN ≥ 4
+        // with a non-degenerate hull these are the polyhedron edges; for CN < 4
+        // (or coplanar CN ≥ 4) there are no 3D hull edges and we fall back to
+        // all vertex pairs. This keeps trans/skew/face-diagonal pairs out of
+        // the metric for octahedral, cubic, and icosahedral shells.
+        let hullEdges: [(Int, Int)]? = {
+            guard let faces, !faces.isEmpty, count >= 4 else { return nil }
+            return edges(of: faces)
+        }()
+
         let angles: [Float]? = {
+            // Angle deviation requires at least 3 neighbors; with fewer
+            // there is no meaningful angular spread to measure.
             guard count >= 3 else { return nil }
+            let edgePairs = hullEdges ?? allPairs(count)
+            guard !edgePairs.isEmpty else { return nil }
             var values: [Float] = []
-            values.reserveCapacity(count * (count - 1) / 2)
-            for i in 0..<count {
-                for j in (i + 1)..<count {
-                    let vi = shell[i] - center
-                    let vj = shell[j] - center
-                    let li = length(vi), lj = length(vj)
-                    guard li > 1e-7, lj > 1e-7 else { return nil }
-                    let cosine = dot(vi, vj) / (li * lj)
-                    guard cosine.isFinite else { return nil }
-                    let angle = acos(min(max(cosine, -1), 1)) * 180 / .pi
-                    guard angle.isFinite else { return nil }
-                    values.append(angle)
-                }
+            values.reserveCapacity(edgePairs.count)
+            for (i, j) in edgePairs {
+                let vi = shell[i] - center
+                let vj = shell[j] - center
+                let li = length(vi), lj = length(vj)
+                guard li > 1e-7, lj > 1e-7 else { return nil }
+                let cosine = dot(vi, vj) / (li * lj)
+                guard cosine.isFinite else { return nil }
+                let angle = acos(min(max(cosine, -1), 1)) * 180 / .pi
+                guard angle.isFinite else { return nil }
+                values.append(angle)
             }
             return values
         }()
@@ -166,32 +283,16 @@ enum PolyhedronAnalyzer {
         let ideal = idealAngle(for: count)
         let angleDeviation: Float? = angles.flatMap { observed -> Float? in
             var sum = 0.0
-            var kept = 0
             let meanAngle = observed.reduce(0.0) { $0 + Double($1) } / Double(observed.count)
-            let reference: Double
-            if let ideal {
-                reference = Double(ideal)
-            } else {
-                reference = meanAngle
-            }
-            // Regular polyhedra with antipodal vertices (octahedron, cube,
-            // icosahedron) also contain trans/skew angle classes (180° and the
-            // cube's 109.47°) that are not part of the ideal-angle comparison.
-            // They are separated by the midpoint between the ideal angle and
-            // 180°: a regular octahedron's 12 cis angles (90°) are kept while
-            // its 3 trans angles (180°) are excluded.
-            let exclusionThreshold = ideal.map { 180.0 - Double($0) * 0.5 } ?? .infinity
-            for angle in observed where Double(angle) < exclusionThreshold {
+            let reference: Double = ideal.map { Double($0) } ?? meanAngle
+            for angle in observed {
                 sum += pow(Double(angle) - reference, 2)
-                kept += 1
             }
-            guard kept > 0 else { return nil }
-            let value = Float(sqrt(sum / Double(kept)))
+            let value = Float(sqrt(sum / Double(observed.count)))
             return value.isFinite ? value : nil
         }
 
-        // Convex hull volume of the vertex set (3D hull only).
-        let volume = hullVolume(of: shell)
+        // Volume ratio: hull volume over the ideal regular-polyhedron volume.
         let volumeRatio: Float?
         if let volume, volume > 1e-12,
            let idealVolume = idealPolyhedronVolume(coordination: count,
@@ -256,39 +357,84 @@ enum PolyhedronAnalyzer {
         return result.isFinite ? result : nil
     }
 
-    /// Exact convex-hull volume of a small 3D point set via outward-oriented
-    /// face enumeration. O(n⁴) with an early-out coplanarity check; callers
-    /// bound n via `maxNeighborsPerAtom`. Returns nil for fewer than 4 points,
-    /// non-finite input, or a degenerate (coplanar) set. Coplanar points on a
-    /// face are tolerated, so slightly noisy shells still produce a volume.
-    static func hullVolume(of points: [SIMD3<Float>]) -> Float? {
+    /// Exact convex-hull volume of a small 3D point set. Coplanar facets are
+    /// deduplicated and triangulated exactly once, so a regular cube at +/-1
+    /// reports volume 8. Returns nil for fewer than 4 points, non-finite input,
+    /// coplanar/degenerate sets, or when the computation is cancelled.
+    static func hullVolume(of points: [SIMD3<Float>],
+                           isCancelled: (() -> Bool)? = nil) -> Float? {
         guard points.count >= 4, points.allSatisfy({ $0.isFinite }) else { return nil }
-
-        // Centroid is used only to orient faces outward.
+        let doublePoints = points.map { $0.double }
         var centroid = SIMD3<Double>.zero
-        for p in points { centroid += p.double }
+        for p in doublePoints { centroid += p }
         centroid /= Double(points.count)
+        guard let faces = computeHullFaces(of: doublePoints, centroid: centroid,
+                                            isCancelled: isCancelled) else { return nil }
+        guard !faces.isEmpty else { return nil }
+        return hullVolumeFromFaces(faces, points: doublePoints)
+    }
 
-        var signedVolume = 0.0
+    // MARK: - Convex hull face enumeration
+
+    /// Characteristic linear scale of a point set: the bounding-box diagonal.
+    /// Used to turn the dimensionless `coplanarityTolerance` into an absolute
+    /// linear distance. O(n), never traps, zero only for a degenerate
+    /// single-point set (which has no 3D hull regardless).
+    private static func pointCloudExtent(_ points: [SIMD3<Double>]) -> Double {
+        guard let first = points.first else { return 0.0 }
+        var minB = first, maxB = first
+        for p in points.dropFirst() {
+            minB = min(minB, p)
+            maxB = max(maxB, p)
+        }
+        return length(maxB - minB)
+    }
+
+    /// Enumerate the convex hull faces of a 3D point set, grouping coplanar
+    /// triples into single faces and computing the 2D-hull polygon for each.
+    /// Returns nil if cancelled, an empty array if the points are coplanar or
+    /// otherwise degenerate (no 3D face), or one `HullFace` per hull facet.
+    private static func computeHullFaces(of points: [SIMD3<Double>],
+                                         centroid: SIMD3<Double>,
+                                         isCancelled: (() -> Bool)?) -> [HullFace]? {
         let n = points.count
-        let tolerance = coplanarityTolerance
+        guard n >= 4 else { return [] }
+
+        // Scale-aware linear tolerance: the dimensionless coplanarityTolerance
+        // multiplied by the point-cloud extent gives an absolute distance
+        // threshold consistent with the linear distance `dot(unit, p) - offset`.
+        let extent = pointCloudExtent(points)
+        let linearTolerance = Double(coplanarityTolerance) * extent
+
+        // Fast coplanarity reject: if every point lies on a single plane the
+        // set has no 3D hull. This also avoids the degenerate face grouping
+        // below, which would otherwise merge all coplanar triples into one.
+        if areAllCoplanar(points, linearTolerance: linearTolerance) { return [] }
+
+        // Canonical plane key → group index. Coplanar triples (same plane,
+        // same side of the polyhedron) collapse into one group.
+        var planeToGroup: [HullPlane: Int] = [:]
+        var planeGroups: [Int: Set<Int>] = [:]
+        var groupNormals: [Int: SIMD3<Double>] = [:]
 
         for i in 0..<n {
+            guard !cancelled(isCancelled) else { return nil }
             for j in (i + 1)..<n {
                 for k in (j + 1)..<n {
-                    let a = points[i].double, b = points[j].double, c = points[k].double
+                    let a = points[i], b = points[j], c = points[k]
                     let normal = cross(b - a, c - a)
                     let normalLength = length(normal)
-                    guard normalLength > 1e-12 else { continue }   // degenerate triple
+                    guard normalLength > 1e-12 else { continue }
                     let unit = normal / normalLength
+                    let offset = dot(unit, a)
 
-                    // All remaining points must lie on one side (within tolerance).
+                    // All remaining points must lie on one side (within the
+                    // scale-aware linear tolerance).
                     var side = 0.0
                     var isFace = true
                     for (m, p) in points.enumerated() where m != i && m != j && m != k {
-                        let d = dot(unit, p.double - a)
-                        let limit = Double(tolerance) * max(1.0, normalLength)
-                        guard abs(d) <= limit else {
+                        let d = dot(unit, p) - offset
+                        guard abs(d) <= linearTolerance else {
                             if side == 0 {
                                 side = d
                             } else if d * side < 0 {
@@ -300,21 +446,207 @@ enum PolyhedronAnalyzer {
                     }
                     guard isFace else { continue }
 
-                    // Orient the face outward (away from the centroid) and
-                    // accumulate the signed tetrahedron volume.
-                    var face = (a, b, c)
-                    if dot(unit, a - centroid) < 0 {
-                        face = (a, c, b)
+                    let plane = HullPlane(normal: unit, offset: offset)
+                    let groupIndex: Int
+                    if let existing = planeToGroup[plane] {
+                        groupIndex = existing
+                    } else {
+                        groupIndex = planeToGroup.count
+                        planeToGroup[plane] = groupIndex
+                        groupNormals[groupIndex] = unit
                     }
-                    signedVolume += dot(face.0, cross(face.1, face.2)) / 6.0
+                    if planeGroups[groupIndex] == nil {
+                        planeGroups[groupIndex] = Set()
+                    }
+                    planeGroups[groupIndex]!.insert(i)
+                    planeGroups[groupIndex]!.insert(j)
+                    planeGroups[groupIndex]!.insert(k)
                 }
             }
         }
+        guard !cancelled(isCancelled) else { return nil }
 
+        // Build a HullFace per plane group.
+        var result: [HullFace] = []
+        result.reserveCapacity(planeGroups.count)
+        for (groupIndex, vertexSet) in planeGroups {
+            guard !cancelled(isCancelled) else { return nil }
+            let vertexIndices = Array(vertexSet).sorted()
+            guard vertexIndices.count >= 3 else { continue }
+            let facePoints = vertexIndices.map { points[$0] }
+            let rawNormal = groupNormals[groupIndex]!
+
+            // Orient the normal outward (away from the polyhedron centroid).
+            let faceCentroid = facePoints.reduce(SIMD3<Double>.zero) { $0 + $1 } / Double(facePoints.count)
+            let outwardNormal = dot(rawNormal, faceCentroid - centroid) >= 0 ? rawNormal : -rawNormal
+
+            // 2D convex hull of the face polygon, counterclockwise when viewed
+            // from outside.
+            let hullIndices = faceHull2D(facePoints, outwardNormal: outwardNormal)
+            guard hullIndices.count >= 3 else { continue }
+
+            result.append(HullFace(vertexIndices: vertexIndices,
+                                   hullIndices: hullIndices,
+                                   outwardNormal: outwardNormal))
+        }
+        return result
+    }
+
+    /// Signed volume of a closed triangulated surface from the origin: sum of
+    /// dot(a, cross(b, c)) / 6 over every triangle. The caller takes abs().
+    private static func hullVolumeFromFaces(_ faces: [HullFace], points: [SIMD3<Double>]) -> Float? {
+        var signedVolume = 0.0
+        for face in faces {
+            let hull = face.hullIndices
+            guard hull.count >= 3 else { continue }
+            for m in 1..<(hull.count - 1) {
+                let a = points[face.vertexIndices[hull[0]]]
+                let b = points[face.vertexIndices[hull[m]]]
+                let c = points[face.vertexIndices[hull[m + 1]]]
+                signedVolume += dot(a, cross(b, c)) / 6.0
+            }
+        }
         let volume = abs(signedVolume)
         guard volume.isFinite, volume > 1e-12 else { return nil }
         let result = Float(volume)
         return result.isFinite ? result : nil
+    }
+
+    /// Deduplicated hull edges from triangulated faces. Each edge is the
+    /// pair of original point indices, ordered (min, max) for dedup.
+    private static func edges(of faces: [HullFace]) -> [(Int, Int)] {
+        var edgeSet = Set<IntPair>()
+        for face in faces {
+            let hull = face.hullIndices
+            guard hull.count >= 2 else { continue }
+            for i in 0..<hull.count {
+                let j = (i + 1) % hull.count
+                let vi = face.vertexIndices[hull[i]]
+                let vj = face.vertexIndices[hull[j]]
+                let a = min(vi, vj), b = max(vi, vj)
+                edgeSet.insert(IntPair(a: a, b: b))
+            }
+        }
+        return edgeSet.map { ($0.a, $0.b) }
+    }
+
+    /// True when all points lie on a single plane (within the scale-aware
+    /// linear tolerance). Uses the same contract as the face test in
+    /// `computeHullFaces`: `linearTolerance = coplanarityTolerance * extent`.
+    private static func areAllCoplanar(_ points: [SIMD3<Double>], linearTolerance: Double) -> Bool {
+        let n = points.count
+        guard n >= 4 else { return true }
+        for i in 0..<n {
+            for j in (i + 1)..<n {
+                for k in (j + 1)..<n {
+                    let normal = cross(points[j] - points[i], points[k] - points[i])
+                    let normalLength = length(normal)
+                    guard normalLength > 1e-12 else { continue }
+                    let unit = normal / normalLength
+                    let offset = dot(unit, points[i])
+                    var allOnPlane = true
+                    for p in points {
+                        if abs(dot(unit, p) - offset) > linearTolerance {
+                            allOnPlane = false
+                            break
+                        }
+                    }
+                    return allOnPlane
+                }
+            }
+        }
+        return true
+    }
+
+    // MARK: - 2D convex hull on a face plane
+
+    /// 2D convex hull of coplanar 3D points projected onto their plane,
+    /// returning indices into `points` in counterclockwise order when viewed
+    /// from the direction of `outwardNormal`. Andrew's monotone chain.
+    private static func faceHull2D(_ points: [SIMD3<Double>],
+                                   outwardNormal: SIMD3<Double>) -> [Int] {
+        let n = points.count
+        guard n >= 3 else { return Array(0..<n) }
+
+        // Right-handed (u, v, outwardNormal) basis for the plane.
+        let arbitrary = abs(outwardNormal.x) < 0.9 ? SIMD3<Double>(1, 0, 0) : SIMD3<Double>(0, 1, 0)
+        let u = normalize(cross(outwardNormal, arbitrary))
+        let v = cross(outwardNormal, u)
+
+        let projected = points.map { (dot($0, u), dot($0, v)) }
+        let hull = convexHull2D(projected)
+
+        // Ensure counterclockwise (positive signed area).
+        var signedArea = 0.0
+        for i in 0..<hull.count {
+            let j = (i + 1) % hull.count
+            signedArea += projected[hull[i]].0 * projected[hull[j]].1
+                - projected[hull[j]].0 * projected[hull[i]].1
+        }
+        return signedArea > 0 ? hull : hull.reversed()
+    }
+
+    /// Andrew's monotone chain convex hull for 2D points. Returns indices into
+    /// `points` in counterclockwise order.
+    private static func convexHull2D(_ points: [(Double, Double)]) -> [Int] {
+        let n = points.count
+        guard n >= 3 else { return Array(0..<n) }
+
+        let sorted = (0..<n).sorted { a, b in
+            if points[a].0 != points[b].0 { return points[a].0 < points[b].0 }
+            return points[a].1 < points[b].1
+        }
+
+        func cross2D(_ o: Int, _ a: Int, _ b: Int) -> Double {
+            let oa0 = points[a].0 - points[o].0
+            let oa1 = points[a].1 - points[o].1
+            let ob0 = points[b].0 - points[o].0
+            let ob1 = points[b].1 - points[o].1
+            return oa0 * ob1 - oa1 * ob0
+        }
+
+        var lower: [Int] = []
+        for idx in sorted {
+            while lower.count >= 2
+                    && cross2D(lower[lower.count - 2], lower[lower.count - 1], idx) <= 1e-10 {
+                lower.removeLast()
+            }
+            lower.append(idx)
+        }
+
+        var upper: [Int] = []
+        for idx in sorted.reversed() {
+            while upper.count >= 2
+                    && cross2D(upper[upper.count - 2], upper[upper.count - 1], idx) <= 1e-10 {
+                upper.removeLast()
+            }
+            upper.append(idx)
+        }
+
+        lower.removeLast()
+        upper.removeLast()
+        return lower + upper
+    }
+
+    // MARK: - Helpers
+
+    /// All C(n, 2) unordered pairs, used as the angle source for CN < 4 where
+    /// no 3D hull edges exist.
+    private static func allPairs(_ n: Int) -> [(Int, Int)] {
+        var result: [(Int, Int)] = []
+        result.reserveCapacity(n * (n - 1) / 2)
+        for i in 0..<n {
+            for j in (i + 1)..<n {
+                result.append((i, j))
+            }
+        }
+        return result
+    }
+
+    private static func normalize(_ v: SIMD3<Double>) -> SIMD3<Double> {
+        let len = length(v)
+        guard len > 1e-12 else { return v }
+        return v / len
     }
 
     private static func cancelled(_ isCancelled: (() -> Bool)?) -> Bool {

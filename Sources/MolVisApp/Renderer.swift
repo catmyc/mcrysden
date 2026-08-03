@@ -791,8 +791,10 @@ final class Renderer: NSObject {
             }
             if !scene.displayMode.is2D {
                 guard drawForceArrows(enc, frameBuffer: frameBuffer) else { return false }
-                guard drawDisplacementArrows(enc, frameBuffer: frameBuffer) else { return false }
             }
+            // Displacement arrows draw in every display mode (including 2D)
+            // using the shared line pipeline; still gated by showStructure above.
+            guard drawDisplacementArrows(enc, frameBuffer: frameBuffer) else { return false }
         }
 
         guard drawCell(enc, frameBuffer: frameBuffer) else { return false }

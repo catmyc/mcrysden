@@ -90,6 +90,8 @@ enum RasterExporter {
         renderer.showCoordinationColors = options.showCoordinationColors
         renderer.selectedKPathNode = options.selectedKPathNode
         renderer.msaaSampleCount = options.msaaSampleCount ?? scene.msaaSampleCount
+        renderer.displacementArrows = options.displacementArrows
+        renderer.showDisplacementArrows = options.showDisplacementArrows
         if let bg = background {
             renderer.clearColorOverride = MTLClearColorMake(bg.r, bg.g, bg.b, bg.a)
         }

@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-03 (v1.1.36: complete polyhedron metrics, two-structure comparison, region/expression filtering, and bond-distance labels; 32 focused tests)**.
+Last updated: **2026-08-03 (v1.1.37: hardened polyhedron metrics, structure comparison, filters, bond labels, and comparison exports; 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -107,9 +107,9 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
 - [x] Atom table with fractional/Cartesian coordinates and coordination numbers (v1.1.35): element/label/CN filtering, linked multiple selection, transactional Cartesian/fractional coordinate editing, validation, bounded undo/redo, rebonding, and symmetry/k-path/coordination invalidation.
 - [x] Coordination analysis (v1.1.35): periodic-image shells/CN and coloring, selected-neighbor readout, a bounded virtualized neighbor table, bond-length/angle histograms and CSV, normalized 3D RDF with explicit lower-dimensional unavailable states, and minimum-image distance/angle/dihedral measurements for skew 1D/2D/3D cells.
-- [x] Polyhedron volume/distortion metrics (v1.1.36): first-shell convex-hull volume, mean bond-length distortion, ideal-angle-referenced angle deviation with trans/skew class exclusion, and volume ratio vs. the regular polyhedron; bounded virtualized metrics table and sidebar readout derived from the coordination analysis.
-- [x] Two-structure comparison (v1.1.36): reference-file loading, per-element nearest-neighbor minimum-image matching, RMS/mean/max displacement, matched/unmatched reporting, on-canvas displacement arrows, detail panel, and CSV export.
-- [x] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels (v1.1.36): region/expression filtering (`x>0.5`, `a<=0.25`, `box:…`, `sphere:…`) joins the linked atom-table element/label/CN filters, and a persisted bond-distance label toggle draws formatted Å text at each projected bond midpoint.
+- [x] Polyhedron volume/distortion metrics (v1.1.36; hardened v1.1.37): first-shell convex-hull volume, mean bond-length distortion, ideal-angle-referenced angle deviation with trans/skew class exclusion, and volume ratio vs. the regular polyhedron; bounded virtualized metrics table and cancellable background sidebar analysis.
+- [x] Two-structure comparison (v1.1.36; hardened v1.1.37): asynchronous reference loading, bounded per-element nearest-neighbor minimum-image matching for translated/skew cells, RMS/mean/max displacement, matched/unmatched reporting, 2D/3D displacement arrows, detail panel, escaped CSV, and current-view export propagation.
+- [x] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels (v1.1.36; hardened v1.1.37): fail-closed region/expression filtering (`x>0.5`, `a<=0.25`, `box:…`, `sphere:…`) joins the linked atom-table element/label/CN filters, and a persisted, bounded bond-distance label toggle draws clamped Å text at projected bond midpoints.
 
 ### Structure editing and generation
 - [~] Cartesian/fractional atom-coordinate editing with bounded undo/redo is implemented (v1.1.35). Insert/remove/substitute operations, bulk displacement tools, lattice-parameter editing, and a unified full editing history remain pending.

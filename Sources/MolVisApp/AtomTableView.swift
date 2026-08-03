@@ -253,7 +253,15 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
                     continue
                 }
                 coordinationFilters.append(filter)
-            } else if let filter = parseCoordinateFilter(term) {
+            } else if isCoordinateIntent(term) {
+                // Any term that begins with an axis letter followed by a
+                // comparison-operator character is structured coordinate
+                // intent: it must parse or fail closed (suppress all rows),
+                // never fall through to label text matching.
+                guard let filter = parseCoordinateFilter(term) else {
+                    hasInvalidTerm = true
+                    continue
+                }
                 coordinateFilters.append(filter)
             } else if term.lowercased().hasPrefix("box:") {
                 guard let filter = parseBoxFilter(String(term.dropFirst(4))) else {
@@ -277,6 +285,24 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
                            coordinateFilters: coordinateFilters,
                            regionFilters: regionFilters,
                            hasInvalidTerm: hasInvalidTerm)
+    }
+
+    /// True when `term` begins with an axis letter (x/y/z/a/b/c) followed by
+    /// a comparison-operator character. Such terms are structured coordinate
+    /// intent and must fail closed rather than fall through to label text.
+    private func isCoordinateIntent(_ term: String) -> Bool {
+        guard let first = term.first else { return false }
+        switch first {
+        case "x", "X", "y", "Y", "z", "Z", "a", "A", "b", "B", "c", "C":
+            break
+        default:
+            return false
+        }
+        // Safely inspect the second character without constructing a Character
+        // from a multi-character String (which would trap).
+        let rest = term.dropFirst()
+        guard let second = rest.first else { return false }
+        return second == ">" || second == "<" || second == "="
     }
 
     private func applyFilter(_ query: FilterQuery) {
@@ -392,8 +418,16 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
                     coord.y >= minimum.y && coord.y <= maximum.y &&
                     coord.z >= minimum.z && coord.z <= maximum.z
             case .sphere(let center, let radius):
-                let dx = coord.x - center.x, dy = coord.y - center.y, dz = coord.z - center.z
-                return dx * dx + dy * dy + dz * dz <= radius * radius
+                // Compute the squared distance in Double so Float
+                // subtraction/squaring overflow to infinity cannot make
+                // infinity <= infinity match.
+                let dx = Double(coord.x) - Double(center.x)
+                let dy = Double(coord.y) - Double(center.y)
+                let dz = Double(coord.z) - Double(center.z)
+                let distSq = dx * dx + dy * dy + dz * dz
+                let radiusSq = Double(radius) * Double(radius)
+                guard distSq.isFinite, radiusSq.isFinite else { return false }
+                return distSq <= radiusSq
             }
         }
     }
@@ -470,10 +504,13 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// Parse `xmin,ymin,zmin,xmax,ymax,zmax` (Cartesian Å). Returns nil for
-    /// malformed or non-finite input or an inverted box.
+    /// malformed or non-finite input, an inverted box, or any empty field.
     private func parseBoxFilter(_ expression: String) -> RegionFilter? {
-        let parts = expression.split(separator: ",").map(String.init)
+        let parts = expression.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 6 else { return nil }
+        // Reject empty/whitespace-only fields explicitly: an empty field must
+        // not parse as 0 via Float(""), which would silently match.
+        guard parts.allSatisfy({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return nil }
         let values = parts.compactMap { Float($0) }
         guard values.count == 6, values.allSatisfy({ $0.isFinite }) else { return nil }
         let minimum = SIMD3<Float>(values[0], values[1], values[2])
@@ -484,10 +521,13 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// Parse `cx,cy,cz,r` (Cartesian Å). Returns nil for malformed or
-    /// non-finite input or a non-positive radius.
+    /// non-finite input, a non-positive radius, or any empty field. Sphere
+    /// matching uses finite Double arithmetic so Float subtraction/squaring
+    /// overflow cannot make infinity <= infinity match.
     private func parseSphereFilter(_ expression: String) -> RegionFilter? {
-        let parts = expression.split(separator: ",").map(String.init)
+        let parts = expression.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 4 else { return nil }
+        guard parts.allSatisfy({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return nil }
         let values = parts.compactMap { Float($0) }
         guard values.count == 4, values.allSatisfy({ $0.isFinite }),
               values[3] > 0 else { return nil }

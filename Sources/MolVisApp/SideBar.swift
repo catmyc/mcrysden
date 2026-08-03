@@ -127,8 +127,10 @@ struct SideBar: View {
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         Toggle("Displacement arrows", isOn: $state.showComparisonArrows)
+                            .disabled(state.comparisonCalculating)
                         HStack {
                             Button("Export CSV") { state.onExportComparisonCSV?() }
+                                .disabled(state.comparisonCalculating)
                             Button("Clear") { state.onClearComparison?() }
                         }
                         .buttonStyle(.bordered)
