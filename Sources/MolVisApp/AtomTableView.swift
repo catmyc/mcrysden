@@ -103,7 +103,7 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private func setup() {
         searchField.translatesAutoresizingMaskIntoConstraints = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
-        searchField.placeholderString = "Element/label terms; cn:N, cn:>=N, cn:<=N"
+        searchField.placeholderString = "Element/label; cn:N, cn:>=N; x>0.5, a<=0.25; box:x1,y1,z1,x2,y2,z2; sphere:x,y,z,r"
 
         searchField.target = self
         searchField.action = #selector(searchChanged(_:))
@@ -229,10 +229,12 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private struct FilterQuery {
         let textTerms: [String]
         let coordinationFilters: [CoordinationFilter]
-        let hasInvalidCoordinationTerm: Bool
+        let coordinateFilters: [CoordinateFilter]
+        let regionFilters: [RegionFilter]
+        let hasInvalidTerm: Bool
 
         var containsCoordinationTerm: Bool {
-            hasInvalidCoordinationTerm || !coordinationFilters.isEmpty
+            hasInvalidTerm || !coordinationFilters.isEmpty
         }
     }
 
@@ -240,15 +242,31 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let terms = searchField.stringValue.split(whereSeparator: { $0.isWhitespace })
         var textTerms: [String] = []
         var coordinationFilters: [CoordinationFilter] = []
-        var hasInvalidCoordinationTerm = false
+        var coordinateFilters: [CoordinateFilter] = []
+        var regionFilters: [RegionFilter] = []
+        var hasInvalidTerm = false
         for rawTerm in terms {
             let term = String(rawTerm)
             if term.lowercased().hasPrefix("cn:") {
                 guard let filter = parseCoordinationFilter(String(term.dropFirst(3))) else {
-                    hasInvalidCoordinationTerm = true
+                    hasInvalidTerm = true
                     continue
                 }
                 coordinationFilters.append(filter)
+            } else if let filter = parseCoordinateFilter(term) {
+                coordinateFilters.append(filter)
+            } else if term.lowercased().hasPrefix("box:") {
+                guard let filter = parseBoxFilter(String(term.dropFirst(4))) else {
+                    hasInvalidTerm = true
+                    continue
+                }
+                regionFilters.append(filter)
+            } else if term.lowercased().hasPrefix("sphere:") {
+                guard let filter = parseSphereFilter(String(term.dropFirst(7))) else {
+                    hasInvalidTerm = true
+                    continue
+                }
+                regionFilters.append(filter)
             } else {
                 textTerms.append(term.lowercased())
             }
@@ -256,7 +274,9 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
         return FilterQuery(textTerms: textTerms,
                            coordinationFilters: coordinationFilters,
-                           hasInvalidCoordinationTerm: hasInvalidCoordinationTerm)
+                           coordinateFilters: coordinateFilters,
+                           regionFilters: regionFilters,
+                           hasInvalidTerm: hasInvalidTerm)
     }
 
     private func applyFilter(_ query: FilterQuery) {
@@ -265,7 +285,8 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         var indices: [Int] = []
         var rowsByOriginalIndex: [Int: Int] = [:]
         if query.textTerms.isEmpty && query.coordinationFilters.isEmpty
-            && !query.hasInvalidCoordinationTerm {
+            && query.coordinateFilters.isEmpty && query.regionFilters.isEmpty
+            && !query.hasInvalidTerm {
             indices.reserveCapacity(atoms.count)
             rowsByOriginalIndex.reserveCapacity(atoms.count)
         }
@@ -273,13 +294,17 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         for (originalIndex, atom) in atoms.enumerated() {
             let symbol = ElementTable.symbol(atom.atomicNumber).lowercased()
             let label = atom.label.lowercased()
-            let matches = !query.hasInvalidCoordinationTerm &&
+            let matches = !query.hasInvalidTerm &&
                 query.textTerms.allSatisfy { symbol.contains($0) || label.contains($0) } &&
                 query.coordinationFilters.allSatisfy { filter in
                     guard let coordinationNumbers,
                           originalIndex < coordinationNumbers.count else { return false }
                     return filter.matches(coordinationNumbers[originalIndex])
-                }
+                } &&
+                query.coordinateFilters.allSatisfy { filter in
+                    filter.matches(atom.coord, fractionalCoords[originalIndex])
+                } &&
+                query.regionFilters.allSatisfy { $0.matches(atom.coord) }
             if matches {
                 rowsByOriginalIndex[originalIndex] = indices.count
                 indices.append(originalIndex)
@@ -314,6 +339,65 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
+    /// One numeric comparison on a Cartesian (x/y/z) or fractional (a/b/c)
+    /// coordinate axis. Fractional comparisons require the cell; when the
+    /// fractional coordinate is unavailable the atom never matches.
+    private struct CoordinateFilter {
+        enum Axis: Int {
+            case x = 0, y = 1, z = 2
+        }
+
+        enum Operation {
+            case less, lessEqual, equal, greaterEqual, greater
+
+            func matches(_ lhs: Float, _ rhs: Float) -> Bool {
+                switch self {
+                case .less: return lhs < rhs
+                case .lessEqual: return lhs <= rhs
+                case .equal: return abs(lhs - rhs) <= 1e-3
+                case .greaterEqual: return lhs >= rhs
+                case .greater: return lhs > rhs
+                }
+            }
+        }
+
+        let isFractional: Bool
+        let axis: Axis
+        let operation: Operation
+        let value: Float
+
+        func matches(_ coord: SIMD3<Float>, _ fractional: SIMD3<Float>?) -> Bool {
+            let component: Float
+            if isFractional {
+                guard let fractional else { return false }
+                component = fractional[axis.rawValue]
+            } else {
+                component = coord[axis.rawValue]
+            }
+            guard component.isFinite else { return false }
+            return operation.matches(component, value)
+        }
+    }
+
+    /// A Cartesian region filter: an axis-aligned box or a sphere. Both are
+    /// matched against the atom's Cartesian coordinate.
+    private enum RegionFilter {
+        case box(minimum: SIMD3<Float>, maximum: SIMD3<Float>)
+        case sphere(center: SIMD3<Float>, radius: Float)
+
+        func matches(_ coord: SIMD3<Float>) -> Bool {
+            switch self {
+            case .box(let minimum, let maximum):
+                return coord.x >= minimum.x && coord.x <= maximum.x &&
+                    coord.y >= minimum.y && coord.y <= maximum.y &&
+                    coord.z >= minimum.z && coord.z <= maximum.z
+            case .sphere(let center, let radius):
+                let dx = coord.x - center.x, dy = coord.y - center.y, dz = coord.z - center.z
+                return dx * dx + dy * dy + dz * dz <= radius * radius
+            }
+        }
+    }
+
     private func parseCoordinationFilter(_ expression: String) -> CoordinationFilter? {
         let operation: (Int) -> CoordinationFilter
         let numberText: String
@@ -332,6 +416,83 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
               numberText.allSatisfy({ $0 >= "0" && $0 <= "9" }),
               let number = Int(numberText) else { return nil }
         return operation(number)
+    }
+
+    /// Parse a coordinate-comparison term like `x>0.5`, `a<=0.25`, `z==1.5`.
+    /// The axis letter (x/y/z Cartesian, a/b/c fractional) is followed by one
+    /// of `>`, `>=`, `<`, `<=`, `=`, `==`. Returns nil for non-finite values
+    /// or a missing/invalid operator.
+    private func parseCoordinateFilter(_ term: String) -> CoordinateFilter? {
+        guard term.count >= 3 else { return nil }
+        let axisCharacter = term[term.startIndex]
+        let isFractional: Bool
+        let axis: CoordinateFilter.Axis
+        switch axisCharacter {
+        case "x", "X": axis = .x; isFractional = false
+        case "y", "Y": axis = .y; isFractional = false
+        case "z", "Z": axis = .z; isFractional = false
+        case "a", "A": axis = .x; isFractional = true
+        case "b", "B": axis = .y; isFractional = true
+        case "c", "C": axis = .z; isFractional = true
+        default: return nil
+        }
+
+        let remainder = term.dropFirst()
+        let operation: CoordinateFilter.Operation
+        let numberText: Substring
+        if remainder.hasPrefix(">=") {
+            operation = .greaterEqual
+            numberText = remainder.dropFirst(2)
+        } else if remainder.hasPrefix("<=") {
+            operation = .lessEqual
+            numberText = remainder.dropFirst(2)
+        } else if remainder.hasPrefix("==") {
+            operation = .equal
+            numberText = remainder.dropFirst(2)
+        } else if remainder.hasPrefix(">") {
+            operation = .greater
+            numberText = remainder.dropFirst(1)
+        } else if remainder.hasPrefix("<") {
+            operation = .less
+            numberText = remainder.dropFirst(1)
+        } else if remainder.hasPrefix("=") {
+            operation = .equal
+            numberText = remainder.dropFirst(1)
+        } else {
+            return nil
+        }
+
+        guard !numberText.isEmpty,
+              let value = Float(numberText),
+              value.isFinite else { return nil }
+        return CoordinateFilter(isFractional: isFractional, axis: axis,
+                                operation: operation, value: value)
+    }
+
+    /// Parse `xmin,ymin,zmin,xmax,ymax,zmax` (Cartesian Å). Returns nil for
+    /// malformed or non-finite input or an inverted box.
+    private func parseBoxFilter(_ expression: String) -> RegionFilter? {
+        let parts = expression.split(separator: ",").map(String.init)
+        guard parts.count == 6 else { return nil }
+        let values = parts.compactMap { Float($0) }
+        guard values.count == 6, values.allSatisfy({ $0.isFinite }) else { return nil }
+        let minimum = SIMD3<Float>(values[0], values[1], values[2])
+        let maximum = SIMD3<Float>(values[3], values[4], values[5])
+        guard minimum.x <= maximum.x, minimum.y <= maximum.y,
+              minimum.z <= maximum.z else { return nil }
+        return .box(minimum: minimum, maximum: maximum)
+    }
+
+    /// Parse `cx,cy,cz,r` (Cartesian Å). Returns nil for malformed or
+    /// non-finite input or a non-positive radius.
+    private func parseSphereFilter(_ expression: String) -> RegionFilter? {
+        let parts = expression.split(separator: ",").map(String.init)
+        guard parts.count == 4 else { return nil }
+        let values = parts.compactMap { Float($0) }
+        guard values.count == 4, values.allSatisfy({ $0.isFinite }),
+              values[3] > 0 else { return nil }
+        return .sphere(center: SIMD3<Float>(values[0], values[1], values[2]),
+                       radius: values[3])
     }
 
     private func rebuildFilterPreservingSelection() {

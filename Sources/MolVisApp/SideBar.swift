@@ -108,6 +108,7 @@ struct SideBar: View {
                 }
                 .pickerStyle(.menu)
                 Toggle("Show Scale", isOn: $state.showScaleIndicator)
+                Toggle("Bond Distances", isOn: $state.showBondDistances)
             }
             // --- Structure Summary ----------------------------------------------
             // Compact readout of the loaded structure. Hidden entirely for an
@@ -117,6 +118,22 @@ struct SideBar: View {
                     structureSummaryGrid(summary)
                     Button("Atom Table…") { state.onShowAtomTable?() }
                         .buttonStyle(.bordered)
+                    Divider()
+                    Button("Compare…") { state.onShowComparison?() }
+                        .buttonStyle(.bordered)
+                    if !state.comparisonStatusText.isEmpty {
+                        Text(state.comparisonStatusText)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Toggle("Displacement arrows", isOn: $state.showComparisonArrows)
+                        HStack {
+                            Button("Export CSV") { state.onExportComparisonCSV?() }
+                            Button("Clear") { state.onClearComparison?() }
+                        }
+                        .buttonStyle(.bordered)
+                        .font(.caption)
+                    }
                 }
             }
             // --- Appearance: material + background ---------------------------------
@@ -308,6 +325,14 @@ struct SideBar: View {
                         Button("Neighbor Table…") { state.onShowNeighborTable?() }
                             .buttonStyle(.bordered)
                         distributionContent
+                        if !state.polyhedronSummaryText.isEmpty {
+                            Divider()
+                            Text(state.polyhedronSummaryText)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.secondary)
+                            Button("Polyhedron Metrics…") { state.onShowPolyhedronTable?() }
+                                .buttonStyle(.bordered)
+                        }
                     }
                 }
             }

@@ -11,6 +11,7 @@ final class LabelOverlayView: NSView {
             case selectedRouteNode
             case tooltip
             case scaleIndicator
+            case bondDistance
 
             var isExportable: Bool { self != .tooltip }
         }
@@ -197,6 +198,8 @@ final class LabelOverlayView: NSView {
         switch style {
         case .atom:
             return NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        case .bondDistance:
+            return NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
         case .routeNode, .selectedRouteNode, .scaleIndicator:
             return NSFont.boldSystemFont(ofSize: NSFont.smallSystemFontSize)
         case .tooltip:
@@ -212,6 +215,8 @@ final class LabelOverlayView: NSView {
     private static func textColor(for label: Label) -> NSColor {
         switch label.style {
         case .atom:
+            return .white
+        case .bondDistance:
             return .white
         case .routeNode:
             return NSColor(calibratedRed: 0.45, green: 0.92, blue: 1, alpha: 1)
@@ -243,6 +248,8 @@ final class LabelOverlayView: NSView {
         switch style {
         case .atom:
             return .zero
+        case .bondDistance:
+            return CGSize(width: 3, height: 1)
         case .routeNode:
             return CGSize(width: 3, height: 2)
         case .selectedRouteNode:
@@ -266,6 +273,8 @@ final class LabelOverlayView: NSView {
         switch label.style {
         case .atom:
             return .clear
+        case .bondDistance:
+            return NSColor.black.withAlphaComponent(0.55)
         case .routeNode:
             return NSColor.black.withAlphaComponent(0.62)
         case .selectedRouteNode:
@@ -285,6 +294,8 @@ final class LabelOverlayView: NSView {
         switch label.style {
         case .atom:
             return .clear
+        case .bondDistance:
+            return NSColor.white.withAlphaComponent(0.35)
         case .routeNode:
             return NSColor(calibratedRed: 0.45, green: 0.92, blue: 1, alpha: 0.9)
         case .selectedRouteNode:

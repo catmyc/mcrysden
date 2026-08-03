@@ -110,6 +110,10 @@ final class Renderer: NSObject {
     /// not Scene state, so coordination coloring is never persisted.
     var coordinationNumbers: [Int] = []
     var showCoordinationColors: Bool = false
+    /// Runtime-only displacement arrows from a two-structure comparison
+    /// (start, vector in Å), installed by the controller; drawn at 1:1 scale.
+    var displacementArrows: [(start: SIMD3<Float>, vector: SIMD3<Float>)] = []
+    var showDisplacementArrows: Bool = false
 
     /// Discrete, colorblind-readable colors indexed by coordination number. Values
     /// below zero and zero map to the first color; values >= the maximum valid
@@ -787,6 +791,7 @@ final class Renderer: NSObject {
             }
             if !scene.displayMode.is2D {
                 guard drawForceArrows(enc, frameBuffer: frameBuffer) else { return false }
+                guard drawDisplacementArrows(enc, frameBuffer: frameBuffer) else { return false }
             }
         }
 
@@ -1362,6 +1367,41 @@ final class Renderer: NSObject {
     private func makePerpendicular(_ d: SIMD3<Float>) -> SIMD3<Float> {
         let cand = abs(d.x) < 0.9 ? SIMD3<Float>(1, 0, 0) : SIMD3<Float>(0, 1, 0)
         return normalize(cand - d * simd_dot(cand, d))
+    }
+
+    // MARK: - Comparison displacement arrows
+
+    /// Runtime-only displacement arrows from a two-structure comparison,
+    /// installed by the controller (never persisted). Each entry draws an arrow
+    /// from `start` to `start + vector` at 1:1 scale in Å, using the shared line
+    /// pipeline. Gated on the controller-set toggle so structures without a
+    /// comparison draw nothing.
+    @discardableResult
+    private func drawDisplacementArrows(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard showDisplacementArrows, !displacementArrows.isEmpty else { return true }
+        var verts: [SIMD3<Float>] = []
+        verts.reserveCapacity(displacementArrows.count * 8)
+        let headFrac: Float = 0.18
+        let headSpread: Float = 0.5
+        for arrow in displacementArrows {
+            let start = arrow.start
+            let vector = arrow.vector
+            guard start.isFinite, vector.isFinite else { continue }
+            let length = simd_length(vector)
+            guard length > 1e-6, length.isFinite else { continue }
+            let tip = start + vector
+            verts.append(start); verts.append(tip)
+            let dir = vector / length
+            let perp = makePerpendicular(dir)
+            let side = length * headFrac
+            let back = tip - dir * side
+            let left = back + perp * side * headSpread
+            let right = back - perp * side * headSpread
+            verts.append(tip); verts.append(left)
+            verts.append(tip); verts.append(right)
+        }
+        if verts.isEmpty { return true }
+        return drawLineBuffer(verts, color: SIMD3<Float>(1.0, 0.2, 0.9), enc: enc, frameBuffer: frameBuffer)
     }
 
     // MARK: - True 2D primitives (flat screen-space atoms + 1px bonds)

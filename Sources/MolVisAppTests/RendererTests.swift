@@ -7,8 +7,10 @@ private enum Thrown: Error { case noGPU, noTex }
 
 final class RendererTests: XCTestCase {
     // Baseline render coverage: a successful encode must put foreground geometry
-    // into a readable Metal target, including the alternate space-fill radius path.
-    func testRendererProducesDrawablePixels() throws {
+    // into a readable Metal target, including the alternate space-fill radius
+    // path, and instancing must preserve atom positions (a wider footprint and a
+    // different framebuffer than a one-atom scene).
+    func testRendererProducesDistinctDrawableGeometry() throws {
         var scene = Scene()
         scene.background = "#000000"
         scene.showAxes = false
@@ -25,11 +27,9 @@ final class RendererTests: XCTestCase {
         let spaceFillImage = try render(scene: spaceFill, dist: 8)
         XCTAssertGreaterThan(nonzeroPixels(spaceFillImage), 0,
                              "space-fill geometry must render through the same Metal path")
-    }
 
-    // Instancing must preserve atom positions: two atoms must occupy a wider
-    // footprint and a different framebuffer than a one-atom scene.
-    func testDistinctAtomsRenderAsDistinctGeometry() throws {
+        // Instancing must preserve atom positions: two atoms must occupy a wider
+        // footprint and a different framebuffer than a one-atom scene.
         var one = Scene()
         one.background = "#000000"
         one.showAxes = false

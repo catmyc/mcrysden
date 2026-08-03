@@ -230,6 +230,10 @@ struct Scene: Codable {
     var showCellFrame: Bool = true
     var showAxes: Bool = true
     var showLabels: Bool = false
+    /// Show live distance text above each displayed bond. Defaults off to
+    /// preserve existing visuals; the label overlay draws the text at the
+    /// projected bond midpoint with a small background chip.
+    @DefaultFalse var showBondDistances: Bool = false
     /// Show the scale indicator overlay. Defaults off to preserve existing visuals.
     @DefaultFalse var showScaleIndicator: Bool = false
     /// Hide the atomic structure (atoms/bonds/polyhedra), keeping the cell

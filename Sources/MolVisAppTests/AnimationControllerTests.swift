@@ -300,15 +300,17 @@ final class AnimationControllerTests: XCTestCase {
         XCTAssertNil(planeController.colorPlane.grid, "grid data must be cleared off the plane")
         XCTAssertTrue(planeController.colorPlane.isHidden, "plane must hide on a no-grid frame")
         XCTAssertFalse(planeController.canvas.isHidden, "canvas must be restored when the plane hides")
+
+        // The same reload transaction must also apply the preserved multi-orbital
+        // selection and clamp the carried iso level against the selected field.
+        try assertMultiOrbitalSelectionAppliedDuringReload()
     }
 
-    // MARK: - Multi-orbital selection and iso clamp must agree on the selected orbital
-    // BEFORE the frame is installed, so the renderer shows the orbital whose iso range
-    // the sidebar reports. AXSF animations never parse to multi-orbital frames, so the
-    // helper is exercised via a focused synthetic Scene test.
-
-    @MainActor
-    func testMultiOrbitalSelectionAppliedDuringReload() throws {
+    // Multi-orbital selection and iso clamp must agree on the selected orbital
+    // BEFORE the frame is installed, so the renderer shows the orbital whose iso
+    // range the sidebar reports. AXSF animations never parse to multi-orbital
+    // frames, so the helper is exercised via a focused synthetic Scene test.
+    private func assertMultiOrbitalSelectionAppliedDuringReload() throws {
         // Two fictional orbitals with distinguishable ranges/values; selection "2"
         // clamps onto the second (index 1). Prior to the rework, next's default first-
         // orbital selection survived and the renderer drew orbital 0 while the picker

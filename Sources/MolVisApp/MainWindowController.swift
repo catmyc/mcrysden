@@ -4,6 +4,7 @@ import Metal
 import MetalKit
 import simd
 import SwiftUI
+import UniformTypeIdentifiers
 
 private struct RouteLabelBucket: Hashable {
     let x: Int
@@ -132,8 +133,18 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Standalone neighbor table (virtualized). Owned by the controller but not
     /// installed in any window until `showNeighborTable` lazily creates it.
     let neighborTable = NeighborTableView(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
+    /// Standalone first-shell polyhedron metrics table. Owned by the controller
+    /// but not installed in any window until `showPolyhedronTable` creates it.
+    let polyhedronTable = PolyhedronTableView(frame: NSRect(x: 0, y: 0, width: 760, height: 480))
+    /// Standalone two-structure comparison panel. Owned by the controller but
+    /// not installed in any window until a comparison is loaded.
+    let comparisonPanel = ComparisonPanelView(frame: NSRect(x: 0, y: 0, width: 420, height: 380))
     /// Lazily-created, reusable auxiliary window hosting `neighborTable`.
     private(set) var neighborTableWindow: NSWindow?
+    /// Lazily-created, reusable auxiliary window hosting `polyhedronTable`.
+    private(set) var polyhedronTableWindow: NSWindow?
+    /// Lazily-created, reusable auxiliary window hosting `comparisonPanel`.
+    private(set) var comparisonWindow: NSWindow?
     /// Runtime-only distribution analysis derived from the coordination result.
     private(set) var distributionAnalysis: DistributionAnalysis?
     /// Lazily-created, reusable auxiliary window hosting `atomTable`. nil until the
@@ -198,6 +209,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private var coordinationCancellationToken: CoordinationCancellationToken?
     private var coordinationDebounceCancellation: (() -> Void)?
     private var coordinationGeneration = 0
+    /// Derived first-shell polyhedron metrics (aligned to `scene.atoms`), computed
+    /// on a background work item after the coordination result is installed.
+    private(set) var polyhedronMetrics: [PolyhedronMetrics]? = nil
+    private var polyhedronWorkItem: DispatchWorkItem?
+    private var polyhedronGeneration = 0
+    /// Test seam mirroring `coordinationAnalysisDidUpdate`.
+    internal var polyhedronAnalysisDidUpdate: (() -> Void)?
+    /// Runtime-only two-structure comparison: the reference structure loaded by
+    /// the user and the last computed result. Never persisted.
+    private(set) var comparisonResult: StructureComparisonResult?
+    private(set) var comparisonReferenceTitle: String?
     /// Distribution analysis is derived on a background work item so the main
     /// thread is not blocked by the O(27·n²) RDF enumeration or the
     /// O(n·k²) bond-angle sweep.
@@ -437,6 +459,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onSelectKPathNode = { [weak self] index in self?.selectKPathNode(index) }
         state.onShowAtomTable = { [weak self] in self?.showAtomTable() }
         state.onShowNeighborTable = { [weak self] in self?.showNeighborTable() }
+        state.onShowPolyhedronTable = { [weak self] in self?.showPolyhedronTable() }
+        state.onShowComparison = { [weak self] in self?.chooseComparisonReference() }
+        state.onClearComparison = { [weak self] in self?.clearComparison() }
+        state.onExportComparisonCSV = { [weak self] in self?.exportComparisonCSV() }
         state.onExportDistributionCSV = { [weak self] dist in
             guard let self else { return }
             self.exportDistributionCSV(dist)
@@ -550,6 +576,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         loadGeneration += 1   // cancel any pending background drop loads
         clearReciprocalFocusForSceneReplacement()
         installCameraBookmarks(cameraBookmarks)
+        // A new document invalidates any two-structure comparison: the reference
+        // was matched against the previous atom ordering. Drop readouts, panel
+        // content, and displacement arrows before installing the new scene.
+        clearComparison()
         self.scene = scene
         self.sourceURL = url
         self.forcedFormat = format
@@ -1009,6 +1039,212 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         neighborTable.update(analysis: analysis, atoms: scene.atoms)
     }
 
+    /// Lazily create (once) and show the auxiliary polyhedron-metrics panel.
+    func showPolyhedronTable() {
+        if polyhedronTableWindow == nil {
+            let win = NSWindow(contentRect: polyhedronTable.frame,
+                                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                backing: .buffered, defer: false)
+            win.title = "Polyhedron Metrics"
+            win.isReleasedWhenClosed = false
+            win.contentView = polyhedronTable
+            polyhedronTableWindow = win
+        }
+        polyhedronTableWindow?.makeKeyAndOrderFront(nil)
+        updatePolyhedronTable()
+    }
+
+    /// Push the current polyhedron metrics into the panel. Safe to call when
+    /// the panel is hidden or the analysis is absent (both are no-ops).
+    private func updatePolyhedronTable() {
+        guard let window = polyhedronTableWindow, window.isVisible else { return }
+        polyhedronTable.update(atoms: scene.atoms, metrics: polyhedronMetrics)
+    }
+
+    /// Present an open panel to choose a reference structure, then load it and
+    /// compare it against the currently displayed atoms.
+    func chooseComparisonReference() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Reference Structure"
+        panel.message = "Compare the displayed structure against a reference file."
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        let contentTypes = App.openPanelExtensions.compactMap { UTType(filenameExtension: $0) }
+        if !contentTypes.isEmpty {
+            panel.allowedContentTypes = contentTypes
+        }
+        panel.beginSheetModal(for: window) { [weak self] result in
+            guard let self, result == .OK, let url = panel.url else { return }
+            do {
+                try self.loadComparisonReference(from: url)
+            } catch {
+                print("[mcrysden] comparison load failed: \(error)")
+                self.presentComparisonError(error, url: url)
+            }
+        }
+    }
+
+    /// Load a reference structure from `url`, compare it against the current
+    /// scene, and install the result (readouts, panel, displacement arrows).
+    func loadComparisonReference(from url: URL) throws {
+        let loaded = try Parser.load(url)
+        let reference = Scene(loaded: loaded)
+        guard !reference.atoms.isEmpty else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "reference file contains no atoms")
+        }
+        let sourceAtoms = scene.atoms
+        let result = StructureComparator.compare(source: sourceAtoms,
+                                                 target: reference.atoms,
+                                                 sourceCell: scene.cell,
+                                                 periodicDim: scene.periodicDim)
+        guard let result else {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "comparison failed: invalid geometry or limits exceeded")
+        }
+        installComparison(result, referenceTitle: url.lastPathComponent)
+    }
+
+    /// Install a completed comparison: update the sidebar readout, the panel,
+    /// the displacement arrows, and request a render.
+    private func installComparison(_ result: StructureComparisonResult,
+                                   referenceTitle: String) {
+        comparisonResult = result
+        comparisonReferenceTitle = referenceTitle
+        var lines: [String] = []
+        lines.append("Reference: \(referenceTitle)")
+        if let rms = result.rmsDisplacement {
+            lines.append(String(format: "RMSD: %.4f Å", rms))
+        } else {
+            lines.append("RMSD: —")
+        }
+        lines.append("Matched \(result.matchedPairCount) / \(scene.atoms.count) atoms")
+        state.comparisonStatusText = lines.joined(separator: "\n")
+        if comparisonWindow == nil {
+            let win = NSWindow(contentRect: comparisonPanel.frame,
+                               styleMask: [.titled, .closable, .miniaturizable],
+                               backing: .buffered, defer: false)
+            win.title = "Structure Comparison"
+            win.isReleasedWhenClosed = false
+            win.contentView = comparisonPanel
+            comparisonWindow = win
+        }
+        comparisonPanel.onChooseReference = { [weak self] in self?.chooseComparisonReference() }
+        comparisonPanel.update(referenceTitle: referenceTitle, result: result)
+        comparisonWindow?.makeKeyAndOrderFront(nil)
+        updateDisplacementArrows()
+        setNeedsRender()
+    }
+
+    /// Test seam: install a comparison result without presenting panels or
+    /// open panels. Mirrors the production installation path (readouts,
+    /// panel content, arrows, render request).
+    internal func installComparisonForTesting(_ result: StructureComparisonResult,
+                                              referenceTitle: String) {
+        comparisonResult = result
+        comparisonReferenceTitle = referenceTitle
+        var lines: [String] = []
+        lines.append("Reference: \(referenceTitle)")
+        if let rms = result.rmsDisplacement {
+            lines.append(String(format: "RMSD: %.4f Å", rms))
+        } else {
+            lines.append("RMSD: —")
+        }
+        lines.append("Matched \(result.matchedPairCount) / \(scene.atoms.count) atoms")
+        state.comparisonStatusText = lines.joined(separator: "\n")
+        comparisonPanel.update(referenceTitle: referenceTitle, result: result)
+        updateDisplacementArrows()
+        setNeedsRender()
+    }
+
+    /// Clear the active comparison (readouts, panel content, arrows).
+    func clearComparison() {
+        comparisonResult = nil
+        comparisonReferenceTitle = nil
+        state.comparisonStatusText = ""
+        state.showComparisonArrows = false
+        renderer?.displacementArrows = []
+        renderer?.showDisplacementArrows = false
+        if let window = comparisonWindow, window.isVisible {
+            comparisonPanel.update(referenceTitle: "—",
+                                   result: StructureComparisonResult(
+                                       matches: [], unmatchedSourceIndices: [],
+                                       unmatchedTargetIndices: [],
+                                       rmsDisplacement: nil, meanDisplacement: nil,
+                                       maxDisplacement: nil, perElement: [],
+                                       maxMatchDistance: StructureComparator.defaultMaxMatchDistance,
+                                       isComplete: true))
+        }
+        setNeedsRender()
+    }
+
+    /// Rebuild the renderer's displacement arrows from the active comparison
+    /// and the current scene atom positions. Indices that no longer exist (e.g.
+    /// after a frame reload) are dropped. Called on every render so a changed
+    /// atom ordering cannot leave stale arrows.
+    private func updateDisplacementArrows() {
+        guard let result = comparisonResult else {
+            renderer?.displacementArrows = []
+            return
+        }
+        let atoms = scene.atoms
+        renderer?.displacementArrows = result.matches.compactMap { match in
+            guard match.sourceIndex >= 0, match.sourceIndex < atoms.count else { return nil }
+            let start = atoms[match.sourceIndex].coord
+            guard start.isFinite, match.displacement.isFinite else { return nil }
+            return (start: start, vector: match.displacement)
+        }
+    }
+
+    /// Present a save panel and write the comparison as CSV: one row per
+    /// matched pair (source index, element, dx, dy, dz, distance) plus summary
+    /// lines. Unmatched atoms are listed at the end.
+    func exportComparisonCSV() {
+        guard let result = comparisonResult else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "comparison.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            var lines: [String] = []
+            if let title = self.comparisonReferenceTitle {
+                lines.append("# Reference: \(title)")
+            }
+            if let rms = result.rmsDisplacement {
+                lines.append(String(format: "# RMSD: %.4f Å", rms))
+            }
+            lines.append("# Cutoff: \(result.maxMatchDistance) Å; matched: \(result.matchedPairCount)")
+            lines.append("source_index,element,dx,dy,dz,distance_angstrom")
+            for match in result.matches {
+                guard match.sourceIndex >= 0,
+                      match.sourceIndex < self.scene.atoms.count else { continue }
+                let atom = self.scene.atoms[match.sourceIndex]
+                let symbol = atom.label.isEmpty
+                    ? ElementTable.symbol(atom.atomicNumber) : atom.label
+                lines.append(String(
+                    format: "%d,\(symbol),%.6f,%.6f,%.6f,%.6f",
+                    match.sourceIndex + 1, match.displacement.x, match.displacement.y,
+                    match.displacement.z, match.distance))
+            }
+            lines.append("# Unmatched source atoms: "
+                + result.unmatchedSourceIndices.map { "\($0 + 1)" }.joined(separator: ","))
+            lines.append("# Unmatched reference atoms: "
+                + result.unmatchedTargetIndices.map { "\($0 + 1)" }.joined(separator: ","))
+            let text = lines.joined(separator: "\n")
+            do { try text.write(to: url, atomically: true, encoding: .utf8) }
+            catch { print("[mcrysden] comparison CSV export failed: \(error)") }
+        }
+    }
+
+    /// Present the comparison load failure as an alert sheet on the main window.
+    private func presentComparisonError(_ error: Error, url: URL) {
+        let alert = NSAlert()
+        alert.messageText = "Comparison Failed"
+        alert.informativeText = "\(url.lastPathComponent): \(error.localizedDescription)"
+        alert.alertStyle = .warning
+        alert.beginSheetModal(for: window)
+    }
+
     /// Present a save panel and write the distribution analysis as CSV.
     /// The RDF CSV emits actual g(r) values, not raw counts.
     private func exportDistributionCSV(_ dist: DistributionAnalysis) {
@@ -1100,6 +1336,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             }
             lastCoordinationDelegateIs2D = is2D
         }
+        // Comparison arrows are runtime-only renderer state; keep the delegate's
+        // toggle in step with the sidebar on every delegate refresh.
+        renderer?.showDisplacementArrows = state.showComparisonArrows
         installEditorBZCache()
     }
 
@@ -1108,6 +1347,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         renderer?.currentCamera = camera
         renderer2D?.currentCamera = camera
         refreshDelegate()
+        // Displacement arrows follow the displayed atom ordering (a frame
+        // reload may change indices); rebuild them on every render request.
+        updateDisplacementArrows()
         updateLabels()
         let text = buildInfoText()
         if infoPanel.string != text { infoPanel.string = text }
@@ -1167,6 +1409,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         cancelCoordinationRequest()
         coordinationGeneration += 1
         distributionGeneration += 1
+        polyhedronGeneration += 1
         state.isPlaying = false
         infoWindow.orderOut(nil)
     }
@@ -1644,6 +1887,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             }
         }
 
+        // Live bond-distance labels: distance text above each projected bond
+        // midpoint. Bounded and deterministic (bond order); follows the atom
+        // label layer so hiding atom labels must not hide bond distances.
+        if scene.showBondDistances {
+            labels += Self.bondDistanceLabels(scene: scene, camera: camera, viewport: viewport)
+        }
+
         // Scale indicators are viewport labels rather than scene geometry. Build
         // them from the same validated camera/viewport used for atom/route labels
         // so the live overlay and export projection stay identical. The canvas
@@ -1713,6 +1963,53 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 guard !occupied.intersects(collisionRect) else { continue }
                 occupied.insert(collisionRect)
                 labels.append(item.label)
+            }
+        }
+        return labels
+    }
+
+    /// Generate bond-distance labels for the given scene/camera/viewport.
+    /// Each displayed bond contributes one label at its projected midpoint,
+    /// offset above the bond, formatted in Å. Bonds whose endpoints or
+    /// midpoint project outside the viewport are skipped; the total is bounded
+    /// by `maxLabels` for readability. Deterministic (bond order), so live and
+    /// export compositing stay identical.
+    static func bondDistanceLabels(scene: Scene, camera: Camera,
+                                   viewport: SIMD2<Float>,
+                                   maxLabels: Int = 200) -> [LabelOverlayView.Label] {
+        guard maxLabels > 0 else { return [] }
+        let atoms = scene.atoms
+        guard !atoms.isEmpty, !scene.bonds.isEmpty else { return [] }
+
+        var labels: [LabelOverlayView.Label] = []
+        labels.reserveCapacity(min(scene.bonds.count, maxLabels))
+        for bond in scene.bonds {
+            guard labels.count < maxLabels else { break }
+            guard bond.i >= 0, bond.i < atoms.count,
+                  bond.j >= 0, bond.j < atoms.count else { continue }
+            let a = atoms[bond.i].coord
+            let b = atoms[bond.j].coord
+            guard a.isFinite, b.isFinite else { continue }
+            let distance = simd_length(b - a)
+            guard distance.isFinite, distance > 1e-6 else { continue }
+            let midpoint = (a + b) * 0.5
+            guard let screen = projectPoint(midpoint, camera: camera, viewport: viewport) else {
+                continue
+            }
+            let text = String(format: "%.2f", distance)
+            let label = LabelOverlayView.Label(symbol: text,
+                                               x: screen.x - 12, y: screen.y - 12,
+                                               style: .bondDistance)
+            // Keep the complete chip inside the viewport when it fits.
+            let rect = LabelOverlayView.drawingRect(for: label)
+            if rect.maxX > CGFloat(viewport.x) {
+                let shifted = LabelOverlayView.Label(symbol: text,
+                                                     x: screen.x - rect.width - 6,
+                                                     y: screen.y - 12,
+                                                     style: .bondDistance)
+                labels.append(shifted)
+            } else {
+                labels.append(label)
             }
         }
         return labels
@@ -1867,7 +2164,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     private func projectLabelPoint(_ world: SIMD3<Float>, camera: Camera,
                                    viewport: SIMD2<Float>) -> CGPoint? {
-        guard finite(world), validReciprocalViewport(viewport) else { return nil }
+        Self.projectPoint(world, camera: camera, viewport: viewport)
+    }
+
+    /// Project a world point into top-origin viewport pixels with the given
+    /// camera, rejecting points behind the near plane or outside the viewport.
+    /// Shared by atom/route/bond-distance label projection so live and export
+    /// compositing use exactly the same geometry.
+    static func projectPoint(_ world: SIMD3<Float>, camera: Camera,
+                             viewport: SIMD2<Float>) -> CGPoint? {
+        guard world.x.isFinite, world.y.isFinite, world.z.isFinite,
+              validViewport(viewport) else { return nil }
         let viewPosition = camera.viewMatrix() * SIMD4<Float>(world.x, world.y, world.z, 1)
         let depth = -viewPosition.z
         guard depth > 0.01, depth.isFinite else { return nil }
@@ -1884,6 +2191,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let y = (1 - (ndc.y * 0.5 + 0.5)) * viewport.y
         guard x.isFinite, y.isFinite else { return nil }
         return CGPoint(x: CGFloat(x), y: CGFloat(y))
+    }
+
+    private static func validViewport(_ viewport: SIMD2<Float>) -> Bool {
+        guard viewport.x.isFinite, viewport.y.isFinite,
+              viewport.x > 0, viewport.y > 0 else { return false }
+        return true
     }
 
     private func validBZPresentation(_ presentation: BZPresentation) -> Bool {
@@ -2418,6 +2731,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.showCellFrame = state.showCellFrame
         scene.showAxes = state.showAxes
         scene.showLabels = state.showLabels
+        scene.showBondDistances = state.showBondDistances
         scene.showScaleIndicator = state.showScaleIndicator
         // User controls push state -> scene so the renderer reads the new value.
         // (showBrillouinZone is the renderer's source of truth via scene.* .)
@@ -2454,6 +2768,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // gates the draw on forceSet + showForces, so writing is unconditional.
         scene.showForces = state.showForces
         scene.forceScale = state.forceScale
+        // Comparison displacement arrows are runtime-only renderer state (the
+        // reference structure is never persisted); push the toggle through.
+        renderer?.showDisplacementArrows = state.showComparisonArrows
         // MSAA sample count. Validated values only (1,2,4,8); the sidebar picker
         // can produce nothing else. Written unconditionally; the renderer gates
         // use on the value being > 1.
@@ -2665,6 +2982,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationDebounceCancellation = nil
         distributionWorkItem?.cancel()
         distributionWorkItem = nil
+        polyhedronWorkItem?.cancel()
+        polyhedronWorkItem = nil
     }
 
     private func startCoordinationAnalysis(debounced: Bool) {
@@ -2675,6 +2994,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationCancellationToken = token
         coordinationAnalysis = nil
         clearCoordinationNumbers()
+        // A restart supersedes any previous polyhedron metrics derived from the
+        // old coordination result; clear them so the readouts never show stale
+        // values while the new analysis is in flight.
+        polyhedronGeneration += 1
+        polyhedronWorkItem = nil
+        clearPolyhedronMetrics()
         state.coordinationAnalysisAvailable = false
         state.coordinationStatusText = scene.atoms.isEmpty ? "Unavailable" : "Calculating…"
         state.coordinationSummaryText = scene.atoms.isEmpty ? "No atoms" : ""
@@ -2826,6 +3151,42 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         distributionWorkItem = work
         DispatchQueue.global(qos: .userInitiated).async(execute: work)
 
+        // Derive first-shell polyhedron metrics on a background work item too.
+        // The hull volume enumeration is O(n⁴) per atom, bounded to the first
+        // shell (≤ 24 neighbors) and 4,096 atoms, so it must never run on the
+        // main thread. Stale results from superseded requests are discarded via
+        // the generation token, exactly like the distribution analysis.
+        polyhedronWorkItem?.cancel()
+        polyhedronGeneration += 1
+        let polyGeneration = polyhedronGeneration
+        let polyAtoms = scene.atoms
+        let polyResult = result
+        let polyWork = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.polyhedronGeneration == polyGeneration else { return }
+            let metrics = PolyhedronAnalyzer.analyze(
+                analysis: polyResult, atoms: polyAtoms,
+                isCancelled: { [weak self] in
+                    guard let self else { return true }
+                    return self.polyhedronGeneration != polyGeneration
+                })
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.polyhedronGeneration == polyGeneration else { return }
+                self.polyhedronWorkItem = nil
+                guard let metrics, metrics.count == self.scene.atoms.count else {
+                    self.clearPolyhedronMetrics()
+                    return
+                }
+                self.polyhedronMetrics = metrics
+                self.state.polyhedronSummaryText = Self.polyhedronSummary(metrics: metrics)
+                self.updatePolyhedronTable()
+                self.polyhedronAnalysisDidUpdate?()
+            }
+        }
+        polyhedronWorkItem = polyWork
+        DispatchQueue.global(qos: .userInitiated).async(execute: polyWork)
+
         coordinationAnalysisDidUpdate?()
     }
 
@@ -2834,10 +3195,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationCancellationToken = nil
         coordinationWorkItem = nil
         distributionGeneration += 1
+        polyhedronGeneration += 1
+        polyhedronWorkItem = nil
         coordinationAnalysis = nil
         distributionAnalysis = nil
         state.distributionAnalysis = nil
         state.distributionAnalysisAvailable = false
+        clearPolyhedronMetrics()
         clearCoordinationNumbers()
         state.coordinationAnalysisAvailable = false
         state.coordinationStatusText = "Unavailable"
@@ -2849,15 +3213,47 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         cancelCoordinationRequest()
         coordinationGeneration += 1
         distributionGeneration += 1
+        polyhedronGeneration += 1
         coordinationAnalysis = nil
         distributionAnalysis = nil
         state.distributionAnalysis = nil
         state.distributionAnalysisAvailable = false
+        clearPolyhedronMetrics()
         clearCoordinationNumbers()
         state.coordinationAnalysisAvailable = false
         state.coordinationStatusText = status
         state.coordinationSummaryText = summary
         coordinationAnalysisDidUpdate?()
+    }
+
+    /// Drop the derived polyhedron metrics and their sidebar/table readouts.
+    private func clearPolyhedronMetrics() {
+        polyhedronMetrics = nil
+        state.polyhedronSummaryText = ""
+        if let window = polyhedronTableWindow, window.isVisible {
+            polyhedronTable.update(atoms: scene.atoms, metrics: nil)
+        }
+    }
+
+    /// Human-readable one-line summary of the per-atom polyhedron metrics.
+    private static func polyhedronSummary(metrics: [PolyhedronMetrics]) -> String {
+        let volumes = metrics.compactMap { $0.volume }
+        let distortions = metrics.compactMap { $0.bondLengthDistortion }
+        let angles = metrics.compactMap { $0.angleDeviation }
+        var parts: [String] = []
+        if !volumes.isEmpty {
+            let mean = volumes.reduce(0, +) / Float(volumes.count)
+            parts.append(String(format: "Mean polyhedron volume: %.3f Å³", mean))
+        }
+        if !distortions.isEmpty {
+            let mean = distortions.reduce(0, +) / Float(distortions.count)
+            parts.append(String(format: "Mean bond-length distortion: %.4f", mean))
+        }
+        if !angles.isEmpty {
+            let mean = angles.reduce(0, +) / Float(angles.count)
+            parts.append(String(format: "Mean angle deviation: %.2f°", mean))
+        }
+        return parts.isEmpty ? "" : parts.joined(separator: "\n")
     }
 
     private func cellsEqual(_ lhs: Cell?, _ rhs: Cell?) -> Bool {
@@ -3142,6 +3538,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showCellFrame = scene.showCellFrame
         next.showAxes = scene.showAxes
         next.showLabels = scene.showLabels
+        next.showBondDistances = scene.showBondDistances
         next.showScaleIndicator = scene.showScaleIndicator
         next.showStructure = scene.showStructure
         next.showBrillouinZone = restoredShowBZ

@@ -22,6 +22,7 @@ final class StateStoreTests: XCTestCase {
         scene.background = "#112233"
         scene.backgroundBottom = "#445566"
         scene.showScaleIndicator = true
+        scene.showBondDistances = true
         scene.msaaSampleCount = 2
         scene.currentFrame = 7
         // Rendering-quality fields.
@@ -113,6 +114,7 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(restored.background, "#112233")
         XCTAssertEqual(restored.backgroundBottom, "#445566")
         XCTAssertTrue(restored.showScaleIndicator)
+        XCTAssertTrue(restored.showBondDistances)
         XCTAssertEqual(restored.msaaSampleCount, 2)
         XCTAssertEqual(restored.currentFrame, 7)
         XCTAssertEqual(restored.currentOrbital, 1)

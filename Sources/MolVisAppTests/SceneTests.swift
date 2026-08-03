@@ -68,6 +68,73 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(geometry.atoms[0].coord.x, 0, accuracy: 1e-5)
         XCTAssertEqual(geometry.atoms[1].coord.x, 0.25 * 5.43, accuracy: 0.01)
         XCTAssertEqual(geometry.atoms[2].coord, SIMD3<Float>(1, 2, 3))
+
+        // Format dispatch: extension sniffing, standard projected-DOS names,
+        // open-panel advertisement, and extension-renamed content loading.
+        XCTAssertEqual(ParseFormat.from(url: fixture("si110.xsf")), .xsf)
+        XCTAssertEqual(ParseFormat.from(url: fixture("N2O.cube")), .cube)
+        XCTAssertEqual(ParseFormat.from(url: fixture("si_relax.out")), .pwo)
+        XCTAssertEqual(ParseFormat.from(url: URL(fileURLWithPath: "/tmp/prefix.pdos_atm#1(Fe)_wfc#2(p)")), .dos)
+        XCTAssertTrue(App.openPanelExtensions.contains("g98"))
+        XCTAssertTrue(App.openPanelExtensions.contains("gz"))
+
+        let qe = try Parser.load(fixture("si_relax.out"))
+        XCTAssertEqual(qe.atoms.count, 2)
+        XCTAssertNotNil(qe.cell)
+
+        let g98URL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-\(UUID().uuidString).g98")
+        defer { try? FileManager.default.removeItem(at: g98URL) }
+        try Data(contentsOf: fixture("N2O.cube")).write(to: g98URL)
+        let g98 = try Parser.load(g98URL)
+        XCTAssertEqual(g98.scalarField?.nx, 19)
+        XCTAssertEqual(g98.atoms.count, 3)
+
+        let gzipURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-\(UUID().uuidString).xsf.gz")
+        defer { try? FileManager.default.removeItem(at: gzipURL) }
+        let gzip = Process()
+        gzip.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+        gzip.arguments = ["-c", fixture("si.grid.xsf").path]
+        let output = Pipe()
+        gzip.standardOutput = output
+        try gzip.run()
+        let compressed = output.fileHandleForReading.readDataToEndOfFile()
+        gzip.waitUntilExit()
+        XCTAssertEqual(gzip.terminationStatus, 0)
+        try compressed.write(to: gzipURL)
+        let gzipped = try Parser.load(gzipURL)
+        XCTAssertEqual(gzipped.atoms.count, 2)
+        XCTAssertNotNil(gzipped.scalarField)
+
+        // Extension-renamed content is sniffed by content, not extension.
+        let orcaOutURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-\(UUID().uuidString).out")
+        defer { try? FileManager.default.removeItem(at: orcaOutURL) }
+        try Data(contentsOf: fixture("orca.orca")).write(to: orcaOutURL)
+        XCTAssertEqual(ParseFormat.from(url: orcaOutURL), .orca)
+
+        let fhiOutURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-\(UUID().uuidString).out")
+        defer { try? FileManager.default.removeItem(at: fhiOutURL) }
+        try Data(contentsOf: fixture("fhi_gaas_surface.fhi")).write(to: fhiOutURL)
+        XCTAssertEqual(ParseFormat.from(url: fhiOutURL), .fhi)
+
+        // --msaa CLI parsing: accepts 1/2/4/8 (1 = explicit Off override); rejects the rest.
+        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "1"]).msaaSampleCount, 1)
+        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "2"]).msaaSampleCount, 2)
+        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "4"]).msaaSampleCount, 4)
+        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "8"]).msaaSampleCount, 8)
+        XCTAssertNil(try App.parseArguments(["file.xsf"]).msaaSampleCount)
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "3"])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("1, 2, 4, or 8"), "unexpected error: \(error)")
+        }
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa"]))
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "2", "--msaa", "4"]))
+        // Duplicate detection must fire even when the first value is 1 (explicit Off):
+        // a separate seen flag must track the repeat regardless of the stored value.
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "1", "--msaa", "4"]))
+        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "1", "--msaa", "1"]))
     }
 
     func testCRYSCALExpansionSymbolsAndPolymer() throws {
@@ -383,7 +450,7 @@ final class SceneTests: XCTestCase {
         XCTAssertNotEqual(orca0.atoms[0].coord.x, orcaLast.atoms[0].coord.x, accuracy: 1e-4)
     }
 
-    func testSupercellAndSlabSafety() throws {
+    func testSupercellSlabAndMalformedInputSafety() throws {
         let base = Scene(loaded: try Parser.load(fixture("si110.xsf")))
         let doubled = base.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
         XCTAssertEqual(doubled.atoms.count, 4)
@@ -404,9 +471,8 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(overflow.superCell, SuperCell())
         let nonPositive = base.widenSuperCell(SuperCell(n1: 0, n2: 2, n3: 2))
         XCTAssertEqual(nonPositive.atoms.count, base.atoms.count)
-    }
 
-    func testMalformedAndSingularInputIsSafe() throws {
+        // Malformed input must fail with a useful ParseError, never trap.
         XCTAssertThrowsError(try Parser.load(fixture("bad.xyz"), as: .xyz)) { error in
             guard case ParseError.parse(_, _, let reason) = error else {
                 return XCTFail("malformed input should produce ParseError.parse, got \(error)")
@@ -422,71 +488,5 @@ final class SceneTests: XCTestCase {
             planeB: Plane(h: 0, k: -1, l: 0, distance: 1)))
         XCTAssertEqual(unchanged.atoms.count, singular.atoms.count)
         XCTAssertNil(unchanged.slab)
-    }
-
-    func testOpenFormatDispatch() throws {
-        XCTAssertEqual(ParseFormat.from(url: fixture("si110.xsf")), .xsf)
-        XCTAssertEqual(ParseFormat.from(url: fixture("N2O.cube")), .cube)
-        XCTAssertEqual(ParseFormat.from(url: fixture("si_relax.out")), .pwo)
-        XCTAssertEqual(ParseFormat.from(url: URL(fileURLWithPath: "/tmp/prefix.pdos_atm#1(Fe)_wfc#2(p)")), .dos)
-        XCTAssertTrue(App.openPanelExtensions.contains("g98"))
-        XCTAssertTrue(App.openPanelExtensions.contains("gz"))
-
-        let qe = try Parser.load(fixture("si_relax.out"))
-        XCTAssertEqual(qe.atoms.count, 2)
-        XCTAssertNotNil(qe.cell)
-
-        let g98URL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mcrysden-\(UUID().uuidString).g98")
-        defer { try? FileManager.default.removeItem(at: g98URL) }
-        try Data(contentsOf: fixture("N2O.cube")).write(to: g98URL)
-        let g98 = try Parser.load(g98URL)
-        XCTAssertEqual(g98.scalarField?.nx, 19)
-        XCTAssertEqual(g98.atoms.count, 3)
-
-        let gzipURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mcrysden-\(UUID().uuidString).xsf.gz")
-        defer { try? FileManager.default.removeItem(at: gzipURL) }
-        let gzip = Process()
-        gzip.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
-        gzip.arguments = ["-c", fixture("si.grid.xsf").path]
-        let output = Pipe()
-        gzip.standardOutput = output
-        try gzip.run()
-        let compressed = output.fileHandleForReading.readDataToEndOfFile()
-        gzip.waitUntilExit()
-        XCTAssertEqual(gzip.terminationStatus, 0)
-        try compressed.write(to: gzipURL)
-        let gzipped = try Parser.load(gzipURL)
-        XCTAssertEqual(gzipped.atoms.count, 2)
-        XCTAssertNotNil(gzipped.scalarField)
-
-        let orcaOutURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mcrysden-\(UUID().uuidString).out")
-        defer { try? FileManager.default.removeItem(at: orcaOutURL) }
-        try Data(contentsOf: fixture("orca.orca")).write(to: orcaOutURL)
-        XCTAssertEqual(ParseFormat.from(url: orcaOutURL), .orca)
-
-        let fhiOutURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mcrysden-\(UUID().uuidString).out")
-        defer { try? FileManager.default.removeItem(at: fhiOutURL) }
-        try Data(contentsOf: fixture("fhi_gaas_surface.fhi")).write(to: fhiOutURL)
-        XCTAssertEqual(ParseFormat.from(url: fhiOutURL), .fhi)
-
-        // --msaa CLI parsing: accepts 1/2/4/8 (1 = explicit Off override); rejects the rest.
-        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "1"]).msaaSampleCount, 1)
-        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "2"]).msaaSampleCount, 2)
-        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "4"]).msaaSampleCount, 4)
-        XCTAssertEqual(try App.parseArguments(["file.xsf", "--msaa", "8"]).msaaSampleCount, 8)
-        XCTAssertNil(try App.parseArguments(["file.xsf"]).msaaSampleCount)
-        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "3"])) { error in
-            XCTAssertTrue(error.localizedDescription.contains("1, 2, 4, or 8"), "unexpected error: \(error)")
-        }
-        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa"]))
-        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "2", "--msaa", "4"]))
-        // Duplicate detection must fire even when the first value is 1 (explicit Off):
-        // a separate seen flag must track the repeat regardless of the stored value.
-        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "1", "--msaa", "4"]))
-        XCTAssertThrowsError(try App.parseArguments(["file.xsf", "--msaa", "1", "--msaa", "1"]))
     }
 }

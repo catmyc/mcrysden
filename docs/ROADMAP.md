@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-03 (v1.1.35: complete CRYSCAL expansion, coordination distributions, atom-coordinate editing, and rendering-quality controls; 32 focused tests)**.
+Last updated: **2026-08-03 (v1.1.36: complete polyhedron metrics, two-structure comparison, region/expression filtering, and bond-distance labels; 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 32 focused tests: consolidated parser-family and scene workflows, renderer/raster/vector export, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements and coordination distributions, atom-coordinate editing, animation-frame lifecycle, all-system CRYSCAL expansion, rendering quality, and QE `tpiba_b` export coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 32 focused tests: consolidated parser-family and scene workflows, renderer/raster/vector export, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements and coordination distributions, atom-coordinate editing, animation-frame lifecycle, all-system CRYSCAL expansion, rendering quality, QE `tpiba_b` export, polyhedron volume/distortion oracles, two-structure RMSD matching, atom-table region/expression filters, and bond-distance labels. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
@@ -107,8 +107,9 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
 - [x] Atom table with fractional/Cartesian coordinates and coordination numbers (v1.1.35): element/label/CN filtering, linked multiple selection, transactional Cartesian/fractional coordinate editing, validation, bounded undo/redo, rebonding, and symmetry/k-path/coordination invalidation.
 - [x] Coordination analysis (v1.1.35): periodic-image shells/CN and coloring, selected-neighbor readout, a bounded virtualized neighbor table, bond-length/angle histograms and CSV, normalized 3D RDF with explicit lower-dimensional unavailable states, and minimum-image distance/angle/dihedral measurements for skew 1D/2D/3D cells.
-- [ ] Polyhedron volume/distortion metrics and two-structure comparison with displacement vectors and RMS displacement.
-- [~] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels. Linked atom-table element/label/CN filters and selection, plus coordination coloring, are implemented; region/expression filtering and on-screen bond-distance labels remain pending.
+- [x] Polyhedron volume/distortion metrics (v1.1.36): first-shell convex-hull volume, mean bond-length distortion, ideal-angle-referenced angle deviation with trans/skew class exclusion, and volume ratio vs. the regular polyhedron; bounded virtualized metrics table and sidebar readout derived from the coordination analysis.
+- [x] Two-structure comparison (v1.1.36): reference-file loading, per-element nearest-neighbor minimum-image matching, RMS/mean/max displacement, matched/unmatched reporting, on-canvas displacement arrows, detail panel, and CSV export.
+- [x] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels (v1.1.36): region/expression filtering (`x>0.5`, `a<=0.25`, `box:…`, `sphere:…`) joins the linked atom-table element/label/CN filters, and a persisted bond-distance label toggle draws formatted Å text at each projected bond midpoint.
 
 ### Structure editing and generation
 - [~] Cartesian/fractional atom-coordinate editing with bounded undo/redo is implemented (v1.1.35). Insert/remove/substitute operations, bulk displacement tools, lattice-parameter editing, and a unified full editing history remain pending.
@@ -146,7 +147,7 @@ All 10 original Tier A items complete: Gaussian Cube/G98, BXSF/Fermi surfaces, 3
 ## Tier C — validated by interaction, not files
 
 - [~] **Structure editing**: Cartesian/fractional coordinate edits and bounded undo/redo are implemented; cut cluster/molecule, substitute/remove/insert/displace workflows, elastic cell deformation, and multi-slab generation remain pending.
-- [ ] **On-screen bond distance labels** — live distance text above each bond.
+- [x] **On-screen bond distance labels** — live distance text above each bond (v1.1.36).
 - [ ] **Image-background variant** — only `solid` + `gradient_top` exist.
 - [ ] **Print** of the view (`NSPrintOperation`).
 - [ ] **Stereo / anaglyph** rendering.

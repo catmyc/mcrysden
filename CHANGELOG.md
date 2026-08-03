@@ -2,6 +2,20 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.36] — 2026-08-03
+
+### Added
+
+- Completed the structure-information and analysis backlog:
+  - First-shell coordination-polyhedron volume and distortion metrics (convex-hull volume, mean bond-length distortion, ideal-angle-referenced angle deviation, and volume ratio vs. the regular polyhedron) with a bounded virtualized metrics table and sidebar readout, derived from the coordination analysis on a background queue.
+  - Two-structure comparison against a reference file with per-element nearest-neighbor minimum-image matching, RMS/mean/max displacement, matched/unmatched atom reporting, on-canvas displacement arrows, a detail panel, and text/CSV export.
+  - Region and expression atom-table filtering: Cartesian and fractional coordinate comparisons (`x>0.5`, `a<=0.25`, …), Cartesian `box:` and `sphere:` regions, combinable with element/label and `cn:` terms; malformed structured terms fail closed.
+  - On-screen bond-distance labels: a persisted Show Bond Distances toggle draws formatted Å text at each projected bond midpoint through the shared live/export label compositing path.
+
+### Tests
+
+- Kept 32 focused tests while adding consolidated coverage for polyhedron volume/distortion oracles, two-structure RMSD/unmatched matching (periodic, edge-wrapped, and molecular), atom-table region/expression filters, and bond-distance label projection/state round trips.
+
 ## [1.1.35] — 2026-08-03
 
 ### Added

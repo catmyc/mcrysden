@@ -31,6 +31,9 @@ final class SideBarState: ObservableObject {
     @Published var showCellFrame: Bool = true { didSet { onChange?() } }
     @Published var showAxes: Bool = true { didSet { onChange?() } }
     @Published var showLabels: Bool = false { didSet { onChange?() } }
+    /// Show live distance text above each displayed bond. Synced to
+    /// scene.showBondDistances in syncFromScene/syncFromState.
+    @Published var showBondDistances: Bool = false { didSet { onChange?() } }
     /// Show the scale indicator overlay. Synced to scene.showScaleIndicator in
     /// syncFromScene(); the controller mirrors changes back into the Scene.
     @Published var showScaleIndicator: Bool = false { didSet { onChange?() } }
@@ -94,6 +97,16 @@ final class SideBarState: ObservableObject {
     @Published var coordinationStatusText: String = "Off"
     @Published var coordinationSummaryText: String = ""
     @Published var coordinationAnalysisAvailable = false
+    /// Runtime-only first-shell polyhedron metrics derived from the current
+    /// coordination analysis (volume, bond-length distortion, angle deviation).
+    /// The controller computes these on a background queue; not persisted.
+    @Published var polyhedronSummaryText: String = ""
+    /// Runtime-only two-structure comparison status (reference name + RMSD).
+    /// Empty when no comparison is active. Not persisted.
+    @Published var comparisonStatusText: String = ""
+    /// Draw the comparison displacement arrows in the viewport. Runtime-only
+    /// (the comparison reference itself is never persisted).
+    @Published var showComparisonArrows: Bool = false { didSet { onChange?() } }
     // --- Electronic-structure graph interaction ---------------------------------
     // View-only state driving the band/DOS grapher views. None of these are scene
     // fields, so they do not participate in state-file persistence. The controller
@@ -121,9 +134,20 @@ final class SideBarState: ObservableObject {
     /// Present the neighbor table panel for the current coordination analysis.
     /// The controller owns the NeighborTableView and lazily creates the window.
     var onShowNeighborTable: (() -> Void)?
+    /// Present the first-shell polyhedron metrics panel. The controller owns
+    /// the PolyhedronTableView and lazily creates the window.
+    var onShowPolyhedronTable: (() -> Void)?
     /// Export the distribution analysis as CSV. The controller presents a save
     /// panel and writes the CSV text. Not a scene field.
     var onExportDistributionCSV: ((DistributionAnalysis) -> Void)?
+    /// Present the two-structure comparison panel. The controller owns the
+    /// reference structure and the panel, and lazily creates the window.
+    var onShowComparison: (() -> Void)?
+    /// Clear the active two-structure comparison (reference, arrows, readouts).
+    var onClearComparison: (() -> Void)?
+    /// Export the active comparison summary as CSV. The controller presents a
+    /// save panel and writes the per-match data. Not a scene field.
+    var onExportComparisonCSV: (() -> Void)?
     /// Computed electronic-analysis report (band or DOS). Set by the controller
     /// from the actually-displayed graph (DOS takes viewport precedence); nil
     /// when neither graph is available. Not a scene field.
@@ -322,6 +346,7 @@ final class SideBarState: ObservableObject {
         showCellFrame = scene.showCellFrame
         showAxes = scene.showAxes
         showLabels = scene.showLabels
+        showBondDistances = scene.showBondDistances
         showScaleIndicator = scene.showScaleIndicator
         showBrillouinZone = scene.showBrillouinZone
         isCrystal = scene.isCrystal
