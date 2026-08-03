@@ -76,9 +76,9 @@ final class SceneTests: XCTestCase {
         }
         let crystalNames = [
             ("crystal_ZnS.r1", 8), ("crystal_mgo.r1", 8),
-            ("crystal_rutile.r1", 2), ("crystal_graphite.r1", 2),
-            ("crystal_corundum.r1", 2), ("crystal_chabazite.r1", 5),
-            ("crystal_argonite.r1", 4),
+            ("crystal_rutile.r1", 6), ("crystal_graphite.r1", 4),
+            ("crystal_corundum.r1", 30), ("crystal_chabazite.r1", 144),
+            ("crystal_argonite.r1", 20),
         ]
         for (name, atomCount) in crystalNames {
             let scene = Scene(loaded: try Parser.load(fixture(name), as: .crystal))
@@ -95,6 +95,56 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(mgo.crystalSymmetry?.symmetry?.spaceGroupNumber, 225)
         XCTAssertEqual(counts(mgo.atoms)[12], 4)
         XCTAssertEqual(counts(mgo.atoms)[8], 4)
+
+        // Non-cubic CRYSCAL expansion: verify completeness, symmetry
+        // availability, and per-species counts for representative systems.
+        let rutileLoaded = try Parser.load(fixture("crystal_rutile.r1"), as: .crystal)
+        XCTAssertEqual(rutileLoaded.symmetryInputCompleteness, .complete)
+        let rutile = Scene(loaded: rutileLoaded)
+        XCTAssertEqual(rutile.crystalSymmetry?.symmetry?.spaceGroupNumber, 136)
+        XCTAssertEqual(counts(rutile.atoms)[22], 2)
+        XCTAssertEqual(counts(rutile.atoms)[8], 4)
+        let graphiteLoaded = try Parser.load(fixture("crystal_graphite.r1"), as: .crystal)
+        XCTAssertEqual(graphiteLoaded.symmetryInputCompleteness, .complete)
+        let graphite = Scene(loaded: graphiteLoaded)
+        XCTAssertEqual(graphite.crystalSymmetry?.symmetry?.spaceGroupNumber, 194)
+        XCTAssertEqual(counts(graphite.atoms)[6], 4)
+        let corundumLoaded = try Parser.load(fixture("crystal_corundum.r1"), as: .crystal)
+        XCTAssertEqual(corundumLoaded.symmetryInputCompleteness, .complete)
+        let corundum = Scene(loaded: corundumLoaded)
+        XCTAssertEqual(corundum.crystalSymmetry?.symmetry?.spaceGroupNumber, 167)
+        XCTAssertEqual(counts(corundum.atoms)[13], 12)
+        XCTAssertEqual(counts(corundum.atoms)[8], 18)
+        let chabaziteLoaded = try Parser.load(fixture("crystal_chabazite.r1"), as: .crystal)
+        XCTAssertEqual(chabaziteLoaded.symmetryInputCompleteness, .complete)
+        let chabazite = Scene(loaded: chabaziteLoaded)
+        XCTAssertEqual(chabazite.crystalSymmetry?.symmetry?.spaceGroupNumber, 166)
+        XCTAssertEqual(counts(chabazite.atoms)[14], 36)
+        XCTAssertEqual(counts(chabazite.atoms)[8], 108)
+        let aragoniteLoaded = try Parser.load(fixture("crystal_argonite.r1"), as: .crystal)
+        XCTAssertEqual(aragoniteLoaded.symmetryInputCompleteness, .complete)
+        let aragonite = Scene(loaded: aragoniteLoaded)
+        XCTAssertEqual(aragonite.crystalSymmetry?.symmetry?.spaceGroupNumber, 62)
+        XCTAssertEqual(counts(aragonite.atoms)[20], 4)
+        XCTAssertEqual(counts(aragonite.atoms)[6], 4)
+        XCTAssertEqual(counts(aragonite.atoms)[8], 12)
+
+        // Remaining lattice-system Hall conventions: triclinic P1,
+        // monoclinic unique-b P2, and primitive trigonal P3.
+        for (group, lattice, expected) in [
+            (1, "4 5 6 80 90 70", 1),
+            (3, "4 5 6 100", 2),
+            (143, "4 6", 3),
+        ] {
+            let text = "synthetic-\(group)\nCRYSTAL\n0 0 0\n\(group)\n\(lattice)\n1\n6 0.123 0.234 0.345\nSTOP\n"
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mcrysden-sg-\(group)-\(UUID().uuidString).r1")
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let loaded = try Parser.load(url, as: .crystal)
+            XCTAssertEqual(loaded.atoms.count, expected, "space group \(group)")
+            XCTAssertEqual(loaded.symmetryInputCompleteness, .complete, "space group \(group)")
+        }
 
         let ptURL = fixture("crystal_Pt_fcc.r1")
         let ptLoaded = try Parser.load(ptURL, as: .crystal)
@@ -134,13 +184,122 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(unknown.atoms.count, 1)
         XCTAssertEqual(unknown.symmetryInputCompleteness, .asymmetricUnit)
 
+        // POLYMER is a 1D periodic crystal: isCrystal=true, periodicDim=1.
         let polymer = try Parser.load(fixture("crystal_polymer.r1"), as: .crystal)
-        XCTAssertFalse(polymer.isCrystal)
+        XCTAssertTrue(polymer.isCrystal)
         XCTAssertEqual(polymer.atoms.count, 6)
-        XCTAssertNil(polymer.cell)
+        let polymerCell = try XCTUnwrap(polymer.cell)
+        XCTAssertEqual(polymerCell.a.x, 2.4402, accuracy: 1e-4)
+        XCTAssertEqual(polymerCell.a.y, 0, accuracy: 1e-5)
+        XCTAssertEqual(polymerCell.b.x, 0, accuracy: 1e-5)
+        XCTAssertNotEqual(polymerCell.b.y, 0)
+        XCTAssertNotEqual(polymerCell.c.z, 0)
+        XCTAssertEqual(polymer.periodicDim, 1)
         XCTAssertEqual(polymer.symmetryInputCompleteness, .asymmetricUnit)
         XCTAssertEqual(polymer.atoms[0].coord.x, 0.5, accuracy: 1e-5)
         XCTAssertEqual(polymer.atoms[0].coord.y, 0.7219, accuracy: 1e-5)
+
+        // SLAB record (CRYSCAL/YCrySDen semantics): after an expanded CRYSTAL,
+        // SLAB / h k l / NSLAB VACUUM cuts a 2D periodic surface.
+        let slab = try Parser.load(fixture("crystal_Pt322.r1"), as: .crystal)
+        XCTAssertTrue(slab.isCrystal)
+        XCTAssertGreaterThan(slab.atoms.count, 0)
+        XCTAssertEqual(slab.periodicDim, 2)
+        XCTAssertEqual(slab.symmetryInputCompleteness, .complete)
+        let slabCell = try XCTUnwrap(slab.cell)
+        XCTAssertEqual(slabCell.c.x, 0, accuracy: 1e-5)
+        XCTAssertEqual(slabCell.c.y, 0, accuracy: 1e-5)
+        XCTAssertNotEqual(slabCell.c.z, 0, accuracy: 1e-5)
+        XCTAssertNotEqual(slabCell.a.x, 0, accuracy: 1e-5)
+        let cZ = slabCell.c.z
+        XCTAssertGreaterThanOrEqual(cZ, 10.0, "c.z must include the 10 Å user vacuum")
+        for atom in slab.atoms {
+            XCTAssertGreaterThanOrEqual(atom.coord.z, -1e-3,
+                                        "slab atom z must be nonnegative")
+            XCTAssertLessThan(atom.coord.z, cZ,
+                              "slab atom z must be below c.z")
+        }
+
+        // Malformed SLAB records must throw useful ParseError with path.
+        let ptBase = try String(contentsOf: fixture("crystal_Pt322.r1"), encoding: .utf8)
+        // Degenerate Miller indices (0 0 0).
+        let degSource = ptBase.replacingOccurrences(of: "3 2 2", with: "0 0 0")
+        let degURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-deg-\(UUID().uuidString).r1")
+        try degSource.write(to: degURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: degURL) }
+        XCTAssertThrowsError(try Parser.load(degURL, as: .crystal)) { error in
+            guard case ParseError.parse(let path, _, let reason) = error else {
+                return XCTFail("expected ParseError.parse, got \(error)")
+            }
+            XCTAssertEqual(path, degURL.path, "ParseError must carry the file path")
+            XCTAssertTrue(reason.contains("degenerate") || reason.contains("0 0 0"),
+                          "expected degenerate-Miller error, got: \(reason)")
+        }
+        // NSLAB = 0 (must be positive).
+        let zeroLayer = ptBase.replacingOccurrences(of: "1 10", with: "0 10")
+        let zlURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-zl-\(UUID().uuidString).r1")
+        try zeroLayer.write(to: zlURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: zlURL) }
+        XCTAssertThrowsError(try Parser.load(zlURL, as: .crystal)) { error in
+            guard case ParseError.parse(let path, _, let reason) = error else {
+                return XCTFail("expected ParseError.parse, got \(error)")
+            }
+            XCTAssertEqual(path, zlURL.path)
+            XCTAssertTrue(reason.contains("positive") || reason.contains("layer"),
+                          "expected positive-layer error, got: \(reason)")
+        }
+        // Negative vacuum.
+        let negVac = ptBase.replacingOccurrences(of: "1 10", with: "1 -5")
+        let nvURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-nv-\(UUID().uuidString).r1")
+        try negVac.write(to: nvURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: nvURL) }
+        XCTAssertThrowsError(try Parser.load(nvURL, as: .crystal)) { error in
+            guard case ParseError.parse(let path, _, let reason) = error else {
+                return XCTFail("expected ParseError.parse, got \(error)")
+            }
+            XCTAssertEqual(path, nvURL.path)
+            XCTAssertTrue(reason.contains("vacuum") || reason.contains("non-negative"),
+                          "expected vacuum error, got: \(reason)")
+        }
+
+        // NSLAB > 1 regression: Pt(322) with 3 layers.
+        let nSlab3Base = """
+        Pt-3layer-slab
+        CRYSTAL
+        1 0 0
+        F M 3 M
+        3.92
+        1
+        78 0.0 0.0 0.0
+        SLAB
+        3 2 2
+        3 8.0
+        EXTPRT
+        STOP
+        """
+        let nSlab3URL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-nslab3-\(UUID().uuidString).r1")
+        try nSlab3Base.write(to: nSlab3URL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: nSlab3URL) }
+        let slab3 = try Parser.load(nSlab3URL, as: .crystal)
+        XCTAssertTrue(slab3.isCrystal)
+        XCTAssertGreaterThan(slab3.atoms.count, 0)
+        XCTAssertEqual(slab3.periodicDim, 2)
+        XCTAssertEqual(slab3.symmetryInputCompleteness, .complete)
+        let slab3Cell = try XCTUnwrap(slab3.cell)
+        XCTAssertGreaterThanOrEqual(slab3Cell.c.z, 8.0,
+                                    "c.z must include the 8 Å user vacuum")
+        XCTAssertGreaterThan(slab3Cell.c.z, 8.0,
+                             "c.z must exceed vacuum alone (slab has thickness)")
+        for atom in slab3.atoms {
+            XCTAssertGreaterThanOrEqual(atom.coord.z, -1e-3)
+            XCTAssertLessThan(atom.coord.z, slab3Cell.c.z)
+        }
+        XCTAssertGreaterThan(slab3.atoms.count, slab.atoms.count,
+                             "3-layer slab should have more atoms than 1-layer")
     }
 
     func testScalarFieldsMarchingCubesAndMultiOrbitalIntegration() throws {

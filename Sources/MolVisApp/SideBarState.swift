@@ -112,6 +112,18 @@ final class SideBarState: ObservableObject {
     /// Computed band-gap summary text (e.g. "Eg = 1.23 eV (direct)").
     /// Set by the controller; not a scene field.
     @Published var bandGapSummary: String = ""
+    /// Runtime-only distribution analysis derived from the coordination result.
+    /// Nil when coordination is disabled or analysis is unavailable. Not a
+    /// scene field and not persisted.
+    @Published var distributionAnalysis: DistributionAnalysis?
+    /// Whether the distribution analysis (bond/angle/RDF) is available.
+    @Published var distributionAnalysisAvailable = false
+    /// Present the neighbor table panel for the current coordination analysis.
+    /// The controller owns the NeighborTableView and lazily creates the window.
+    var onShowNeighborTable: (() -> Void)?
+    /// Export the distribution analysis as CSV. The controller presents a save
+    /// panel and writes the CSV text. Not a scene field.
+    var onExportDistributionCSV: ((DistributionAnalysis) -> Void)?
     /// Computed electronic-analysis report (band or DOS). Set by the controller
     /// from the actually-displayed graph (DOS takes viewport precedence); nil
     /// when neither graph is available. Not a scene field.
@@ -215,6 +227,21 @@ final class SideBarState: ObservableObject {
     /// MSAA sample count for the Metal render target. Bound to the Appearance
     /// sidebar picker (Off/2x/4x/8x); the raw value IS the sample count.
     @Published var msaaSampleCount: Int = 1 { didSet { onChange?() } }
+    /// Scene-object opacity (0 = transparent, 1 = opaque). At 1.0 the output is
+    /// identical to the original opaque path.
+    @Published var opacity: Float = 1.0 { didSet { onChange?() } }
+    /// Line width in pixels for scene lines. 1 = original 1px.
+    @Published var lineWidth: Float = 1.0 { didSet { onChange?() } }
+    /// Depth-cueing (fog) strength: 0 = off; >0 fades distant fragments.
+    @Published var depthCueingStrength: Float = 0.0 { didSet { onChange?() } }
+    /// Ambient-occlusion strength: 0 = off; >0 darkens atoms/bonds.
+    @Published var aoStrength: Float = 0.0 { didSet { onChange?() } }
+    /// Soft-shadow strength: 0 = off; >0 darkens sides of atoms/bonds.
+    @Published var shadowStrength: Float = 0.0 { didSet { onChange?() } }
+    /// AO quality level (0 = off, 1 = low, 2 = medium, 3 = high).
+    @Published var aoQuality: Int = 2 { didSet { onChange?() } }
+    /// Soft-shadow quality level (0 = off, 1 = low, 2 = medium, 3 = high).
+    @Published var shadowQuality: Int = 2 { didSet { onChange?() } }
     /// Human-readable force/energy/stress readout for the Forces sidebar section,
     /// set by the controller from scene.forceSet on every render. Not @Published:
     /// it changes only when the scene reloads, so a plain assignment suffices.
@@ -268,6 +295,21 @@ final class SideBarState: ObservableObject {
     /// Export the electronic-analysis report as CSV. The controller presents a
     /// save panel and writes `csv`. Not a scene field.
     var onExportElectronicAnalysisCSV: ((ElectronicAnalysisReport) -> Void)?
+
+    /// Apply a publication preset's quality settings to this state. The preset
+    /// is an action (not document state): it sets multiple quality fields at
+    /// once without being persisted or synced back from the scene.
+    func applyPreset(_ preset: PublicationPreset) {
+        var tmp = Scene()
+        preset.apply(to: &tmp)
+        opacity = tmp.opacity
+        lineWidth = tmp.lineWidth
+        depthCueingStrength = tmp.depthCueingStrength
+        aoStrength = tmp.aoStrength
+        shadowStrength = tmp.shadowStrength
+        aoQuality = tmp.aoQuality
+        shadowQuality = tmp.shadowQuality
+    }
 
     /// Reflect a loaded scene's controls into the sidebar WITHOUT triggering
     /// onChange (so we don't immediately re-mutate the scene we just loaded).
@@ -345,6 +387,13 @@ final class SideBarState: ObservableObject {
         showForces = scene.showForces
         forceScale = scene.forceScale
         msaaSampleCount = scene.msaaSampleCount
+        opacity = scene.opacity
+        lineWidth = scene.lineWidth
+        depthCueingStrength = scene.depthCueingStrength
+        aoStrength = scene.aoStrength
+        shadowStrength = scene.shadowStrength
+        aoQuality = scene.aoQuality
+        shadowQuality = scene.shadowQuality
         onChange = saved
     }
 

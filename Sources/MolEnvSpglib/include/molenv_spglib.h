@@ -94,25 +94,51 @@ const char *molenv_spglib_last_error(void);
 MolEnvSpglibStatus molenv_spglib_niggli_reduce(double lattice_rows[9],
                                                double symprec);
 
-/* Resolve an International Hermann–Mauguin symbol to a unique cubic space
-   group (International Tables numbers 195 through 230). Case, whitespace,
-   minus signs, slash punctuation, and screw-axis underscores are normalized
-   only while comparing against spglib's database aliases. A successful call
-   leaves `out_spacegroup_number` as zero when the symbol is unknown,
-   non-cubic, or ambiguous; no guess is made. */
-MolEnvSpglibStatus molenv_spglib_cubic_spacegroup_number(const char *symbol,
-                                                          int32_t *out_spacegroup_number);
+/* Resolve an International Hermann–Mauguin symbol to a unique space group
+   (International Tables numbers 1 through 230). Case, whitespace, minus
+   signs, slash punctuation, and screw-axis underscores are normalized only
+   while comparing against spglib's database aliases. A successful call
+   leaves `out_spacegroup_number` as zero when the symbol is unknown or
+   ambiguous; no guess is made. */
+MolEnvSpglibStatus molenv_spglib_spacegroup_number(const char *symbol,
+                                                   int32_t *out_spacegroup_number);
 
-/* Copy the conventional-coordinate operations for one numeric cubic space
-   group (International Tables numbers 195 through 230) into caller-owned
-   flat buffers. No spglib-owned pointer escapes this call. `rotations` has
+/* Select a Hall setting compatible with Parser lattice conventions and copy
+   its operations into caller-owned flat buffers. Rhombohedral R groups use
+   the hexagonal H choice, monoclinic groups (3–15) use the
+   unique-b choice, and others use the canonical lowest Hall number. No
+   spglib-owned pointer escapes this call. `rotations` has
    `max_operations * 9` entries and `translations` has `max_operations * 3`;
-   both are required when max_operations is positive. */
-MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
-                                                   int32_t rotations[],
-                                                   double translations[],
-                                                   int32_t max_operations,
-                                                   int32_t *out_operations);
+   both are required when max_operations is positive. Returns
+   MOLENV_SPGLIB_SEARCH_FAILED when no compatible Hall setting exists. */
+MolEnvSpglibStatus molenv_spglib_operations(int32_t spacegroup_number,
+                                            int32_t rotations[],
+                                            double translations[],
+                                            int32_t max_operations,
+                                            int32_t *out_operations);
+
+/* Resolve a Hall setting for a space group that is compatible with the
+   parser lattice conventions AND whose international symbol matches the
+   given alias. `symbol` may be NULL for the plain convention-based
+   selection. When non-NULL, the alias is normalized the same way as
+   molenv_spglib_spacegroup_number and must exactly match the selected
+   Hall setting's own symbol; an alias that resolves to a different
+   setting fails safely. Returns the chosen Hall number (>0) on success,
+   or 0 when no compatible setting exists. */
+int32_t molenv_spglib_select_hall_number(int32_t spacegroup_number,
+                                         const char *symbol);
+
+/* Symbol-aware variant of molenv_spglib_operations. When `symbol` is
+   non-NULL, the Hall setting is selected by matching the symbol (via
+   molenv_spglib_select_hall_number); when NULL, the plain convention-based
+   selection is used. This lets CRYSCAL symbolic groups expand with the
+   correct setting for their declared lattice convention. */
+MolEnvSpglibStatus molenv_spglib_operations_with_symbol(int32_t spacegroup_number,
+                                                       const char *symbol,
+                                                       int32_t rotations[],
+                                                       double translations[],
+                                                       int32_t max_operations,
+                                                       int32_t *out_operations);
 
 #ifdef __cplusplus
 }

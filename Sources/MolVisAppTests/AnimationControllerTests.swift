@@ -38,6 +38,198 @@ final class AnimationControllerTests: XCTestCase {
         gridController.state.frameIndex = 0
         XCTAssertEqual(gridController.scene.currentFrame, 0)
         XCTAssertEqual(gridController.state.frameIndex, 0)
+
+        // MARK: - Atom-coordinate editing regression coverage
+        // Populate the atom table so commitAtomEdit can resolve filtered rows.
+        // (Table window is not visible in tests, so refreshAtomTable is skipped.)
+        relaxController.atomTable.update(atoms: relaxController.scene.atoms,
+                                          cell: relaxController.scene.cell,
+                                          selectedAtoms: relaxController.scene.selectedAtoms)
+
+        // --- Cartesian edit: change x of atom 0 ---
+        let cartOriginalX = relaxController.scene.atoms[0].coord.x
+        let cartOriginalY = relaxController.scene.atoms[0].coord.y
+        let cartOriginalZ = relaxController.scene.atoms[0].coord.z
+        let cartOriginalLabel = relaxController.scene.atoms[0].label
+        let cartOriginalForce = relaxController.scene.atoms[0].force
+        let cartOriginalAN = relaxController.scene.atoms[0].atomicNumber
+        let cartNewX = cartOriginalX + 1.5
+        let cartResult = relaxController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colX,
+            value: String(format: "%.3f", cartNewX))
+        XCTAssertEqual(cartResult, .accepted)
+        XCTAssertEqual(relaxController.scene.atoms[0].coord.x, cartNewX, accuracy: 1e-4)
+        // Unchanged components preserved.
+        XCTAssertEqual(relaxController.scene.atoms[0].coord.y, cartOriginalY, accuracy: 1e-6)
+        XCTAssertEqual(relaxController.scene.atoms[0].coord.z, cartOriginalZ, accuracy: 1e-6)
+        // Identity / label / force preserved.
+        XCTAssertEqual(relaxController.scene.atoms[0].atomicNumber, cartOriginalAN)
+        XCTAssertEqual(relaxController.scene.atoms[0].label, cartOriginalLabel)
+        XCTAssertEqual(relaxController.scene.atoms[0].force, cartOriginalForce)
+
+        // --- Fractional edit: change fractional a of atom 1 ---
+        guard relaxController.scene.cell != nil else {
+            throw XCTSkip("si_relax.out has no cell; cannot test fractional edit")
+        }
+        let fracBefore = relaxController.scene.fractionalCoord(relaxController.scene.atoms[1].coord)!
+        let fracNewA = fracBefore.x + 0.1
+        let fracResult = relaxController.commitAtomEdit(
+            row: 1, columnIdentifier: AtomTableView.colA,
+            value: String(format: "%.3f", fracNewA))
+        XCTAssertEqual(fracResult, .accepted)
+        let fracAfter = relaxController.scene.fractionalCoord(relaxController.scene.atoms[1].coord)!
+        XCTAssertEqual(fracAfter.x, fracNewA, accuracy: 1e-3)
+        // Other fractional components preserved.
+        XCTAssertEqual(fracAfter.y, fracBefore.y, accuracy: 1e-4)
+        XCTAssertEqual(fracAfter.z, fracBefore.z, accuracy: 1e-4)
+
+        // --- Measurement invalidation ---
+        // Set a locked measurement, then edit — measurement must clear.
+        relaxController.scene.selectedAtoms = [0, 1]
+        relaxController.scene.measurementMode = .distance
+        relaxController.scene.measurementResult = Scene.computeMeasurement(
+            mode: .distance, atoms: relaxController.scene.atoms,
+            selected: [0, 1], cell: relaxController.scene.cell,
+            periodicDim: relaxController.scene.periodicDim)
+        XCTAssertNotNil(relaxController.scene.measurementResult)
+        let measEditResult = relaxController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colY,
+            value: String(format: "%.3f", cartOriginalY + 0.5))
+        XCTAssertEqual(measEditResult, .accepted)
+        XCTAssertNil(relaxController.scene.measurementResult,
+                     "editing an atom must invalidate the locked measurement")
+
+        // Edited source snapshots survive a supercell round trip.
+        let editedBase = relaxController.scene
+        let expanded = editedBase.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
+        let restoredBase = expanded.widenSuperCell(SuperCell())
+        XCTAssertEqual(restoredBase.atoms, editedBase.atoms)
+        XCTAssertEqual(restoredBase.bonds.map { [$0.i, $0.j] },
+                       editedBase.bonds.map { [$0.i, $0.j] })
+
+        // --- Real undo / redo through the document undo manager ---
+        relaxController.undoCoordinateEdit()
+        XCTAssertEqual(relaxController.scene.atoms[0].coord.y, cartOriginalY, accuracy: 1e-4)
+        XCTAssertNotNil(relaxController.scene.measurementResult)
+        relaxController.redoCoordinateEdit()
+        XCTAssertEqual(relaxController.scene.atoms[0].coord.y, cartOriginalY + 0.5, accuracy: 1e-4)
+        XCTAssertNil(relaxController.scene.measurementResult)
+
+        // --- Coordination lifecycle: enabling coordination restarts analysis ---
+        relaxController.state.coordinationEnabled = true
+        XCTAssertEqual(relaxController.state.coordinationStatusText, "Calculating…")
+
+        // --- Invalid / nonfinite rejection leaves scene unchanged ---
+        let preRejectSnapshot = relaxController.scene
+        let nanResult = relaxController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colX, value: "nan")
+        XCTAssertEqual(nanResult, .rejected(reason: "\"nan\" is not a finite number."))
+        XCTAssertEqual(relaxController.scene.atoms[0].coord, preRejectSnapshot.atoms[0].coord)
+        XCTAssertEqual(relaxController.scene.atoms[1].coord, preRejectSnapshot.atoms[1].coord)
+        let infResult = relaxController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colX, value: "inf")
+        XCTAssertEqual(infResult, .rejected(reason: "\"inf\" is not a finite number."))
+        XCTAssertEqual(relaxController.scene.atoms[0].coord, preRejectSnapshot.atoms[0].coord)
+        let emptyResult = relaxController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colX, value: "not_a_number")
+        XCTAssertEqual(emptyResult, .rejected(reason: "\"not_a_number\" is not a finite number."))
+        XCTAssertEqual(relaxController.scene.atoms[0].coord, preRejectSnapshot.atoms[0].coord)
+
+        // --- Active supercell / slab edit rejection ---
+        relaxController.state.n1 = 2
+        relaxController.state.onChange?()
+        XCTAssertGreaterThan(relaxController.scene.superCell.total, 1)
+        relaxController.syncAtomTableEditingState()
+        XCTAssertFalse(relaxController.atomTable.isEditingEnabled)
+        let scReject = relaxController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colX, value: "0.000")
+        XCTAssertEqual(scReject, .rejected(reason: "Editing disabled: supercell active. Reset the supercell to 1×1×1 to edit atom coordinates."))
+        // Reset supercell; enable slab.
+        relaxController.state.n1 = 1
+        relaxController.state.slabEnabled = true
+        relaxController.state.onChange?()
+        XCTAssertNotNil(relaxController.scene.slab)
+        relaxController.syncAtomTableEditingState()
+        XCTAssertFalse(relaxController.atomTable.isEditingEnabled)
+        let slabReject = relaxController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colX, value: "0.000")
+        XCTAssertEqual(slabReject, .rejected(reason: "Editing disabled: slab active. Remove the slab to edit atom coordinates."))
+        XCTAssertEqual(relaxController.scene.atoms[0].coord, preRejectSnapshot.atoms[0].coord,
+                       "rejected edits must not change the scene")
+
+        // --- Molecule bonds update after coordinate edit ---
+        let molURL = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/h2o.xyz")
+        let molScene = Scene(loaded: try Parser.load(molURL))
+        let molController = MainWindowController(scene: Scene(), showWindow: false)
+        molController.loadFile(molScene, from: molURL, format: nil, frameIndex: 0)
+        XCTAssertNil(molController.scene.cell, "h2o.xyz is a molecule")
+        molController.atomTable.update(atoms: molController.scene.atoms,
+                                        cell: molController.scene.cell,
+                                        selectedAtoms: molController.scene.selectedAtoms)
+        let molBondsBefore = molController.scene.bonds
+        XCTAssertFalse(molBondsBefore.isEmpty, "molecule must have bonds after loading")
+        let molOrigX = molController.scene.atoms[0].coord.x
+        let molResult = molController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colX,
+            value: String(format: "%.3f", molOrigX + 0.5))
+        XCTAssertEqual(molResult, .accepted)
+        XCTAssertFalse(molController.scene.bonds.isEmpty,
+                       "molecule bonds must be recomputed after edit")
+        XCTAssertEqual(molController.scene.atoms[0].coord.x, molOrigX + 0.5, accuracy: 1e-4)
+
+        // --- Asymmetric-unit symmetry completeness preserved after edit ---
+        let asuController = AnimationControllerTests.findAsymmetricUnitController()
+        let asuCompletenessBefore = asuController.scene.crystalSymmetry?.inputCompleteness ?? .complete
+        XCTAssertNotEqual(asuCompletenessBefore, .complete,
+                          "fixture should be parsed as asymmetric-unit")
+        asuController.atomTable.update(atoms: asuController.scene.atoms,
+                                        cell: asuController.scene.cell,
+                                        selectedAtoms: asuController.scene.selectedAtoms)
+        let asuOrigX = asuController.scene.atoms[0].coord.x
+        let asuResult = asuController.commitAtomEdit(
+            row: 0, columnIdentifier: AtomTableView.colX,
+            value: String(format: "%.3f", asuOrigX + 0.1))
+        XCTAssertEqual(asuResult, .accepted)
+        let asuCompletenessAfter = asuController.scene.crystalSymmetry?.inputCompleteness ?? .complete
+        XCTAssertEqual(asuCompletenessAfter, asuCompletenessBefore,
+                       "edit must preserve asymmetric-unit completeness")
+        XCTAssertNil(asuController.scene.crystalSymmetry?.symmetry,
+                     "incomplete input must not gain symmetry after edit")
+    }
+
+    /// Find a CRYSCAL fixture that parses as asymmetric-unit (incomplete).
+    /// The parser expands numeric space groups (1-230) to `.complete`; files
+    /// with space group 0 or unrecognized symbols stay `.asymmetricUnit`.
+    static func findAsymmetricUnitController() -> MainWindowController {
+        let candidates = [
+            "crystal_argonite.r1",
+            "crystal_calcite.r1",
+            "crystal_chabazite.r1",
+            "crystal_cluster.r1",
+            "crystal_corundum.r1",
+            "crystal_cuprite.r1",
+            "crystal_graphite.r1",
+            "crystal_mgo.r1",
+            "crystal_polymer.r1",
+            "crystal_pyrite.r1",
+            "crystal_rutile.r1",
+            "crystal_zro2.r1",
+        ]
+        for name in candidates {
+            let url = URL(fileURLWithPath: #file)
+                .deletingLastPathComponent()
+                .appendingPathComponent("Fixtures/\(name)")
+            let scene = try! Scene(loaded: Parser.load(url))
+            let completeness = scene.crystalSymmetry?.inputCompleteness ?? .complete
+            if completeness != .complete {
+                let controller = MainWindowController(scene: Scene(), showWindow: false)
+                controller.loadFile(scene, from: url, format: nil, frameIndex: 0)
+                return controller
+            }
+        }
+        fatalError("no asymmetric-unit CRYSCAL fixture found")
     }
 
     // MARK: - Per-frame metadata gates + orbital/iso selection must track the

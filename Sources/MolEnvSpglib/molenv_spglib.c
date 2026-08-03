@@ -15,6 +15,7 @@
 #define MOLENV_SPGLIB_MAX_OPERATIONS 4096
 #define MOLENV_SPGLIB_FIRST_CUBIC_SPACEGROUP 195
 #define MOLENV_SPGLIB_LAST_CUBIC_SPACEGROUP 230
+#define MOLENV_SPGLIB_LAST_SPACEGROUP 230
 #define MOLENV_SPGLIB_LAST_HALL_NUMBER 530
 #define MOLENV_SPGLIB_NORMALIZED_SYMBOL_CAPACITY 64
 /* Spglib's symprec is a Cartesian distance in Angstroms. Keep synchronous
@@ -577,8 +578,12 @@ static int normalized_symbol_matches(const char *normalized_input,
            strcmp(normalized_input, normalized_candidate) == 0;
 }
 
-MolEnvSpglibStatus molenv_spglib_cubic_spacegroup_number(const char *symbol,
-                                                          int32_t *out_spacegroup_number) {
+MolEnvSpglibStatus molenv_spglib_operations_with_symbol(
+    int32_t spacegroup_number, const char *symbol, int32_t rotations[],
+    double translations[], int32_t max_operations, int32_t *out_operations);
+
+MolEnvSpglibStatus molenv_spglib_spacegroup_number(const char *symbol,
+                                                   int32_t *out_spacegroup_number) {
     char normalized_symbol[MOLENV_SPGLIB_NORMALIZED_SYMBOL_CAPACITY];
     int matched_spacegroup = 0;
     int ambiguous = 0;
@@ -586,7 +591,7 @@ MolEnvSpglibStatus molenv_spglib_cubic_spacegroup_number(const char *symbol,
 
     molenv_spglib_error[0] = '\0';
     if (out_spacegroup_number == NULL) {
-        set_error("missing cubic space-group output number");
+        set_error("missing space-group output number");
         return MOLENV_SPGLIB_INVALID_ARGUMENT;
     }
     *out_spacegroup_number = 0;
@@ -597,11 +602,9 @@ MolEnvSpglibStatus molenv_spglib_cubic_spacegroup_number(const char *symbol,
     }
 
     /* Search every Hall setting and every international-symbol spelling in the
-       vendored database. Multiple settings for one group are harmless; an
-       alias that reaches different international numbers is not accepted.
-       The caller subsequently asks cubic_operations for the number, which
-       deliberately selects the same lowest-Hall conventional setting used for
-       numeric CRYSCAL groups. */
+       vendored database across all 230 space groups. Multiple settings for
+       one group are harmless; an alias that reaches different international
+       numbers is not accepted. */
     for (hall = 1; hall <= MOLENV_SPGLIB_LAST_HALL_NUMBER; hall++) {
         SpglibSpacegroupType type = spg_get_spacegroup_type(hall);
         const char *candidates[3] = {
@@ -622,56 +625,167 @@ MolEnvSpglibStatus molenv_spglib_cubic_spacegroup_number(const char *symbol,
             }
         }
     }
-    if (!ambiguous && matched_spacegroup >= MOLENV_SPGLIB_FIRST_CUBIC_SPACEGROUP &&
-        matched_spacegroup <= MOLENV_SPGLIB_LAST_CUBIC_SPACEGROUP) {
+    if (!ambiguous && matched_spacegroup >= 1 &&
+        matched_spacegroup <= MOLENV_SPGLIB_LAST_SPACEGROUP) {
         *out_spacegroup_number = (int32_t)matched_spacegroup;
     }
     return MOLENV_SPGLIB_OK;
 }
 
-MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
-                                                   int32_t rotations[],
-                                                   double translations[],
-                                                   int32_t max_operations,
-                                                   int32_t *out_operations) {
-    int hall_number = 0;
+/* Infer the lattice system from a space group number using the standard
+   International Tables ranges. */
+static int lattice_system_rhombohedral(int spacegroup_number) {
+    switch (spacegroup_number) {
+        case 146: case 148: case 155: case 160:
+        case 161: case 166: case 167:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int lattice_system_monoclinic(int spacegroup_number) {
+    return spacegroup_number >= 3 && spacegroup_number <= 15;
+}
+
+/* Select a Hall setting compatible with parser lattice conventions.
+   Rhombohedral R groups use the hexagonal H choice, monoclinic groups
+   (3–15) use the unique-b choice, and others use the canonical lowest Hall
+   number. When `symbol` is non-NULL, the selected Hall setting's own
+   normalized symbol must match it; otherwise the choice fails safely. */
+int32_t molenv_spglib_select_hall_number(int32_t spacegroup_number,
+                                         const char *symbol) {
+    char normalized_symbol[MOLENV_SPGLIB_NORMALIZED_SYMBOL_CAPACITY];
+    int want_h = 0;
+    int want_unique_b = 0;
+    int first_hall = 0;
+    int best_hall = 0;
+    int hall;
+
+    molenv_spglib_error[0] = '\0';
+    if (spacegroup_number < 1 || spacegroup_number > MOLENV_SPGLIB_LAST_SPACEGROUP) {
+        set_error("space-group number out of range");
+        return 0;
+    }
+
+    want_h = lattice_system_rhombohedral(spacegroup_number);
+    want_unique_b = lattice_system_monoclinic(spacegroup_number);
+
+    /* If a symbol was supplied, the selected Hall setting must match it. */
+    int have_symbol = 0;
+    if (symbol != NULL) {
+        have_symbol = normalize_international_symbol(symbol, normalized_symbol);
+    }
+
+    for (hall = 1; hall <= MOLENV_SPGLIB_LAST_HALL_NUMBER; hall++) {
+        SpglibSpacegroupType type = spg_get_spacegroup_type(hall);
+        if (type.number != spacegroup_number) continue;
+
+        if (first_hall == 0) first_hall = hall;
+
+        /* Enforce symbol compatibility when a symbol was given. */
+        if (have_symbol) {
+            const char *candidates[3] = {
+                type.international_short,
+                type.international,
+                type.international_full
+            };
+            int matches = 0;
+            for (int c = 0; c < 3; c++) {
+                if (normalized_symbol_matches(normalized_symbol, candidates[c])) {
+                    matches = 1;
+                    break;
+                }
+            }
+            if (!matches) continue;
+        }
+
+        /* Rhombohedral R groups: require the hexagonal H choice. */
+        if (want_h) {
+            if (type.choice[0] == 'H') {
+                best_hall = hall;
+                break;
+            }
+            continue;
+        }
+
+        /* Monoclinic: every choice beginning with 'b' uses the parser's
+           unique-b convention. Suffixes select cell/origin variants while
+           preserving that unique axis; prefer the first compatible one. */
+        if (want_unique_b) {
+            if (type.choice[0] == 'b') {
+                best_hall = hall;
+                break;
+            }
+            continue;
+        }
+
+        /* Others: canonical lowest Hall number wins. */
+        best_hall = hall;
+        break;
+    }
+
+    if (best_hall == 0) {
+        if (want_h) {
+            set_error("space group has no hexagonal Hall setting compatible with CRYSCAL");
+        } else if (want_unique_b) {
+            set_error("space group has no unique-b Hall setting compatible with CRYSCAL");
+        } else if (first_hall == 0) {
+            set_error("space group is absent from the spglib database");
+        } else {
+            set_error("space group has no Hall setting compatible with CRYSCAL");
+        }
+        return 0;
+    }
+    return (int32_t)best_hall;
+}
+
+MolEnvSpglibStatus molenv_spglib_operations(int32_t spacegroup_number,
+                                            int32_t rotations[],
+                                            double translations[],
+                                            int32_t max_operations,
+                                            int32_t *out_operations) {
+    return molenv_spglib_operations_with_symbol(spacegroup_number, NULL, rotations,
+                                                translations, max_operations,
+                                                out_operations);
+}
+
+/* Core operation lookup with optional symbol-selected Hall setting.
+   When `symbol` is non-NULL, the Hall setting must match the symbol
+   (via molenv_spglib_select_hall_number); otherwise the plain
+   convention-based Hall selection is used. */
+MolEnvSpglibStatus molenv_spglib_operations_with_symbol(int32_t spacegroup_number,
+                                                       const char *symbol,
+                                                       int32_t rotations[],
+                                                       double translations[],
+                                                       int32_t max_operations,
+                                                       int32_t *out_operations) {
+    int hall_number;
     int database_rotations[192][3][3];
     double database_translations[192][3];
     int operation_count;
-    int hall;
     int i;
     int j;
 
     molenv_spglib_error[0] = '\0';
     if (out_operations == NULL) {
-        set_error("missing cubic-operation output count");
+        set_error("missing operation output count");
         return MOLENV_SPGLIB_INVALID_ARGUMENT;
     }
     *out_operations = 0;
-    if (spacegroup_number < MOLENV_SPGLIB_FIRST_CUBIC_SPACEGROUP ||
-        spacegroup_number > MOLENV_SPGLIB_LAST_CUBIC_SPACEGROUP) {
-        set_error("cubic operation lookup requires space-group number 195 through 230");
+    if (spacegroup_number < 1 || spacegroup_number > MOLENV_SPGLIB_LAST_SPACEGROUP) {
+        set_error("operation lookup requires space-group number 1 through 230");
         return MOLENV_SPGLIB_INVALID_ARGUMENT;
     }
     if (max_operations <= 0 || max_operations > 192 || rotations == NULL ||
         translations == NULL) {
-        set_error("invalid cubic-operation output buffers");
+        set_error("invalid operation output buffers");
         return MOLENV_SPGLIB_INVALID_ARGUMENT;
     }
 
-    /* The first Hall setting is the canonical conventional setting for each
-       numeric cubic group. Some groups have a second setting; CRYSCAL gives
-       only the numeric group, so selecting the lowest Hall number is the
-       deterministic International-Tables setting. */
-    for (hall = 1; hall <= MOLENV_SPGLIB_LAST_HALL_NUMBER; hall++) {
-        SpglibSpacegroupType type = spg_get_spacegroup_type(hall);
-        if (type.number == spacegroup_number) {
-            hall_number = hall;
-            break;
-        }
-    }
+    hall_number = (int)molenv_spglib_select_hall_number(spacegroup_number, symbol);
     if (hall_number == 0) {
-        set_error("numeric cubic space group is absent from the spglib database");
+        /* Error message already set by molenv_spglib_select_hall_number. */
         return MOLENV_SPGLIB_SEARCH_FAILED;
     }
 
@@ -679,11 +793,11 @@ MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
                                                        database_translations,
                                                        hall_number);
     if (operation_count <= 0 || operation_count > 192) {
-        set_error("spglib returned an invalid cubic operation count");
+        set_error("spglib returned an invalid operation count");
         return MOLENV_SPGLIB_SEARCH_FAILED;
     }
     if (operation_count > max_operations) {
-        set_error("cubic operation output capacity is too small");
+        set_error("operation output capacity is too small");
         return MOLENV_SPGLIB_INVALID_ARGUMENT;
     }
     for (i = 0; i < operation_count; i++) {
@@ -692,7 +806,7 @@ MolEnvSpglibStatus molenv_spglib_cubic_operations(int32_t spacegroup_number,
         }
         for (j = 0; j < 3; j++) {
             if (!isfinite(database_translations[i][j])) {
-                set_error("spglib returned a non-finite cubic operation translation");
+                set_error("spglib returned a non-finite operation translation");
                 return MOLENV_SPGLIB_SEARCH_FAILED;
             }
             translations[i * 3 + j] = database_translations[i][j];

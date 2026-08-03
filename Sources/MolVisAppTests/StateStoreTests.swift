@@ -24,6 +24,14 @@ final class StateStoreTests: XCTestCase {
         scene.showScaleIndicator = true
         scene.msaaSampleCount = 2
         scene.currentFrame = 7
+        // Rendering-quality fields.
+        scene.opacity = 0.42
+        scene.lineWidth = 3.5
+        scene.depthCueingStrength = 0.75
+        scene.aoStrength = 0.6
+        scene.shadowStrength = 0.55
+        scene.aoQuality = 3
+        scene.shadowQuality = 1
 
         let fields = [
             ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
@@ -115,6 +123,14 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(restored.kPathBreaks, scene.kPathBreaks)
         XCTAssertEqual(restored.kPathProvenance, .userEdited)
         XCTAssertEqual(sampling, 42)
+        // Rendering-quality round-trip (exact, bounded values).
+        XCTAssertEqual(restored.opacity, 0.42, accuracy: 0.0001)
+        XCTAssertEqual(restored.lineWidth, 3.5, accuracy: 0.0001)
+        XCTAssertEqual(restored.depthCueingStrength, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(restored.aoStrength, 0.6, accuracy: 0.0001)
+        XCTAssertEqual(restored.shadowStrength, 0.55, accuracy: 0.0001)
+        XCTAssertEqual(restored.aoQuality, 3)
+        XCTAssertEqual(restored.shadowQuality, 1)
 
         let assertCamera: (Camera, SIMD3<Float>, Float, simd_quatf, Bool) -> Void = {
             actual, center, distance, rotation, perspective in
@@ -208,6 +224,14 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(sampling, 20, "missing k-path sampling uses the KPath default")
         XCTAssertEqual(scene.displayMode, .ballStick)
         XCTAssertEqual(scene.atomScale, 0.35, accuracy: 0.0001)
+        // Missing rendering-quality keys keep defaults (preserve original output).
+        XCTAssertEqual(scene.opacity, 1.0, "missing opacity key keeps opaque default")
+        XCTAssertEqual(scene.lineWidth, 1.0, "missing lineWidth key keeps 1px default")
+        XCTAssertEqual(scene.depthCueingStrength, 0.0, "missing depthCueingStrength key keeps off default")
+        XCTAssertEqual(scene.aoStrength, 0.0, "missing aoStrength key keeps off default")
+        XCTAssertEqual(scene.shadowStrength, 0.0, "missing shadowStrength key keeps off default")
+        XCTAssertEqual(scene.aoQuality, 2, "missing aoQuality key keeps medium default")
+        XCTAssertEqual(scene.shadowQuality, 2, "missing shadowQuality key keeps medium default")
     }
 
     func testStateFormatIsFlatAndRejectsFutureVersion() throws {
@@ -330,7 +354,7 @@ final class StateStoreTests: XCTestCase {
         XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
                                                 cameraBookmarks: &bookmarks, from: tmp),
                              "unsupported msaaSampleCount must reject") { error in
-            guard case let ParseError.parse(path, _, reason) = error else {
+            guard case let ParseError.parse(_, _, reason) = error else {
                 return XCTFail("expected a malformed-msaa parse error")
             }
             XCTAssertTrue(reason.contains("msaaSampleCount"), "reason should mention msaaSampleCount")
@@ -368,6 +392,58 @@ final class StateStoreTests: XCTestCase {
             }
         }
         try assertUnchanged()
+
+        // Non-numeric rendering-quality values are silently ignored (fallback
+        // to default) rather than rejected. Use a minimal payload without a
+        // camera/bookmarks so we can isolate the rendering-quality fields.
+        let nonnumericQuality: [String: Any] = [
+            "version": 1,
+            "displayMode": "ballStick",
+            "atomScale": 0.9,
+            "opacity": "not a number",
+            "lineWidth": "fat",
+            "depthCueingStrength": true,
+        ]
+        try JSONSerialization.data(withJSONObject: nonnumericQuality, options: []).write(to: tmp)
+        var sceneNonnumeric = Scene()
+        sceneNonnumeric.opacity = 0.5
+        sceneNonnumeric.lineWidth = 3.0
+        sceneNonnumeric.depthCueingStrength = 0.5
+        sceneNonnumeric.aoStrength = 0.5
+        sceneNonnumeric.shadowStrength = 0.5
+        var cameraNonnumeric: Camera? = nil
+        var bookmarksNonnumeric: [CameraBookmark?] = []
+        XCTAssertNoThrow(try StateStore.load(into: &sceneNonnumeric, camera: &cameraNonnumeric,
+                                            cameraBookmarks: &bookmarksNonnumeric, from: tmp),
+                        "non-numeric rendering-quality values must not throw")
+        XCTAssertEqual(sceneNonnumeric.opacity, 0.5, "non-numeric opacity falls back to pre-load value")
+        XCTAssertEqual(sceneNonnumeric.lineWidth, 3.0, "non-numeric lineWidth falls back to pre-load value")
+        // JSON true deserializes as NSNumber boolean, which casts to 1.0 (finiteFloat accepts it).
+        XCTAssertEqual(sceneNonnumeric.depthCueingStrength, 1.0, "boolean depthCueingStrength decodes as 1.0")
+
+        // Out-of-bounds rendering-quality values are clamped, not rejected.
+        let oobQuality: [String: Any] = [
+            "version": 1,
+            "displayMode": "ballStick",
+            "atomScale": 0.9,
+            "opacity": 99.0,
+            "lineWidth": -5.0,
+            "depthCueingStrength": 42.0,
+            "aoStrength": -1.0,
+            "shadowStrength": 100.0,
+        ]
+        try JSONSerialization.data(withJSONObject: oobQuality, options: []).write(to: tmp)
+        var sceneOob = Scene()
+        var cameraOob: Camera? = nil
+        var bookmarksOob: [CameraBookmark?] = []
+        XCTAssertNoThrow(try StateStore.load(into: &sceneOob, camera: &cameraOob,
+                                            cameraBookmarks: &bookmarksOob, from: tmp),
+                        "out-of-bounds rendering-quality values must not throw")
+        XCTAssertEqual(sceneOob.opacity, 1.0, "opacity clamps to 1.0")
+        XCTAssertEqual(sceneOob.lineWidth, 1.0, "lineWidth clamps to 1.0 minimum")
+        XCTAssertEqual(sceneOob.depthCueingStrength, 1.0, "depthCueingStrength clamps to 1.0")
+        XCTAssertEqual(sceneOob.aoStrength, 0.0, "aoStrength clamps to 0.0 minimum")
+        XCTAssertEqual(sceneOob.shadowStrength, 1.0, "shadowStrength clamps to 1.0")
 
         // Nonintegral msaaSampleCount must also reject.
         let nonintegralMSAA: [String: Any] = [

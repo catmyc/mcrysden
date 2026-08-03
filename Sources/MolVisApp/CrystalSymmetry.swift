@@ -244,9 +244,21 @@ struct CrystalSymmetryAnalysis {
     let symmetry: CrystalSymmetry?
     let unavailableReason: CrystalSymmetryUnavailableReason?
     let tolerance: Double
+    /// The input-completeness assumption supplied to the analyzer. Preserved
+    /// across coordinate edits so an asymmetric-unit/unknown file is never
+    /// falsely promoted to `.complete` by a later edit.
+    let inputCompleteness: SymmetryInputCompleteness
 
     var isAvailable: Bool { symmetry != nil }
     var reasonDescription: String? { unavailableReason?.description }
+
+    init(symmetry: CrystalSymmetry?, unavailableReason: CrystalSymmetryUnavailableReason?,
+         tolerance: Double, inputCompleteness: SymmetryInputCompleteness = .complete) {
+        self.symmetry = symmetry
+        self.unavailableReason = unavailableReason
+        self.tolerance = tolerance
+        self.inputCompleteness = inputCompleteness
+    }
 }
 
 /// Keep the derived value out of persisted Scene data. StateStore's explicit
@@ -299,45 +311,40 @@ enum CrystalSymmetryAnalyzer {
     static func analyze(cell: Cell?, atoms: [Atom], isCrystal: Bool,
                         periodicDim: Int, tolerance: Double = defaultTolerance,
                         inputCompleteness: SymmetryInputCompleteness = .complete) -> CrystalSymmetryAnalysis {
+        // Helper that threads `inputCompleteness` into every return path so the
+        // analyzer never silently drops the caller's completeness assumption.
+        func result(symmetry: CrystalSymmetry?,
+                    reason: CrystalSymmetryUnavailableReason?) -> CrystalSymmetryAnalysis {
+            CrystalSymmetryAnalysis(symmetry: symmetry, unavailableReason: reason,
+                                    tolerance: tolerance, inputCompleteness: inputCompleteness)
+        }
         guard practicalToleranceRange.contains(tolerance) else {
-            return CrystalSymmetryAnalysis(symmetry: nil, unavailableReason: .invalidTolerance,
-                                            tolerance: tolerance)
+            return result(symmetry: nil, reason: .invalidTolerance)
         }
         guard isCrystal, periodicDim == 3 else {
-            return CrystalSymmetryAnalysis(symmetry: nil, unavailableReason: .notThreeDimensional,
-                                            tolerance: tolerance)
+            return result(symmetry: nil, reason: .notThreeDimensional)
         }
         guard inputCompleteness == .complete else {
-            return CrystalSymmetryAnalysis(symmetry: nil,
-                                            unavailableReason: .incompleteInput(inputCompleteness),
-                                            tolerance: tolerance)
+            return result(symmetry: nil, reason: .incompleteInput(inputCompleteness))
         }
         guard let cell else {
-            return CrystalSymmetryAnalysis(symmetry: nil, unavailableReason: .missingCell,
-                                            tolerance: tolerance)
+            return result(symmetry: nil, reason: .missingCell)
         }
         guard !atoms.isEmpty else {
-            return CrystalSymmetryAnalysis(symmetry: nil, unavailableReason: .noAtoms,
-                                            tolerance: tolerance)
+            return result(symmetry: nil, reason: .noAtoms)
         }
         guard atoms.count <= baseAtomCap else {
-            return CrystalSymmetryAnalysis(
-                symmetry: nil,
-                unavailableReason: .atomCountExceeded(atoms.count, baseAtomCap),
-                tolerance: tolerance
-            )
+            return result(symmetry: nil, reason: .atomCountExceeded(atoms.count, baseAtomCap))
         }
         let cellValues = [cell.a.x, cell.a.y, cell.a.z,
                           cell.b.x, cell.b.y, cell.b.z,
                           cell.c.x, cell.c.y, cell.c.z].map(Double.init)
         guard cellValues.allSatisfy(\.isFinite) else {
-            return CrystalSymmetryAnalysis(symmetry: nil, unavailableReason: .nonFiniteCell,
-                                            tolerance: tolerance)
+            return result(symmetry: nil, reason: .nonFiniteCell)
         }
         let lattice = CrystalSymmetryMatrix(cellValues)
         guard isWellConditioned(lattice) else {
-            return CrystalSymmetryAnalysis(symmetry: nil, unavailableReason: .singularCell,
-                                            tolerance: tolerance)
+            return result(symmetry: nil, reason: .singularCell)
         }
 
         var fractional: [SIMD3<Double>] = []
@@ -347,19 +354,14 @@ enum CrystalSymmetryAnalyzer {
         for (index, atom) in atoms.enumerated() {
             let cartesian = SIMD3<Double>(Double(atom.coord.x), Double(atom.coord.y), Double(atom.coord.z))
             guard cartesian.x.isFinite, cartesian.y.isFinite, cartesian.z.isFinite else {
-                return CrystalSymmetryAnalysis(symmetry: nil,
-                                                unavailableReason: .nonFiniteAtom(index),
-                                                tolerance: tolerance)
+                return result(symmetry: nil, reason: .nonFiniteAtom(index))
             }
             guard atom.atomicNumber > 0, atom.atomicNumber <= Int(Int32.max) else {
-                return CrystalSymmetryAnalysis(symmetry: nil,
-                                                unavailableReason: .invalidAtomicNumber(index),
-                                                tolerance: tolerance)
+                return result(symmetry: nil, reason: .invalidAtomicNumber(index))
             }
             guard let f = fractionalCoordinate(cartesian, latticeRows: lattice),
                   f.x.isFinite, f.y.isFinite, f.z.isFinite else {
-                return CrystalSymmetryAnalysis(symmetry: nil, unavailableReason: .singularCell,
-                                                tolerance: tolerance)
+                return result(symmetry: nil, reason: .singularCell)
             }
             fractional.append(f)
             types.append(Int32(atom.atomicNumber))
@@ -372,14 +374,9 @@ enum CrystalSymmetryAnalyzer {
                 types: types,
                 tolerance: tolerance
             )
-            return CrystalSymmetryAnalysis(symmetry: symmetry, unavailableReason: nil,
-                                            tolerance: tolerance)
+            return result(symmetry: symmetry, reason: nil)
         } catch {
-            return CrystalSymmetryAnalysis(
-                symmetry: nil,
-                unavailableReason: .bridgeFailure(error.localizedDescription),
-                tolerance: tolerance
-            )
+            return result(symmetry: nil, reason: .bridgeFailure(error.localizedDescription))
         }
     }
 

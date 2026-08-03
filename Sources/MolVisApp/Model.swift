@@ -123,6 +123,61 @@ enum MSAASampleCount: Int, CaseIterable {
 
 struct ColorScheme: Codable { var mode: String = "atomic" }
 
+/// Publication-quality presets that set multiple rendering controls at once.
+/// Each preset configures line width, opacity, depth cueing, AO, and shadows for
+/// a common output target. `.default` preserves the original rendering exactly.
+enum PublicationPreset: String, Codable, CaseIterable {
+    case `default` = "default"
+    case journal = "journal"
+    case presentation = "presentation"
+    case print = "print"
+    var label: String {
+        switch self {
+        case .default: return "Default"
+        case .journal: return "Journal (fine lines, subtle AO)"
+        case .presentation: return "Presentation (bold lines)"
+        case .print: return "Print (depth cueing, stronger shading)"
+        }
+    }
+    /// Apply this preset's quality settings to the given scene.
+    func apply(to scene: inout Scene) {
+        switch self {
+        case .default:
+            scene.lineWidth = 1.0
+            scene.opacity = 1.0
+            scene.depthCueingStrength = 0.0
+            scene.aoStrength = 0.0
+            scene.shadowStrength = 0.0
+            scene.aoQuality = 2
+            scene.shadowQuality = 2
+        case .journal:
+            scene.lineWidth = 1.5
+            scene.opacity = 1.0
+            scene.depthCueingStrength = 0.0
+            scene.aoStrength = 0.4
+            scene.shadowStrength = 0.3
+            scene.aoQuality = 2
+            scene.shadowQuality = 2
+        case .presentation:
+            scene.lineWidth = 3.0
+            scene.opacity = 1.0
+            scene.depthCueingStrength = 0.0
+            scene.aoStrength = 0.0
+            scene.shadowStrength = 0.0
+            scene.aoQuality = 2
+            scene.shadowQuality = 2
+        case .print:
+            scene.lineWidth = 2.0
+            scene.opacity = 1.0
+            scene.depthCueingStrength = 0.35
+            scene.aoStrength = 0.5
+            scene.shadowStrength = 0.4
+            scene.aoQuality = 3
+            scene.shadowQuality = 3
+        }
+    }
+}
+
 struct Scene: Codable {
     var atoms: [Atom] = []
     var bonds: [Bond] = []
@@ -253,6 +308,32 @@ struct Scene: Codable {
     /// Runtime-only symmetry analysis of the pristine 3D periodic structure.
     /// It is intentionally excluded from synthesized Scene persistence.
     @NonPersisted var crystalSymmetry: CrystalSymmetryAnalysis?
+
+    // MARK: - Rendering quality controls
+    // These drive configurable line widths, transparency, depth cueing, and
+    // ambient-occlusion / soft-shadow approximations. All default to values that
+    // preserve the original output exactly.
+
+    /// Scene-object opacity (0 = fully transparent, 1 = fully opaque). At 1.0 the
+    /// alpha-blended result is identical to the original opaque path.
+    var opacity: Float = 1.0
+    /// Line width in pixels for scene lines (cell frame, axes, BZ, k-path,
+    /// measurements, forces). 1 = original 1px; >1 uses an expanded-quad path.
+    var lineWidth: Float = 1.0
+    /// Depth-cueing (fog) strength: 0 = off; >0 fades distant fragments toward
+    /// the background color. The cueing range is derived from the framing sphere.
+    var depthCueingStrength: Float = 0.0
+    /// Ambient-occlusion strength: 0 = off; >0 darkens atoms/bonds surrounded by
+    /// neighbors. The per-atom AO factor is computed from neighbor geometry.
+    var aoStrength: Float = 0.0
+    /// Soft-shadow strength: 0 = off; >0 darkens sides of atoms/bonds where
+    /// neighbors block the light direction.
+    var shadowStrength: Float = 0.0
+    /// AO quality level (0 = off, 1 = low, 2 = medium, 3 = high). Controls the
+    /// neighbor search radius and sampling density.
+    var aoQuality: Int = 2
+    /// Soft-shadow quality level (0 = off, 1 = low, 2 = medium, 3 = high).
+    var shadowQuality: Int = 2
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

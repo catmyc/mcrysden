@@ -281,6 +281,95 @@ enum PeriodicGeometry {
         for i in 0..<n where kA[i] != kB[i] { return kA[i] < kB[i] }
         return false
     }
+
+    /// Returns the angle (in degrees) at vertex `b` between atoms a-b-c,
+    /// using minimum-image displacements for periodic cells. Returns nil for
+    /// invalid/non-finite input or degenerate (zero-length) vectors.
+    static func minimumImageAngle(a: SIMD3<Float>, b: SIMD3<Float>, c: SIMD3<Float>,
+                                   cell: Cell?, periodicDim: Int) -> Float? {
+        guard (0...3).contains(periodicDim) else { return nil }
+        guard a.isFinite, b.isFinite, c.isFinite else { return nil }
+
+        let d0: SIMD3<Float>
+        let d2: SIMD3<Float>
+
+        if periodicDim == 0 || cell == nil {
+            d0 = a - b
+            d2 = c - b
+        } else {
+            guard let cell, cell.isFinite,
+                  let disp0 = minimumImageDisplacement(from: b, to: a, cell: cell,
+                                                        periodicDim: periodicDim),
+                  let disp2 = minimumImageDisplacement(from: b, to: c, cell: cell,
+                                                        periodicDim: periodicDim) else {
+                return nil
+            }
+            d0 = disp0
+            d2 = disp2
+        }
+
+        let len0 = length(d0)
+        let len2 = length(d2)
+        guard len0.isFinite, len0 > 1e-8, len2.isFinite, len2 > 1e-8 else { return nil }
+
+        let cosAngle = min(max(dot(d0 / len0, d2 / len2), -1), 1)
+        let angle = acos(cosAngle) * 180 / .pi
+        guard angle.isFinite else { return nil }
+        return angle
+    }
+
+    /// Returns the unsigned dihedral angle (in degrees, 0–180) for atoms
+    /// a-b-c-d, using minimum-image displacements for periodic cells.
+    /// Returns nil for invalid/non-finite input or degenerate vectors.
+    /// The result is unsigned (acos-based) to match the non-periodic path in
+    /// Scene.computeMeasurement.
+    static func minimumImageDihedral(a: SIMD3<Float>, b: SIMD3<Float>,
+                                      c: SIMD3<Float>, d: SIMD3<Float>,
+                                      cell: Cell?, periodicDim: Int) -> Float? {
+        guard (0...3).contains(periodicDim) else { return nil }
+        guard a.isFinite, b.isFinite, c.isFinite, d.isFinite else { return nil }
+
+        let ba: SIMD3<Float>
+        let cbVec: SIMD3<Float>
+        let dc: SIMD3<Float>
+
+        if periodicDim == 0 || cell == nil {
+            ba = a - b
+            cbVec = b - c
+            dc = c - d
+        } else {
+            guard let cell, cell.isFinite,
+                  let dispBA = minimumImageDisplacement(from: b, to: a, cell: cell,
+                                                         periodicDim: periodicDim),
+                  let dispCB = minimumImageDisplacement(from: c, to: b, cell: cell,
+                                                         periodicDim: periodicDim),
+                  let dispDC = minimumImageDisplacement(from: d, to: c, cell: cell,
+                                                         periodicDim: periodicDim) else {
+                return nil
+            }
+            ba = dispBA
+            cbVec = dispCB
+            dc = dispDC
+        }
+
+        let lenBA = length(ba)
+        let lenCB = length(cbVec)
+        let lenDC = length(dc)
+        guard lenBA.isFinite, lenBA > 1e-8, lenCB.isFinite, lenCB > 1e-8,
+              lenDC.isFinite, lenDC > 1e-8 else { return nil }
+
+        let n1 = cross(ba, cbVec)
+        let n2 = cross(cbVec, dc)
+        let lenN1 = length(n1)
+        let lenN2 = length(n2)
+        guard lenN1.isFinite, lenN1 > 1e-8, lenN2.isFinite, lenN2 > 1e-8 else { return nil }
+
+        // Unsigned dihedral (0-180°), matching the non-periodic convention.
+        let cosDihedral = min(max(dot(n1 / lenN1, n2 / lenN2), -1), 1)
+        let dihedral = acos(cosDihedral) * 180 / .pi
+        guard dihedral.isFinite else { return nil }
+        return dihedral
+    }
 }
 
 extension SIMD3 where Scalar == Float {
@@ -295,4 +384,23 @@ extension SIMD3 where Scalar == Double {
 
 extension Cell {
     var isFinite: Bool { a.isFinite && b.isFinite && c.isFinite }
+
+    /// True when the cell has a nonzero volume (the three vectors are linearly
+    /// independent) AND all components are finite. A singular (zero-volume)
+    /// cell has no well-defined fractional coordinates.
+    var isNonsingular: Bool {
+        guard isFinite else { return false }
+        let det = a.x * (b.y * c.z - c.y * b.z)
+                - b.x * (a.y * c.z - c.y * a.z)
+                + c.x * (a.y * b.z - b.y * a.z)
+        // Normalize by the product of the vector lengths so the threshold is
+        // scale-invariant (matches the fractional-conversion convention).
+        func length(_ v: SIMD3<Float>) -> Float {
+            sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+        }
+        let scale = length(a) * length(b) * length(c)
+        guard scale.isFinite, scale > 0 else { return false }
+        let relative = abs(det) / scale
+        return relative.isFinite && relative > 1e-12
+    }
 }

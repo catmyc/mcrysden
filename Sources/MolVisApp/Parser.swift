@@ -729,27 +729,24 @@ enum Parser {
         // Keep the numeric declaration separate from the original symbol used
         // for lattice-system inference. The C façade compares symbolic aliases
         // against spglib's full database and returns a number only for a unique
-        // cubic match; zero means unknown, non-cubic, or ambiguous.
+        // match among all 230 groups; zero means unknown or ambiguous.
         let numericSpaceGroup = spgTok.count == 1 ? Int(spgTok[0]) : nil
-        let symbolicCubicSpaceGroup: Int? = {
+        let symbolicSpaceGroup: Int? = {
             guard numericSpaceGroup == nil, !spgTok.isEmpty else { return nil }
             let symbol = spgTok.joined(separator: " ")
             var resolved: Int32 = 0
             let status = symbol.withCString { pointer in
-                molenv_spglib_cubic_spacegroup_number(pointer, &resolved)
+                molenv_spglib_spacegroup_number(pointer, &resolved)
             }
             guard status == MOLENV_SPGLIB_OK else { return nil }
             let number = Int(resolved)
-            return (195...230).contains(number) ? number : nil
+            return (1...230).contains(number) ? number : nil
         }()
-        let originalSymbolSpaceGroup: Int? = {
-            let sym = spgTok.joined().uppercased()
-            switch sym {
-            case "PMCN": return 53
-            default: return nil
-            }
-        }()
-        let spgNumber: Int = numericSpaceGroup ?? symbolicCubicSpaceGroup ?? originalSymbolSpaceGroup ?? 0
+        if let numericSpaceGroup, !(1...230).contains(numericSpaceGroup) {
+            throw failure(spaceGroupLine,
+                          "CRYSCAL space-group number \(numericSpaceGroup) is outside 1...230")
+        }
+        let spgNumber: Int = numericSpaceGroup ?? symbolicSpaceGroup ?? 0
 
         // crystal system -> lattice-param count + cell angles, per the standard
         // crystallographic convention (International Tables) that CRYSCAL's r1 line
@@ -794,7 +791,7 @@ enum Parser {
         }
         guard lats.count == nLat else { throw failure(idx, "bad CRYSCAL lattice constants") }
 
-        let cell: Cell = {
+        var cell: Cell = {
             switch system {
             case .cubic:
                 return Cell.fromLattice(a: lats[0], b: lats[0], c: lats[0], alpha: 90, beta: 90, gamma: 90)
@@ -885,20 +882,44 @@ enum Parser {
         }
 
         var completeness: SymmetryInputCompleteness = .asymmetricUnit
-        let candidateExpansionSpaceGroup = numericSpaceGroup ?? symbolicCubicSpaceGroup
+        let candidateExpansionSpaceGroup = numericSpaceGroup ?? symbolicSpaceGroup
         let supportsExpansion = kind == "CRYSTAL" &&
-            candidateExpansionSpaceGroup.map { (195...230).contains($0) } == true
+            candidateExpansionSpaceGroup.map { (1...230).contains($0) } == true
         if supportsExpansion, let expansionSpaceGroup = candidateExpansionSpaceGroup {
+            // Resolve the symbol for Hall setting selection. For symbolic
+            // groups, the symbol constrains which Hall setting is used; for
+            // numeric groups, NULL selects the convention-based choice
+            // (hexagonal H for rhombohedral R groups, unique-b for monoclinic,
+            // canonical lowest for others).
+            let symbolForHall: String? = {
+                if numericSpaceGroup != nil { return nil }
+                guard !spgTok.isEmpty else { return nil }
+                return spgTok.joined(separator: " ")
+            }()
             let maxOperations = 192
             var rotations = [Int32](repeating: 0, count: maxOperations * 9)
             var translations = [Double](repeating: 0, count: maxOperations * 3)
             var operationCount: Int32 = 0
             let status = rotations.withUnsafeMutableBufferPointer { rotationBuffer in
                 translations.withUnsafeMutableBufferPointer { translationBuffer in
-                    molenv_spglib_cubic_operations(
-                        Int32(expansionSpaceGroup), rotationBuffer.baseAddress,
-                        translationBuffer.baseAddress, Int32(maxOperations), &operationCount
-                    )
+                    // Use the symbol-aware Hall selection: numeric groups pass
+                    // NULL for convention-based choice; symbolic groups pass the
+                    // alias so the Hall setting must match it.
+                    if let symbol = symbolForHall {
+                        return symbol.withCString { pointer in
+                            molenv_spglib_operations_with_symbol(
+                                Int32(expansionSpaceGroup), pointer,
+                                rotationBuffer.baseAddress,
+                                translationBuffer.baseAddress,
+                                Int32(maxOperations), &operationCount
+                            )
+                        }
+                    } else {
+                        return molenv_spglib_operations(
+                            Int32(expansionSpaceGroup), rotationBuffer.baseAddress,
+                            translationBuffer.baseAddress, Int32(maxOperations), &operationCount
+                        )
+                    }
                 }
             }
             guard status == MOLENV_SPGLIB_OK else {
@@ -1020,13 +1041,111 @@ enum Parser {
             completeness = .complete
         }
 
+        // Optional SLAB record (CRYSCAL/YCrySDen semantics): after an expanded
+        // CRYSTAL atom block, a SLAB record cuts a 2D periodic surface.
+        // Format:
+        //   SLAB
+        //   <h> <k> <l>          Miller indices of the surface plane
+        //   <NSLAB> <VACUUM>     number of atomic layers; vacuum thickness (Å)
+        var appliedSlab = false
+        if !isPolymer, atoms.isEmpty == false, kind == "CRYSTAL" {
+            if let peek = lines.indices.contains(idx) ? lines[idx] : nil,
+               peek.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "SLAB" {
+                _ = next() // consume SLAB line
+                let slabLine = idx
+                guard let millerLine = next() else {
+                    throw failure(slabLine, "truncated CRYSCAL SLAB Miller indices")
+                }
+                let millerTok = tok(millerLine)
+                guard millerTok.count >= 3,
+                      let h = Int(millerTok[0]), let k = Int(millerTok[1]), let l = Int(millerTok[2]) else {
+                    throw failure(slabLine, "malformed CRYSCAL SLAB Miller indices")
+                }
+                guard h != 0 || k != 0 || l != 0 else {
+                    throw failure(slabLine, "CRYSCAL SLAB Miller indices (0 0 0) are degenerate")
+                }
+                let millerCap = 1_000_000
+                guard (-millerCap...millerCap).contains(h),
+                      (-millerCap...millerCap).contains(k),
+                      (-millerCap...millerCap).contains(l) else {
+                    throw failure(slabLine, "CRYSCAL SLAB Miller index exceeds cap \(millerCap)")
+                }
+                guard let paramLine = next() else {
+                    throw failure(slabLine, "truncated CRYSCAL SLAB parameter record")
+                }
+                let paramTok = tok(paramLine)
+                guard paramTok.count >= 2,
+                      let nSlab = Int(paramTok[0]), let vacuum = Float(paramTok[1]) else {
+                    throw failure(slabLine, "malformed CRYSCAL SLAB parameter record")
+                }
+                guard nSlab > 0 else {
+                    throw failure(slabLine, "CRYSCAL SLAB layer count must be positive")
+                }
+                guard nSlab <= 1000 else {
+                    throw failure(slabLine, "CRYSCAL SLAB layer count exceeds cap")
+                }
+                guard vacuum.isFinite, vacuum >= 0 else {
+                    throw failure(slabLine, "CRYSCAL SLAB vacuum must be finite and non-negative")
+                }
+                guard vacuum <= 10_000 else {
+                    throw failure(slabLine, "CRYSCAL SLAB vacuum exceeds cap")
+                }
+                let slabResult = try CRYSCALSlabBuilder.build(
+                    atoms: atoms, cell: cell, h: h, k: k, l: l,
+                    nSlab: nSlab, vacuum: vacuum,
+                    url: url, slabLineIndex: slabLine
+                )
+                atoms = slabResult.atoms
+                cell = slabResult.cell
+                appliedSlab = true
+            }
+        }
+
         var out = LoadedScene()
         out.title = url.lastPathComponent
         out.atoms = atoms
         out.symmetryInputCompleteness = completeness
-        out.isCrystal = !isPolymer
-        if !isPolymer { out.cell = cell }
+        out.isCrystal = true
+        out.periodicDim = 3
+        if isPolymer {
+            // POLYMER is a 1D periodic crystal along x. Build a non-singular
+            // finite embedding: a is the period; b and c are orthogonal to a
+            // and sized to bound the Cartesian atom positions with a margin.
+            out.cell = Self.makePolymerCell(period: lats[0], atoms: atoms)
+            out.periodicDim = 1
+        } else if kind == "SLAB" && !appliedSlab {
+            // Top-level SLAB: the parsed cell is the 2D surface cell.
+            out.cell = cell
+            out.periodicDim = 2
+        } else {
+            out.cell = cell
+            if appliedSlab {
+                out.periodicDim = 2
+            }
+        }
         return out
+    }
+
+    /// Build a non-singular finite-embedding cell for a 1D polymer.
+    ///
+    /// The period is along x. The y/z padding is derived from the Cartesian
+    /// atom extent so the cell tightly bounds the atoms with a small margin.
+    /// This is a mathematical embedding; only the a direction is physically
+    /// periodic (periodicDim = 1).
+    private static func makePolymerCell(period: Float, atoms: [Atom]) -> Cell {
+        var minY: Float = 0, maxY: Float = 0, minZ: Float = 0, maxZ: Float = 0
+        for atom in atoms {
+            minY = min(minY, atom.coord.y)
+            maxY = max(maxY, atom.coord.y)
+            minZ = min(minZ, atom.coord.z)
+            maxZ = max(maxZ, atom.coord.z)
+        }
+        let margin: Float = 5.0
+        let bY = max(1.0, maxY - minY + margin)
+        let cZ = max(1.0, maxZ - minZ + margin)
+        return Cell(a: SIMD3<Float>(period, 0, 0),
+                    b: SIMD3<Float>(0, bY, 0),
+                    c: SIMD3<Float>(0, 0, cZ))
     }
 
     private static let b2a: Float = 0.52917721067
@@ -1273,6 +1392,327 @@ enum Parser {
         }
         return out
     }
+}
+
+// MARK: - CRYSCAL slab construction
+
+/// CRYSCAL/YCrySDen slab construction from an expanded bulk crystal.
+///
+/// The SLAB record specifies a surface by Miller indices (h,k,l), the
+/// number of atomic layers NSLAB, and the vacuum thickness VACUUM (Å).
+/// Construction uses exact integer-lattice algebra:
+///   1. Reduce (h,k,l) by gcd.
+///   2. Derive integer step s with h*s.a+k*s.b+l*s.c=1 (extended GCD).
+///   3. Derive primitive in-plane kernel basis t1, t2 (exact Bezout).
+///   4. Replicate expanded-bulk atoms along s to produce ≥NSLAB planes.
+///   5. Wrap into the primitive in-plane parallelogram.
+///   6. Group into distinct atomic planes; keep NSLAB consecutive.
+///   7. Deduplicate periodically in-plane by species.
+///   8. Shift z to nonnegative; set c = actual slab extent + user vacuum.
+enum CRYSCALSlabBuilder {
+    struct Result {
+        let atoms: [Atom]
+        let cell: Cell
+    }
+
+    /// Fixed practical candidate cap.
+    private static let candidateCap = 100_000
+    /// Tolerance for grouping atoms into planes (fraction of interplanar spacing).
+    private static let planeToleranceFraction = 1e-5
+    /// Tolerance for in-plane dedup (dimensionless fractional).
+    private static let dedupToleranceFraction = 0.001
+
+    static func build(atoms: [Atom], cell: Cell, h: Int, k: Int, l: Int,
+                      nSlab: Int, vacuum: Float, url: URL,
+                      slabLineIndex: Int) throws -> Result {
+        func err(_ reason: String) -> ParseError {
+            ParseError.parse(path: url.path, line: max(1, slabLineIndex + 1), reason: reason)
+        }
+
+        // Reduce Miller indices by gcd.
+        let g = gcd(abs(h), gcd(abs(k), abs(l)))
+        let (h0, k0, l0) = (h / g, k / g, l / g)
+
+        // Direct cell vectors.
+        let cellA = SIMD3<Double>(Double(cell.a.x), Double(cell.a.y), Double(cell.a.z))
+        let cellB = SIMD3<Double>(Double(cell.b.x), Double(cell.b.y), Double(cell.b.z))
+        let cellC = SIMD3<Double>(Double(cell.c.x), Double(cell.c.y), Double(cell.c.z))
+
+        // Compute reciprocal vector G = h0 a* + k0 b* + l0 c* (physics convention).
+        let recip = cell.reciprocalVectors
+        let aStar = SIMD3<Double>(Double(recip.a.x), Double(recip.a.y), Double(recip.a.z))
+        let bStar = SIMD3<Double>(Double(recip.b.x), Double(recip.b.y), Double(recip.b.z))
+        let cStar = SIMD3<Double>(Double(recip.c.x), Double(recip.c.y), Double(recip.c.z))
+        let gVec = SIMD3<Double>(Double(h0) * aStar.x + Double(k0) * bStar.x + Double(l0) * cStar.x,
+                               Double(h0) * aStar.y + Double(k0) * bStar.y + Double(l0) * cStar.y,
+                               Double(h0) * aStar.z + Double(k0) * bStar.z + Double(l0) * cStar.z)
+        let gNorm = simd_length(gVec)
+        guard gNorm.isFinite, gNorm > 1e-12 else {
+            throw err("degenerate surface normal for Miller indices (\(h) \(k) \(l))")
+        }
+        let nVec = gVec / gNorm
+
+        // Interplanar spacing d = 2π / |G|.
+        let d = (2.0 * Double.pi) / gNorm
+        guard d.isFinite, d > 1e-12 else {
+            throw err("degenerate interplanar spacing for (\(h) \(k) \(l))")
+        }
+
+        // Step vector s in fractional coords: h0*s.a + k0*s.b + l0*s.c = 1.
+        let sFrac = try extendedGCD3(h: h0, k: k0, l: l0, err: err)
+        let sCart = Double(sFrac.0) * cellA + Double(sFrac.1) * cellB + Double(sFrac.2) * cellC
+
+        // Primitive in-plane integer kernel basis t1, t2 (exact Bezout).
+        let (t1Frac, t2Frac) = try kernelBasis(h: h0, k: k0, l: l0, err: err)
+        let surfA = Double(t1Frac.0) * cellA + Double(t1Frac.1) * cellB + Double(t1Frac.2) * cellC
+        let surfB = Double(t2Frac.0) * cellA + Double(t2Frac.1) * cellB + Double(t2Frac.2) * cellC
+        let surfALen = simd_length(surfA)
+        let surfBLen = simd_length(surfB)
+        guard surfALen > 1e-12, surfBLen > 1e-12 else {
+            throw err("surface cell vector is degenerate for (\(h) \(k) \(l))")
+        }
+
+        // Build rotation mapping surface normal to z.
+        let u = surfA / surfALen
+        let w = nVec
+        let vRaw = simd_cross(w, u)
+        let vNorm = simd_length(vRaw)
+        guard vNorm > 1e-12 else {
+            throw err("surface normal parallel to surface vector for (\(h) \(k) \(l))")
+        }
+        let v = vRaw / vNorm
+
+        func rotate(_ p: SIMD3<Double>) -> SIMD3<Double> {
+            return SIMD3(simd_dot(u, p), simd_dot(v, p), simd_dot(w, p))
+        }
+
+        // Surface cell vectors in the rotated frame (z ≈ 0).
+        let rotSurfA = rotate(surfA)
+        let rotSurfB = rotate(surfB)
+        let detM = rotSurfA.x * rotSurfB.y - rotSurfB.x * rotSurfA.y
+        guard abs(detM) > 1e-12 else {
+            throw err("surface cell has zero area for (\(h) \(k) \(l))")
+        }
+        let invM11 = rotSurfB.y / detM
+        let invM12 = -rotSurfB.x / detM
+        let invM21 = -rotSurfA.y / detM
+        let invM22 = rotSurfA.x / detM
+
+        func surfaceFractional(_ px: Double, _ py: Double) -> SIMD2<Double> {
+            let alpha = invM11 * px + invM12 * py
+            let beta = invM21 * px + invM22 * py
+            return SIMD2(alpha - floor(alpha), beta - floor(beta))
+        }
+
+        // Compute replication range along s to produce ≥NSLAB planes.
+        var minZRaw = Double.greatestFiniteMagnitude
+        var maxZRaw = -Double.greatestFiniteMagnitude
+        for atom in atoms {
+            let p = SIMD3<Double>(Double(atom.coord.x), Double(atom.coord.y), Double(atom.coord.z))
+            let rp = rotate(p)
+            minZRaw = min(minZRaw, rp.z)
+            maxZRaw = max(maxZRaw, rp.z)
+        }
+        let bulkExtent = maxZRaw - minZRaw
+        let rawExtraSteps = (bulkExtent / d).rounded(.up) + 2
+        guard rawExtraSteps.isFinite, rawExtraSteps >= 0,
+              rawExtraSteps <= Double(Self.candidateCap) else {
+            throw err("surface slab replication range exceeds practical cap")
+        }
+        let extraSteps = Int(rawExtraSteps)
+        let repSum = nSlab.addingReportingOverflow(extraSteps)
+        guard !repSum.overflow else {
+            throw err("surface slab replication range overflowed")
+        }
+        let nRep = repSum.partialValue
+        let doubledRep = nRep.multipliedReportingOverflow(by: 2)
+        guard !doubledRep.overflow else {
+            throw err("surface slab replication range overflowed")
+        }
+        let copyCount = doubledRep.partialValue.addingReportingOverflow(1)
+        guard !copyCount.overflow else {
+            throw err("surface slab replication range overflowed")
+        }
+        let totalCandidates = atoms.count.multipliedReportingOverflow(by: copyCount.partialValue)
+        guard !totalCandidates.overflow, totalCandidates.partialValue <= Self.candidateCap else {
+            throw err("surface slab candidate count \(totalCandidates.overflow ? "overflowed" : "\(totalCandidates.partialValue)") exceeds cap \(Self.candidateCap)")
+        }
+
+        // Replicate atoms along sCart and project into the surface cell.
+        var candidates: [(frac: SIMD2<Double>, z: Double, atom: Atom)] = []
+        candidates.reserveCapacity(totalCandidates.partialValue)
+
+        for atom in atoms {
+            let p0 = SIMD3<Double>(Double(atom.coord.x), Double(atom.coord.y), Double(atom.coord.z))
+            for i in -nRep...nRep {
+                let translation = Double(i) * sCart
+                let rp = rotate(p0 + translation)
+                guard rp.x.isFinite, rp.y.isFinite, rp.z.isFinite else {
+                    throw err("atom position non-finite after surface transformation")
+                }
+                let frac = surfaceFractional(rp.x, rp.y)
+                candidates.append((frac: frac, z: rp.z, atom: atom))
+            }
+        }
+
+        guard !candidates.isEmpty else {
+            throw err("no candidate atoms generated for surface slab")
+        }
+
+        // Group into distinct atomic planes.
+        let planeTol = planeToleranceFraction * d
+        candidates.sort { $0.z < $1.z }
+
+        struct Plane {
+            var zMean: Double
+            var members: [(frac: SIMD2<Double>, atom: Atom)]
+        }
+        var planes: [Plane] = []
+        for cand in candidates {
+            if let last = planes.last, abs(cand.z - last.zMean) < planeTol {
+                let n = Double(last.members.count)
+                planes[planes.count - 1].zMean = (last.zMean * n + cand.z) / (n + 1)
+                planes[planes.count - 1].members.append((cand.frac, cand.atom))
+            } else {
+                planes.append(Plane(zMean: cand.z, members: [(cand.frac, cand.atom)]))
+            }
+        }
+
+        guard !planes.isEmpty else {
+            throw err("no atomic planes identified for surface slab")
+        }
+
+        // Keep exactly NSLAB consecutive planes starting from the lowest.
+        guard nSlab <= planes.count else {
+            throw err("requested \(nSlab) layers but only \(planes.count) atomic planes found")
+        }
+        let keptPlanes = Array(planes[0..<nSlab])
+
+        // Deduplicate within each plane by species at the same wrapped fractional
+        // position using dimensionless fractional tolerance with 0/1 wrapping.
+        let dedupTol = Self.dedupToleranceFraction
+        var kept: [Atom] = []
+        var minZ = Double.greatestFiniteMagnitude
+        var maxZ = -Double.greatestFiniteMagnitude
+
+        func wrappedDelta(_ a: Double, _ b: Double) -> Double {
+            let delta = abs(a - b)
+            return min(delta, 1.0 - delta)
+        }
+
+        for plane in keptPlanes {
+            var seen: [(frac: SIMD2<Double>, species: Int)] = []
+            for member in plane.members {
+                let isDup = seen.contains { existing in
+                    existing.species == member.atom.atomicNumber &&
+                        wrappedDelta(existing.frac.x, member.frac.x) < dedupTol &&
+                        wrappedDelta(existing.frac.y, member.frac.y) < dedupTol
+                }
+                if !isDup {
+                    seen.append((member.frac, member.atom.atomicNumber))
+                    let cartX = member.frac.x * rotSurfA.x + member.frac.y * rotSurfB.x
+                    let cartY = member.frac.x * rotSurfA.y + member.frac.y * rotSurfB.y
+                    let z = plane.zMean
+                    kept.append(Atom(coord: SIMD3<Float>(Float(cartX), Float(cartY), Float(z)),
+                                     atomicNumber: member.atom.atomicNumber,
+                                     label: member.atom.label))
+                    minZ = min(minZ, z)
+                    maxZ = max(maxZ, z)
+                }
+            }
+        }
+
+        guard !kept.isEmpty else {
+            throw err("all candidate atoms deduplicated away; no slab atoms remain")
+        }
+
+        // Shift z so the bottom of the slab is at z = 0.
+        if minZ != 0 {
+            for i in 0..<kept.count {
+                kept[i].coord.z -= Float(minZ)
+            }
+        }
+        let slabExtent = Double(maxZ - minZ)
+        let requestedLength = slabExtent + Double(vacuum)
+        // c is a nonperiodic mathematical embedding. A one-plane, zero-vacuum
+        // slab has zero geometric thickness, so retain one interplanar spacing
+        // solely to keep Cell nonsingular; positive requested thickness/vacuum
+        // is represented exactly.
+        let cLength = requestedLength > 0 ? requestedLength : d
+        guard cLength.isFinite, cLength > 0 else {
+            throw err("slab extent + vacuum is non-finite or non-positive")
+        }
+
+        let slabCell = Cell(
+            a: SIMD3<Float>(Float(rotSurfA.x), Float(rotSurfA.y), 0),
+            b: SIMD3<Float>(Float(rotSurfB.x), Float(rotSurfB.y), 0),
+            c: SIMD3<Float>(0, 0, Float(cLength))
+        )
+        return Result(atoms: kept, cell: slabCell)
+    }
+}
+
+// MARK: - Integer-lattice algebra helpers
+
+/// Greatest common divisor (Euclidean algorithm).
+private func gcd(_ a: Int, _ b: Int) -> Int {
+    var a = a, b = b
+    while b != 0 { (a, b) = (b, a % b) }
+    return a
+}
+
+/// Extended GCD for 2 integers: returns (g, x, y) with x*a + y*b = g.
+private func egcd2(_ a: Int, _ b: Int) -> (g: Int, x: Int, y: Int) {
+    if b == 0 { return (abs(a), a >= 0 ? 1 : -1, 0) }
+    let (g, x1, y1) = egcd2(b, a % b)
+    return (g, y1, x1 - (a / b) * y1)
+}
+
+/// Extended GCD for 3 integers: find (a, b, c) such that a*h + b*k + c*l = gcd(h,k,l).
+private func extendedGCD3(h: Int, k: Int, l: Int,
+                          err: (String) -> ParseError) throws -> (Int, Int, Int) {
+    let (g1, a, b) = egcd2(h, k)
+    let (g2, c, d) = egcd2(g1, l)
+    guard g2 == 1 else {
+        throw err("Miller indices (\(h), \(k), \(l)) have gcd \(g2) != 1")
+    }
+    return (c * a, c * b, d)
+}
+
+/// Find a primitive integer kernel basis for the plane h*x + k*y + l*z = 0.
+/// Uses an exact Bezout construction so that cross(t1, t2) = (h, k, l).
+///
+/// For h≠0 or k≠0: d=gcd(h,k), t1=(k/d,-h/d,0), find p,q with p*h+q*k=d
+/// via extended GCD, t2=(p*l,q*l,-d). Then cross(t1,t2) = (h,k,l).
+/// For h=k=0 (l=±1): t1=(1,0,0), t2=(0,1,0).
+private func kernelBasis(h: Int, k: Int, l: Int,
+                         err: (String) -> ParseError) throws -> ((Int, Int, Int), (Int, Int, Int)) {
+    // Handle h=k=0 (so l=±1 since gcd=1).
+    if h == 0 && k == 0 {
+        return ((1, 0, 0), (0, 1, 0))
+    }
+    // Bezout construction: d = gcd(h,k), t1 = (k/d, -h/d, 0).
+    let d = gcd(abs(h), abs(k))
+    let t1 = (k / d, -h / d, 0)
+    // Find p,q with p*h + q*k = d via extended GCD.
+    let (_, p, q) = egcd2(h, k)
+    let t2 = (p * l, q * l, -d)
+    // Verify cross(t1, t2) = (h, k, l).
+    let cx = t1.1 * t2.2 - t1.2 * t2.1
+    let cy = t1.2 * t2.0 - t1.0 * t2.2
+    let cz = t1.0 * t2.1 - t1.1 * t2.0
+    if cx == h && cy == k && cz == l {
+        return (t1, t2)
+    }
+    // Try negating t2.
+    let t2n = (-t2.0, -t2.1, -t2.2)
+    let cx2 = t1.1 * t2n.2 - t1.2 * t2n.1
+    let cy2 = t1.2 * t2n.0 - t1.0 * t2n.2
+    let cz2 = t1.0 * t2n.1 - t1.1 * t2n.0
+    if cx2 == h && cy2 == k && cz2 == l {
+        return (t1, t2n)
+    }
+    throw err("kernel basis construction failed for (\(h), \(k), \(l))")
 }
 
 // Minimal element-symbol helper used by the cube + WIEN2k readers (avoids

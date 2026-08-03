@@ -2,6 +2,24 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.35] — 2026-08-03
+
+### Added
+
+- Completed coordination analysis with a bounded virtualized neighbor table, bond-length and bond-angle histograms/CSV, normalized 3D radial distribution functions, and periodic minimum-image angle/dihedral measurements for skew lower- and full-dimensional cells.
+- Completed CRYSCAL structure expansion across space groups 1–230 using convention-compatible spglib Hall settings, plus bounded primitive hkl `SLAB` generation with layer/vacuum controls and finite 1D-periodic `POLYMER` representation.
+- Added transactional Cartesian/fractional editing in the atom table with finite/singular-cell validation, molecule/crystal rebonding, bounded document undo/redo, and symmetry, k-path, BZ, summary, coordination, and distribution invalidation.
+- Added persisted rendering-quality controls for line width, scene opacity, depth cueing, bounded ambient occlusion and soft shadows, quality levels, publication presets, and the `--preset` CLI override across live and exported render paths.
+
+### Fixed
+
+- Preserved asymmetric-unit completeness across coordinate edits, bounded dense AO/shadow and RDF work, corrected transparent-object ordering and line alpha, and made thick lines pixel/aspect/depth correct.
+- Hardened CRYSCAL surface integer arithmetic, candidate limits, periodic in-plane deduplication, malformed-record diagnostics, and lower-dimensional cell semantics.
+
+### Tests
+
+- Kept 32 focused tests while extending consolidated cases for all-system CRYSCAL expansion, multi-layer slabs, coordinate edit/undo lifecycle, periodic coordination distributions and RDF oracles, renderer layout/quality/transparency, and state round trips.
+
 ## [1.1.34] — 2026-08-02
 
 ### Added

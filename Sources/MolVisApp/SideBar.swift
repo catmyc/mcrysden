@@ -17,6 +17,10 @@ struct SideBar: View {
     @State private var editKy: String = ""
     @State private var editKz: String = ""
     @State private var editLabel: String = ""
+    // Local preset picker state. The preset is an action (not document state),
+    // so this is view-local and never persisted or synced.
+    @State private var selectedPreset: PublicationPreset = .default
+
     // Tracks whether any per-node editor field holds keyboard focus. Used to commit
     // the draft once on focus loss (instead of every keystroke) and to keep an
     // external route mutation from clobbering a draft in progress while focused.
@@ -166,6 +170,43 @@ struct SideBar: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                // Rendering-quality controls: line width, transparency, depth cueing,
+                // and AO/shadow approximations.
+                Text("Quality").font(.subheadline).bold()
+                Slider(value: $state.opacity, in: 0.05...1.0) { Text("Opacity: \(state.opacity, specifier: "%.2f")") }
+                Slider(value: $state.lineWidth, in: 1.0...6.0) { Text("Line Width: \(state.lineWidth, specifier: "%.1f") px") }
+                Slider(value: $state.depthCueingStrength, in: 0...1) { Text("Depth Cueing: \(state.depthCueingStrength, specifier: "%.2f")") }
+                Toggle("Ambient Occlusion", isOn: Binding(
+                    get: { state.aoStrength > 0 },
+                    set: { state.aoStrength = $0 ? 0.5 : 0.0 }))
+                if state.aoStrength > 0 {
+                    Slider(value: $state.aoStrength, in: 0.05...1) { Text("AO Strength: \(state.aoStrength, specifier: "%.2f")") }
+                    Picker("AO Quality", selection: $state.aoQuality) {
+                        ForEach(0...3, id: \.self) { Text(aoQualityLabel($0)).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                Toggle("Soft Shadows", isOn: Binding(
+                    get: { state.shadowStrength > 0 },
+                    set: { state.shadowStrength = $0 ? 0.5 : 0.0 }))
+                if state.shadowStrength > 0 {
+                    Slider(value: $state.shadowStrength, in: 0.05...1) { Text("Shadow Strength: \(state.shadowStrength, specifier: "%.2f")") }
+                    Picker("Shadow Quality", selection: $state.shadowQuality) {
+                        ForEach(0...3, id: \.self) { Text(shadowQualityLabel($0)).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                // Preset is an action (not document state): selecting one
+                // applies its quality settings to the state fields.
+                Picker("Preset", selection: $selectedPreset) {
+                    ForEach(PublicationPreset.allCases, id: \.self) {
+                        Text($0.label).tag($0)
+                    }
+                }
+                .pickerStyle(.menu)
+                .onChange(of: selectedPreset) { _, newValue in
+                    state.applyPreset(newValue)
+                }
             }
             // --- Isosurface (volumetric scalar field) ---------------------------
             // Shown only when the loaded file carried a DATAGRID/.cube-style 3D
@@ -262,6 +303,12 @@ struct SideBar: View {
                     }
                     Toggle("Color by coordination", isOn: $state.showCoordinationColors)
                         .disabled(!state.coordinationEnabled || !state.coordinationAnalysisAvailable)
+                    if state.coordinationAnalysisAvailable {
+                        Divider()
+                        Button("Neighbor Table…") { state.onShowNeighborTable?() }
+                            .buttonStyle(.bordered)
+                        distributionContent
+                    }
                 }
             }
             // --- Electronic-structure graph interaction -----------------------------
@@ -572,6 +619,46 @@ struct SideBar: View {
             .foregroundColor(.secondary)
     }
 
+    /// Distribution/RDF readout derived from the coordination analysis. Shows
+    /// bond-length and bond-angle histograms plus the radial distribution
+    /// function (3D periodic only, actual g(r) values). Each can be exported
+    /// as CSV.
+    @ViewBuilder
+    private var distributionContent: some View {
+        if let dist = state.distributionAnalysis {
+            Text("Bond lengths: \(dist.uniquePairCount) unique pairs")
+                .font(.caption).foregroundColor(.secondary)
+            Text(dist.bondLengthHistogram.bins.isEmpty ? "(no bonds)" :
+                dist.bondLengthHistogram.bins.map { "\($0.center): \($0.count)" }.joined(separator: ", "))
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundColor(.secondary)
+                .lineLimit(3)
+            Text("Bond angles: \(dist.uniqueAngleCount) unique angles")
+                .font(.caption).foregroundColor(.secondary)
+            if dist.radialDistribution.isAvailable {
+                let rdf = dist.radialDistribution
+                Text("RDF: \(rdf.pairCount) pairs, r ≤ \(String(format: "%.1f", rdf.maxRadius)) Å" + (rdf.wasCapped ? " (capped)" : ""))
+                    .font(.caption).foregroundColor(.secondary)
+                // Show peak g(r) value as a quick readout
+                if let peakBin = rdf.bins.max(by: { $0.g < $1.g }) {
+                    Text("Peak g(r) = \(String(format: "%.2f", peakBin.g)) at \(String(format: "%.2f", peakBin.center)) Å")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Text("RDF: \(dist.radialDistribution.unavailableReason ?? "unavailable")")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            HStack {
+                Button("Export CSV") { state.onExportDistributionCSV?(dist) }
+                    .buttonStyle(.bordered).font(.caption)
+            }
+        } else {
+            Text("Distribution analysis unavailable")
+            .font(.caption).foregroundColor(.secondary)
+        }
+    }
+
     @ViewBuilder
     private var kPathContent: some View {
         Toggle("Brillouin Zone", isOn: $state.showBrillouinZone)
@@ -786,6 +873,24 @@ private func structureSummaryGrid(_ summary: StructureSummary) -> some View {
                 Text(summary.pointGroup ?? "—")
             }
         }
+    }
+}
+
+private func aoQualityLabel(_ value: Int) -> String {
+    switch value {
+    case 0: return "Off"
+    case 1: return "Low"
+    case 2: return "Med"
+    default: return "High"
+    }
+}
+
+private func shadowQualityLabel(_ value: Int) -> String {
+    switch value {
+    case 0: return "Off"
+    case 1: return "Low"
+    case 2: return "Med"
+    default: return "High"
     }
 }
 

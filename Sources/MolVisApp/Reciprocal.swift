@@ -13,6 +13,25 @@ import simd
 // k-path export documents this and scales accordingly.
 
 extension Cell {
+    /// The 3×3 matrix [a b c] with the cell vectors as columns, in Double
+    /// precision. Its inverse maps Cartesian coordinates to fractional.
+    var inverseMatrix: simd_double3x3? {
+        let components = [a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z]
+        guard components.allSatisfy({ $0.isFinite }) else { return nil }
+        let mat = simd_double3x3(
+            columns: (SIMD3<Double>(Double(a.x), Double(a.y), Double(a.z)),
+                      SIMD3<Double>(Double(b.x), Double(b.y), Double(b.z)),
+                      SIMD3<Double>(Double(c.x), Double(c.y), Double(c.z))))
+        guard abs(mat.determinant) > 1e-18 else { return nil }
+        return mat.inverse
+    }
+
+    /// Cell vectors in Double precision.
+    var doubleVectors: (a: SIMD3<Double>, b: SIMD3<Double>, c: SIMD3<Double>) {
+        (SIMD3<Double>(Double(a.x), Double(a.y), Double(a.z)),
+         SIMD3<Double>(Double(b.x), Double(b.y), Double(b.z)),
+         SIMD3<Double>(Double(c.x), Double(c.y), Double(c.z)))
+    }
     /// Conventional reciprocal lattice vectors (including 2pi) from the DIRECT
     /// conventional cell: a* = 2pi (b x c) / volume, cyclic, volume = a.(bxc).
     /// Correct for primitive conventional cells; for centered cells (fcc/bcc)

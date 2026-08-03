@@ -23,17 +23,31 @@ extension Scene {
                 value = length(sel[1] - sel[0])
             }
         case .angle:
-            let d0 = sel[0] - sel[1], d2 = sel[2] - sel[1]
-            guard length(d0) > 1e-8, length(d2) > 1e-8 else { return nil }
-            let v0 = normalize(d0), v2 = normalize(d2)
-            value = acos(min(max(dot(v0, v2), -1), 1)) * 180 / .pi
+            if let cell = cell, cell.isFinite, periodicDim > 0 {
+                guard let angle = PeriodicGeometry.minimumImageAngle(
+                    a: sel[0], b: sel[1], c: sel[2],
+                    cell: cell, periodicDim: periodicDim) else { return nil }
+                value = angle
+            } else {
+                let d0 = sel[0] - sel[1], d2 = sel[2] - sel[1]
+                guard length(d0) > 1e-8, length(d2) > 1e-8 else { return nil }
+                let v0 = normalize(d0), v2 = normalize(d2)
+                value = acos(min(max(dot(v0, v2), -1), 1)) * 180 / .pi
+            }
         case .dihedral:
-            let d0 = sel[0] - sel[1], d1 = sel[1] - sel[2], d2 = sel[2] - sel[3]
-            guard length(d0) > 1e-8, length(d1) > 1e-8, length(d2) > 1e-8 else { return nil }
-            let ba = normalize(d0), cb = normalize(d1), dc = normalize(d2)
-            let n1 = cross(ba, cb), n2 = cross(cb, dc)
-            guard length(n1) > 1e-8, length(n2) > 1e-8 else { return nil }
-            value = acos(min(max(dot(normalize(n1), normalize(n2)), -1), 1)) * 180 / .pi
+            if let cell = cell, cell.isFinite, periodicDim > 0 {
+                guard let dihedral = PeriodicGeometry.minimumImageDihedral(
+                    a: sel[0], b: sel[1], c: sel[2], d: sel[3],
+                    cell: cell, periodicDim: periodicDim) else { return nil }
+                value = dihedral
+            } else {
+                let d0 = sel[0] - sel[1], d1 = sel[1] - sel[2], d2 = sel[2] - sel[3]
+                guard length(d0) > 1e-8, length(d1) > 1e-8, length(d2) > 1e-8 else { return nil }
+                let ba = normalize(d0), cb = normalize(d1), dc = normalize(d2)
+                let n1 = cross(ba, cb), n2 = cross(cb, dc)
+                guard length(n1) > 1e-8, length(n2) > 1e-8 else { return nil }
+                value = acos(min(max(dot(normalize(n1), normalize(n2)), -1), 1)) * 180 / .pi
+            }
         case .none:
             return nil
         }
@@ -250,6 +264,11 @@ extension Scene {
     }
 
     /// Camera that frames both atoms AND any volumetric grid, used as the single
+    /// The radius of the scene's framing sphere (atoms + any volumetric grid).
+    /// Used to compute depth-cueing ranges. Returns 0 for an empty scene.
+    func boundingSphereRadius() -> Float { framingSphere().radius }
+
+    /// Camera that frames both atoms AND any volumetric grid, used as the single
     /// source of truth by the live window and both exporters. Atomic scenes are in
     /// Å (floored at 8); reciprocal-space grids (BXSF) span only ~0.2 units, so the
     /// floor would leave the camera way too far and the surface invisibly small — fit
@@ -313,7 +332,7 @@ extension Scene {
         }}}
         var out = self
         out.atoms = newAtoms
-        out.bonds = Self.rebond(newAtoms, cell: cell)
+        out.bonds = Self.rebond(newAtoms, cell: cell, isCrystal: true, periodicDim: 3)
         out.preslabAtoms = newAtoms    // snapshot for `applySlab`
         out.superCell = sc
         // For a hand-built scene (no pristine base yet), snapshot the pre-expansion
@@ -336,12 +355,15 @@ extension Scene {
         return out
     }
 
-    // Mark this unavailable for v1 bonds cross images without a C bridge — but
-    // provide a pure-Swift fallback using covalent radii for v1. Task 8 wires the
-    // real C bridge; for now keep it simple:
-    /// Recompute bonds for the given atom set and unit cell using the C
-    /// covalent-radii heuristic (the same `make_bonds` that parsers call).
-    static func rebond(_ atoms: [Atom], cell: Cell) -> [Bond] {
+    /// Recompute bonds for the given atom set using the C covalent-radii
+    /// heuristic (the same `make_bonds` that parsers call).
+    ///
+    /// `cell` may be nil for molecules (non-periodic structures); the C
+    /// heuristic then uses `is_crystal = 0` so no minimum-image wrapping is
+    /// applied. `isCrystal` and `periodicDim` select the correct bonding
+    /// mode: crystals bond across periodic images (up to `periodicDim`
+    /// dimensions); molecules bond purely by distance in free space.
+    static func rebond(_ atoms: [Atom], cell: Cell?, isCrystal: Bool, periodicDim: Int) -> [Bond] {
         let nat = atoms.count
         guard nat > 0 else { return [] }
 
@@ -361,11 +383,15 @@ extension Scene {
         var scene = MolEnvScene()
         scene.natoms = Int32(nat)
         scene.atoms = cAtoms
-        scene.cell = ((cell.a.x, cell.a.y, cell.a.z),
-                      (cell.b.x, cell.b.y, cell.b.z),
-                      (cell.c.x, cell.c.y, cell.c.z))
-        scene.is_crystal = 1
-        scene.periodic_dim = 3
+        if let cell {
+            scene.cell = ((cell.a.x, cell.a.y, cell.a.z),
+                          (cell.b.x, cell.b.y, cell.b.z),
+                          (cell.c.x, cell.c.y, cell.c.z))
+        } else {
+            scene.cell = ((0, 0, 0), (0, 0, 0), (0, 0, 0))
+        }
+        scene.is_crystal = isCrystal ? 1 : 0
+        scene.periodic_dim = Int32(periodicDim)
 
         var nb: Int32 = 0
         var bondPtr: UnsafeMutablePointer<MolEnvBond>? = nil
@@ -388,7 +414,7 @@ extension Scene {
             // Removing the slab — restore the full pre-slab atom set.
             var s = self
             s.atoms = preslabAtoms.isEmpty ? s.atoms : preslabAtoms
-            if let c = s.cell { s.bonds = Self.rebond(s.atoms, cell: c) } else { s.bonds = [] }
+            if let c = s.cell { s.bonds = Self.rebond(s.atoms, cell: c, isCrystal: s.isCrystal, periodicDim: s.periodicDim) } else { s.bonds = [] }
             s.slab = nil
             // Restoring the pre-slab set invalidates indices into the filtered set;
             // leave selection untouched only when the set is genuinely unchanged.
@@ -421,7 +447,7 @@ extension Scene {
         var out = self
         if out.preslabAtoms.isEmpty { out.preslabAtoms = src }
         out.atoms = kept
-        out.bonds = Self.rebond(kept, cell: cell)
+        out.bonds = Self.rebond(kept, cell: cell, isCrystal: true, periodicDim: 3)
         out.slab = slab
         // A filter that drops atoms invalidates selection indices; if the filtered
         // set is identical to the current one the indices are still valid.

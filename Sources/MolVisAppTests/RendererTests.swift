@@ -57,6 +57,223 @@ final class RendererTests: XCTestCase {
         try assertOrientationGizmo()
         try assertStandardCrystalViews()
         try assertScaleIndicator()
+        try assertRenderingQualityControls()
+    }
+
+    // Rendering-quality contract: line widths, transparency, depth cueing, and
+    // AO/shadow must each be independently configurable and visibly functional,
+    // while defaults preserve the original output exactly. Consolidated into the
+    // camera/lighting/scale contract test to keep the test count at 32.
+    private func assertRenderingQualityControls() throws {
+        var scene = Scene()
+        scene.background = "#000000"
+        scene.showAxes = false
+        scene.showCellFrame = true
+        scene.atoms = [Atom(coord: SIMD3(-1.5, 0, 0), atomicNumber: 6, label: "C"),
+                       Atom(coord: SIMD3(1.5, 0, 0), atomicNumber: 6, label: "C")]
+        scene.bonds = [Bond(i: 0, j: 1)]
+        scene.cell = Cell(a: SIMD3(4, 0, 0), b: SIMD3(0, 4, 0), c: SIMD3(0, 0, 4))
+
+        // Default output is the baseline.
+        let baseline = try render(scene: scene, dist: 10, w: 120, h: 120)
+        let baselineHash = pixelHash(baseline)
+        XCTAssertGreaterThan(nonzeroPixels(baseline), 0)
+
+        // --- Transparency: opacity < 1 must change the frame ---
+        var transparent = scene
+        transparent.opacity = 0.5
+        let transparentHash = pixelHash(try render(scene: transparent, dist: 10, w: 120, h: 120))
+        XCTAssertNotEqual(baselineHash, transparentHash, "transparency must change the frame")
+        XCTAssertGreaterThan(nonzeroPixels(try render(scene: transparent, dist: 10, w: 120, h: 120)), 0)
+
+        // --- Depth cueing: must change the frame when enabled ---
+        var fogged = scene
+        fogged.depthCueingStrength = 0.8
+        let foggedHash = pixelHash(try render(scene: fogged, dist: 10, w: 120, h: 120))
+        XCTAssertNotEqual(baselineHash, foggedHash, "depth cueing must change the frame")
+
+        // --- Ambient occlusion: must change the frame when enabled ---
+        var ao = scene
+        ao.aoStrength = 0.8
+        ao.aoQuality = 2
+        let aoHash = pixelHash(try render(scene: ao, dist: 10, w: 120, h: 120))
+        XCTAssertNotEqual(baselineHash, aoHash, "AO must change the frame")
+
+        // --- Soft shadows: must change the frame when enabled ---
+        var shadow = scene
+        shadow.shadowStrength = 0.8
+        shadow.shadowQuality = 2
+        let shadowHash = pixelHash(try render(scene: shadow, dist: 10, w: 120, h: 120))
+        XCTAssertNotEqual(baselineHash, shadowHash, "soft shadows must change the frame")
+
+        // --- Publication presets: non-default presets must change the frame ---
+        for preset in PublicationPreset.allCases {
+            var presetScene = scene
+            preset.apply(to: &presetScene)
+            let presetHash = pixelHash(try render(scene: presetScene, dist: 10, w: 120, h: 120))
+            if preset == .default {
+                XCTAssertEqual(baselineHash, presetHash,
+                               "default preset must preserve the original output")
+            } else {
+                XCTAssertNotEqual(baselineHash, presetHash,
+                                  "\(preset.label) preset must change the frame")
+            }
+        }
+
+        // --- Bounded AO/shadow seam: large + dense structures must not hang ---
+        // Large structure: exceeds the global cap, must degrade safely to unity.
+        struct Timer { static func time(_ block: () -> Void) -> TimeInterval {
+            let start = Date(); block(); return -start.timeIntervalSinceNow
+        }}
+        var largeAtoms: [Atom] = []
+        largeAtoms.reserveCapacity(200_000)
+        for i in 0..<200_000 {
+            largeAtoms.append(Atom(coord: SIMD3(Float(i % 100), Float((i / 100) % 100), Float(i / 10000)),
+                                   atomicNumber: 6, label: "C"))
+        }
+        var largeScene = scene
+        largeScene.atoms = largeAtoms
+        largeScene.bonds = []
+        largeScene.aoStrength = 0.8
+        largeScene.aoQuality = 2
+        largeScene.shadowStrength = 0.8
+        largeScene.shadowQuality = 2
+        var largeRendered = false
+        let largeTime = Timer.time {
+            largeRendered = (try? render(scene: largeScene, dist: 200, w: 32, h: 32)) != nil
+        }
+        XCTAssertTrue(largeRendered, "large structure (200k atoms) must render without hanging")
+        XCTAssertLessThan(largeTime, 5.0, "large structure AO/shadow must complete in bounded time")
+
+        // Dense structure: all atoms in a tiny volume (single bin), must not hang.
+        var denseAtoms: [Atom] = []
+        denseAtoms.reserveCapacity(5_000)
+        for i in 0..<5_000 {
+            // All within a 1x1x1 cube → single bin, worst case for naive O(n^2)
+            denseAtoms.append(Atom(coord: SIMD3(Float(i % 10) * 0.01, Float((i / 10) % 10) * 0.01, Float(i / 100) * 0.01),
+                                   atomicNumber: 6, label: "C"))
+        }
+        var denseScene = scene
+        denseScene.atoms = denseAtoms
+        denseScene.bonds = []
+        denseScene.aoStrength = 0.8
+        denseScene.aoQuality = 3
+        denseScene.shadowStrength = 0.8
+        denseScene.shadowQuality = 3
+        var denseRendered = false
+        let denseTime = Timer.time {
+            denseRendered = (try? render(scene: denseScene, dist: 20, w: 32, h: 32)) != nil
+        }
+        XCTAssertTrue(denseRendered, "dense structure (5k atoms, single bin) must render without hanging")
+        XCTAssertLessThan(denseTime, 2.0, "dense structure AO/shadow must complete in bounded time")
+
+        // Anisotropic: atoms spread thin in Y/Z but long in X. Bin math must
+        // not miss neighbors or index out of bounds.
+        var anisoAtoms: [Atom] = []
+        anisoAtoms.reserveCapacity(10_000)
+        for i in 0..<10_000 {
+            // X spans 1000 units, Y and Z span only 0.5 units → highly anisotropic
+            anisoAtoms.append(Atom(coord: SIMD3(Float(i) * 0.1, Float(i % 5) * 0.01, Float(i % 5) * 0.01),
+                                   atomicNumber: 6, label: "C"))
+        }
+        var anisoScene = scene
+        anisoScene.atoms = anisoAtoms
+        anisoScene.bonds = []
+        anisoScene.aoStrength = 0.8
+        anisoScene.aoQuality = 3
+        anisoScene.shadowStrength = 0.8
+        anisoScene.shadowQuality = 3
+        var anisoRendered = false
+        let anisoTime = Timer.time {
+            anisoRendered = (try? render(scene: anisoScene, dist: 500, w: 32, h: 32)) != nil
+        }
+        XCTAssertTrue(anisoRendered, "anisotropic structure must render without hanging or crashing")
+        XCTAssertLessThan(anisoTime, 3.0, "anisotropic structure AO/shadow must complete in bounded time")
+
+        // Shadow-only: AO disabled, shadow enabled. Must not scan O(n^2) in
+        // dense scenes (per-atom cap must count ALL candidates, not just AO).
+        var shadowOnlyAtoms: [Atom] = []
+        shadowOnlyAtoms.reserveCapacity(3_000)
+        for i in 0..<3_000 {
+            shadowOnlyAtoms.append(Atom(coord: SIMD3(Float(i % 10) * 0.01, Float((i / 10) % 10) * 0.01, Float(i / 100) * 0.01),
+                                       atomicNumber: 6, label: "C"))
+        }
+        var shadowOnlyScene = scene
+        shadowOnlyScene.atoms = shadowOnlyAtoms
+        shadowOnlyScene.bonds = []
+        shadowOnlyScene.aoStrength = 0.0  // AO disabled
+        shadowOnlyScene.aoQuality = 0
+        shadowOnlyScene.shadowStrength = 0.8  // shadow enabled
+        shadowOnlyScene.shadowQuality = 3
+        var shadowOnlyRendered = false
+        let shadowOnlyTime = Timer.time {
+            shadowOnlyRendered = (try? render(scene: shadowOnlyScene, dist: 20, w: 32, h: 32)) != nil
+        }
+        XCTAssertTrue(shadowOnlyRendered, "shadow-only dense structure must render without hanging")
+        XCTAssertLessThan(shadowOnlyTime, 2.0, "shadow-only dense structure must complete in bounded time")
+
+        // --- Line width geometry seam: verify thick lines render with correct
+        // pixel width and aspect ratio. A horizontal line in a non-square
+        // viewport should have its length preserved and width uniform.
+        var lineScene = Scene()
+        lineScene.background = "#000000"
+        lineScene.showAxes = false
+        lineScene.showCellFrame = true
+        lineScene.cell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10))
+        lineScene.atoms = []
+        lineScene.bonds = []
+        lineScene.lineWidth = 4.0  // thick line path
+        // Render at non-square aspect to check aspect-correct geometry.
+        let lineRender = try render(scene: lineScene, dist: 10, w: 200, h: 100)
+        XCTAssertGreaterThan(nonzeroPixels(lineRender), 0, "thick cell-frame lines must render")
+        // With lineWidth=4, the lines should be visibly thicker than 1px.
+        // A 1px line at 200x100 would cover fewer pixels than a 4px line.
+        let thickHash = pixelHash(lineRender)
+        lineScene.lineWidth = 1.0
+        let thinRender = try render(scene: lineScene, dist: 10, w: 200, h: 100)
+        let thinHash = pixelHash(thinRender)
+        XCTAssertNotEqual(thickHash, thinHash, "thick vs thin lines must differ")
+        XCTAssertGreaterThan(nonzeroPixels(lineRender), nonzeroPixels(thinRender),
+                             "thick lines must cover more pixels than thin lines")
+
+        // --- Line opacity: lines must honor scene opacity (not always opaque).
+        var opaqueLineScene = Scene()
+        opaqueLineScene.background = "#000000"
+        opaqueLineScene.showAxes = false
+        opaqueLineScene.showCellFrame = true
+        opaqueLineScene.cell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10))
+        opaqueLineScene.atoms = []
+        opaqueLineScene.bonds = []
+        opaqueLineScene.lineWidth = 1.0
+        opaqueLineScene.opacity = 1.0
+        let opaqueLineRender = try render(scene: opaqueLineScene, dist: 10, w: 120, h: 120)
+        let opaqueLineHash = pixelHash(opaqueLineRender)
+        var transLineScene = opaqueLineScene
+        transLineScene.opacity = 0.5
+        let transLineRender = try render(scene: transLineScene, dist: 10, w: 120, h: 120)
+        let transLineHash = pixelHash(transLineRender)
+        XCTAssertNotEqual(opaqueLineHash, transLineHash,
+                          "line opacity must change the rendered output")
+        // Semi-transparent lines should produce different (lower intensity) output.
+        // Both should have foreground pixels, but the semi-transparent ones blend toward bg.
+        XCTAssertGreaterThan(nonzeroPixels(opaqueLineRender), 0,
+                             "opaque lines must render pixels")
+        XCTAssertGreaterThan(nonzeroPixels(transLineRender), 0,
+                             "semi-transparent lines must also render pixels")
+
+        // Shortcut: both effects disabled must return unity immediately.
+        var disabledScene = scene
+        disabledScene.aoStrength = 0.0
+        disabledScene.shadowStrength = 0.0
+        disabledScene.aoQuality = 2  // quality is non-zero but strength is zero
+        disabledScene.shadowQuality = 2
+        var disabledRendered = false
+        let disabledTime = Timer.time {
+            disabledRendered = (try? render(scene: disabledScene, dist: 10, w: 32, h: 32)) != nil
+        }
+        XCTAssertTrue(disabledRendered, "disabled AO/shadow must render")
+        // With both effects off, should be fast (no neighbor analysis).
+        XCTAssertLessThan(disabledTime, 1.0, "disabled AO/shadow must shortcut immediately")
     }
 
     // 2D rendering intentionally replaces the 3D camera projection.  Keep an
@@ -307,6 +524,34 @@ final class RendererTests: XCTestCase {
     // MARK: - Camera, lighting, orientation and scale
 
     private func assertCameraRelativeLighting() {
+        // Explicit layout assertions: Swift FrameData/InstanceData must match
+        // their Metal counterparts byte-for-byte. Metal float3 pads to 16 bytes
+        // (like SIMD3<Float>), so these offsets are invariant.
+        XCTAssertEqual(MemoryLayout<FrameData>.stride, 224,
+                       "FrameData stride drifted from Metal layout")
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.view)!, 0)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.proj)!, 64)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.lightDir)!, 128)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.ambient)!, 144)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.eyePos)!, 160)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.lineWidth)!, 176)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.opacity)!, 180)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.depthCueingStrength)!, 184)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.fogNear)!, 188)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.fogFar)!, 192)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.aoStrength)!, 196)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.shadowStrength)!, 200)
+        XCTAssertEqual(MemoryLayout<FrameData>.offset(of: \.backgroundColor)!, 208)
+        // InstanceData: model(64) + color(16) + radius(4) + metalness(4) + aoFactor(4) + shadowFactor(4) = 96
+        XCTAssertEqual(MemoryLayout<InstanceData>.stride, 96,
+                       "InstanceData stride drifted from Metal layout")
+        XCTAssertEqual(MemoryLayout<InstanceData>.offset(of: \.model)!, 0)
+        XCTAssertEqual(MemoryLayout<InstanceData>.offset(of: \.color)!, 64)
+        XCTAssertEqual(MemoryLayout<InstanceData>.offset(of: \.radius)!, 80)
+        XCTAssertEqual(MemoryLayout<InstanceData>.offset(of: \.metalness)!, 84)
+        XCTAssertEqual(MemoryLayout<InstanceData>.offset(of: \.aoFactor)!, 88)
+        XCTAssertEqual(MemoryLayout<InstanceData>.offset(of: \.shadowFactor)!, 92)
+
         var lighting = Lighting()
         lighting.azimuth = 0
         lighting.elevation = 0

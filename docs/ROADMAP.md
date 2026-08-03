@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-02 (v1.1.34: configurable Metal multisample anti-aliasing; 32 focused tests; v1.1.33 context: standard crystallographic camera views, camera bookmarks, and adaptive scale indicators)**.
+Last updated: **2026-08-03 (v1.1.35: complete CRYSCAL expansion, coordination distributions, atom-coordinate editing, and rendering-quality controls; 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 32 focused tests: consolidated parser-family and scene workflows, renderer/raster/vector export, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements, animation-frame lifecycle, CRYSCAL cubic expansion, and QE `tpiba_b` export coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 32 focused tests: consolidated parser-family and scene workflows, renderer/raster/vector export, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements and coordination distributions, atom-coordinate editing, animation-frame lifecycle, all-system CRYSCAL expansion, rendering quality, and QE `tpiba_b` export coverage. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
@@ -101,17 +101,17 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
 
 ### Crystal input completeness
-- [~] CIF declared-operation asymmetric-unit expansion is complete in v1.1.22. CRYSCAL numeric and unambiguous symbolic cubic `CRYSTAL` groups 195–230 now expand through spglib's database-backed operations, with symbolic names resolved by a normalized Hermann–Mauguin lookup, periodic dedup/species mapping, and downstream symmetry/k-path availability; ambiguous/unknown symbols remain incomplete by design, while the pending expansion scope is limited to non-cubic `CRYSTAL` groups, `SLAB`, and `POLYMER`.
+- [x] CIF declared-operation expansion and CRYSCAL completion (v1.1.35): numeric and unambiguous symbolic `CRYSTAL` groups 1–230 expand through convention-compatible spglib Hall settings with periodic species deduplication; `SLAB` builds bounded primitive hkl surface cells with requested layer/vacuum controls; and `POLYMER` is represented as a finite 1D-periodic crystal. Ambiguous/unknown symbols remain incomplete by design.
 
 ### Structure information and analysis
 - [x] Structure summary with lattice lengths/angles, volume, density, composition, formula, and symmetry data (v1.1.18).
-- [~] Atom table with fractional/Cartesian coordinates, and coordination numbers. Read-only Cartesian/fractional table with element/label/CN filtering, coordination numbers, and linked multiple selection implemented; atom editing remains pending.
-- [~] Coordination shells, a single coordination-color toggle applied across supported render modes, selected nearest-neighbor readout, and minimum-image periodic distance are implemented for molecules and 1D/2D/3D skew cells; full neighbor tables, bond/angle distributions, radial distribution functions, and periodic angle/dihedral extensions remain pending.
+- [x] Atom table with fractional/Cartesian coordinates and coordination numbers (v1.1.35): element/label/CN filtering, linked multiple selection, transactional Cartesian/fractional coordinate editing, validation, bounded undo/redo, rebonding, and symmetry/k-path/coordination invalidation.
+- [x] Coordination analysis (v1.1.35): periodic-image shells/CN and coloring, selected-neighbor readout, a bounded virtualized neighbor table, bond-length/angle histograms and CSV, normalized 3D RDF with explicit lower-dimensional unavailable states, and minimum-image distance/angle/dihedral measurements for skew 1D/2D/3D cells.
 - [ ] Polyhedron volume/distortion metrics and two-structure comparison with displacement vectors and RMS displacement.
 - [~] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels. Linked atom-table element/label/CN filters and selection, plus coordination coloring, are implemented; region/expression filtering and on-screen bond-distance labels remain pending.
 
 ### Structure editing and generation
-- [ ] Insert, remove, substitute, and displace atoms; edit Cartesian/fractional coordinates and lattice parameters; and maintain full undo/redo history.
+- [~] Cartesian/fractional atom-coordinate editing with bounded undo/redo is implemented (v1.1.35). Insert/remove/substitute operations, bulk displacement tools, lattice-parameter editing, and a unified full editing history remain pending.
 - [ ] Primitive/conventional transformations, elastic cell deformation, cluster cutting, multi-slab construction, Miller-index surface-cell generation, termination selection, and vacuum control. Existing h/k/l slab controls only filter atoms between fractional planes.
 - [ ] Defect workflows for vacancies, substitutions, and interstitials, with export to XSF, CIF, POSCAR, XYZ, and QE input.
 
@@ -125,7 +125,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Standard crystallographic `[100]`/`[110]`/`[111]` camera views.
 - [x] Three document-scoped named camera bookmark slots with save, recall, and clear actions; exact validated presentation/projection restoration; disabled recalls for empty slots; and optional `.mvis-state` persistence.
 - [x] Adaptive scale indicators (v1.1.33): persisted opt-in Show Scale with an adaptive 1-2-5 Å/nm bar, orthographic-span and perspective camera-center-plane conventions, orbit/zoom/viewport-stable placement, shared live/raster/raster-backed-vector label compositing, and suppression for graph/color-plane views or invalid geometry.
-- [~] Multisample anti-aliasing is implemented (v1.1.34): persisted live Off/2x/4x/8x control, per-export Use Document/Off/2x/4x/8x override, `--msaa`, shared live/raster/raster-backed-vector resolve path, and safe device fallback. Configurable line widths, scene-object transparency, depth cueing, ambient occlusion/soft shadows, and publication presets remain pending.
+- [x] Rendering quality (v1.1.35): persisted configurable line widths, scene-object transparency, depth cueing, bounded ambient-occlusion and soft-shadow approximations with quality levels, publication presets and `--preset`, plus the v1.1.34 live/export MSAA controls and safe device fallback. Defaults preserve prior rendering.
 - [ ] Higher-resolution labels and true vector export for cells, BZs, k-paths, and graphs; image backgrounds, printing, and stereo/anaglyph rendering.
 
 ### Animation, conversion, and extensibility
@@ -145,7 +145,7 @@ All 10 original Tier A items complete: Gaussian Cube/G98, BXSF/Fermi surfaces, 3
 
 ## Tier C — validated by interaction, not files
 
-- [ ] **Structure editing**: cut cluster/molecule; substitute/remove/insert/displace atoms; elastic cell deformation; multi-slab; undo-redo stack.
+- [~] **Structure editing**: Cartesian/fractional coordinate edits and bounded undo/redo are implemented; cut cluster/molecule, substitute/remove/insert/displace workflows, elastic cell deformation, and multi-slab generation remain pending.
 - [ ] **On-screen bond distance labels** — live distance text above each bond.
 - [ ] **Image-background variant** — only `solid` + `gradient_top` exist.
 - [ ] **Print** of the view (`NSPrintOperation`).

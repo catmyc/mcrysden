@@ -64,6 +64,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         /// Whether --msaa was seen at all. Used to reject duplicate --msaa
         /// flags regardless of the first value.
         var msaaSeen = false
+        /// Publication preset override. nil = flag omitted (use scene/default).
+        var preset: PublicationPreset? = nil
         var help = false
     }
 
@@ -190,6 +192,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 // 1 is an explicit Off override: store it so it overrides a scene
                 // default (e.g. 4x from a loaded state). nil means the flag was omitted.
                 options.msaaSampleCount = value
+            } else if !optionsEnded && argument == "--preset" {
+                guard options.preset == nil, index + 1 < args.count,
+                      let preset = PublicationPreset(rawValue: args[index + 1]) else {
+                    throw CLIError.invalid("--preset requires one of: " + PublicationPreset.allCases.map { $0.rawValue }.joined(separator: ", "))
+                }
+                index += 1
+                options.preset = preset
             } else if !optionsEnded, let info = formatTable.first(where: { $0.flag == argument }) {
                 guard forced == nil else { throw CLIError.invalid("multiple force-format flags are not allowed") }
                 forced = info.format
@@ -488,7 +497,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             do {
                 try Self.validateExportDestination(outURL, input: inURL, state: options.stateURL)
                 var kPathSampling = 20
-                let (scene, camera, _) = try Self.loadScene(
+                var (scene, camera, _) = try Self.loadScene(
                     from: inURL,
                     format: options.format,
                     cliFrame: options.frame,
@@ -497,6 +506,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     kPathSampling: &kPathSampling
                 )
                 let exportSize = CGSize(width: 800, height: 800)
+                // Apply a --preset override to the scene's rendering quality.
+                if let preset = options.preset {
+                    preset.apply(to: &scene)
+                }
                 // Carry the explicit --msaa override into the export's render options so
                 // it applies to the exported image without mutating the document scene.
                 // nil (flag omitted) leaves the scene default; any value (including 1)
@@ -534,6 +547,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 // state's setting; nil (flag omitted) leaves the scene default intact.
                 if let msaa = options.msaaSampleCount {
                     scene.msaaSampleCount = msaa
+                }
+                // Apply a --preset override to the scene's rendering quality.
+                if let preset = options.preset {
+                    preset.apply(to: &scene)
                 }
                 let wc = MainWindowController(scene: Scene())
                 windowRegistry.add(wc)
@@ -1095,7 +1112,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.34"
+    static let appVersion = "1.1.35"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -1120,6 +1137,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         open a specific frame with --frame N (0-based frame index).
         Export format is chosen by extension: .png (raster) or .pdf/.svg/.eps/.ps (raster-backed containers).
         Control multisampled antialiasing with --msaa 1|2|4|8 (1 = explicit Off override; omit to use scene default).
+        Apply rendering-quality settings with --preset default|journal|presentation|print.
         """)
     }
 }

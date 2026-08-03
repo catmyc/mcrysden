@@ -1,6 +1,21 @@
 import Foundation
 import simd
 import AppKit
+import AudioToolbox
+
+/// Result of attempting to commit an atom-coordinate edit from the table.
+/// The controller returns this to the table so the table can update its
+/// display or reject the edit without retaining a copy of the scene.
+enum EditCommitResult: Equatable {
+    /// The edit was valid and applied. The controller has already updated the
+    /// scene and run the invalidation lifecycle; the table should refresh the
+    /// affected row from its (now current) `atoms` snapshot.
+    case accepted
+    /// The edit was rejected: the value was non-finite, the cell was singular
+    /// for a fractional edit, or the geometry was not editable (supercell/slab
+    /// active). The table beeps and keeps the previous value.
+    case rejected(reason: String)
+}
 
 /// A standalone virtualized atom table: an NSSearchField above a scrolling
 /// NSTableView showing one row per (filtered) atom. Data-source backed —
@@ -14,6 +29,23 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     let searchField: NSSearchField
     let tableView: NSTableView
     var onSelectionChange: (([Int]) -> Void)?
+    /// Invoked when the user commits an edit to a coordinate cell. The row is
+    /// the currently-filtered row, the column identifies x/y/z or a/b/c, and
+    /// `value` is the raw text from the field editor. The controller validates
+    /// and applies the edit transactionally; the result tells the table whether
+    /// to accept (refresh) or reject (beep + keep old value).
+    var onCommitEdit: ((Int, NSUserInterfaceItemIdentifier, String) -> EditCommitResult)?
+    /// When false, coordinate cells are shown but editing is disabled. Set by
+    /// the controller when the displayed geometry is not pristine (supercell
+    /// or slab active) so edits cannot corrupt base/preslab invariants.
+    var isEditingEnabled: Bool = true
+    /// Human-readable reason why editing is disabled, shown as a tooltip on
+    /// the coordinate columns. nil when editing is enabled.
+    var editingDisabledReason: String?
+    /// The reason the most recent commit was rejected. Surfaced as the
+    /// table's accessibility description so invalid input is communicated
+    /// beyond a beep. Cleared on the next successful edit or table update.
+    var lastRejectionReason: String?
     private(set) var filteredAtomIndices: [Int] = []
 
     private let scrollView: NSScrollView
@@ -109,6 +141,13 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
             col.title = title
             col.width = width
             col.minWidth = 40
+            // Coordinate columns (x/y/z, a/b/c) are editable; the rest are not.
+            switch id {
+            case Self.colX, Self.colY, Self.colZ, Self.colA, Self.colB, Self.colC:
+                col.isEditable = true
+            default:
+                col.isEditable = false
+            }
             tableView.addTableColumn(col)
         }
 
@@ -131,6 +170,7 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         self.cell = cell
         self.fractionalCoords = atoms.map { cartesianToFractional($0.coord) }
         selectedOriginalAtomIndices = normalizedOriginalIndices(selectedAtoms)
+        lastRejectionReason = nil
         updateCoordinationNumbers(coordinationNumbers, rebuildFilterWhenNoCoordinationTerm: true)
     }
 
@@ -377,6 +417,51 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
         return value(atRow: row, columnIdentifier: id)
     }
 
+    /// Commit an edited coordinate value. Routes the edit through the
+    /// controller's `onCommitEdit` callback for transactional validation and
+    /// application; never mutates the table's private `atoms` snapshot.
+    func tableView(_ tableView: NSTableView, setObjectValue object: Any?,
+                   for tableColumn: NSTableColumn?, row: Int) {
+        // Only coordinate columns are editable; ignore anything else defensively.
+        guard let id = tableColumn?.identifier, isCoordinateColumn(id) else { return }
+        guard row >= 0, row < filteredAtomIndices.count else { return }
+
+        let text = (object as? String) ?? ""
+        let result = onCommitEdit?(row, id, text) ?? .rejected(reason: "")
+        switch result {
+        case .accepted:
+            // The controller has updated the scene and will refresh the table
+            // through the normal `update(atoms:...)` path. No local mutation.
+            lastRejectionReason = nil
+            tableView.setAccessibilityHelp(nil)
+            tableView.toolTip = editingDisabledReason
+        case .rejected(let reason):
+            // Beep, reload the rejected cell so the canonical value is redrawn
+            // (the field editor's text is stale), and expose the reason for
+            // accessibility/tooltip.
+            AudioServicesPlaySystemSound(1104)
+            if let col = tableView.tableColumns.firstIndex(where: { $0.identifier == id }) {
+                tableView.reloadData(forRowIndexes: IndexSet(integer: row),
+                                     columnIndexes: IndexSet(integer: col))
+            }
+            // Surface the rejection reason for accessibility and pointer users.
+            lastRejectionReason = reason
+            tableView.setAccessibilityHelp(reason)
+            tableView.toolTip = reason
+        }
+    }
+
+    /// Gate editing on a per-column basis: only coordinate cells are editable,
+    /// and only while `isEditingEnabled` is true (pristine geometry). When
+    /// editing is disabled, the delegate returns false so the field editor
+    /// never appears and the cell stays read-only.
+    func tableView(_ tableView: NSTableView,
+                   shouldEdit tableColumn: NSTableColumn?, row: Int) -> Bool {
+        guard let id = tableColumn?.identifier else { return false }
+        guard isCoordinateColumn(id) else { return false }
+        return isEditingEnabled
+    }
+
     // MARK: - Math helpers
 
     /// Cramer's rule on the [a b c] system. Returns nil for a missing/singular
@@ -438,5 +523,16 @@ final class AtomTableView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private func formatFloat(_ v: Float) -> String? {
         guard v.isFinite else { return nil }
         return String(format: "%.3f", v)
+    }
+
+    /// True for the six coordinate columns (Cartesian x/y/z and fractional
+    /// a/b/c). These are the only cells the user can edit.
+    private func isCoordinateColumn(_ id: NSUserInterfaceItemIdentifier) -> Bool {
+        switch id {
+        case Self.colX, Self.colY, Self.colZ, Self.colA, Self.colB, Self.colC:
+            return true
+        default:
+            return false
+        }
     }
 }

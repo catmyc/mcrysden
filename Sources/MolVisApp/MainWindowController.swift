@@ -129,6 +129,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// controller but not installed in any window until `showAtomTable` lazily
     /// creates the auxiliary panel.
     let atomTable = AtomTableView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+    /// Standalone neighbor table (virtualized). Owned by the controller but not
+    /// installed in any window until `showNeighborTable` lazily creates it.
+    let neighborTable = NeighborTableView(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
+    /// Lazily-created, reusable auxiliary window hosting `neighborTable`.
+    private(set) var neighborTableWindow: NSWindow?
+    /// Runtime-only distribution analysis derived from the coordination result.
+    private(set) var distributionAnalysis: DistributionAnalysis?
     /// Lazily-created, reusable auxiliary window hosting `atomTable`. nil until the
     /// first `showAtomTable`; repeated calls reuse this same window.
     private(set) var atomTableWindow: NSWindow?
@@ -191,6 +198,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private var coordinationCancellationToken: CoordinationCancellationToken?
     private var coordinationDebounceCancellation: (() -> Void)?
     private var coordinationGeneration = 0
+    /// Distribution analysis is derived on a background work item so the main
+    /// thread is not blocked by the O(27·n²) RDF enumeration or the
+    /// O(n·k²) bond-angle sweep.
+    private var distributionWorkItem: DispatchWorkItem?
+    private var distributionGeneration = 0
     private var lastCoordinationEnabled = false
     private var lastCoordinationScale = CoordinationAnalyzer.defaultRadiusScale
     /// Complete CN data installed for the currently displayed atom ordering.
@@ -257,6 +269,18 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// overwrite a later-scrubbed or more recent load. Incremented at each
     /// loadFile / loadDroppedFile entry; the capture before async work gates install.
     private var loadGeneration = 0
+    /// Guards against re-entrant scene mutation during commit/undo so a
+    /// lifecycle callback (e.g. coordination update) that touches the scene
+    /// cannot silently discard an in-progress edit.
+    private var isCommittingEdit = false
+    /// When non-nil, undo is disabled for coordinate edits (structure too
+    /// large). The string explains why; surfaced via the table's editing-
+    /// disabled reason when relevant.
+    private var coordinateUndoDisabledReason: String?
+    /// The reason the most recent commit was rejected. Surfaces as the
+    /// table's accessibility/status text so invalid input is communicated
+    /// beyond a beep.
+    private(set) var lastEditRejectionReason: String?
     /// Repeating timer driving AXSF playback. Held weakly by the runloop; we
     /// recreate it on Play and invalidate on Pause/stop in `syncFromState`.
     private var playTimer: Timer?
@@ -370,6 +394,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let f = CGRect(x: 0, y: 0, width: 1100, height: 750)
         window = NSWindow(contentRect: f, styleMask: [.titled,.closable,.miniaturizable,.resizable], backing: .buffered, defer: false)
         super.init()
+        // Set up the window's undo manager for coordinate editing. The Edit
+        // menu's Undo/Redo items (target nil) resolve to this manager through
+        // the first-responder chain.
+        window.undoManager?.levelsOfUndo = 64
+        window.undoManager?.groupsByEvent = false
         window.delegate = self
         state.onChange = { [weak self] in self?.syncFromState() }
         state.onResetView = { [weak self] in self?.resetView() }
@@ -407,6 +436,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onResetKPath = { [weak self] in self?.resetKPathDefault() }
         state.onSelectKPathNode = { [weak self] index in self?.selectKPathNode(index) }
         state.onShowAtomTable = { [weak self] in self?.showAtomTable() }
+        state.onShowNeighborTable = { [weak self] in self?.showNeighborTable() }
+        state.onExportDistributionCSV = { [weak self] dist in
+            guard let self else { return }
+            self.exportDistributionCSV(dist)
+        }
         state.onExportElectronicAnalysisText = { [weak self] report in
             guard let self else { return }
             self.exportElectronicAnalysisText(report.summaryText)
@@ -466,6 +500,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 self.showInfoWindow()
             }
             self.setNeedsRender()
+        }
+        // Coordinate editing in the atom table. The table routes every cell
+        // commit here for transactional validation and application; the table
+        // itself never mutates a private copy of the atoms.
+        atomTable.onCommitEdit = { [weak self] row, columnIdentifier, value in
+            guard let self else { return .rejected(reason: "") }
+            return self.commitAtomEdit(row: row, columnIdentifier: columnIdentifier, value: value)
         }
         // syncFromScene (above) installed the initial route via replaceKPath, bumping
         // routeGeneration; mirror that so the first real syncFromState does not treat
@@ -673,10 +714,325 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     private func updateAtomTable() {
         coordinationFullTableRefreshCount += 1
+        syncAtomTableEditingState()
         atomTable.update(atoms: scene.atoms, cell: scene.cell, selectedAtoms: scene.selectedAtoms,
                          coordinationNumbers: installedCoordinationNumbers.isEmpty
                             ? nil : installedCoordinationNumbers)
         lastSyncedSelection = scene.selectedAtoms
+    }
+
+    // MARK: - Atom-coordinate editing
+
+    /// Record the rejection reason and return `.Rejected`. Centralizes the
+    /// bookkeeping so every rejection path surfaces the reason to the UI.
+    private func rejectEdit(reason: String) -> EditCommitResult {
+        lastEditRejectionReason = reason
+        return .rejected(reason: reason)
+    }
+
+    /// Validate and apply a coordinate edit committed from the atom table.
+    /// Transactional: the scene is left unchanged when the edit is rejected.
+    /// `row` is the filtered table row; `columnIdentifier` is x/y/z or a/b/c;
+    /// `value` is the raw text from the field editor. Returns `.accepted` when
+    /// the edit was applied, `.rejected` otherwise (the table beeps).
+    func commitAtomEdit(row: Int, columnIdentifier: NSUserInterfaceItemIdentifier,
+                        value: String) -> EditCommitResult {
+        // Re-entrancy guard: a lifecycle callback that touches the scene must
+        // never discard an in-progress commit.
+        guard !isCommittingEdit else {
+            return rejectEdit(reason: "")
+        }
+        isCommittingEdit = true
+        defer { isCommittingEdit = false }
+
+        // Resolve the filtered row to the original displayed atom index.
+        guard row >= 0, row < atomTable.filteredAtomIndices.count else {
+            return rejectEdit(reason: "")
+        }
+        let atomIndex = atomTable.filteredAtomIndices[row]
+        guard atomIndex >= 0, atomIndex < scene.atoms.count else {
+            return rejectEdit(reason: "")
+        }
+
+        // Editing is only allowed on pristine geometry: no supercell expansion
+        // and no slab. Otherwise a coordinate edit would corrupt the base /
+        // preslab invariants that widening and slab filtering rebuild from.
+        if scene.superCell.total > 1 {
+            return rejectEdit(reason: "Editing disabled: supercell active. "
+                + "Reset the supercell to 1×1×1 to edit atom coordinates.")
+        }
+        if scene.slab != nil {
+            return rejectEdit(reason: "Editing disabled: slab active. "
+                + "Remove the slab to edit atom coordinates.")
+        }
+        if scene.atoms.count > Self.coordinateUndoMaxAtoms {
+            return rejectEdit(reason: "Editing disabled: structure has \(scene.atoms.count) atoms "
+                + "(editable cap \(Self.coordinateUndoMaxAtoms)).")
+        }
+
+        // Validate the new value: must parse as a finite Float.
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard let newValue = Float(trimmed), newValue.isFinite else {
+            return rejectEdit(reason: "\"\(trimmed)\" is not a finite number.")
+        }
+
+        let currentCoord = scene.atoms[atomIndex].coord
+        var newCoord = currentCoord
+
+        switch columnIdentifier {
+        case AtomTableView.colX: newCoord.x = newValue
+        case AtomTableView.colY: newCoord.y = newValue
+        case AtomTableView.colZ: newCoord.z = newValue
+        case AtomTableView.colA, AtomTableView.colB, AtomTableView.colC:
+            // Fractional edit: requires a finite, nonsingular cell so the
+            // fractional<->Cartesian conversion is well-defined.
+            guard let cell = scene.cell, cell.isFinite else {
+                return rejectEdit(reason: "Fractional edit requires a finite unit cell.")
+            }
+            guard cell.isNonsingular else {
+                return rejectEdit(reason: "Fractional edit requires a nonsingular unit cell.")
+            }
+            // Convert the displayed fractional value to Cartesian. Preserve the
+            // unchanged fractional components, then convert the full triplet.
+            let currentFrac = scene.fractionalCoord(currentCoord) ?? SIMD3(0, 0, 0)
+            var targetFrac = currentFrac
+            switch columnIdentifier {
+            case AtomTableView.colA: targetFrac.x = newValue
+            case AtomTableView.colB: targetFrac.y = newValue
+            case AtomTableView.colC: targetFrac.z = newValue
+            default: break
+            }
+            let cartesian = cell.cartesian(targetFrac)
+            guard cartesian.isFinite else {
+                return rejectEdit(reason: "Fractional conversion produced a non-finite coordinate.")
+            }
+            newCoord = cartesian
+        default:
+            return rejectEdit(reason: "")
+        }
+
+        // No-op when the value is unchanged — don't pollute the undo stack.
+        if newCoord == currentCoord {
+            lastEditRejectionReason = nil
+            return .accepted
+        }
+
+        // Capture the pre-edit scene for undo BEFORE mutating.
+        let preEditScene = scene
+
+        // Apply the edit: copy the atom, preserve identity/label/force, update
+        // only the coordinate.
+        var editedAtom = scene.atoms[atomIndex]
+        editedAtom.coord = newCoord
+
+        // Push the edit onto the scene transactionally.
+        var newScene = scene
+        newScene.atoms[atomIndex] = editedAtom
+        // For pristine geometry (the only editable case), all source snapshots
+        // must mirror the edited atoms. Otherwise a later slab, supercell reset,
+        // or BZ invalidation could silently restore stale pre-edit geometry.
+        if newScene.superCell.total <= 1 && newScene.slab == nil {
+            newScene.baseAtoms = newScene.atoms
+            newScene.preslabAtoms = newScene.atoms
+        }
+        // Recompute bonds for the edited atom set (C covalent-radii heuristic).
+        // Handles both crystals (periodic, bonds across images) and molecules
+        // (non-periodic, distance-only). Never leaves stale or empty molecule
+        // bonds after a coordinate edit.
+        newScene.bonds = Scene.rebond(newScene.atoms, cell: newScene.cell,
+                                       isCrystal: newScene.isCrystal,
+                                       periodicDim: newScene.periodicDim)
+        if newScene.superCell.total <= 1 && newScene.slab == nil {
+            newScene.baseBonds = newScene.bonds
+        }
+        // A coordinate change invalidates the locked measurement: the picked
+        // atoms' positions shifted.
+        newScene.measurementResult = nil
+        // Invalidate symmetry analysis and the generated k-path that derives
+        // from it. Preserve the prior input-completeness so an asymmetric-unit
+        // or unknown file is never promoted to `.complete` by an edit. User-
+        // edited routes are preserved (cell is unchanged).
+        let priorCompleteness = scene.crystalSymmetry?.inputCompleteness ?? .complete
+        newScene.crystalSymmetry = CrystalSymmetryAnalyzer.analyze(
+            cell: newScene.cell,
+            atoms: newScene.atoms,
+            isCrystal: newScene.isCrystal,
+            periodicDim: newScene.periodicDim,
+            inputCompleteness: priorCompleteness
+        )
+        // Regenerate the canonical path only for valid complete 3D crystals.
+        // User-edited routes remain exact; incomplete/unknown/2D inputs skip
+        // regeneration (installCanonicalPath clears the path when symmetry is
+        // unavailable, which is the correct conservative behavior).
+        let isComplete3DCrystal = newScene.isCrystal && newScene.periodicDim == 3
+            && priorCompleteness == .complete
+        if newScene.kPathProvenance == .generated, let cell = newScene.cell,
+           isComplete3DCrystal {
+            newScene.installCanonicalPath(cell: cell)
+        }
+
+        // Install the new scene. `scene.didSet` invalidates the BZ cache when
+        // reciprocal geometry changed (it did: base atoms changed).
+        scene = newScene
+
+        // Register bounded undo: capture the pre-edit scene. Coalesced — one
+        // entry per cell commit.
+        pushCoordinateUndo(preEditScene)
+
+        // Run the remaining invalidation lifecycle.
+        runCoordinateEditLifecycle()
+
+        // Set up the table for the next edit: editing is enabled on pristine
+        // geometry, disabled otherwise (defensive — we already checked above).
+        syncAtomTableEditingState()
+
+        return .accepted
+    }
+
+    /// Per-snapshot atom cap for undo. Each undo entry captures a full Scene
+    /// (atoms + bonds + cell + fields); at ~32 bytes/atom plus bonds, a 500k-
+    /// atom structure would burn ~16 MB per snapshot. Cap so the bounded
+    /// history (levelsOfUndo) never exceeds a reasonable memory budget.
+    static let coordinateUndoMaxAtoms = 10_000
+
+    /// Register an undo action with the window's undo manager. One entry
+    /// per commit; the redo stack (in NSUndoManager) is cleared automatically
+    /// because a new edit invalidates redo history. Skipped (with a clear
+    /// status) when the structure exceeds the undo atom cap.
+    private func pushCoordinateUndo(_ preEditScene: Scene) {
+        if preEditScene.atoms.count > Self.coordinateUndoMaxAtoms {
+            coordinateUndoDisabledReason = "Undo disabled: structure has \(preEditScene.atoms.count) atoms (cap \(Self.coordinateUndoMaxAtoms))."
+            return
+        }
+        coordinateUndoDisabledReason = nil
+        // One explicit group per table-cell commit. This avoids accidentally
+        // merging programmatic commits in the same run-loop event and mirrors
+        // the UI contract exactly.
+        guard let undoManager = window.undoManager else { return }
+        undoManager.beginUndoGrouping()
+        undoManager.registerUndo(withTarget: self) { [weak self] _ in
+            self?.restoreSceneForUndo(preEditScene)
+        }
+        undoManager.setActionName("Edit Atom Coordinate")
+        undoManager.endUndoGrouping()
+    }
+
+    /// Restore a pre- or post-edit scene as part of an undo/redo. Called by
+    /// NSUndoManager. Registers the inverse action so undo and redo are
+    /// symmetric, then runs the invalidation lifecycle.
+    func restoreSceneForUndo(_ targetScene: Scene) {
+        let currentScene = scene
+        scene = targetScene
+        // Register the inverse so the user can redo (or undo again).
+        window.undoManager?.registerUndo(withTarget: self) { [weak self] _ in
+            self?.restoreSceneForUndo(currentScene)
+        }
+        window.undoManager?.setActionName("Edit Atom Coordinate")
+        runCoordinateEditLifecycle()
+        syncAtomTableEditingState()
+    }
+
+    /// Undo the most recent coordinate edit. Delegates to the window's undo
+    /// manager, which dispatches to `restoreSceneForUndo`.
+    func undoCoordinateEdit() {
+        window.undoManager?.undo()
+    }
+
+    /// Redo the most recent undone coordinate edit.
+    func redoCoordinateEdit() {
+        window.undoManager?.redo()
+    }
+
+    /// The invalidation lifecycle shared by commit, undo, and redo. Updates
+    /// the structure summary, BZ-dependent geometry, coordination analysis,
+    /// distribution analysis, the atom table, and the renderer.
+    private func runCoordinateEditLifecycle() {
+        // Structure summary reflects the new geometry.
+        state.structureSummary = StructureSummary(scene, symmetry: scene.crystalSymmetry)
+        // The k-path sidebar mirror must agree with the scene's route (which
+        // may have been regenerated). Replace atomically without triggering
+        // onChange -> syncFromState, which would push stale state back.
+        state.replaceKPath(points: scene.kPathPoints, breaks: scene.kPathBreaks,
+                           provenance: scene.kPathProvenance, signature: scene.kPathSignature)
+        // Cancel in-flight coordination/distribution work and restart for the
+        // new atom ordering.
+        coordinationGeometryDidChange()
+        // Refresh the atom table (unless a cell edit is in progress).
+        refreshAtomTable()
+        // Render the updated scene.
+        setNeedsRender()
+    }
+
+    /// Sync the atom table's editing-enabled flag and tooltip with the current
+    /// geometry. Editing is only safe on pristine (unexpanded, unslabbed) geometry.
+    internal func syncAtomTableEditingState() {
+        let pristine = scene.superCell.total <= 1 && scene.slab == nil
+        let withinEditCap = scene.atoms.count <= Self.coordinateUndoMaxAtoms
+        let enabled = pristine && withinEditCap
+        let reason: String?
+        if scene.slab != nil {
+            reason = "Editing disabled: slab active. Remove the slab to edit coordinates."
+        } else if scene.superCell.total > 1 {
+            reason = "Editing disabled: supercell active. Reset to 1×1×1 to edit coordinates."
+        } else if !withinEditCap {
+            reason = "Editing disabled: structure has \(scene.atoms.count) atoms "
+                + "(editable cap \(Self.coordinateUndoMaxAtoms))."
+        } else {
+            reason = nil
+        }
+        atomTable.isEditingEnabled = enabled
+        atomTable.editingDisabledReason = reason
+        atomTable.tableView.toolTip = reason
+        atomTable.tableView.setAccessibilityHelp(reason)
+    }
+
+    /// Lazily create (once) and show the auxiliary neighbor-table panel.
+    func showNeighborTable() {
+        if neighborTableWindow == nil {
+            let win = NSWindow(contentRect: neighborTable.frame,
+                                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                backing: .buffered, defer: false)
+            win.title = "Neighbor Table"
+            win.isReleasedWhenClosed = false
+            win.contentView = neighborTable
+            neighborTableWindow = win
+        }
+        neighborTableWindow?.makeKeyAndOrderFront(nil)
+        updateNeighborTable()
+    }
+
+    /// Push the current coordination analysis into the neighbor table. O(n)
+    /// over the flat neighbor list, so only call on coordination changes.
+    private func updateNeighborTable() {
+        guard let window = neighborTableWindow, window.isVisible,
+              let analysis = coordinationAnalysis else { return }
+        neighborTable.update(analysis: analysis, atoms: scene.atoms)
+    }
+
+    /// Present a save panel and write the distribution analysis as CSV.
+    /// The RDF CSV emits actual g(r) values, not raw counts.
+    private func exportDistributionCSV(_ dist: DistributionAnalysis) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "distribution.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            var lines: [String] = []
+            lines.append("# Bond-length distribution (\(dist.uniquePairCount) unique pairs)")
+            lines.append(dist.bondLengthHistogram.csv())
+            lines.append("")
+            lines.append("# Bond-angle distribution (\(dist.uniqueAngleCount) unique angles)")
+            lines.append(dist.bondAngleHistogram.csv())
+            lines.append("")
+            lines.append("# Radial distribution function")
+            if dist.radialDistribution.isAvailable {
+                lines.append("# maxRadius: \(dist.radialDistribution.maxRadius) Å" + (dist.radialDistribution.wasCapped ? " (capped)" : ""))
+            }
+            lines.append(dist.radialDistribution.csv())
+            let text = lines.joined(separator: "\n")
+            do { try text.write(to: url, atomically: true, encoding: .utf8) }
+            catch { print("[mcrysden] distribution CSV export failed: \(error)") }
+        }
     }
 
     private func updateCoordinationTable() {
@@ -810,6 +1166,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         stopPlayback()
         cancelCoordinationRequest()
         coordinationGeneration += 1
+        distributionGeneration += 1
         state.isPlaying = false
         infoWindow.orderOut(nil)
     }
@@ -2306,6 +2663,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationWorkItem = nil
         coordinationDebounceCancellation?()
         coordinationDebounceCancellation = nil
+        distributionWorkItem?.cancel()
+        distributionWorkItem = nil
     }
 
     private func startCoordinationAnalysis(debounced: Bool) {
@@ -2423,6 +2782,50 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationWorkItem = nil
         coordinationCancellationToken = nil
         setNeedsRender()
+
+        // Derive distribution analysis on a background work item so the main
+        // thread is not blocked by the O(27·n²) RDF enumeration or the
+        // O(n·k²) bond-angle sweep. Each request gets a generation token so
+        // stale results from a superseded request are discarded.
+        distributionWorkItem?.cancel()
+        distributionGeneration += 1
+        let distGeneration = distributionGeneration
+        let distAtoms = scene.atoms
+        // Use the effective (widened) coordination cell so that volume,
+        // density, and minimum-image periodicity are consistent with the
+        // coordination analysis that produced the neighbor records.
+        let distCell = effectiveCoordinationCell(for: scene)
+        let distPeriodicDim = scene.periodicDim
+        let distResult = result
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.distributionGeneration == distGeneration else { return }
+            let dist = DistributionAnalyzer.analyze(distResult, atoms: distAtoms,
+                                                     cell: distCell,
+                                                     periodicDim: distPeriodicDim,
+                                                     isCancelled: { [weak self] in
+                                                         guard let self else { return true }
+                                                         return self.distributionGeneration != distGeneration
+                                                     })
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.distributionGeneration == distGeneration else { return }
+                if let dist {
+                    self.distributionAnalysis = dist
+                    self.state.distributionAnalysis = dist
+                    self.state.distributionAnalysisAvailable = true
+                } else {
+                    self.distributionAnalysis = nil
+                    self.state.distributionAnalysis = nil
+                    self.state.distributionAnalysisAvailable = false
+                }
+                self.distributionWorkItem = nil
+                self.setNeedsRender()
+            }
+        }
+        distributionWorkItem = work
+        DispatchQueue.global(qos: .userInitiated).async(execute: work)
+
         coordinationAnalysisDidUpdate?()
     }
 
@@ -2430,7 +2833,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationCancellationToken?.cancel()
         coordinationCancellationToken = nil
         coordinationWorkItem = nil
+        distributionGeneration += 1
         coordinationAnalysis = nil
+        distributionAnalysis = nil
+        state.distributionAnalysis = nil
+        state.distributionAnalysisAvailable = false
         clearCoordinationNumbers()
         state.coordinationAnalysisAvailable = false
         state.coordinationStatusText = "Unavailable"
@@ -2441,7 +2848,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private func clearCoordinationAnalysis(status: String, summary: String) {
         cancelCoordinationRequest()
         coordinationGeneration += 1
+        distributionGeneration += 1
         coordinationAnalysis = nil
+        distributionAnalysis = nil
+        state.distributionAnalysis = nil
+        state.distributionAnalysisAvailable = false
         clearCoordinationNumbers()
         state.coordinationAnalysisAvailable = false
         state.coordinationStatusText = status

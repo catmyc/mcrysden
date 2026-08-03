@@ -44,6 +44,13 @@ enum StateStore {
         payload["showColorPlane"] = scene.showColorPlane
         payload["forceScale"] = scene.forceScale
         payload["msaaSampleCount"] = scene.msaaSampleCount
+        payload["opacity"] = scene.opacity
+        payload["lineWidth"] = scene.lineWidth
+        payload["depthCueingStrength"] = scene.depthCueingStrength
+        payload["aoStrength"] = scene.aoStrength
+        payload["shadowStrength"] = scene.shadowStrength
+        payload["aoQuality"] = scene.aoQuality
+        payload["shadowQuality"] = scene.shadowQuality
         payload["atomScale"] = scene.atomScale
         payload["bondRadius"] = scene.bondRadius
         payload["lighting"] = [
@@ -254,6 +261,29 @@ enum StateStore {
         // scene/camera/bookmarks preserved).
         if let raw = obj["msaaSampleCount"] {
             candidate.msaaSampleCount = try strictMSAASampleCount(raw, field: "msaaSampleCount", url: url)
+        }
+        // Rendering-quality fields. All optional for backward compatibility;
+        // missing keys keep the Scene defaults (which preserve original output).
+        if let v = try finiteFloat(obj["opacity"], field: "opacity") {
+            candidate.opacity = min(1.0, max(0.0, v))
+        }
+        if let v = try finiteFloat(obj["lineWidth"], field: "lineWidth") {
+            candidate.lineWidth = min(10.0, max(1.0, v))
+        }
+        if let v = try finiteFloat(obj["depthCueingStrength"], field: "depthCueingStrength") {
+            candidate.depthCueingStrength = min(1.0, max(0.0, v))
+        }
+        if let v = try finiteFloat(obj["aoStrength"], field: "aoStrength") {
+            candidate.aoStrength = min(1.0, max(0.0, v))
+        }
+        if let v = try finiteFloat(obj["shadowStrength"], field: "shadowStrength") {
+            candidate.shadowStrength = min(1.0, max(0.0, v))
+        }
+        if let v = obj["aoQuality"] as? Int {
+            candidate.aoQuality = min(3, max(0, v))
+        }
+        if let v = obj["shadowQuality"] as? Int {
+            candidate.shadowQuality = min(3, max(0, v))
         }
         if let v = try finiteFloat(obj["atomScale"], field: "atomScale") { candidate.atomScale = min(1.0, max(0.05, v)) }
         if let v = try finiteFloat(obj["bondRadius"], field: "bondRadius") {

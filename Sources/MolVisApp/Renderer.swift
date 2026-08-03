@@ -6,7 +6,7 @@ import simd
 // 16 bytes (3 floats + 4-byte tail pad), so radius lands at offset 80, not 76.
 // We align by using a 16-byte float4 for color on BOTH sides, eliminating the
 // ambiguity entirely. The shader consumes color.rgb.
-struct InstanceData { var model: float4x4; var color: SIMD4<Float>; var radius: Float; var metalness: Float }
+struct InstanceData { var model: float4x4; var color: SIMD4<Float>; var radius: Float; var metalness: Float; var aoFactor: Float; var shadowFactor: Float }
 
 /// Per-frame uniforms shared by every pipeline. Laid out to match the Metal
 /// `FrameData` struct EXACTLY (float3 slots occupy 16 bytes with tail padding,
@@ -22,6 +22,15 @@ struct FrameData {
     var specular: Float          // material.specular weight
     var shininess: Float         // material.shininess exponent
     var eyePos: SIMD3<Float>     // world-space camera position (for the specular term)
+    // Appended rendering-quality fields (byte-compatible: inserted after eyePos)
+    var lineWidth: Float         // scene line width in pixels (1 = original 1px)
+    var opacity: Float           // scene-object opacity 0...1 (1 = opaque)
+    var depthCueingStrength: Float // 0 = off; >0 fades distant fragments toward bg
+    var fogNear: Float           // view-space depth at which cueing begins
+    var fogFar: Float            // view-space depth at which cueing is full
+    var aoStrength: Float        // 0 = off; >0 applies per-instance AO factor
+    var shadowStrength: Float    // 0 = off; >0 applies per-instance shadow factor
+    var backgroundColor: SIMD3<Float> // bg color depth cueing fades toward
 }
 
 enum RenderError: Error { case makeCommandQueue, makeFunction, makeBuffer, makePipeline }
@@ -36,6 +45,7 @@ final class Renderer: NSObject {
     private var flat2DPipeline: MTLRenderPipelineState   // unlit screen-space quads (2D atoms)
     private var polyPipeline: MTLRenderPipelineState     // flat-shaded polyhedron triangles
     private var gradPipeline: MTLRenderPipelineState     // fullscreen gradient quad
+    private var thickLinePipeline: MTLRenderPipelineState // expanded-NDC quad lines (configurable width)
     private let library: MTLLibrary
 
     /// MSAA sample count for offscreen export rendering. nil → the scene's
@@ -53,7 +63,7 @@ final class Renderer: NSObject {
     }
     private var msaaPipelineCache: [Int: (atom: MTLRenderPipelineState, line: MTLRenderPipelineState,
                                           flat2D: MTLRenderPipelineState, poly: MTLRenderPipelineState,
-                                          grad: MTLRenderPipelineState)] = [:]
+                                          grad: MTLRenderPipelineState, thickLine: MTLRenderPipelineState)] = [:]
     private var msaaColorTexture: MTLTexture?
     private var msaaColorTextureKey: (w: Int, h: Int, samples: Int) = (0, 0, 0)
     private var msaaDepthTexture: MTLTexture?
@@ -61,6 +71,8 @@ final class Renderer: NSObject {
 
     private let overlayDepthState: MTLDepthStencilState?
     private let depthStencilState: MTLDepthStencilState?
+    /// Depth state for transparent objects: less-equal compare with no depth write.
+    private let transparentDepthState: MTLDepthStencilState?
     /// Depth state for the BZ k-path route overlay: less-than-or-equal compare with
     /// DEPTH WRITES DISABLED. Route segments/nodes share the BZ landmarks' depth, so
     /// a strict `.less` compare can drop equal-depth route fragments behind the white
@@ -253,7 +265,8 @@ final class Renderer: NSObject {
     /// sidebar's azimuth/elevation describe a camera-space light, which is
     /// transformed into world space so orbiting the structure changes which
     /// surfaces face the viewer-fixed light.
-    static func makeFrame(view: float4x4, proj: float4x4, lighting: Lighting, eye: SIMD3<Float>) -> FrameData {
+    static func makeFrame(view: float4x4, proj: float4x4, lighting: Lighting, eye: SIMD3<Float>,
+                          backgroundColor: SIMD3<Float> = SIMD3<Float>(0, 0, 0)) -> FrameData {
         let az = lighting.azimuth * .pi / 180.0
         let el = lighting.elevation * .pi / 180.0
         let cel = cos(el)
@@ -262,7 +275,11 @@ final class Renderer: NSObject {
         return FrameData(view: view, proj: proj, lightDir: lightDir,
                          ambient: lighting.ambient, diffuse: lighting.diffuse,
                          specular: lighting.specular, shininess: lighting.shininess,
-                         eyePos: eye)
+                         eyePos: eye,
+                         lineWidth: 1.0, opacity: 1.0,
+                         depthCueingStrength: 0.0, fogNear: 0.0, fogFar: 0.0,
+                         aoStrength: 0.0, shadowStrength: 0.0,
+                         backgroundColor: backgroundColor)
     }
 
     /// Parse a "#rrggbb" (or "rrggbb") hex string into an MTLClearColor. Named for
@@ -305,15 +322,18 @@ final class Renderer: NSObject {
     struct PolyIn { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float3 color [[attribute(2)]]; };
     // Gradient quad vertex: NDC xy only.
     struct GradIn { float2 position [[attribute(0)]]; };
+    // Thick line vertex: NDC position (expanded from world-space line segments on CPU).
+    struct ThickLineIn { float3 position [[attribute(0)]]; };
 
-    struct InstanceData { float4x4 model; float4 color; float radius; float metalness; };
-    struct FrameData { float4x4 view; float4x4 proj; float3 lightDir; float ambient; float diffuse; float specular; float shininess; float3 eyePos; };
+    struct InstanceData { float4x4 model; float4 color; float radius; float metalness; float aoFactor; float shadowFactor; };
+    struct FrameData { float4x4 view; float4x4 proj; float3 lightDir; float ambient; float diffuse; float specular; float shininess; float3 eyePos; float lineWidth; float opacity; float depthCueingStrength; float fogNear; float fogFar; float aoStrength; float shadowStrength; float3 backgroundColor; };
 
-    struct VInOut  { float4 position [[position]]; float3 worldPos; float3 normal; float3 color; };
+    struct VInOut  { float4 position [[position]]; float3 worldPos; float3 normal; float3 color; float aoFactor; float shadowFactor; };
     struct LineVOut { float4 position [[position]]; float3 color; };
     struct Flat2DOut { float4 position [[position]]; float3 color; float2 local; };
     struct PolyOut { float4 position [[position]]; float3 worldPos; float3 normal; float3 color; };
     struct GradOut { float4 position [[position]]; float y; };
+    struct ThickLineVOut { float4 position [[position]]; float3 color; };
 
     // Blinn-Phong shading shared by the atom/bond AND polyhedron pipelines.
     // N, worldPos are the lit fragment; albedo is its base color. The half-vector
@@ -327,7 +347,14 @@ final class Renderer: NSObject {
         float3 H = normalize(L + V);
         float spec = (f.shininess > 0.0) ? pow(max(dot(N, H), 0.0), f.shininess) : 0.0;
         float3 color = albedo * (f.ambient + f.diffuse * diff) + float3(1.0) * f.specular * spec;
-        return clamp(color, 0.0, 1.0);
+        color = clamp(color, 0.0, 1.0);
+        // Depth cueing: fade distant fragments toward the background color.
+        if (f.depthCueingStrength > 0.0) {
+            float depth = length(f.eyePos - worldPos);
+            float fog = clamp((depth - f.fogNear) / (f.fogFar - f.fogNear), 0.0, 1.0);
+            color = mix(color, f.backgroundColor, fog * f.depthCueingStrength);
+        }
+        return color;
     }
 
     // Correct normal matrix (inverse-transpose of the linear 3x3) under nonuniform
@@ -369,12 +396,19 @@ final class Renderer: NSObject {
         float3x3 normalMatrix = normalMatrix3x3(model3);
         o.normal = normalMatrix * in.normal;
         o.color = inst.color.rgb;
+        o.aoFactor = inst.aoFactor;
+        o.shadowFactor = inst.shadowFactor;
         o.position = f.proj * f.view * world;
         return o;
     }
 
     fragment float4 f_main(VInOut in [[stage_in]], constant FrameData &f [[buffer(2)]]) {
-        return float4(shade(in.color, in.normal, in.worldPos, f), 1.0);
+        float3 color = shade(in.color, in.normal, in.worldPos, f);
+        // Per-instance AO/shadow: mix(1.0, factor, strength) is a no-op when off.
+        float ao = mix(1.0, in.aoFactor, f.aoStrength);
+        float shadow = mix(1.0, in.shadowFactor, f.shadowStrength);
+        color *= ao * shadow;
+        return float4(color, f.opacity);
     }
 
     vertex LineVOut lv_main(LineVertexIn in [[stage_in]],
@@ -383,16 +417,16 @@ final class Renderer: NSObject {
         LineVOut o; o.color = color; o.position = f.proj * f.view * float4(in.position, 1.0); return o;
     }
 
-    fragment float4 lf_main(LineVOut in [[stage_in]]) { return float4(in.color, 1.0); }
+    fragment float4 lf_main(LineVOut in [[stage_in]], constant FrameData &f [[buffer(2)]]) { return float4(in.color, f.opacity); }
 
     // Unlit screen-space quad for 2D atoms: discard fragments outside the unit
     // circle so each atom reads as a filled disc rather than a square.
     vertex Flat2DOut flat2D_v(Flat2DIn in [[stage_in]]) {
         Flat2DOut o; o.position = float4(in.position, 0.0, 1.0); o.color = in.color; o.local = in.local; return o;
     }
-    fragment float4 flat2D_f(Flat2DOut in [[stage_in]]) {
+    fragment float4 flat2D_f(Flat2DOut in [[stage_in]], constant FrameData &f [[buffer(2)]]) {
         if (length(in.local) > 1.0) discard_fragment();
-        return float4(in.color, 1.0);
+        return float4(in.color, f.opacity);
     }
 
     // Flat-shaded polyhedron triangles: same Blinn-Phong lighting as the atoms,
@@ -402,7 +436,8 @@ final class Renderer: NSObject {
         o.position = f.proj * f.view * float4(in.position, 1.0); return o;
     }
     fragment float4 poly_f(PolyOut in [[stage_in]], constant FrameData &f [[buffer(2)]]) {
-        return float4(shade(in.color, in.normal, in.worldPos, f), 1.0);
+        float3 color = shade(in.color, in.normal, in.worldPos, f);
+        return float4(color, f.opacity);
     }
 
     // Fullscreen vertical-gradient quad drawn behind the scene. `y` is the NDC
@@ -414,6 +449,20 @@ final class Renderer: NSObject {
                            constant float3 &bottom [[buffer(2)]]) {
         float t = in.y * 0.5 + 0.5;
         return float4(mix(bottom, top, t), 1.0);
+    }
+
+    // Thick line pipeline: vertices are pre-expanded NDC positions (from world-space
+    // line segments on the CPU). The vertex shader passes them straight through with
+    // w=1 (no view/proj transform). Color comes from a shared constant buffer.
+    vertex ThickLineVOut thickLine_v(ThickLineIn in [[stage_in]],
+                                     constant float3 &color [[buffer(3)]]) {
+        ThickLineVOut o;
+        o.position = float4(in.position, 1.0);
+        o.color = color;
+        return o;
+    }
+    fragment float4 thickLine_f(ThickLineVOut in [[stage_in]], constant FrameData &f [[buffer(2)]]) {
+        return float4(in.color, f.opacity);
     }
     """
 
@@ -434,10 +483,13 @@ final class Renderer: NSObject {
             let pv = lib.makeFunction(name: "poly_v"),
             let pf = lib.makeFunction(name: "poly_f"),
             let gv = lib.makeFunction(name: "grad_v"),
-            let gf = lib.makeFunction(name: "grad_f")
+            let gf = lib.makeFunction(name: "grad_f"),
+            let tlv = lib.makeFunction(name: "thickLine_v"),
+            let tlf = lib.makeFunction(name: "thickLine_f")
         else { throw RenderError.makeFunction }
 
         // Atom/bond pipeline — lit instanced spheres/cylinders/cones.
+        // Blending enabled for transparency: opacity=1.0 result is identical to opaque.
         let atomVD = Renderer.makeAtomVertexDescriptor()
         let atomPD = MTLRenderPipelineDescriptor()
         atomPD.vertexFunction = v
@@ -445,9 +497,12 @@ final class Renderer: NSObject {
         atomPD.vertexDescriptor = atomVD
         atomPD.colorAttachments[0].pixelFormat = .rgba8Unorm
         atomPD.depthAttachmentPixelFormat = depthPixelFormat
+        Renderer.enableAlphaBlending(atomPD.colorAttachments[0])
         self.atomPipeline = try device.makeRenderPipelineState(descriptor: atomPD)
 
         // Line pipeline — 1px strokes (cell frame, axes, gizmo labels, measurements).
+        // Blending enabled for scene-object transparency: when opacity = 1.0 the
+        // blend result is identical to opaque, so default output is preserved.
         let lineVD = Renderer.makeLineVertexDescriptor()
         let linePD = MTLRenderPipelineDescriptor()
         linePD.vertexFunction = lv
@@ -455,6 +510,7 @@ final class Renderer: NSObject {
         linePD.vertexDescriptor = lineVD
         linePD.colorAttachments[0].pixelFormat = .rgba8Unorm
         linePD.depthAttachmentPixelFormat = depthPixelFormat
+        Renderer.enableAlphaBlending(linePD.colorAttachments[0])
         self.linePipeline = try device.makeRenderPipelineState(descriptor: linePD)
 
         // 2D flat pipeline — unlit screen-space quads (2D atoms as filled discs).
@@ -465,6 +521,7 @@ final class Renderer: NSObject {
         flatPD.vertexDescriptor = flatVD
         flatPD.colorAttachments[0].pixelFormat = .rgba8Unorm
         flatPD.depthAttachmentPixelFormat = depthPixelFormat
+        Renderer.enableAlphaBlending(flatPD.colorAttachments[0])
         self.flat2DPipeline = try device.makeRenderPipelineState(descriptor: flatPD)
 
         // Polyhedron pipeline — flat-shaded Voronoi-like cells lit by the same
@@ -476,6 +533,7 @@ final class Renderer: NSObject {
         polyPD.vertexDescriptor = polyVD
         polyPD.colorAttachments[0].pixelFormat = .rgba8Unorm
         polyPD.depthAttachmentPixelFormat = depthPixelFormat
+        Renderer.enableAlphaBlending(polyPD.colorAttachments[0])
         self.polyPipeline = try device.makeRenderPipelineState(descriptor: polyPD)
 
         // Gradient pipeline — fullscreen vertical gradient drawn behind the scene.
@@ -487,6 +545,18 @@ final class Renderer: NSObject {
         gradPD.colorAttachments[0].pixelFormat = .rgba8Unorm
         gradPD.depthAttachmentPixelFormat = depthPixelFormat
         self.gradPipeline = try device.makeRenderPipelineState(descriptor: gradPD)
+
+        // Thick line pipeline — expanded-NDC quad lines for configurable width.
+        // Blending enabled for scene-object transparency.
+        let thickVD = Renderer.makeLineVertexDescriptor()
+        let thickPD = MTLRenderPipelineDescriptor()
+        thickPD.vertexFunction = tlv
+        thickPD.fragmentFunction = tlf
+        thickPD.vertexDescriptor = thickVD
+        thickPD.colorAttachments[0].pixelFormat = .rgba8Unorm
+        thickPD.depthAttachmentPixelFormat = depthPixelFormat
+        Renderer.enableAlphaBlending(thickPD.colorAttachments[0])
+        self.thickLinePipeline = try device.makeRenderPipelineState(descriptor: thickPD)
 
         self.sphereMesh = Geometry.unitSphere()
         self.cylinderMesh = Geometry.unitCylinder()
@@ -515,6 +585,10 @@ final class Renderer: NSObject {
         self.quadVB = qvb
         self.overlayDepthState = Renderer.makeOverlayDepthState(device: device)
         self.depthStencilState = Renderer.makeDepthStencilState(device: device)
+        // Transparent depth state: less-equal compare with NO depth write. Lets
+        // transparent objects composite back-to-front without occluding each
+        // other via the depth buffer (which would drop later fragments).
+        self.transparentDepthState = Renderer.makeTransparentDepthState(device: device)
         // The route overlay cannot render without this state, so fail init (rather
         // than silently leaving the route invisible) if the device rejects it.
         guard let routeDepthState = Renderer.makeRouteDepthState(device: device) else {
@@ -530,6 +604,30 @@ final class Renderer: NSObject {
         d.depthCompareFunction = .always
         d.isDepthWriteEnabled = false
         return device.makeDepthStencilState(descriptor: d)
+    }
+
+    /// Depth state for transparent objects: less-equal compare (so a transparent
+    /// fragment still shows through opaque geometry in front of it) with depth
+    /// writes disabled (so transparent fragments don't occlude each other, letting
+    /// back-to-front blending composite them correctly).
+    private static func makeTransparentDepthState(device: MTLDevice) -> MTLDepthStencilState? {
+        let d = MTLDepthStencilDescriptor()
+        d.depthCompareFunction = .lessEqual
+        d.isDepthWriteEnabled = false
+        return device.makeDepthStencilState(descriptor: d)
+    }
+
+    /// Enable standard alpha blending on a pipeline color attachment. When the
+    /// fragment alpha is 1.0 (the default), the blend result is identical to opaque
+    /// rendering, so existing output is preserved. Used for scene-object transparency.
+    private static func enableAlphaBlending(_ attachment: MTLRenderPipelineColorAttachmentDescriptor) {
+        attachment.isBlendingEnabled = true
+        attachment.rgbBlendOperation = .add
+        attachment.alphaBlendOperation = .add
+        attachment.sourceRGBBlendFactor = .sourceAlpha
+        attachment.sourceAlphaBlendFactor = .one
+        attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
     }
 
     // MARK: - Lock-bearing encode API
@@ -554,10 +652,35 @@ final class Renderer: NSObject {
             cam.perspective = false
         }
 
+        // Background color for depth cueing: derive from the scene background so
+        // distant fragments fade toward what's already drawn.
+        let bgColor: SIMD3<Float>
+        if let override = clearColorOverride {
+            bgColor = SIMD3<Float>(Float(override.red), Float(override.green), Float(override.blue))
+        } else if scene.backgroundType == .gradient_top {
+            bgColor = Renderer.float3FromHex(scene.backgroundBottom)
+        } else {
+            bgColor = Renderer.float3FromHex(scene.background)
+        }
+        // Depth-cueing range from the framing sphere.
+        let sceneRadius = scene.boundingSphereRadius()
+        let camDist = simd_length(cam.eyePosition() - sceneCentroid())
+        let fogNear = max(0.1, camDist - sceneRadius * 1.5)
+        let fogFar = camDist + sceneRadius * 2.0
         var frame = Renderer.makeFrame(view: cam.viewMatrix(),
                                        proj: cam.projectionMatrix(aspect: aspect),
                                        lighting: scene.lighting,
-                                       eye: cam.eyePosition())
+                                       eye: cam.eyePosition(),
+                                       backgroundColor: bgColor)
+        frame.lineWidth = scene.lineWidth
+        frame.opacity = scene.opacity
+        frame.depthCueingStrength = scene.depthCueingStrength
+        frame.fogNear = fogNear
+        frame.fogFar = fogFar
+        frame.aoStrength = scene.aoStrength
+        frame.shadowStrength = scene.shadowStrength
+        // Sync the world-space light direction for the AO/shadow cache key.
+        currentLightDir = frame.lightDir
         if !Renderer.forceNextBufferAllocationSuccess {
             Renderer.forceNextBufferAllocationSuccess = true
             return false
@@ -635,10 +758,29 @@ final class Renderer: NSObject {
         // frame/axes/BZ branches below draw regardless.
         if scene.showStructure {
             if scene.displayMode.is2D {
-                guard drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h) else { return false }
-                guard drawBonds2D(enc, frameBuffer: frameBuffer) else { return false }
+                // Transparent 2D: disable depth writes so flat atoms/bonds blend.
+                if scene.opacity < 1.0, let tds = transparentDepthState {
+                    enc.setDepthStencilState(tds)
+                    defer { enc.setDepthStencilState(depthStencilState) }
+                    guard drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h) else { return false }
+                    guard drawBonds2D(enc, frameBuffer: frameBuffer) else { return false }
+                } else {
+                    guard drawAtoms2D(enc, frameBuffer: frameBuffer, w: w, h: h) else { return false }
+                    guard drawBonds2D(enc, frameBuffer: frameBuffer) else { return false }
+                }
             } else if scene.displayMode == .polyhedral {
-                guard drawPolyhedral(enc, frameBuffer: frameBuffer) else { return false }
+                // Transparent polyhedra: sort cells back-to-front by centroid
+                // depth and disable depth writes so blending composites correctly.
+                if scene.opacity < 1.0 {
+                    guard drawPolyhedralTransparent(enc: enc, frameBuffer: frameBuffer) else { return false }
+                } else {
+                    guard drawPolyhedral(enc, frameBuffer: frameBuffer) else { return false }
+                }
+            } else if scene.opacity < 1.0 {
+                // Transparent path: unified back-to-front sorting across atoms
+                // and bonds with depth writes disabled, so blending composites
+                // correctly regardless of draw order.
+                guard drawTransparentStructure(enc: enc, frameBuffer: frameBuffer) else { return false }
             } else {
                 guard drawAtoms(enc, frameBuffer: frameBuffer) else { return false }
                 guard drawBonds(enc, frameBuffer: frameBuffer) else { return false }
@@ -685,13 +827,14 @@ final class Renderer: NSObject {
         // Swap the active pipelines to the MSAA variants for the duration of this
         // encode, then restore the originals. The shared drawScene() references
         // the ivars directly, so it transparently uses the MSAA pipelines.
-        let saved = (atomPipeline, linePipeline, flat2DPipeline, polyPipeline, gradPipeline)
-        defer { atomPipeline = saved.0; linePipeline = saved.1; flat2DPipeline = saved.2; polyPipeline = saved.3; gradPipeline = saved.4 }
+        let saved = (atomPipeline, linePipeline, flat2DPipeline, polyPipeline, gradPipeline, thickLinePipeline)
+        defer { atomPipeline = saved.0; linePipeline = saved.1; flat2DPipeline = saved.2; polyPipeline = saved.3; gradPipeline = saved.4; thickLinePipeline = saved.5 }
         atomPipeline = pipelines.atom
         linePipeline = pipelines.line
         flat2DPipeline = pipelines.flat2D
         polyPipeline = pipelines.poly
         gradPipeline = pipelines.grad
+        thickLinePipeline = pipelines.thickLine
 
         let clearColor: MTLClearColor
         if let override = clearColorOverride {
@@ -751,10 +894,13 @@ final class Renderer: NSObject {
             let pv = library.makeFunction(name: "poly_v"),
             let pf = library.makeFunction(name: "poly_f"),
             let gv = library.makeFunction(name: "grad_v"),
-            let gf = library.makeFunction(name: "grad_f")
+            let gf = library.makeFunction(name: "grad_f"),
+            let tlv = library.makeFunction(name: "thickLine_v"),
+            let tlf = library.makeFunction(name: "thickLine_f")
         else { return false }
 
-        func pipeline(vertex: MTLFunction, fragment: MTLFunction, vd: MTLVertexDescriptor) -> MTLRenderPipelineState? {
+        func pipeline(vertex: MTLFunction, fragment: MTLFunction, vd: MTLVertexDescriptor,
+                     blend: Bool = false) -> MTLRenderPipelineState? {
             let pd = MTLRenderPipelineDescriptor()
             pd.vertexFunction = vertex
             pd.fragmentFunction = fragment
@@ -762,17 +908,19 @@ final class Renderer: NSObject {
             pd.colorAttachments[0].pixelFormat = .rgba8Unorm
             pd.rasterSampleCount = sampleCount
             pd.depthAttachmentPixelFormat = depthPixelFormat
+            if blend { Renderer.enableAlphaBlending(pd.colorAttachments[0]) }
             return try? device.makeRenderPipelineState(descriptor: pd)
         }
 
-        guard let atom = pipeline(vertex: v, fragment: f, vd: Renderer.makeAtomVertexDescriptor()),
-              let line = pipeline(vertex: lv, fragment: lf, vd: Renderer.makeLineVertexDescriptor()),
-              let flat2D = pipeline(vertex: f2v, fragment: f2f, vd: Renderer.makeFlat2DVertexDescriptor()),
-              let poly = pipeline(vertex: pv, fragment: pf, vd: Renderer.makePolyVertexDescriptor()),
-              let grad = pipeline(vertex: gv, fragment: gf, vd: Renderer.makeGradVertexDescriptor())
+        guard let atom = pipeline(vertex: v, fragment: f, vd: Renderer.makeAtomVertexDescriptor(), blend: true),
+              let line = pipeline(vertex: lv, fragment: lf, vd: Renderer.makeLineVertexDescriptor(), blend: true),
+              let flat2D = pipeline(vertex: f2v, fragment: f2f, vd: Renderer.makeFlat2DVertexDescriptor(), blend: true),
+              let poly = pipeline(vertex: pv, fragment: pf, vd: Renderer.makePolyVertexDescriptor(), blend: true),
+              let grad = pipeline(vertex: gv, fragment: gf, vd: Renderer.makeGradVertexDescriptor()),
+              let thickLine = pipeline(vertex: tlv, fragment: tlf, vd: Renderer.makeLineVertexDescriptor(), blend: true)
         else { return false }
 
-        msaaPipelineCache[sampleCount] = (atom: atom, line: line, flat2D: flat2D, poly: poly, grad: grad)
+        msaaPipelineCache[sampleCount] = (atom: atom, line: line, flat2D: flat2D, poly: poly, grad: grad, thickLine: thickLine)
         return true
     }
 
@@ -836,23 +984,165 @@ final class Renderer: NSObject {
 
     // MARK: - Atoms
 
-    @discardableResult
+    /// Per-atom AO/shadow factors from neighbor geometry. Bounded deterministic
+    /// approximations using uniform spatial bins. Returns unity immediately when
+    /// both effects are disabled (strength 0). Enforces global + per-atom caps
+    /// so it never hangs at the supercell limit.
+    private var cachedAOShadowFactors: (ao: [Float], shadow: [Float])? = nil
+    private var cachedAOShadowKey: (atoms: Int, coords: [SIMD3<Float>], aoQuality: Int,
+                                    shadowQuality: Int, aoEnabled: Bool, shadowEnabled: Bool,
+                                    lightDir: SIMD3<UInt32>)? = nil
+    private static let aoGlobalCap = 50_000   // max atoms analyzed
+    private static let aoNeighborCap = 64      // max neighbors per atom
+    private func computeAOShadowFactors() -> (ao: [Float], shadow: [Float]) {
+        let n = scene.atoms.count
+        if n == 0 { return ([], []) }
+        // Shortcut based on STRENGTH (what the shader uses), not quality.
+        // Default is strength=0, quality=2 -> returns unity immediately.
+        if scene.aoStrength == 0 && scene.shadowStrength == 0 {
+            // Empty arrays are the unity sentinel used by every draw path.
+            return ([], [])
+        }
+        let coords = scene.atoms.map { $0.coord }
+        let lightDir = currentLightDir
+        // Cache key: quality affects search radius, light direction affects shadow.
+        // Strength is applied in the shader, so it is NOT part of the cache key.
+        let aoQuality = max(0, min(3, scene.aoQuality))
+        let shadowQuality = max(0, min(3, scene.shadowQuality))
+        let lightKey = SIMD3<UInt32>(
+            UInt32(((lightDir.x + 1.0) * 0.5) * 1023.0),
+            UInt32(((lightDir.y + 1.0) * 0.5) * 1023.0),
+            UInt32(((lightDir.z + 1.0) * 0.5) * 1023.0))
+        let aoEnabled = scene.aoStrength > 0
+        let shadowEnabled = scene.shadowStrength > 0
+        if let key = cachedAOShadowKey, key.atoms == n,
+           key.aoQuality == aoQuality, key.shadowQuality == shadowQuality,
+           key.aoEnabled == aoEnabled, key.shadowEnabled == shadowEnabled,
+           key.lightDir == lightKey,
+           let cached = cachedAOShadowFactors,
+           zip(key.coords, coords).allSatisfy({ $0 == $1 }) {
+            return cached
+        }
+        // Compute search radii only for enabled effects.
+        let baseRadius: Float = 3.5
+        let aoRadius = scene.aoStrength > 0 ? baseRadius * (0.6 + Float(aoQuality) * 0.4) : 0
+        let shadowRadius = scene.shadowStrength > 0 ? baseRadius * (0.6 + Float(shadowQuality) * 0.4) : 0
+        let searchRadius = max(aoRadius, shadowRadius)
+        var ao = aoEnabled ? [Float](repeating: 1.0, count: n) : []
+        var shadow = shadowEnabled ? [Float](repeating: 1.0, count: n) : []
+
+        // Global cap: if exceeded, degrade safely to unity for all atoms.
+        if searchRadius > 0 && n <= Self.aoGlobalCap {
+            // Bin size = searchRadius guarantees all neighbors are within +/-1 bin,
+            // so scanning 27 bins (3x3x3) is sufficient.
+            let binSize = searchRadius
+            var bmin = coords[0], bmax = coords[0]
+            for i in 1..<n {
+                bmin = min(bmin, coords[i])
+                bmax = max(bmax, coords[i])
+            }
+            let extent = bmax - bmin + SIMD3<Float>(repeating: 1e-4)
+            let binCountX = max(1, min(128, Int(ceil(extent.x / binSize))))
+            let binCountY = max(1, min(128, Int(ceil(extent.y / binSize))))
+            let binCountZ = max(1, min(128, Int(ceil(extent.z / binSize))))
+            let totalBins = binCountX * binCountY * binCountZ
+            // Bin heads: index into a linked-list array.
+            var binHead = [Int](repeating: -1, count: totalBins)
+            var binNext = [Int](repeating: -1, count: n)
+            for i in 0..<n {
+                let rel = coords[i] - bmin
+                let bx = min(binCountX-1, max(0, Int(rel.x / binSize)))
+                let by = min(binCountY-1, max(0, Int(rel.y / binSize)))
+                let bz = min(binCountZ-1, max(0, Int(rel.z / binSize)))
+                let binIndex = bx + binCountX * (by + binCountY * bz)
+                binNext[i] = binHead[binIndex]
+                binHead[binIndex] = i
+            }
+            // For each atom, scan the 27 neighboring bins.
+            for i in 0..<n {
+                let ci = coords[i]
+                let rel = ci - bmin
+                let bx = min(binCountX-1, max(0, Int(rel.x / binSize)))
+                let by = min(binCountY-1, max(0, Int(rel.y / binSize)))
+                let bz = min(binCountZ-1, max(0, Int(rel.z / binSize)))
+                var aoSum: Float = 0
+                var shadowSum: Float = 0
+                var candidateChecks = 0
+                atomScan: for dx in -1...1 {
+                    for dy in -1...1 {
+                        for dz in -1...1 {
+                            let nx = bx + dx, ny = by + dy, nz = bz + dz
+                            if nx < 0 || nx >= binCountX { continue }
+                            if ny < 0 || ny >= binCountY { continue }
+                            if nz < 0 || nz >= binCountZ { continue }
+                            let binIndex = nx + binCountX * (ny + binCountY * nz)
+                            var j = binHead[binIndex]
+                            while j != -1 {
+                                if j != i {
+                                    // Candidate cap: count EVERY neighbor examined
+                                    // (regardless of effect/distance) so shadow-only
+                                    // dense scenes are also bounded.
+                                    candidateChecks += 1
+                                    if candidateChecks >= Self.aoNeighborCap { break atomScan }
+                                    let d = coords[j] - ci
+                                    let dist = simd_length(d)
+                                    if dist < aoRadius, dist > 1e-5 {
+                                        aoSum += 1.0 - dist / aoRadius
+                                    }
+                                    if dist < shadowRadius, dist > 1e-5 {
+                                        let towardLight = simd_dot(d / dist, lightDir)
+                                        if towardLight > 0 {
+                                            shadowSum += towardLight * (1.0 - dist / shadowRadius)
+                                        }
+                                    }
+                                }
+                                j = binNext[j]
+                            }
+                        }
+                    }
+                }
+                if aoSum > 0 {
+                    ao[i] = max(0.15, 1.0 - aoSum * 0.18)
+                }
+                if shadowSum > 0 {
+                    shadow[i] = max(0.15, 1.0 - shadowSum * 0.22)
+                }
+            }
+        }
+        // else: n > globalCap -> ao/shadow remain unity (safe degradation)
+        cachedAOShadowFactors = (ao, shadow)
+        cachedAOShadowKey = (atoms: n, coords: coords, aoQuality: aoQuality,
+                             shadowQuality: shadowQuality, aoEnabled: aoEnabled,
+                             shadowEnabled: shadowEnabled, lightDir: lightKey)
+        return (ao, shadow)
+    }
+
     private func drawAtoms(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
         let selected = Set(scene.selectedAtoms)
-        var inst: [InstanceData] = []
+        let aoShadow = computeAOShadowFactors()
+        let view = sceneView(frameBuffer)
+        var inst: [(depth: Float, data: InstanceData)] = []
         inst.reserveCapacity(scene.atoms.count)
         for (i, a) in scene.atoms.enumerated() {
             let radius = atomRadius(z: a.atomicNumber)
-            if radius <= 0 { continue }                  // polyhedral/wireFrame: atoms not drawn
+            if radius <= 0 { continue }
             let c = atomColor(at: i, selected: selected.contains(i))
-            inst.append(InstanceData(model: float4x4(translation: a.coord),
-                                     color: SIMD4(c.x, c.y, c.z, 1.0),
-                                     radius: radius, metalness: 0.0))
+            let ao = i < aoShadow.ao.count ? aoShadow.ao[i] : 1.0
+            let sh = i < aoShadow.shadow.count ? aoShadow.shadow[i] : 1.0
+            let data = InstanceData(model: float4x4(translation: a.coord),
+                                    color: SIMD4(c.x, c.y, c.z, 1.0),
+                                    radius: radius, metalness: 0.0,
+                                    aoFactor: ao, shadowFactor: sh)
+            let viewPos = view * SIMD4<Float>(a.coord, 1.0)
+            inst.append((depth: -viewPos.z, data: data))
         }
         if inst.isEmpty { return true }
-
-        guard let buf = device.makeBuffer(bytes: inst,
-                                          length: inst.count * MemoryLayout<InstanceData>.stride,
+        if scene.opacity < 1.0 {
+            inst.sort { $0.depth > $1.depth }
+        }
+        let instances = inst.map { $0.data }
+        guard let buf = device.makeBuffer(bytes: instances,
+                                          length: instances.count * MemoryLayout<InstanceData>.stride,
                                           options: []) else { return false }
         enc.setRenderPipelineState(atomPipeline)
         enc.setVertexBuffer(sphereVB, offset: 0, index: 0)
@@ -864,7 +1154,7 @@ final class Renderer: NSObject {
                                   indexType: .uint16,
                                   indexBuffer: sphereIB,
                                   indexBufferOffset: 0,
-                                  instanceCount: inst.count)
+                                  instanceCount: instances.count)
         return true
     }
 
@@ -889,6 +1179,7 @@ final class Renderer: NSObject {
         guard bondsDrawn.contains(scene.displayMode) else { return true }
         let atoms = scene.atoms
         guard atoms.count > 1 else { return true }
+        let aoShadow = computeAOShadowFactors()
 
         var inst: [InstanceData] = []
         inst.reserveCapacity(scene.bonds.count)
@@ -904,7 +1195,12 @@ final class Renderer: NSObject {
                 * float4x4(scale: SIMD3<Float>(scene.bondRadius, len, scene.bondRadius))
             // Coordination coloring is intentionally atom-only; bonds retain CPK colors.
             let c = ElementTable.color(atoms[b.i].atomicNumber)
-            inst.append(InstanceData(model: model, color: SIMD4(c.x, c.y, c.z, 1.0), radius: 1.0, metalness: 0.0))
+            let aoI = b.i < aoShadow.ao.count ? aoShadow.ao[b.i] : 1.0
+            let aoJ = b.j < aoShadow.ao.count ? aoShadow.ao[b.j] : 1.0
+            let shI = b.i < aoShadow.shadow.count ? aoShadow.shadow[b.i] : 1.0
+            let shJ = b.j < aoShadow.shadow.count ? aoShadow.shadow[b.j] : 1.0
+            inst.append(InstanceData(model: model, color: SIMD4(c.x, c.y, c.z, 1.0), radius: 1.0, metalness: 0.0,
+                                    aoFactor: (aoI + aoJ) * 0.5, shadowFactor: (shI + shJ) * 0.5))
         }
         if inst.isEmpty { return true }
 
@@ -922,6 +1218,106 @@ final class Renderer: NSObject {
                                   indexBuffer: cylinderIB,
                                   indexBufferOffset: 0,
                                   instanceCount: inst.count)
+        return true
+    }
+
+    /// Transparent structure rendering: collects atoms and bonds, sorts them
+    /// back-to-front by view depth, and draws them with depth writes disabled.
+    /// This ensures correct alpha blending regardless of object type or draw
+    /// order. Consecutive same-type objects are batched into instanced draws
+    /// to minimize mesh switches.
+    private func drawTransparentStructure(enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard let transparentDepthState = transparentDepthState else { return false }
+        enc.setDepthStencilState(transparentDepthState)
+        defer { enc.setDepthStencilState(depthStencilState) }
+
+        let view = sceneView(frameBuffer)
+        let selected = Set(scene.selectedAtoms)
+        let aoShadow = computeAOShadowFactors()
+
+        // Build atom instances with depths.
+        var atomInst: [(depth: Float, data: InstanceData)] = []
+        atomInst.reserveCapacity(scene.atoms.count)
+        for (i, a) in scene.atoms.enumerated() {
+            let radius = atomRadius(z: a.atomicNumber)
+            if radius <= 0 { continue }
+            let c = atomColor(at: i, selected: selected.contains(i))
+            let ao = i < aoShadow.ao.count ? aoShadow.ao[i] : 1.0
+            let sh = i < aoShadow.shadow.count ? aoShadow.shadow[i] : 1.0
+            let data = InstanceData(model: float4x4(translation: a.coord),
+                                    color: SIMD4(c.x, c.y, c.z, 1.0),
+                                    radius: radius, metalness: 0.0,
+                                    aoFactor: ao, shadowFactor: sh)
+            let viewPos = view * SIMD4<Float>(a.coord, 1.0)
+            atomInst.append((depth: -viewPos.z, data: data))
+        }
+
+        // Build bond instances with depths.
+        var bondInst: [(depth: Float, data: InstanceData)] = []
+        bondInst.reserveCapacity(scene.bonds.count)
+        for b in scene.bonds {
+            guard b.i >= 0, b.i < scene.atoms.count, b.j >= 0, b.j < scene.atoms.count else { continue }
+            let a = scene.atoms[b.i].coord, b2 = scene.atoms[b.j].coord
+            let dir = b2 - a
+            let len = length(dir)
+            guard len > 1e-5 else { continue }
+            let mid = (a + b2) * 0.5
+            let model = float4x4(translation: mid)
+                * .rotation(fromYTo: dir / len)
+                * float4x4(scale: SIMD3<Float>(scene.bondRadius, len, scene.bondRadius))
+            let c = ElementTable.color(scene.atoms[b.i].atomicNumber)
+            let aoI = b.i < aoShadow.ao.count ? aoShadow.ao[b.i] : 1.0
+            let aoJ = b.j < aoShadow.ao.count ? aoShadow.ao[b.j] : 1.0
+            let shI = b.i < aoShadow.shadow.count ? aoShadow.shadow[b.i] : 1.0
+            let shJ = b.j < aoShadow.shadow.count ? aoShadow.shadow[b.j] : 1.0
+            let data = InstanceData(model: model, color: SIMD4(c.x, c.y, c.z, 1.0),
+                                    radius: 1.0, metalness: 0.0,
+                                    aoFactor: (aoI + aoJ) * 0.5, shadowFactor: (shI + shJ) * 0.5)
+            let viewPos = view * SIMD4<Float>(mid, 1.0)
+            bondInst.append((depth: -viewPos.z, data: data))
+        }
+
+        // Unified back-to-front list: (depth, isAtom, index).
+        var objects: [(depth: Float, isAtom: Bool, index: Int)] = []
+        objects.reserveCapacity(atomInst.count + bondInst.count)
+        for (i, atom) in atomInst.enumerated() {
+            objects.append((depth: atom.depth, isAtom: true, index: i))
+        }
+        for (i, bond) in bondInst.enumerated() {
+            objects.append((depth: bond.depth, isAtom: false, index: i))
+        }
+        objects.sort { $0.depth > $1.depth }
+
+        // Draw in sorted order, grouping consecutive same-type objects into
+        // instanced batches to minimize mesh switches.
+        enc.setRenderPipelineState(atomPipeline)
+        enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
+        enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
+
+        var i = 0
+        while i < objects.count {
+            let isAtom = objects[i].isAtom
+            var batch: [Int] = []
+            while i < objects.count && objects[i].isAtom == isAtom {
+                batch.append(objects[i].index)
+                i += 1
+            }
+            guard !batch.isEmpty else { continue }
+            let instances = batch.map { isAtom ? atomInst[$0].data : bondInst[$0].data }
+            guard let buf = device.makeBuffer(bytes: instances,
+                                              length: instances.count * MemoryLayout<InstanceData>.stride,
+                                              options: []) else { return false }
+            let meshVB = isAtom ? sphereVB : cylinderVB
+            let meshIB = isAtom ? sphereIB : cylinderIB
+            enc.setVertexBuffer(meshVB, offset: 0, index: 0)
+            enc.setVertexBuffer(buf, offset: 0, index: 1)
+            enc.drawIndexedPrimitives(type: .triangle,
+                                      indexCount: meshIB.length / MemoryLayout<UInt16>.stride,
+                                      indexType: .uint16,
+                                      indexBuffer: meshIB,
+                                      indexBufferOffset: 0,
+                                      instanceCount: instances.count)
+        }
         return true
     }
 
@@ -1021,27 +1417,65 @@ final class Renderer: NSObject {
         guard let buf = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: []) else { return false }
         enc.setRenderPipelineState(flat2DPipeline)
         enc.setVertexBuffer(buf, offset: 0, index: 0)
+        enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)  // FrameData (opacity) for flat2D_f
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: verts.count)
         return true
     }
 
-    /// 2D bonds: 1px lines between projected atom endpoints, reusing the line
-    /// pipeline (which already draws crisp 1px strokes). The frame's ortho
-    /// view/proj carries the projection; we just feed world-space endpoints.
+    /// 2D bonds: screen-space line segments drawn as quads through the flat2D
+    /// pipeline so they honor opacity (unlike the line pipeline which is opaque).
+    /// Each segment is expanded perpendicular to its screen-space direction.
     @discardableResult
     private func drawBonds2D(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
         guard scene.displayMode == .ballStick2D || scene.displayMode == .line2D else { return true }
         let atoms = scene.atoms
         guard atoms.count > 1 else { return true }
-        var lineVerts: [SIMD3<Float>] = []
-        lineVerts.reserveCapacity(scene.bonds.count * 2)
+        let view = sceneView(frameBuffer)
+        let proj = sceneProj(frameBuffer)
+        let wF = Float(lastW), hF = Float(lastH)
+        let bondWidth: Float = 2.0  // pixels
+        let halfW = bondWidth / (wF * 0.5)
+        let halfH = bondWidth / (hF * 0.5)
+        let bondColor = SIMD3<Float>(0.35, 0.35, 0.35)
+
+        struct V { var px: Float; var py: Float; var lx: Float; var ly: Float; var r: Float; var g: Float; var b: Float }
+        var verts: [V] = []
+        verts.reserveCapacity(scene.bonds.count * 6)
         for b in scene.bonds {
             guard b.i >= 0, b.i < atoms.count, b.j >= 0, b.j < atoms.count else { continue }
-            lineVerts.append(atoms[b.i].coord)
-            lineVerts.append(atoms[b.j].coord)
+            guard let ndc0 = projectNDC2D(atoms[b.i].coord, view: view, proj: proj),
+                  let ndc1 = projectNDC2D(atoms[b.j].coord, view: view, proj: proj) else { continue }
+            let dir = SIMD2<Float>(ndc1.x - ndc0.x, ndc1.y - ndc0.y)
+            let dirLen = simd_length(dir)
+            guard dirLen > 1e-6 else { continue }
+            let perp = SIMD2<Float>(-dir.y, dir.x) / dirLen
+            let o = SIMD2<Float>(perp.x * halfW, perp.y * halfH)
+            let v00 = SIMD2<Float>(ndc0.x + o.x, ndc0.y + o.y)
+            let v01 = SIMD2<Float>(ndc0.x - o.x, ndc0.y - o.y)
+            let v10 = SIMD2<Float>(ndc1.x + o.x, ndc1.y + o.y)
+            let v11 = SIMD2<Float>(ndc1.x - o.x, ndc1.y - o.y)
+            // Two triangles: (v00, v01, v10) and (v01, v11, v10)
+            for (px, py) in [(v00.x, v00.y), (v01.x, v01.y), (v10.x, v10.y), (v01.x, v01.y), (v11.x, v11.y), (v10.x, v10.y)] {
+                verts.append(V(px: px, py: py, lx: 0, ly: 0, r: bondColor.x, g: bondColor.y, b: bondColor.z))
+            }
         }
-        if lineVerts.isEmpty { return true }
-        return drawLineBuffer(lineVerts, color: SIMD3<Float>(0.35, 0.35, 0.35), enc: enc, frameBuffer: frameBuffer)
+        if verts.isEmpty { return true }
+        guard let buf = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: []) else { return false }
+        enc.setRenderPipelineState(flat2DPipeline)
+        enc.setVertexBuffer(buf, offset: 0, index: 0)
+        enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)  // FrameData (opacity) for flat2D_f
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: verts.count)
+        return true
+    }
+
+    /// Project a world point to NDC for 2D rendering, returning nil if the point
+    /// is behind the camera or produces non-finite coordinates.
+    private func projectNDC2D(_ world: SIMD3<Float>, view: float4x4, proj: float4x4) -> SIMD2<Float>? {
+        let clip = proj * view * SIMD4<Float>(world, 1)
+        guard clip.w > 1e-6 else { return nil }
+        let ndc = SIMD2<Float>(clip.x / clip.w, clip.y / clip.w)
+        guard ndc.x.isFinite && ndc.y.isFinite else { return nil }
+        return ndc
     }
 
     // MARK: - Polyhedral display mode (convex Voronoi-like cells)
@@ -1131,6 +1565,64 @@ final class Renderer: NSObject {
         enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
         enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: verts.count)
+        return true
+    }
+
+    /// Transparent polyhedral rendering: builds ALL triangles from ALL cells,
+    /// sorts them back-to-front by centroid depth, and draws with depth writes
+    /// disabled so alpha blending composites correctly. Triangle-level sorting
+    /// is deterministic and defensible for convex cells. All sorted triangles
+    /// are packed into a single contiguous vertex buffer with one draw call.
+    private func drawPolyhedralTransparent(enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard let transparentDepthState = transparentDepthState else { return false }
+        enc.setDepthStencilState(transparentDepthState)
+        defer { enc.setDepthStencilState(depthStencilState) }
+
+        let atoms = scene.atoms
+        guard atoms.count > 1 else { return true }
+        let neigh = buildNeighborCoords()
+        let selected = Set(scene.selectedAtoms)
+        let view = sceneView(frameBuffer)
+
+        struct V { var x: Float; var y: Float; var z: Float; var nx: Float; var ny: Float; var nz: Float; var r: Float; var g: Float; var b: Float }
+        // Collect all triangles with their centroid depths for sorting.
+        var triData: [(depth: Float, verts: [V])] = []
+        for (i, a) in atoms.enumerated() {
+            guard neigh[i].count >= 3 else { continue }
+            guard let tris = Geometry.polyhedronFaces(center: a.coord, neighbors: neigh[i], maxNeighbors: 12) else { continue }
+            let col = atomColor(at: i, selected: selected.contains(i))
+            var j = 0
+            while j < tris.count {
+                let p0 = tris[j], p1 = tris[j + 1], p2 = tris[j + 2]
+                let n = normalize(cross(p1 - p0, p2 - p0))
+                let centroid = (p0 + p1 + p2) / 3.0
+                let viewPos = view * SIMD4<Float>(centroid, 1.0)
+                let verts = [
+                    V(x: p0.x, y: p0.y, z: p0.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z),
+                    V(x: p1.x, y: p1.y, z: p1.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z),
+                    V(x: p2.x, y: p2.y, z: p2.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z)
+                ]
+                triData.append((depth: -viewPos.z, verts: verts))
+                j += 3
+            }
+        }
+        if triData.isEmpty { return true }
+        // Sort back-to-front (largest depth first).
+        triData.sort { $0.depth > $1.depth }
+        // Pack all sorted triangles into one contiguous vertex buffer.
+        var allVerts: [V] = []
+        allVerts.reserveCapacity(triData.count * 3)
+        for tri in triData {
+            allVerts.append(contentsOf: tri.verts)
+        }
+        guard let buf = device.makeBuffer(bytes: allVerts,
+                                          length: allVerts.count * MemoryLayout<V>.stride,
+                                          options: []) else { return false }
+        enc.setRenderPipelineState(polyPipeline)
+        enc.setVertexBuffer(buf, offset: 0, index: 0)
+        enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
+        enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVerts.count)
         return true
     }
 
@@ -1342,7 +1834,8 @@ final class Renderer: NSObject {
             var inst: [InstanceData] = []
             for a in axes {
                 inst.append(InstanceData(model: model(a.dir), color: SIMD4(a.color, 1),
-                                         radius: 1.0, metalness: 0.0))
+                                         radius: 1.0, metalness: 0.0,
+                                         aoFactor: 1.0, shadowFactor: 1.0))
             }
             guard let buf = device.makeBuffer(bytes: inst, length: inst.count * MemoryLayout<InstanceData>.stride, options: []) else { return false }
             enc.setVertexBuffer(meshVB, offset: 0, index: 0)
@@ -1393,18 +1886,84 @@ final class Renderer: NSObject {
         return [world - ax, world + ax, world - ay, world + ay, world - az, world + az]
     }
 
+    /// Expand world-space line segments into NDC-space quads for configurable
+    /// line width. Each segment (p0,p1) becomes 4 vertices (2 triangles) expanded
+    /// perpendicular to the line direction in NDC by half the pixel width.
+    private func expandLineSegmentsToQuads(_ verts: [SIMD3<Float>], view: float4x4, proj: float4x4,
+                                            viewportW: Int, viewportH: Int,
+                                            pixelWidth: Float) -> [SIMD3<Float>]? {
+        guard verts.count >= 2, verts.count % 2 == 0 else { return nil }
+        let wF = Float(viewportW)
+        let hF = Float(viewportH)
+        guard wF > 0, hF > 0 else { return nil }
+        var result: [SIMD3<Float>] = []
+        result.reserveCapacity(verts.count * 3)
+        var i = 0
+        while i < verts.count {
+            let p0 = verts[i], p1 = verts[i + 1]
+            let view0 = view * SIMD4<Float>(p0, 1)
+            let view1 = view * SIMD4<Float>(p1, 1)
+            let clip0 = proj * view0
+            let clip1 = proj * view1
+            guard clip0.w > 1e-6, clip1.w > 1e-6 else { i += 2; continue }
+            let ndc0 = clip0.xyz / clip0.w
+            let ndc1 = clip1.xyz / clip1.w
+            // Compute perpendicular in pixel space, then convert back to NDC.
+            // This gives correct aspect ratio: x NDC units = wF/2 pixels,
+            // y NDC units = hF/2 pixels.
+            let dxNDCPerPixel = 2.0 / wF
+            let dyNDCPerPixel = 2.0 / hF
+            let dirPixels = SIMD2<Float>((ndc1.x - ndc0.x) / dxNDCPerPixel,
+                                        (ndc1.y - ndc0.y) / dyNDCPerPixel)
+            let dirLenPixels = simd_length(dirPixels)
+            guard dirLenPixels > 1e-6 else { i += 2; continue }
+            let perpPixels = SIMD2<Float>(-dirPixels.y, dirPixels.x) / dirLenPixels
+            // Half-width in NDC units (per-axis scaling for correct aspect).
+            let ox = perpPixels.x * (pixelWidth * 0.5) * dxNDCPerPixel
+            let oy = perpPixels.y * (pixelWidth * 0.5) * dyNDCPerPixel
+            // Preserve each endpoint's NDC z (not an average).
+            let v00 = SIMD3<Float>(ndc0.x + ox, ndc0.y + oy, ndc0.z)
+            let v01 = SIMD3<Float>(ndc0.x - ox, ndc0.y - oy, ndc0.z)
+            let v10 = SIMD3<Float>(ndc1.x + ox, ndc1.y + oy, ndc1.z)
+            let v11 = SIMD3<Float>(ndc1.x - ox, ndc1.y - oy, ndc1.z)
+            result.append(contentsOf: [v00, v01, v10, v01, v11, v10])
+            i += 2
+        }
+        return result.isEmpty ? nil : result
+    }
+
     private func drawLineBuffer(_ verts: [SIMD3<Float>], color: SIMD3<Float>,
                                 enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
-        guard let lineVB = device.makeBuffer(bytes: verts,
-                                             length: verts.count * MemoryLayout<SIMD3<Float>>.stride,
-                                             options: []) else { return false }
-        var c = color
-        guard let colorBuf = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: []) else { return false }
-        enc.setRenderPipelineState(linePipeline)
-        enc.setVertexBuffer(lineVB, offset: 0, index: 0)
-        enc.setVertexBuffer(colorBuf, offset: 0, index: 3)
-        enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
-        enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: verts.count)
+        let width = scene.lineWidth
+        if width <= 1.0 {
+            guard let lineVB = device.makeBuffer(bytes: verts,
+                                                 length: verts.count * MemoryLayout<SIMD3<Float>>.stride,
+                                                 options: []) else { return false }
+            var c = color
+            guard let colorBuf = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: []) else { return false }
+            enc.setRenderPipelineState(linePipeline)
+            enc.setVertexBuffer(lineVB, offset: 0, index: 0)
+            enc.setVertexBuffer(colorBuf, offset: 0, index: 3)
+            enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
+            enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)  // FrameData (opacity) for lf_main
+            enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: verts.count)
+        } else {
+            let view = sceneView(frameBuffer)
+            let proj = sceneProj(frameBuffer)
+            guard let quads = expandLineSegmentsToQuads(verts, view: view, proj: proj,
+                                                         viewportW: lastW, viewportH: lastH,
+                                                         pixelWidth: width) else { return true }
+            guard let lineVB = device.makeBuffer(bytes: quads,
+                                                 length: quads.count * MemoryLayout<SIMD3<Float>>.stride,
+                                                 options: []) else { return false }
+            var c = color
+            guard let colorBuf = device.makeBuffer(bytes: &c, length: MemoryLayout<SIMD3<Float>>.stride, options: []) else { return false }
+            enc.setRenderPipelineState(thickLinePipeline)
+            enc.setVertexBuffer(lineVB, offset: 0, index: 0)
+            enc.setVertexBuffer(colorBuf, offset: 0, index: 3)
+            enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)  // FrameData (opacity) for thickLine_f
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: quads.count)
+        }
         return true
     }
 
@@ -1776,6 +2335,13 @@ final class Renderer: NSObject {
         if Renderer.distanceLineCacheKey(for: old) != Renderer.distanceLineCacheKey(for: scene) {
             cachedDistanceLineKey = nil
             cachedDistanceLineVertices = nil
+        }
+
+        // AO/shadow cache: invalidate when quality levels change (coords are
+        // checked inside computeAOShadowFactors via the cache key).
+        if old.aoQuality != scene.aoQuality || old.shadowQuality != scene.shadowQuality {
+            cachedAOShadowFactors = nil
+            cachedAOShadowKey = nil
         }
 
         // Inputs each cache depends on; recomputed cheaply from the scene.
