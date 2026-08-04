@@ -33,8 +33,8 @@ For a one-shot implementation agent:
 
 ```bash
 pi --mode json -p \
-  --model openai-codex/gpt-5.6-luna \
-  --thinking max \
+  --model longcat/LongCat-2.0 \
+  --thinking high \
   --tools read,bash,edit,write \
   --no-extensions --no-skills --no-prompt-templates \
   "Implement the narrowly scoped task. Do not delegate further. ..." \
@@ -47,7 +47,7 @@ pi --mode json -p \
 - Keep project context files enabled for implementation work so subagents receive repository invariants. Use `--no-context-files` only for isolated capability probes.
 - Use an explicit tool allowlist. Analysis/review agents should normally receive only `read,grep,find,ls` (and `bash` when tests or git inspection are required).
 - `--mode json` produces JSONL suitable for capturing tool progress, final output, model identity, and failures. Check the process exit status and stderr before accepting a result.
-- Confirm the selected runtime when needed by having the child print `$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL`; the expected value is `openai-codex|gpt-5.6-luna|max`.
+- Confirm the selected runtime when needed by having the child print `$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL`; the expected value is `longcat|LongCat-2.0|high`.
 
 For a subagent that must receive later review fixes, omit `--no-session`, give it a dedicated `--session-dir`, capture the session id from the JSONL `session` event, and resume it with `--session <id>`. Do not use `--continue` for parallel agents because it can select the wrong session.
 
