@@ -39,6 +39,22 @@ enum StateStore {
         payload["showStructure"] = scene.showStructure
         payload["showIsoSurface"] = scene.showIsoSurface
         payload["isoLevel"] = scene.isoLevel
+        payload["isoSurfaces"] = scene.isoSurfaces.map { spec in
+            ["level": spec.level, "colorHex": spec.colorHex, "sign": spec.sign, "enabled": spec.enabled]
+        }
+        if let clip = scene.clipPlane {
+            payload["clipPlane"] = [
+                "enabled": clip.enabled, "h": clip.h, "k": clip.k, "l": clip.l,
+                "distance": clip.distance, "applyToStructure": clip.applyToStructure,
+                "applyToIsosurfaces": clip.applyToIsosurfaces,
+            ]
+        }
+        payload["colorPlaneColormap"] = scene.colorPlaneColormap.rawValue
+        payload["colorPlaneContourEnabled"] = scene.colorPlaneContourEnabled
+        payload["colorPlaneContourCount"] = scene.colorPlaneContourCount
+        payload["volumeSlices"] = scene.volumeSlices.map { s in
+            ["enabled": s.enabled, "h": s.h, "k": s.k, "l": s.l, "distance": s.distance]
+        }
         payload["currentOrbital"] = scene.currentOrbital
         payload["showFermiSurface"] = scene.showFermiSurface
          payload["showForces"] = scene.showForces
@@ -244,6 +260,74 @@ enum StateStore {
             } else {
                 candidate.isoLevel = requested
             }
+        }
+        // Multiple iso specs (optional). A non-empty valid array overrides the
+        // legacy isoLevel pair; an empty/missing array falls back to legacy.
+        if let rawSpecs = obj["isoSurfaces"] as? [[String: Any]], !rawSpecs.isEmpty {
+            var specs: [IsoSurfaceSpec] = []
+            specs.reserveCapacity(min(rawSpecs.count, 8))
+            for raw in rawSpecs.prefix(8) {
+                guard let level = try finiteFloat(raw["level"], field: "isoSurfaces.level"),
+                      let sign = try finiteFloat(raw["sign"], field: "isoSurfaces.sign"),
+                      let colorHex = raw["colorHex"] as? String,
+                      let enabled = raw["enabled"] as? Bool,
+                      level.isFinite, sign.isFinite else { continue }
+                let clamped: Float
+                if let field = candidate.scalarField {
+                    clamped = min(field.maxValue, max(field.minValue, level))
+                } else {
+                    clamped = level
+                }
+                specs.append(IsoSurfaceSpec(level: clamped, colorHex: colorHex, sign: sign, enabled: enabled))
+            }
+            // Keep only enabled-flagged (or default-true) entries; drop if empty.
+            let enabledSpecs = specs.filter { $0.enabled }
+            if !enabledSpecs.isEmpty {
+                candidate.isoSurfaces = enabledSpecs
+            }
+        }
+        // Clip plane (optional). Absent -> nil. Clamp distance and h/k/l.
+        if let raw = obj["clipPlane"] as? [String: Any] {
+            var clip = ClipPlane()
+            clip.enabled = raw["enabled"] as? Bool ?? false
+            clip.h = min(8, max(-8, raw["h"] as? Int ?? 0))
+            clip.k = min(8, max(-8, raw["k"] as? Int ?? 1))
+            clip.l = min(8, max(-8, raw["l"] as? Int ?? 0))
+            if let d = try finiteFloat(raw["distance"], field: "clipPlane.distance") {
+                clip.distance = min(20, max(-20, d))
+            }
+            clip.applyToStructure = raw["applyToStructure"] as? Bool ?? true
+            clip.applyToIsosurfaces = raw["applyToIsosurfaces"] as? Bool ?? true
+            candidate.clipPlane = clip
+        }
+        // Color-plane colormap. Validate against Colormap cases; fallback .viridis.
+        if let raw = obj["colorPlaneColormap"] as? String {
+            candidate.colorPlaneColormap = Colormap(rawValue: raw) ?? .viridis
+        }
+        // Color-plane contour configuration.
+        if let v = obj["colorPlaneContourEnabled"] as? Bool {
+            candidate.colorPlaneContourEnabled = v
+        }
+        if let v = obj["colorPlaneContourCount"] as? Int {
+            candidate.colorPlaneContourCount = min(20, max(2, v))
+        }
+        // Volume slices (optional). Absent -> empty. Clamp h/k/l to [-8,8],
+        // distance to [-2,2], drop non-finite, cap 3.
+        if let rawSlices = obj["volumeSlices"] as? [[String: Any]] {
+            var slices: [VolumeSlice] = []
+            slices.reserveCapacity(min(rawSlices.count, 3))
+            for raw in rawSlices.prefix(3) {
+                let enabled = raw["enabled"] as? Bool ?? true
+                let h = min(8, max(-8, raw["h"] as? Int ?? 0))
+                let k = min(8, max(-8, raw["k"] as? Int ?? 0))
+                let l = min(8, max(-8, raw["l"] as? Int ?? 1))
+                guard let distance = try? finiteFloat(raw["distance"], field: "volumeSlices.distance") else {
+                    continue
+                }
+                let dist = min(2, max(-2, distance))
+                slices.append(VolumeSlice(enabled: enabled, h: h, k: k, l: l, distance: dist))
+            }
+            candidate.volumeSlices = slices
         }
         if let v = obj["showFermiSurface"] as? Bool { candidate.showFermiSurface = v }
          if let v = obj["showForces"] as? Bool { candidate.showForces = v }

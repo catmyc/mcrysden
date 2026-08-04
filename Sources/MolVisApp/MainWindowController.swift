@@ -123,7 +123,6 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let labelOverlay: LabelOverlayView
     let bandGrapher: BandGrapherView    // 2D band-structure diagram (shown when bandStructure != nil)
     let dosGrapher: DOSGrapherView      // total/projected DOS graph (shown when densityOfStates != nil)
-    let colorPlane: ColorPlaneView      // color-plane / 2D-contour overlay (shown when grid2D != nil and toggled)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
     /// Standalone atom table (search field + virtualized table). Owned by the
@@ -387,10 +386,6 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         dosGrapher.autoresizingMask = [.width, .height]
         dosGrapher.isHidden = true
         viewport.addSubview(dosGrapher)
-        colorPlane = ColorPlaneView(frame: .zero)
-        colorPlane.autoresizingMask = [.width, .height]
-        colorPlane.isHidden = true
-        viewport.addSubview(colorPlane)
         let info = NSTextView(frame: .zero)
         info.isEditable = false
         info.isSelectable = true
@@ -439,6 +434,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         window.undoManager?.groupsByEvent = false
         window.delegate = self
         state.onChange = { [weak self] in self?.syncFromState() }
+        state.onRegionChange = { [weak self] in self?.recomputeRegionIntegration() }
+        state.onComputeWholeField = { [weak self] in self?.computeWholeFieldIntegration() }
         state.onResetView = { [weak self] in self?.resetView() }
         state.onStandardCrystalView = { [weak self] view in
             self?.alignToStandardCrystalView(view)
@@ -635,20 +632,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // persisting view-only availability into the scene.)
         state.electronicStructureEnabled = hasBands || scene.densityOfStates != nil
         updateElectronicStructureGraphs()
-        // A 2D scalar grid: the color-plane overlay is available. On load we push
-        // the grid data and show the plane by default (the canvas is hidden so the
-        // plane fills the viewport); the sidebar toggle drives showColorPlane.
-        if let grid = scene.grid2D {
-            colorPlane.grid = grid.values
-            colorPlane.zLabel = grid.ident
-            colorPlane.contourLevels = defaultContourLevels(for: grid)
-            // Project the skew plane with an affine that keeps BOTH span vectors'
-            // lengths and the angle between them (Gram-Schmidt basis). Passing only
-            // |v0|/|v1| would discard the angle and draw a skew plane rectangular.
-            colorPlane.physicalSpan = Array(grid.vec.prefix(2))
-        } else {
-            colorPlane.grid = nil
-        }
+        // A 2D scalar grid: the color-plane is now drawn as a textured quad in the
+        // Metal scene by the renderer (gated on scene.showColorPlane). No separate
+        // canvas swap needed.
         updateContentVisibility()
         // Initialise the animation controls WITHOUT triggering onChange (which
         // would otherwise try to reload frame 0 on top of this fresh load).
@@ -2946,9 +2932,22 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Color-plane overlay: written unconditionally; the renderer/visibility
         // gates the draw on `scene.grid2D != nil`.
         scene.showColorPlane = state.showColorPlane
+        // Color-plane colormap + contour configuration: mirrored into the scene
+        // here so they persist via StateStore; the renderer applies them to the
+        // in-scene color-plane quad and 3D contour lines.
+        scene.colorPlaneColormap = state.colorPlaneColormap
+        scene.colorPlaneContourEnabled = state.colorPlaneContourEnabled
+        scene.colorPlaneContourCount = min(20, max(2, state.colorPlaneContourCount))
+        // Volume slices: mirror into the scene (capped at 3 in SideBarState).
+        scene.volumeSlices = Array(state.volumeSlices.prefix(3))
+        // Multiple iso specs: mirror into the scene (capped at 8 in SideBarState).
+        scene.isoSurfaces = Array(state.isoSurfaces.prefix(8))
+        // Display-only clip plane: only meaningful when a cell is present.
+        scene.clipPlane = scene.cell != nil ? state.clipPlane : nil
         // Color-plane overlay: a 2D grid may coexist with the 3D structure. The
-        // canvas shows EITHER the 3D scene or the color plane, never both — so the
-        // plane wins only while the toggle is on AND a grid is present.
+        // plane is now drawn as a textured quad in the Metal scene by the renderer
+        // (gated on scene.showColorPlane), so it composites with the structure instead
+        // of swapping the canvas.
         updateContentVisibility()
         if enteringReciprocalEdit, window.isVisible {
             window.makeFirstResponder(canvas)
@@ -3738,7 +3737,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         var visibleScene = scene
         if dosGrapher.isHidden { visibleScene.densityOfStates = nil }
         if bandGrapher.isHidden { visibleScene.bandStructure = nil }
-        if colorPlane.isHidden { visibleScene.grid2D = nil }
+        // The color plane is now drawn by the renderer in the Metal scene, so the
+        // exported scene keeps grid2D intact (the renderer gates on showColorPlane).
         // Apply export options: if the caller passes explicit options, use them;
         // otherwise render with the scene's own background (preserving gradients).
         if let options {
@@ -3756,14 +3756,55 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                                    options: renderOptions)
     }
 
-    /// Pick a small set of iso-contour levels spanning the grid's value range,
-    /// for the color-plane's marching-squares contour trace. Six levels keeps the
-    /// plot legible without overcrowding it.
-    private func defaultContourLevels(for grid: Grid2D) -> [Float] {
-        let lo = grid.minValue, hi = grid.maxValue
-        guard hi > lo else { return [] }
-        let n = 6
-        return (1..<n).map { i in lo + (hi - lo) * Float(i) / Float(n) }
+    /// Compute the region integral for the current sidebar region inputs and
+    /// write the summary (or an error) back into the sidebar state. Guards
+    /// against recomputing when the inputs are unchanged from the last call.
+    func recomputeRegionIntegration() {
+        let stateRef = state
+        // Guard: skip when no field is present.
+        guard let field = scene.scalarField else {
+            state.regionResultSummary = ""
+            state.regionComputeError = nil
+            return
+        }
+        let shape = state.regionShape
+        let center = state.regionCenter
+        let halfExtents = state.regionHalfExtents
+        let radius = state.regionRadius
+        // Guard: only recompute when the region inputs actually changed. The
+        // first call always computes so the sidebar shows an initial readout.
+        if hasComputedRegion && shape == lastRegionShape && center == lastRegionCenter
+            && halfExtents == lastRegionHalfExtents && radius == lastRegionRadius {
+            return
+        }
+        hasComputedRegion = true
+        lastRegionShape = shape
+        lastRegionCenter = center
+        lastRegionHalfExtents = halfExtents
+        lastRegionRadius = radius
+        let region = IntegrationRegion(shape: shape, center: center,
+                                        halfExtents: halfExtents, radius: radius)
+        if let result = RegionIntegration.integrate(field: field, region: region) {
+            state.regionResultSummary = result.summary
+            state.regionComputeError = nil
+        } else {
+            state.regionResultSummary = ""
+            state.regionComputeError = "No samples in region"
+        }
+    }
+
+    /// Compute the whole-field integral (RegionIntegration.integrateAll) and
+    /// write the summary into the sidebar state. No-op when no field is present.
+    func computeWholeFieldIntegration() {
+        guard let field = scene.scalarField else {
+            state.regionWholeFieldSummary = ""
+            return
+        }
+        if let result = RegionIntegration.integrateAll(field: field) {
+            state.regionWholeFieldSummary = "Whole field: " + result.summary
+        } else {
+            state.regionWholeFieldSummary = "Whole field: no samples"
+        }
     }
 
     /// Guards the main syncFromState() path while reloadFrame assigns
@@ -3775,6 +3816,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// edits leave the counter untouched, so editing a selected node keeps its
     /// highlight. Initialized in init/syncFromState from the current state.
     private var lastRouteGeneration = -1
+    /// Last-computed region integration inputs, used to guard against redundant
+    /// recomputation when the sidebar fires onChange for unrelated reasons.
+    private var lastRegionShape: RegionShape = .box
+    private var lastRegionCenter: SIMD3<Float> = .zero
+    private var lastRegionHalfExtents: SIMD3<Float> = SIMD3<Float>(2, 2, 2)
+    private var lastRegionRadius: Float = 2
+    private var hasComputedRegion = false
 
     /// Decode AXSF frame `index` and swap it into the current scene, preserving
     /// the camera and all UI-controllable state (display mode, scales, lighting,
@@ -3971,17 +4019,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             scene.camera = camera
         }
         refreshStandardCrystalViewAvailability()
-        // Refresh the color-plane overlay when the reloaded frame changes grid2D
-        // presence or data, mirroring loadFile so the plane's data/labels/contours
-        // stay consistent across frame reloads.
-        if let grid = next.grid2D {
-            colorPlane.grid = grid.values
-            colorPlane.zLabel = grid.ident
-            colorPlane.contourLevels = defaultContourLevels(for: grid)
-            colorPlane.physicalSpan = Array(grid.vec.prefix(2))
-        } else {
-            colorPlane.grid = nil
-        }
+        // The color-plane is now drawn by the renderer in the Metal scene; frame
+        // reloads update scene.grid2D which the renderer reads directly.
         updateContentVisibility()
         // A frame reload replaces the displayed atom ordering, invalidating any
         // installed two-structure comparison. This path renders later, so
@@ -4180,20 +4219,20 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Metal avoids overlapping plots and avoids hiding a graph with its parent.
     private func updateContentVisibility() {
         // k-path edit mode needs the Metal canvas (the BZ is rendered there); suppress
-        // every graph/color-plane sibling so the editor is usable even on a crystal that
-        // also carries band/DOS/grid data. Exiting edit mode falls through to the normal
+        // every graph sibling so the editor is usable even on a crystal that also
+        // carries band/DOS/grid data. Exiting edit mode falls through to the normal
         // precedence below.
+        // The color plane now lives in the Metal scene (drawn as a textured quad by
+        // the renderer), so it no longer swaps the canvas — the canvas stays visible
+        // and the plane composites with the structure via depth testing.
         let editingReciprocal = state.editKPathOnBZ && scene.isCrystal
         let showDOS = !editingReciprocal && scene.densityOfStates != nil
         let showBands = !editingReciprocal && !showDOS && scene.bandStructure != nil
-        let showPlane = !editingReciprocal && !showDOS && !showBands && state.showColorPlane && scene.grid2D != nil
         dosGrapher.isHidden = !showDOS
         bandGrapher.isHidden = !showBands
-        colorPlane.isHidden = !showPlane
-        canvas.isHidden = !editingReciprocal && (showDOS || showBands || showPlane)
+        canvas.isHidden = !editingReciprocal && (showDOS || showBands)
         if showDOS { dosGrapher.needsDisplay = true }
         if showBands { bandGrapher.needsDisplay = true }
-        if showPlane { colorPlane.needsDisplay = true }
     }
 
     /// Push the sidebar's electronic-structure interaction state into the grapher

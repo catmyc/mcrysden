@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-03 (v1.1.37: hardened polyhedron metrics, structure comparison, filters, bond labels, and comparison exports; 32 focused tests)**.
+Last updated: **2026-08-04 (v1.1.38: volumetric data and rendering completed — multi-isovalues, clipping planes, region integration, colormaps/contours, volume slices, and color-plane compositing; 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -121,8 +121,12 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [~] Band VBM/CBM, direct/indirect gap, metallicity, and effective masses plus DOS center, width, gap estimate, spin moment, and electron-count consistency are surfaced with explicit unavailable/insufficient-data states and text/CSV export. Band extrema and estimated DOS gap edges are linked to graph markers. Linked band/DOS analysis and projected species/orbital coloring remain pending.
 
 ### Volumetric data and rendering
-- [~] Paired positive/negative orbital lobes and fixed color-plane contours are implemented; arbitrary 3D-grid slices/clipping planes, multiple independent isovalues, region integration, and configurable colormaps/contour levels remain pending.
-- [~] Structure and isosurfaces already share the Metal render pass; compositing the sibling color-plane view with structure/isosurfaces remains pending.
+- [x] Multiple independent isovalues (v1.1.38): additive spec list with per-level color/sign/enabled controls, capped at 8, persisted with backward-compatible legacy `isoLevel` fallback; classic ± pair remains the default.
+- [x] Display-only clipping planes (v1.1.38): fractional h/k/l + distance convention culls structure atoms/bonds/polyhedra and Sutherland–Hodgman-clips isosurface/Fermi meshes without scene mutation.
+- [x] Region integration (v1.1.38): bounded uniform-lattice trilinear sampling over box/sphere regions with live integral/mean/volume readouts and whole-field integration.
+- [x] Configurable colormaps (viridis/turbo/inferno/grayscale) and contour-level counts for the color plane, persisted and backward compatible.
+- [x] Volume slices (v1.1.38): arbitrary fractional-plane samples of the 3D field rendered as depth-tested colormap textures (masked samples transparent), up to 3 per scene.
+- [x] Color-plane compositing (v1.1.38): the 2D grid renders as a textured quad inside the Metal scene with structure/isosurfaces, with optional 3D marching-squares contour lines; the fullscreen canvas swap is removed.
 - [x] Standard crystallographic `[100]`/`[110]`/`[111]` camera views.
 - [x] Three document-scoped named camera bookmark slots with save, recall, and clear actions; exact validated presentation/projection restoration; disabled recalls for empty slots; and optional `.mvis-state` persistence.
 - [x] Adaptive scale indicators (v1.1.33): persisted opt-in Show Scale with an adaptive 1-2-5 Å/nm bar, orthographic-span and perspective camera-center-plane conventions, orbit/zoom/viewport-stable placement, shared live/raster/raster-backed-vector label compositing, and suppression for graph/color-plane views or invalid geometry.

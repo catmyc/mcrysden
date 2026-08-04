@@ -39,10 +39,13 @@ struct SideBar: View {
     @AppStorage(CollapsibleSidebarSection.slab.rawValue) private var slabExpanded = true
     @AppStorage(CollapsibleSidebarSection.animation.rawValue) private var animationExpanded = true
     @AppStorage(CollapsibleSidebarSection.isosurface.rawValue) private var isosurfaceExpanded = true
+    @AppStorage(CollapsibleSidebarSection.volumeSlices.rawValue) private var volumeSlicesExpanded = true
     @AppStorage(CollapsibleSidebarSection.fermiSurface.rawValue) private var fermiSurfaceExpanded = true
     @AppStorage(CollapsibleSidebarSection.symmetry.rawValue) private var symmetryExpanded = true
     @AppStorage(CollapsibleSidebarSection.coordination.rawValue) private var coordinationExpanded = true
     @AppStorage(CollapsibleSidebarSection.electronicStructure.rawValue) private var electronicStructureExpanded = true
+    @AppStorage(CollapsibleSidebarSection.clipping.rawValue) private var clippingExpanded = true
+    @AppStorage(CollapsibleSidebarSection.region.rawValue) private var regionExpanded = true
 
     var body: some View {
         Form {
@@ -239,8 +242,59 @@ struct SideBar: View {
                                 value: $state.currentOrbital,
                                 in: 0...(state.orbitalCount - 1))
                     }
+                    // The primary iso level slider is always visible: it seeds new
+                    // levels AND drives the legacy ±pair when the spec list is empty.
                     Slider(value: $state.isoLevel, in: state.isoRange) {
                         Text("Iso level: \(state.isoLevel, specifier: "%.3f")")
+                    }
+                    // When the spec list is non-empty, render exactly the enabled
+                    // specs: one row each with a color swatch, enabled toggle, a
+                    // per-level slider, and a delete button.
+                    ForEach(Array(state.isoSurfaces.enumerated()), id: \.offset) { index, spec in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                ColorPicker("",
+                                            selection: Binding(
+                                                get: { Color(hex: spec.colorHex) ?? .white },
+                                                set: { newColor in
+                                                    var c = state.isoSurfaces
+                                                    c[index].colorHex = newColor.hexString
+                                                    state.isoSurfaces = c
+                                                }),
+                                            supportsOpacity: false)
+                                    .labelsHidden()
+                                    .frame(width: 44, height: 20)
+                                Toggle("On", isOn: Binding(
+                                    get: { state.isoSurfaces[index].enabled },
+                                    set: { var c = state.isoSurfaces; c[index].enabled = $0; state.isoSurfaces = c }))
+                                    .labelsHidden()
+                                Spacer()
+                                Button(role: .destructive) {
+                                    state.removeIsoSurfaceSpec(at: index)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Delete this iso level")
+                            }
+                            Slider(value: Binding(
+                                get: { state.isoSurfaces[index].level },
+                                set: { var c = state.isoSurfaces; c[index].level = $0; state.isoSurfaces = c }),
+                                in: state.isoRange) {
+                                Text("Level \(state.isoSurfaces[index].level, specifier: "%.3f")")
+                            }
+                        }
+                    }
+                    HStack {
+                        Button("+ Add level") {
+                            state.addIsoSurfaceSpec()
+                        }
+                        .disabled(state.isoSurfaces.count >= 8)
+                        Spacer()
+                        Button("Reset to ± pair") {
+                            state.resetIsoSurfaces()
+                        }
+                        .disabled(state.isoSurfaces.isEmpty)
                     }
                 }
             }
@@ -259,6 +313,82 @@ struct SideBar: View {
             if state.hasGrid2D {
                 CollapsibleSection(title: "Color Plane", isExpanded: $colorPlaneExpanded) {
                     Toggle("Show Color Plane", isOn: $state.showColorPlane)
+                    Picker("Colormap", selection: $state.colorPlaneColormap) {
+                        ForEach(Colormap.allCases, id: \.self) { cm in
+                            Text(cm.displayName).tag(cm)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Toggle("Contours", isOn: $state.colorPlaneContourEnabled)
+                    Stepper("Contour count \(state.colorPlaneContourCount)",
+                            value: $state.colorPlaneContourCount,
+                            in: 2...20)
+                        .disabled(!state.colorPlaneContourEnabled)
+                }
+            }
+            // --- Volume Slices (3D scalar field on fractional planes) --------
+            // Shown only when the loaded file carried a 3D scalar grid AND is a
+            // crystal (fractional plane needs a cell). Each slice samples the field
+            // on a fractional plane and draws it as a textured quad in the 3D scene.
+            if state.hasScalarField && state.isCrystal {
+                CollapsibleSection(title: "Volume Slices", isExpanded: $volumeSlicesExpanded) {
+                    ForEach(Array(state.volumeSlices.enumerated()), id: \.offset) { index, slice in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Toggle("On", isOn: Binding(
+                                    get: { state.volumeSlices[index].enabled },
+                                    set: { var c = state.volumeSlices; c[index].enabled = $0; state.volumeSlices = c }))
+                                    .labelsHidden()
+                                Spacer()
+                                Button(role: .destructive) {
+                                    state.removeVolumeSlice(at: index)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Delete this slice")
+                            }
+                            Stepper("h = \(state.volumeSlices[index].h)", value: Binding(
+                                get: { state.volumeSlices[index].h },
+                                set: { var c = state.volumeSlices; c[index].h = $0; state.volumeSlices = c }),
+                                in: -8...8)
+                            Stepper("k = \(state.volumeSlices[index].k)", value: Binding(
+                                get: { state.volumeSlices[index].k },
+                                set: { var c = state.volumeSlices; c[index].k = $0; state.volumeSlices = c }),
+                                in: -8...8)
+                            Stepper("l = \(state.volumeSlices[index].l)", value: Binding(
+                                get: { state.volumeSlices[index].l },
+                                set: { var c = state.volumeSlices; c[index].l = $0; state.volumeSlices = c }),
+                                in: -8...8)
+                            Slider(value: Binding(
+                                get: { state.volumeSlices[index].distance },
+                                set: { var c = state.volumeSlices; c[index].distance = $0; state.volumeSlices = c }),
+                                in: -2...2, step: 0.01) {
+                                Text("Distance: \(state.volumeSlices[index].distance, specifier: "%.2f")")
+                            }
+                        }
+                    }
+                    Button("+ Add slice") {
+                        state.addVolumeSlice()
+                    }
+                    .disabled(state.volumeSlices.count >= 3)
+                }
+            }
+            // --- Clipping plane (crystal only, display-only) -------------------
+            // A display-only plane that culls structure and/or isosurfaces behind
+            // it. Never mutates scene atoms. Fractional convention matches Slab
+            // (keep h*x+k*y+l*z >= distance). Only meaningful with a unit cell.
+            if state.isCrystal {
+                CollapsibleSection(title: "Clipping", isExpanded: $clippingExpanded) {
+                    clippingContent
+                }
+            }
+            // --- Region Integration (view-state only, NOT persisted) -----------
+            // Gated on a scalar field. Bounded uniform-lattice sampling over a
+            // box/sphere region; synchronous recompute on every slider change.
+            if state.hasScalarField {
+                CollapsibleSection(title: "Region Integration", isExpanded: $regionExpanded) {
+                    regionContent
                 }
             }
             // --- Forces (QE output): per-atom force arrows + energy readout. ---
@@ -646,6 +776,94 @@ struct SideBar: View {
             .foregroundColor(.secondary)
     }
 
+    // MARK: - Clipping plane (display-only)
+
+    @ViewBuilder
+    private var clippingContent: some View {
+        let isEnabled = state.clipPlane?.enabled ?? false
+        Toggle("Enable Clip Plane", isOn: Binding(
+            get: { isEnabled },
+            set: { enabled in
+                if enabled {
+                    var clip = state.clipPlane ?? ClipPlane()
+                    clip.enabled = true
+                    state.clipPlane = clip
+                } else {
+                    state.clipPlane = nil
+                }
+            }))
+        Stepper("h \(state.clipPlane?.h ?? 0)", value: Binding(
+            get: { state.clipPlane?.h ?? 0 },
+            set: { var c = state.clipPlane ?? ClipPlane(); c.h = $0; c.enabled = true; state.clipPlane = c }),
+            in: -8...8)
+            .disabled(!isEnabled)
+        Stepper("k \(state.clipPlane?.k ?? 1)", value: Binding(
+            get: { state.clipPlane?.k ?? 1 },
+            set: { var c = state.clipPlane ?? ClipPlane(); c.k = $0; c.enabled = true; state.clipPlane = c }),
+            in: -8...8)
+            .disabled(!isEnabled)
+        Stepper("l \(state.clipPlane?.l ?? 0)", value: Binding(
+            get: { state.clipPlane?.l ?? 0 },
+            set: { var c = state.clipPlane ?? ClipPlane(); c.l = $0; c.enabled = true; state.clipPlane = c }),
+            in: -8...8)
+            .disabled(!isEnabled)
+        Slider(value: Binding(
+            get: { state.clipPlane?.distance ?? 0 },
+            set: { var c = state.clipPlane ?? ClipPlane(); c.distance = $0; c.enabled = true; state.clipPlane = c }),
+            in: -20...20) {
+            Text("Distance: \(state.clipPlane?.distance ?? 0, specifier: "%.2f")")
+        }
+        .disabled(!isEnabled)
+        Toggle("Clip structure", isOn: Binding(
+            get: { state.clipPlane?.applyToStructure ?? true },
+            set: { var c = state.clipPlane ?? ClipPlane(); c.applyToStructure = $0; c.enabled = true; state.clipPlane = c }))
+            .disabled(!isEnabled)
+        Toggle("Clip isosurfaces", isOn: Binding(
+            get: { state.clipPlane?.applyToIsosurfaces ?? true },
+            set: { var c = state.clipPlane ?? ClipPlane(); c.applyToIsosurfaces = $0; c.enabled = true; state.clipPlane = c }))
+            .disabled(!isEnabled)
+    }
+
+    // MARK: - Region integration (view-state only)
+
+    @ViewBuilder
+    private var regionContent: some View {
+        Picker("Shape", selection: $state.regionShape) {
+            ForEach(RegionShape.allCases, id: \.self) { shape in
+                Text(shape.displayName).tag(shape)
+            }
+        }
+        .pickerStyle(.segmented)
+        Slider(value: $state.regionCenter.x, in: -20...20) { Text("Center X: \(state.regionCenter.x, specifier: "%.1f") Å") }
+        Slider(value: $state.regionCenter.y, in: -20...20) { Text("Center Y: \(state.regionCenter.y, specifier: "%.1f") Å") }
+        Slider(value: $state.regionCenter.z, in: -20...20) { Text("Center Z: \(state.regionCenter.z, specifier: "%.1f") Å") }
+        if state.regionShape == .box {
+            Slider(value: $state.regionHalfExtents.x, in: 0.1...20) { Text("Half X: \(state.regionHalfExtents.x, specifier: "%.1f") Å") }
+            Slider(value: $state.regionHalfExtents.y, in: 0.1...20) { Text("Half Y: \(state.regionHalfExtents.y, specifier: "%.1f") Å") }
+            Slider(value: $state.regionHalfExtents.z, in: 0.1...20) { Text("Half Z: \(state.regionHalfExtents.z, specifier: "%.1f") Å") }
+        } else {
+            Slider(value: $state.regionRadius, in: 0.1...20) { Text("Radius: \(state.regionRadius, specifier: "%.1f") Å") }
+        }
+        if let error = state.regionComputeError {
+            Text(error)
+                .font(.caption).foregroundColor(.red)
+        } else if !state.regionResultSummary.isEmpty {
+            Text(state.regionResultSummary)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+        } else {
+            Text("No region computed")
+                .font(.caption).foregroundColor(.secondary)
+        }
+        Button("Whole field") { state.onComputeWholeField?() }
+            .buttonStyle(.bordered).font(.caption)
+        if !state.regionWholeFieldSummary.isEmpty {
+            Text(state.regionWholeFieldSummary)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+        }
+    }
+
     /// Distribution/RDF readout derived from the coordination analysis. Shows
     /// bond-length and bond-angle histograms plus the radial distribution
     /// function (3D periodic only, actual g(r) values). Each can be exported
@@ -929,3 +1147,32 @@ private func spaceGroupText(_ summary: StructureSummary) -> String {
     if let s = summary.spaceGroupSymbol { return s }
     return "—"
 }
+
+// MARK: - Color hex conversion (for the iso-spec ColorPicker)
+
+private extension Color {
+    /// Create a Color from a "#RRGGBB" or "RRGGBB" hex string. Falls back to
+    /// white on malformed input.
+    init?(hex: String) {
+        var s = hex.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let v = UInt32(s, radix: 16) else { return nil }
+        let r = Double((v >> 16) & 0xFF) / 255.0
+        let g = Double((v >> 8) & 0xFF) / 255.0
+        let b = Double(v & 0xFF) / 255.0
+        self.init(red: r, green: g, blue: b)
+    }
+
+    /// Convert to a "#RRGGBB" hex string. Falls back to "#FFFFFF" if the
+    /// color is not in an RGB-compatible colorspace.
+    var hexString: String {
+        let ns = NSColor(self)
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        ns.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let ri = Int((r * 255).rounded())
+        let gi = Int((g * 255).rounded())
+        let bi = Int((b * 255).rounded())
+        return String(format: "#%02X%02X%02X", ri, gi, bi)
+    }
+}
+

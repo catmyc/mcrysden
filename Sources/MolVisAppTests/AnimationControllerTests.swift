@@ -288,18 +288,15 @@ final class AnimationControllerTests: XCTestCase {
 
         planeController.state.frameIndex = 1
         XCTAssertEqual(planeController.scene.currentFrame, 1)
-        XCTAssertNotNil(planeController.colorPlane.grid, "grid data must be pushed onto the plane")
-        XCTAssertEqual(planeController.colorPlane.zLabel, "density")
-        XCTAssertFalse(planeController.colorPlane.contourLevels.isEmpty, "contours must be refreshed")
-        XCTAssertEqual(planeController.colorPlane.physicalSpan.count, 2)
-        XCTAssertFalse(planeController.colorPlane.isHidden, "plane must be visible on a grid frame")
-        XCTAssertTrue(planeController.canvas.isHidden, "canvas must be hidden while the plane shows")
+        XCTAssertNotNil(planeController.scene.grid2D, "grid data must be present on a grid frame")
+        XCTAssertEqual(planeController.scene.grid2D?.ident, "density")
+        // The color plane now lives in the Metal scene; the canvas stays visible.
+        XCTAssertFalse(planeController.canvas.isHidden, "canvas must stay visible (plane composites in 3D)")
 
         planeController.state.frameIndex = 0
         XCTAssertEqual(planeController.scene.currentFrame, 0)
-        XCTAssertNil(planeController.colorPlane.grid, "grid data must be cleared off the plane")
-        XCTAssertTrue(planeController.colorPlane.isHidden, "plane must hide on a no-grid frame")
-        XCTAssertFalse(planeController.canvas.isHidden, "canvas must be restored when the plane hides")
+        XCTAssertNil(planeController.scene.grid2D, "grid data must be cleared on a no-grid frame")
+        XCTAssertFalse(planeController.canvas.isHidden, "canvas must stay visible when no grid")
 
         // The same reload transaction must also apply the preserved multi-orbital
         // selection and clamp the carried iso level against the selected field.

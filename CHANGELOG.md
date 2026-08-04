@@ -2,6 +2,23 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.38] — 2026-08-04
+
+### Added
+
+- Multiple independent isosurface levels: an additive spec list (level, color, sign, enabled) with per-level color pickers, sliders, and toggles in the sidebar, seeded from the legacy iso level, capped at 8, and persisted in `.mvis-state` with backward-compatible legacy `isoLevel` fallback.
+- Display-only clipping plane (fractional h/k/l + distance convention): culls structure atoms/bonds/polyhedra and clips isosurface and Fermi-surface meshes via Sutherland–Hodgman half-space clipping, without mutating the scene; sidebar controls and state persistence with clamped load.
+- Region integration: bounded uniform-lattice sampling with trilinear interpolation over box or sphere regions, live sidebar readout (integral, mean, volume, extrema, sample count) and whole-field integration.
+- Configurable colormaps (viridis/turbo/inferno/grayscale) and contour-level counts for the color plane, persisted and backward compatible.
+- Volume slices: arbitrary fractional-plane sampling of the 3D scalar field rendered as depth-tested textured quads in the Metal scene (colormap-mapped, masked samples transparent), up to 3 slices with sidebar controls and persistence.
+- Color-plane compositing: the 2D grid now renders as a textured quad inside the 3D Metal scene together with structure and isosurfaces, with optional 3D marching-squares contour lines; the previous fullscreen canvas swap is removed.
+- Textured-quad Metal pipeline (linear/clamp sampling, alpha discard) shared by slices and the color plane, including the MSAA export path.
+
+### Changed
+
+- The isosurface renderer cache generalizes from two fixed ± shells to a dynamic per-spec shell cache; the classic paired blue/orange shells remain the default when no spec list is configured, with byte-identical output.
+- Test suite consolidated to exactly 32 focused tests; volumetric coverage (colormaps, region integration, field slicing, clipping, multi-iso, compositing) consolidated into `VolumetricTests.swift`.
+
 ## [1.1.37] — 2026-08-03
 
 ### Fixed

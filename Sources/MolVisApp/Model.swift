@@ -178,6 +178,43 @@ enum PublicationPreset: String, Codable, CaseIterable {
     }
 }
 
+/// One independently-colored isosurface shell. When `scene.isoSurfaces` is non-empty
+/// the renderer draws EXACTLY the enabled specs (each at sign*level in its color);
+/// when empty it falls back to the legacy ±isoLevel pair. A spec with sign 1 renders
+/// faces where field > sign*level. Ignored (legacy path) when the list is empty;
+/// lists longer than 8 specs are capped.
+struct IsoSurfaceSpec: Codable, Equatable {
+    var level: Float
+    var colorHex: String
+    var sign: Float
+    var enabled: Bool
+}
+
+/// A display-only clipping plane (never mutates scene atoms). Fractional convention
+/// identical to Slab: keep points with h*x+k*y+l*z >= distance in fractional coords.
+/// Only meaningful when scene.cell != nil.
+struct ClipPlane: Codable, Equatable {
+    var enabled: Bool = false
+    var h: Int = 0
+    var k: Int = 1
+    var l: Int = 0
+    var distance: Float = 0
+    var applyToStructure: Bool = true
+    var applyToIsosurfaces: Bool = true
+}
+
+/// A 3D volume slice: sample the scalar field on an arbitrary fractional plane
+/// and draw it as a textured quad in the Metal scene. Fractional convention
+/// identical to ClipPlane/Slab (h*x+k*y+l*z >= distance; the plane itself is
+/// h*x+k*y+l*z == distance). Capped at 3 slices.
+struct VolumeSlice: Codable, Equatable {
+    var enabled: Bool = true
+    var h: Int = 0
+    var k: Int = 0
+    var l: Int = 1
+    var distance: Float = 0.5
+}
+
 struct Scene: Codable {
     var atoms: [Atom] = []
     var bonds: [Bond] = []
@@ -198,6 +235,10 @@ struct Scene: Codable {
     /// on a previously-filtered result.
     var preslabAtoms: [Atom] = []
     var slab: Slab?
+    /// An optional display-only clipping plane. nil = no clipping. When present
+    /// and enabled, culls structure atoms/isosurfaces behind the plane. Only
+    /// meaningful when scene.cell != nil.
+    var clipPlane: ClipPlane?
     /// An optional volumetric scalar grid (a DATAGRID block read from an XSF file).
     /// Feeds the isosurface engine; nil for structure-only files.
     var scalarField: ScalarField?
@@ -252,6 +293,10 @@ struct Scene: Codable {
     /// is gated in the UI on the presence of a scalarField.
     var showIsoSurface: Bool = true
     var isoLevel: Float = 0
+    /// Multiple independent isosurface specs. Empty = legacy behavior (two
+    /// complementary shells at +isoLevel/-isoLevel with cool-blue/warm-orange
+    /// colors). Non-empty = render EXACTLY the enabled specs. Capped at 8.
+    var isoSurfaces: [IsoSurfaceSpec] = []
     /// Overlay a Fermi surface (one isosurface per band at the Fermi level). Gated
     /// in the UI on the presence of a fermiSurface and drawn separately from the
     /// scalar-field isosurface so it can be toggled independently.
@@ -283,6 +328,15 @@ struct Scene: Codable {
       /// Toggle the color-plane overlay (DATAGRID_2D only). When on, the 2D
       /// ColorPlaneView replaces the 3D canvas; gated in the UI on `grid2D != nil`.
       @DefaultTrue var showColorPlane: Bool = true
+    /// Colormap for the 2D color plane. Defaults to .viridis (byte-identical output).
+    var colorPlaneColormap: Colormap = .viridis
+    /// Whether contour lines are drawn over the color plane.
+    var colorPlaneContourEnabled: Bool = true
+    /// Number of contour levels (clamped 2...20). Used when contour is enabled.
+    var colorPlaneContourCount: Int = 6
+    /// 3D volume slices: sample the scalar field on arbitrary fractional planes
+    /// and draw them as textured quads in the Metal scene. Empty = none; cap 3.
+    var volumeSlices: [VolumeSlice] = []
     /// Multiplier converting a force (eV/Å) to an arrow length (Å) so typical
     /// forces (0.01–1 eV/Å) span a few Å and read clearly. Sidebar-adjustable.
     var forceScale: Float = 50.0

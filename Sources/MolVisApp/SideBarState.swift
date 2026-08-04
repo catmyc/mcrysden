@@ -227,6 +227,16 @@ final class SideBarState: ObservableObject {
     @Published var showIsoSurface: Bool = true { didSet { onChange?() } }
     @Published var isoLevel: Float = 0 { didSet { onChange?() } }
     @Published var isoRange: ClosedRange<Float> = 0...1
+    /// Multiple independent isosurface specs. Empty = legacy ±pair behavior.
+    /// Non-empty = render exactly the enabled specs. Capped at 8.
+    @Published var isoSurfaces: [IsoSurfaceSpec] = [] { didSet { onChange?() } }
+    /// Small palette used to seed colors for newly-added iso specs.
+    private static let isoPalette: [String] = ["#1f6f99", "#f1773f", "#3fae5a",
+        "#a051b8", "#d62728", "#17becf", "#bcbd22", "#e694c4"]
+    /// Index into isoPalette for the next added spec.
+    private var nextIsoPaletteIndex = 0
+    /// Display-only clipping plane (crystal only). nil = no clipping.
+    @Published var clipPlane: ClipPlane? { didSet { onChange?() } }
     /// True when a volumetric field is present — the sidebar gates the
     /// Isosurface section on this so structure-only files show no empty controls.
     var hasScalarField: Bool = false
@@ -245,6 +255,35 @@ final class SideBarState: ObservableObject {
     /// Toggle the color-plane overlay. Synced in syncFromState(); when on, the
     /// 2D ColorPlaneView replaces the 3D canvas. Meaningful only when hasGrid2D.
     @Published var showColorPlane: Bool = true { didSet { onChange?() } }
+    /// Colormap for the 2D color plane. Defaults to .viridis.
+    @Published var colorPlaneColormap: Colormap = .viridis { didSet { onChange?() } }
+    /// Whether contour lines are drawn over the color plane.
+    @Published var colorPlaneContourEnabled: Bool = true { didSet { onChange?() } }
+    /// Number of contour levels (2...20).
+    @Published var colorPlaneContourCount: Int = 6 { didSet { onChange?() } }
+    /// 3D volume slices: sample the scalar field on arbitrary fractional planes.
+    /// Empty = none; cap 3. Synced from scene.volumeSlices.
+    @Published var volumeSlices: [VolumeSlice] = [] { didSet { onChange?() } }
+    // --- Region integration (view-state only, NOT persisted) ---------------------
+    /// Gated on hasScalarField. The controller recomputes the integral when these
+    /// inputs change and writes the summary back into `regionResultSummary`.
+    @Published var regionShape: RegionShape = .box { didSet { onRegionChange?() } }
+    @Published var regionCenter: SIMD3<Float> = .zero { didSet { onRegionChange?() } }
+    @Published var regionHalfExtents: SIMD3<Float> = SIMD3<Float>(2, 2, 2) { didSet { onRegionChange?() } }
+    @Published var regionRadius: Float = 2 { didSet { onRegionChange?() } }
+    /// Live single-line readout set by the controller. Not @Published (set on load
+    /// and on region recompute, not via didSet).
+    var regionResultSummary: String = ""
+    /// Error text when the region contains no samples. nil = no error.
+    var regionComputeError: String? = nil
+    /// Whole-field integral readout ("Whole field" button). Empty until computed.
+    var regionWholeFieldSummary: String = ""
+    /// Invoked when any region input changes. MainWindowController wires this to
+    /// recompute the integral (guarded against unrelated sidebar changes).
+    var onRegionChange: (() -> Void)?
+    /// Invoked when the user taps "Whole field". The controller computes
+    /// RegionIntegration.integrateAll(field:) and writes the summary.
+    var onComputeWholeField: (() -> Void)?
     /// True when a forceSet (parsed from a QE output) is present — the sidebar
     /// gates the Forces section on this so force-less files show no empty controls.
     var hasForceSet: Bool = false
@@ -402,6 +441,11 @@ final class SideBarState: ObservableObject {
         } else {
             hasScalarField = false
         }
+        // Cap the spec list at 8 on load; the renderer enforces the same cap.
+        isoSurfaces = Array(scene.isoSurfaces.prefix(8))
+        nextIsoPaletteIndex = isoSurfaces.count % SideBarState.isoPalette.count
+        // Clipping plane: nil when absent or when there is no cell to filter against.
+        clipPlane = scene.cell != nil ? scene.clipPlane : nil
         orbitalCount = scene.multiOrbitalFields.count
         currentOrbital = orbitalCount > 0
             ? min(max(0, scene.currentOrbital), orbitalCount - 1)
@@ -416,6 +460,12 @@ final class SideBarState: ObservableObject {
         hasForceSet = (scene.forceSet != nil)
         showForces = scene.showForces
         forceScale = scene.forceScale
+        // Color-plane colormap + contour configuration.
+        colorPlaneColormap = scene.colorPlaneColormap
+        colorPlaneContourEnabled = scene.colorPlaneContourEnabled
+        colorPlaneContourCount = scene.colorPlaneContourCount
+        // Volume slices: cap at 3 on load; the renderer enforces the same cap.
+        volumeSlices = Array(scene.volumeSlices.prefix(3))
         msaaSampleCount = scene.msaaSampleCount
         opacity = scene.opacity
         lineWidth = scene.lineWidth
@@ -766,6 +816,49 @@ final class SideBarState: ObservableObject {
         onResetKPath?()
     }
 
+    // MARK: - Isosurface spec list helpers
+
+    /// Add a new iso spec seeded at the current isoLevel, sign +1, with the next
+    /// palette color. No-op when already at the 8-spec cap.
+    func addIsoSurfaceSpec() {
+        guard isoSurfaces.count < 8 else { return }
+        let color = SideBarState.isoPalette[nextIsoPaletteIndex % SideBarState.isoPalette.count]
+        nextIsoPaletteIndex += 1
+        isoSurfaces.append(IsoSurfaceSpec(level: isoLevel, colorHex: color, sign: 1, enabled: true))
+    }
+
+    /// Remove the spec at `index`. No-op for an out-of-range index.
+    func removeIsoSurfaceSpec(at index: Int) {
+        guard isoSurfaces.indices.contains(index) else { return }
+        isoSurfaces.remove(at: index)
+    }
+
+    /// Toggle a spec's enabled flag. No-op for an out-of-range index.
+    func toggleIsoSurface(at index: Int) {
+        guard isoSurfaces.indices.contains(index) else { return }
+        isoSurfaces[index].enabled.toggle()
+    }
+
+    /// Clear the spec list back to the legacy ±pair behavior.
+    func resetIsoSurfaces() {
+        isoSurfaces = []
+    }
+
+    // MARK: - Volume slice list helpers
+
+    /// Add a new volume slice (default h/k/l/distance, enabled). No-op when already
+    /// at the 3-slice cap.
+    func addVolumeSlice() {
+        guard volumeSlices.count < 3 else { return }
+        volumeSlices.append(VolumeSlice())
+    }
+
+    /// Remove the slice at `index`. No-op for an out-of-range index.
+    func removeVolumeSlice(at index: Int) {
+        guard volumeSlices.indices.contains(index) else { return }
+        volumeSlices.remove(at: index)
+    }
+
     /// Bump `viewResetGeneration` so the SideBar clears its local selected
     /// node/editor and the controller clears the renderer highlight. A view reset
     /// does not replace the route, so `routeGeneration` is intentionally untouched.
@@ -806,6 +899,9 @@ enum CollapsibleSidebarSection: String, CaseIterable {
     case animation = "SideBarCollapsed.animation"
     case coordination = "SideBarCollapsed.coordination"
     case electronicStructure = "SideBarCollapsed.electronicStructure"
+    case clipping = "SideBarCollapsed.clipping"
+    case region = "SideBarCollapsed.region"
+    case volumeSlices = "SideBarCollapsed.volumeSlices"
 
     var defaultsKey: String { rawValue }
 }

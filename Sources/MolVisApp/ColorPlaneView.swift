@@ -24,6 +24,11 @@ final class ColorPlaneView: NSView {
     var exportBackground: NSColor?
     /// When true, draw leaves the context empty for transparent export output.
     var isExportTransparent: Bool = false
+    /// Colormap used to render the scalar grid. Defaults to .viridis for
+    /// byte-identical output with the legacy transfer function.
+    var colormap: Colormap = .viridis
+    /// Contour-generation parameters. Defaults to enabled, 6 levels.
+    var contourConfig: ContourConfig = ContourConfig()
 
     override var isFlipped: Bool { true }
 
@@ -181,7 +186,7 @@ final class ColorPlaneView: NSView {
         guard let vMin = flat.min(), let vMax = flat.max() else { return nil }
         // Constant grid: return a uniform bitmap at the value mapped to viridis.
         guard vMax > vMin else {
-            let (r, gr, b) = viridis(vMin)
+            let (r, gr, b) = colormap.rgb8(vMin)
             var filled = [UInt8](repeating: 0, count: rows * cols * 4)
             for i in 0..<rows * cols { let o = i * 4; filled[o] = r; filled[o+1] = gr; filled[o+2] = b; filled[o+3] = 255 }
             let cs = CGColorSpaceCreateDeviceRGB()
@@ -200,7 +205,7 @@ final class ColorPlaneView: NSView {
         for y in 0..<rows {
             for x in 0..<cols {
                 let t = (g[y][x] - vMin) / range
-                let (r, gr, b) = viridis(t)
+                let (r, gr, b) = colormap.rgb8(t)
                 let o = (y * cols + x) * 4
                 px[o] = r; px[o+1] = gr; px[o+2] = b; px[o+3] = 255
             }
@@ -216,15 +221,7 @@ final class ColorPlaneView: NSView {
         return cg
     }
 
-    /// Trilinear viridis-style colormap, t in [0,1].
-    private func viridis(_ t: Float) -> (UInt8, UInt8, UInt8) {
-        let tt = max(0, min(1, t))
-        // polynomial approximation of viridis
-        let r = max(0, min(1, 0.267004 + tt*(0.003295 + tt*(-0.227411 + tt*(2.787674 + tt*(-2.719152 + tt*0.815994))))))
-        let gr = max(0, min(1, 0.004874 + tt*(0.104041 + tt*(0.546790 + tt*(-1.248878 + tt*(0.745538 + tt*0.207481))))))
-        let b = max(0, min(1, 0.329415 + tt*(1.015680 + tt*(-2.129948 + tt*(2.600750 + tt*(-1.737255 + tt*0.472965))))))
-        return (UInt8(r*255.5), UInt8(gr*255.5), UInt8(b*255.5))
-    }
+
 
     /// Marching-squares contour trace for a single iso level, drawn in view coords.
     ///

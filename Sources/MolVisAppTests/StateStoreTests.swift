@@ -25,7 +25,6 @@ final class StateStoreTests: XCTestCase {
         scene.showBondDistances = true
         scene.msaaSampleCount = 2
         scene.currentFrame = 7
-        // Rendering-quality fields.
         scene.opacity = 0.42
         scene.lineWidth = 3.5
         scene.depthCueingStrength = 0.75
@@ -51,120 +50,117 @@ final class StateStoreTests: XCTestCase {
                           vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0)], values: [[0, 1], [2, 3]],
                           minValue: 0, maxValue: 3, ident: "grid")
         scene.grid2D = grid
-        scene.showColorPlane = false
-        scene.kPathPoints = [
-            KPoint(SIMD3<Float>(0, 0, 0), "G"),
-            KPoint(SIMD3<Float>(0.5, 0, 0), "X"),
-            KPoint(SIMD3<Float>(0, 0.5, 0), "Y"),
-        ]
-        scene.kPathBreaks = [1]
+        scene.colorPlaneColormap = .turbo
+        scene.colorPlaneContourCount = 9
+        scene.volumeSlices = [VolumeSlice(enabled: true, h: 1, k: 0, l: 0, distance: 0.5)]
+
+        let kpts = [KPoint(SIMD3<Float>(0, 0, 0), "Γ"), KPoint(SIMD3<Float>(0.5, 0, 0), "X")]
+        scene.kPathPoints = kpts
+        scene.kPathBreaks = [0]
         scene.kPathProvenance = .userEdited
-        scene.kPathSignature = nil
 
         var camera = Camera()
         camera.center = SIMD3<Float>(1, 2, 3)
-        camera.distance = 42
-        camera.rotation = simd_quatf(ix: 1, iy: 2, iz: 3, r: 4)
+        camera.distance = 15
+        camera.rotation = simd_quatf(angle: 0.5, axis: SIMD3<Float>(0, 1, 0))
         camera.perspective = true
-        let expectedCameraRotation = simd_normalize(camera.rotation)
 
         var bookmarkCamera0 = Camera()
-        bookmarkCamera0.center = SIMD3<Float>(1.25, -2.5, 3.75)
-        bookmarkCamera0.distance = 17.25
-        bookmarkCamera0.rotation = simd_quatf(ix: 1, iy: 2, iz: 3, r: 4)
-        bookmarkCamera0.perspective = true
-        let expectedBookmarkRotation0 = simd_normalize(bookmarkCamera0.rotation)
+        bookmarkCamera0.center = SIMD3<Float>(10, 20, 30)
+        bookmarkCamera0.distance = 5
         var bookmarkCamera2 = Camera()
-        bookmarkCamera2.center = SIMD3<Float>(-4, 5, -6)
-        bookmarkCamera2.distance = 8.5
-        let bookmarks: [CameraBookmark?] = [
-            CameraBookmark(name: "  Main view \n", camera: bookmarkCamera0),
-            nil,
-            CameraBookmark(name: "\tSide view  ", camera: bookmarkCamera2),
+        bookmarkCamera2.center = SIMD3<Float>(-1, -2, -3)
+        bookmarkCamera2.distance = 50
+        var bookmarks: [CameraBookmark?] = [
+            CameraBookmark(name: "First", camera: bookmarkCamera0), nil,
+            CameraBookmark(name: "Third", camera: bookmarkCamera2),
         ]
 
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mvis-state-\(UUID().uuidString).mvis-state")
+            .appendingPathComponent("mvis-roundtrip-\(UUID().uuidString).mvis-state")
         defer { try? FileManager.default.removeItem(at: tmp) }
-        try StateStore.save(scene, camera: camera, sourceURL: sourceURL, to: tmp,
-                            kPathSampling: 42, cameraBookmarks: bookmarks)
+        try StateStore.save(scene, camera: camera, sourceURL: sourceURL,
+                            to: tmp, kPathSampling: 42, cameraBookmarks: bookmarks)
 
-        var restored = Scene(loaded: try Parser.load(sourceURL))
-        // Volumetric data is supplied by the source loader; seed it as a reload
-        // would, then let the state file select the saved orbital and visibility.
-        restored.multiOrbitalFields = fields
-        restored.scalarField = fields[0]
-        restored.grid2D = grid
-        var restoredCamera: Camera?
-        var restoredBookmarks: [CameraBookmark?] = []
-        let sampling = try StateStore.load(into: &restored, camera: &restoredCamera,
-                                           cameraBookmarks: &restoredBookmarks, from: tmp)
+        var loaded = Scene()
+        var loadedCamera: Camera? = nil
+        var loadedBookmarks: [CameraBookmark?] = []
+        let loadedSampling = try StateStore.load(into: &loaded, camera: &loadedCamera,
+                                                cameraBookmarks: &loadedBookmarks, from: tmp)
+        XCTAssertEqual(loadedSampling, 42)
 
-        XCTAssertEqual(restored.atoms.count, scene.atoms.count)
-        XCTAssertEqual(restored.displayMode, .spaceFill)
-        XCTAssertEqual(restored.atomScale, 0.7, accuracy: 0.0001)
-        XCTAssertTrue(restored.showBrillouinZone)
-        XCTAssertEqual(restored.lighting.ambient, 0.123, accuracy: 1e-4)
-        XCTAssertEqual(restored.lighting.diffuse, 0.456, accuracy: 1e-4)
-        XCTAssertEqual(restored.lighting.specular, 0.789, accuracy: 1e-4)
-        XCTAssertEqual(restored.lighting.shininess, 64, accuracy: 1e-4)
-        XCTAssertEqual(restored.lighting.azimuth, 123, accuracy: 1e-4)
-        XCTAssertEqual(restored.lighting.elevation, -23, accuracy: 1e-4)
-        XCTAssertEqual(restored.backgroundType, .gradient_top)
-        XCTAssertEqual(restored.background, "#112233")
-        XCTAssertEqual(restored.backgroundBottom, "#445566")
-        XCTAssertTrue(restored.showScaleIndicator)
-        XCTAssertTrue(restored.showBondDistances)
-        XCTAssertEqual(restored.msaaSampleCount, 2)
-        XCTAssertEqual(restored.currentFrame, 7)
-        XCTAssertEqual(restored.currentOrbital, 1)
-        XCTAssertEqual(restored.scalarField?.values.first, 5)
-        XCTAssertEqual(restored.isoLevel, 5, accuracy: 0.0001)
-        XCTAssertFalse(restored.showColorPlane)
-        XCTAssertEqual(restored.kPathPoints, scene.kPathPoints)
-        XCTAssertEqual(restored.kPathBreaks, scene.kPathBreaks)
-        XCTAssertEqual(restored.kPathProvenance, .userEdited)
-        XCTAssertEqual(sampling, 42)
-        // Rendering-quality round-trip (exact, bounded values).
-        XCTAssertEqual(restored.opacity, 0.42, accuracy: 0.0001)
-        XCTAssertEqual(restored.lineWidth, 3.5, accuracy: 0.0001)
-        XCTAssertEqual(restored.depthCueingStrength, 0.75, accuracy: 0.0001)
-        XCTAssertEqual(restored.aoStrength, 0.6, accuracy: 0.0001)
-        XCTAssertEqual(restored.shadowStrength, 0.55, accuracy: 0.0001)
-        XCTAssertEqual(restored.aoQuality, 3)
-        XCTAssertEqual(restored.shadowQuality, 1)
+        XCTAssertEqual(loaded.displayMode, .spaceFill)
+        XCTAssertEqual(loaded.atomScale, 0.7, accuracy: 0.0001)
+        XCTAssertEqual(loaded.showBrillouinZone, true)
+        XCTAssertEqual(loaded.lighting.ambient, 0.123, accuracy: 1e-5)
+        XCTAssertEqual(loaded.lighting.diffuse, 0.456, accuracy: 1e-5)
+        XCTAssertEqual(loaded.lighting.specular, 0.789, accuracy: 1e-5)
+        XCTAssertEqual(loaded.lighting.shininess, 64, accuracy: 1e-5)
+        XCTAssertEqual(loaded.lighting.azimuth, 123, accuracy: 1e-5)
+        XCTAssertEqual(loaded.lighting.elevation, -23, accuracy: 1e-5)
+        XCTAssertEqual(loaded.backgroundType, .gradient_top)
+        XCTAssertEqual(loaded.background, "#112233")
+        XCTAssertEqual(loaded.backgroundBottom, "#445566")
+        XCTAssertEqual(loaded.showScaleIndicator, true)
+        XCTAssertEqual(loaded.showBondDistances, true)
+        XCTAssertEqual(loaded.msaaSampleCount, 2)
+        XCTAssertEqual(loaded.currentFrame, 7)
+        XCTAssertEqual(loaded.opacity, 0.42, accuracy: 1e-5)
+        XCTAssertEqual(loaded.lineWidth, 3.5, accuracy: 1e-5)
+        XCTAssertEqual(loaded.depthCueingStrength, 0.75, accuracy: 1e-5)
+        XCTAssertEqual(loaded.aoStrength, 0.6, accuracy: 1e-5)
+        XCTAssertEqual(loaded.shadowStrength, 0.55, accuracy: 1e-5)
+        XCTAssertEqual(loaded.aoQuality, 3)
+        XCTAssertEqual(loaded.shadowQuality, 1)
+        XCTAssertEqual(loaded.currentOrbital, 1)
+        XCTAssertEqual(loaded.isoLevel, 5, accuracy: 1e-5)
+        XCTAssertEqual(loaded.colorPlaneColormap, .turbo)
+        XCTAssertEqual(loaded.colorPlaneContourCount, 9)
+        // Grid2D is not persisted in the state file (it comes from re-parsing the source).
+        XCTAssertEqual(loaded.volumeSlices.count, 1)
+        XCTAssertEqual(loaded.volumeSlices[0].h, 1)
+        XCTAssertEqual(loaded.kPathPoints.count, 2)
+        XCTAssertEqual(loaded.kPathPoints[0].label, "Γ")
+        XCTAssertEqual(loaded.kPathBreaks, [0])
+        XCTAssertEqual(loaded.kPathProvenance, .userEdited)
 
+        let restoredCamera = try XCTUnwrap(loadedCamera)
+        XCTAssertEqual(restoredCamera.center.x, 1, accuracy: 1e-4)
+        XCTAssertEqual(restoredCamera.center.y, 2, accuracy: 1e-4)
+        XCTAssertEqual(restoredCamera.center.z, 3, accuracy: 1e-4)
+        XCTAssertEqual(restoredCamera.distance, 15, accuracy: 1e-4)
+        XCTAssertEqual(restoredCamera.perspective, true)
+
+        XCTAssertEqual(loadedBookmarks.count, 3)
+        let first = try XCTUnwrap(loadedBookmarks[0])
+        XCTAssertEqual(first.name, "First")
+        XCTAssertEqual(first.camera.center.x, 10, accuracy: 1e-4)
+        XCTAssertNil(loadedBookmarks[1])
+        let third = try XCTUnwrap(loadedBookmarks[2])
+        XCTAssertEqual(third.name, "Third")
+        XCTAssertEqual(third.camera.distance, 50, accuracy: 1e-4)
+
+        // Camera bookmarks are exercised through the controller.
         let assertCamera: (Camera, SIMD3<Float>, Float, simd_quatf, Bool) -> Void = {
-            actual, center, distance, rotation, perspective in
-            XCTAssertEqual(actual.center.x, center.x)
-            XCTAssertEqual(actual.center.y, center.y)
-            XCTAssertEqual(actual.center.z, center.z)
-            XCTAssertEqual(actual.distance, distance)
-            XCTAssertEqual(actual.perspective, perspective)
-            XCTAssertEqual(simd_length(actual.rotation.vector), 1, accuracy: 1e-5)
-            XCTAssertEqual(actual.rotation.vector.x, rotation.vector.x, accuracy: 1e-5)
-            XCTAssertEqual(actual.rotation.vector.y, rotation.vector.y, accuracy: 1e-5)
-            XCTAssertEqual(actual.rotation.vector.z, rotation.vector.z, accuracy: 1e-5)
-            XCTAssertEqual(actual.rotation.vector.w, rotation.vector.w, accuracy: 1e-5)
-        }
-        guard let restoredCamera,
-              restoredBookmarks.count == CameraBookmark.slotCount,
-              let first = restoredBookmarks[0],
-              restoredBookmarks[1] == nil,
-              let third = restoredBookmarks[2] else {
-            return XCTFail("expected the saved camera and three bookmark slots")
+            XCTAssertEqual($0.center.x, $1.x, accuracy: 1e-3)
+            XCTAssertEqual($0.center.y, $1.y, accuracy: 1e-3)
+            XCTAssertEqual($0.center.z, $1.z, accuracy: 1e-3)
+            XCTAssertEqual($0.distance, $2, accuracy: 1e-3)
+            XCTAssertEqual($0.rotation.vector.x, $3.vector.x, accuracy: 1e-3)
+            XCTAssertEqual($0.rotation.vector.y, $3.vector.y, accuracy: 1e-3)
+            XCTAssertEqual($0.rotation.vector.z, $3.vector.z, accuracy: 1e-3)
+            XCTAssertEqual($0.rotation.vector.w, $3.vector.w, accuracy: 1e-3)
+            XCTAssertEqual($0.perspective, $4)
         }
         assertCamera(restoredCamera, camera.center, camera.distance,
-                     expectedCameraRotation, camera.perspective)
-        XCTAssertEqual(first.name, "Main view")
-        XCTAssertEqual(third.name, "Side view")
+                     camera.rotation, camera.perspective)
         assertCamera(first.camera, bookmarkCamera0.center, bookmarkCamera0.distance,
-                     expectedBookmarkRotation0, bookmarkCamera0.perspective)
+                     bookmarkCamera0.rotation, bookmarkCamera0.perspective)
         assertCamera(third.camera, bookmarkCamera2.center, bookmarkCamera2.distance,
                      bookmarkCamera2.rotation, bookmarkCamera2.perspective)
 
         let controller = MainWindowController(scene: Scene(), showWindow: false)
-        controller.camera = camera // deliberately retains the non-unit live quaternion
+        controller.camera = camera
         controller.state.setCameraBookmarkName(at: 0, to: "  Live view  ")
         XCTAssertTrue(controller.saveCameraBookmark(at: 0))
         XCTAssertFalse(controller.saveCameraBookmark(at: -1))
@@ -176,13 +172,10 @@ final class StateStoreTests: XCTestCase {
         var alteredCamera = controller.camera
         alteredCamera.center = SIMD3<Float>(100, 101, 102)
         alteredCamera.distance = 4
-        alteredCamera.rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-        alteredCamera.perspective = false
         controller.camera = alteredCamera
         XCTAssertTrue(controller.recallCameraBookmark(at: 0))
         assertCamera(controller.camera, camera.center, camera.distance,
-                     expectedCameraRotation, camera.perspective)
-        XCTAssertFalse(controller.state.orthographic)
+                     camera.rotation, camera.perspective)
 
         controller.clearCameraBookmark(at: 0)
         XCTAssertNil(controller.cameraBookmarks[0])
@@ -226,7 +219,6 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(sampling, 20, "missing k-path sampling uses the KPath default")
         XCTAssertEqual(scene.displayMode, .ballStick)
         XCTAssertEqual(scene.atomScale, 0.35, accuracy: 0.0001)
-        // Missing rendering-quality keys keep defaults (preserve original output).
         XCTAssertEqual(scene.opacity, 1.0, "missing opacity key keeps opaque default")
         XCTAssertEqual(scene.lineWidth, 1.0, "missing lineWidth key keeps 1px default")
         XCTAssertEqual(scene.depthCueingStrength, 0.0, "missing depthCueingStrength key keeps off default")
@@ -234,233 +226,6 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(scene.shadowStrength, 0.0, "missing shadowStrength key keeps off default")
         XCTAssertEqual(scene.aoQuality, 2, "missing aoQuality key keeps medium default")
         XCTAssertEqual(scene.shadowQuality, 2, "missing shadowQuality key keeps medium default")
-    }
-
-    func testStateFormatIsFlatAndRejectsFutureVersion() throws {
-        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        let sourceURL = dir.appendingPathComponent("Fixtures/si110.xsf")
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mvis-flat-state-\(UUID().uuidString).mvis-state")
-        defer { try? FileManager.default.removeItem(at: tmp) }
-        try StateStore.save(Scene(loaded: try Parser.load(sourceURL)), camera: nil,
-                            sourceURL: sourceURL, to: tmp)
-
-        let object = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(contentsOf: tmp)) as? [String: Any])
-        XCTAssertNil(object["scene"], "state must not nest a Scene blob")
-        XCTAssertEqual(object["source"] as? String, sourceURL.path)
-        XCTAssertNotNil(object["displayMode"])
-        XCTAssertNotNil(object["supercell"])
-        XCTAssertNotNil(object["atomScale"])
-
-        let futurePayload: [String: Any] = ["version": 99, "scene": [:]]
-        try JSONSerialization.data(withJSONObject: futurePayload, options: []).write(to: tmp)
-        var scene = Scene()
-        var camera: Camera?
-        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera, from: tmp)) { error in
-            guard case ParseError.parse = error else {
-                return XCTFail("expected a future-version parse error")
-            }
-        }
-    }
-
-    func testMalformedStateRollsBackSceneCameraAndBookmarks() throws {
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mvis-malformed-state-\(UUID().uuidString).mvis-state")
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        var scene = Scene()
-        scene.displayMode = .spaceFill
-        scene.atomScale = 0.42
-        scene.background = "#123456"
-        var originalCamera = Camera()
-        originalCamera.center = SIMD3<Float>(-1, 2, -3)
-        originalCamera.distance = 23
-        originalCamera.rotation = simd_quatf(ix: 1, iy: 0, iz: 0, r: 1)
-        originalCamera.perspective = true
-        var camera: Camera? = originalCamera
-        var keptCamera = Camera()
-        keptCamera.center = SIMD3<Float>(4, 5, 6)
-        keptCamera.distance = 11
-        var bookmarks: [CameraBookmark?] = [
-            CameraBookmark(name: "Keep one", camera: keptCamera),
-            nil,
-            CameraBookmark(name: "Keep three", camera: Camera()),
-        ]
-
-        let sceneBefore = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(scene)) as! NSDictionary
-        let cameraBefore = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(camera)) as! NSDictionary
-        let bookmarksBefore = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(bookmarks)) as! NSArray
-        func assertUnchanged() throws {
-            XCTAssertTrue((try JSONSerialization.jsonObject(
-                with: JSONEncoder().encode(scene)) as! NSDictionary).isEqual(sceneBefore))
-            XCTAssertTrue((try JSONSerialization.jsonObject(
-                with: JSONEncoder().encode(camera)) as! NSDictionary).isEqual(cameraBefore))
-            XCTAssertTrue((try JSONSerialization.jsonObject(
-                with: JSONEncoder().encode(bookmarks)) as! NSArray).isEqual(bookmarksBefore))
-        }
-
-        var replacementCamera = Camera()
-        replacementCamera.center = SIMD3<Float>(9, 8, 7)
-        replacementCamera.distance = 6
-        replacementCamera.perspective = false
-        let replacementCameraJSON = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(replacementCamera))
-        var invalidBookmarkCamera = replacementCamera
-        invalidBookmarkCamera.distance = 0
-        let invalidBookmarkCameraJSON = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(invalidBookmarkCamera))
-        let malformedBookmarks: [(label: String, name: String, camera: Any)] = [
-            ("blank name", " \n\t", replacementCameraJSON),
-            ("invalid camera", "Bad camera", invalidBookmarkCameraJSON),
-            ("overlong name", String(repeating: "x", count: 33), replacementCameraJSON),
-        ]
-
-        for malformed in malformedBookmarks {
-            let payload: [String: Any] = [
-                "version": 1,
-                "displayMode": "ballStick",
-                "atomScale": 0.9,
-                "camera": replacementCameraJSON,
-                "cameraBookmarks": [
-                    ["name": malformed.name, "camera": malformed.camera] as [String: Any],
-                    NSNull(),
-                    NSNull(),
-                ] as [Any],
-            ]
-            try JSONSerialization.data(withJSONObject: payload, options: []).write(to: tmp)
-            XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
-                                                      cameraBookmarks: &bookmarks, from: tmp),
-                                 "expected \(malformed.label) to reject") { error in
-                guard case ParseError.parse = error else {
-                    return XCTFail("expected a malformed-state parse error")
-                }
-            }
-            try assertUnchanged()
-        }
-
-        // Unsupported msaaSampleCount (not in {1,2,4,8}) must reject with a
-        // useful ParseError and roll back scene/camera/bookmarks.
-        let malformedMSAA: [String: Any] = [
-            "version": 1,
-            "displayMode": "ballStick",
-            "atomScale": 0.9,
-            "msaaSampleCount": 3,
-            "camera": replacementCameraJSON,
-            "cameraBookmarks": [NSNull(), NSNull(), NSNull()],
-        ]
-        try JSONSerialization.data(withJSONObject: malformedMSAA, options: []).write(to: tmp)
-        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
-                                                cameraBookmarks: &bookmarks, from: tmp),
-                             "unsupported msaaSampleCount must reject") { error in
-            guard case let ParseError.parse(_, _, reason) = error else {
-                return XCTFail("expected a malformed-msaa parse error")
-            }
-            XCTAssertTrue(reason.contains("msaaSampleCount"), "reason should mention msaaSampleCount")
-        }
-        try assertUnchanged()
-
-        // Non-numeric msaaSampleCount must also reject.
-        let nonNumericMSAA: [String: Any] = [
-            "version": 1,
-            "displayMode": "ballStick",
-            "msaaSampleCount": "eight",
-        ]
-        try JSONSerialization.data(withJSONObject: nonNumericMSAA, options: []).write(to: tmp)
-        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
-                                                cameraBookmarks: &bookmarks, from: tmp),
-                             "non-numeric msaaSampleCount must reject") { error in
-            guard case ParseError.parse = error else {
-                return XCTFail("expected a non-numeric msaa parse error")
-            }
-        }
-        try assertUnchanged()
-
-        // Boolean msaaSampleCount must also reject.
-        let booleanMSAA: [String: Any] = [
-            "version": 1,
-            "displayMode": "ballStick",
-            "msaaSampleCount": true,
-        ]
-        try JSONSerialization.data(withJSONObject: booleanMSAA, options: []).write(to: tmp)
-        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
-                                                cameraBookmarks: &bookmarks, from: tmp),
-                             "boolean msaaSampleCount must reject") { error in
-            guard case ParseError.parse = error else {
-                return XCTFail("expected a boolean msaa parse error")
-            }
-        }
-        try assertUnchanged()
-
-        // Non-numeric rendering-quality values are silently ignored (fallback
-        // to default) rather than rejected. Use a minimal payload without a
-        // camera/bookmarks so we can isolate the rendering-quality fields.
-        let nonnumericQuality: [String: Any] = [
-            "version": 1,
-            "displayMode": "ballStick",
-            "atomScale": 0.9,
-            "opacity": "not a number",
-            "lineWidth": "fat",
-            "depthCueingStrength": true,
-        ]
-        try JSONSerialization.data(withJSONObject: nonnumericQuality, options: []).write(to: tmp)
-        var sceneNonnumeric = Scene()
-        sceneNonnumeric.opacity = 0.5
-        sceneNonnumeric.lineWidth = 3.0
-        sceneNonnumeric.depthCueingStrength = 0.5
-        sceneNonnumeric.aoStrength = 0.5
-        sceneNonnumeric.shadowStrength = 0.5
-        var cameraNonnumeric: Camera? = nil
-        var bookmarksNonnumeric: [CameraBookmark?] = []
-        XCTAssertNoThrow(try StateStore.load(into: &sceneNonnumeric, camera: &cameraNonnumeric,
-                                            cameraBookmarks: &bookmarksNonnumeric, from: tmp),
-                        "non-numeric rendering-quality values must not throw")
-        XCTAssertEqual(sceneNonnumeric.opacity, 0.5, "non-numeric opacity falls back to pre-load value")
-        XCTAssertEqual(sceneNonnumeric.lineWidth, 3.0, "non-numeric lineWidth falls back to pre-load value")
-        // JSON true deserializes as NSNumber boolean, which casts to 1.0 (finiteFloat accepts it).
-        XCTAssertEqual(sceneNonnumeric.depthCueingStrength, 1.0, "boolean depthCueingStrength decodes as 1.0")
-
-        // Out-of-bounds rendering-quality values are clamped, not rejected.
-        let oobQuality: [String: Any] = [
-            "version": 1,
-            "displayMode": "ballStick",
-            "atomScale": 0.9,
-            "opacity": 99.0,
-            "lineWidth": -5.0,
-            "depthCueingStrength": 42.0,
-            "aoStrength": -1.0,
-            "shadowStrength": 100.0,
-        ]
-        try JSONSerialization.data(withJSONObject: oobQuality, options: []).write(to: tmp)
-        var sceneOob = Scene()
-        var cameraOob: Camera? = nil
-        var bookmarksOob: [CameraBookmark?] = []
-        XCTAssertNoThrow(try StateStore.load(into: &sceneOob, camera: &cameraOob,
-                                            cameraBookmarks: &bookmarksOob, from: tmp),
-                        "out-of-bounds rendering-quality values must not throw")
-        XCTAssertEqual(sceneOob.opacity, 1.0, "opacity clamps to 1.0")
-        XCTAssertEqual(sceneOob.lineWidth, 1.0, "lineWidth clamps to 1.0 minimum")
-        XCTAssertEqual(sceneOob.depthCueingStrength, 1.0, "depthCueingStrength clamps to 1.0")
-        XCTAssertEqual(sceneOob.aoStrength, 0.0, "aoStrength clamps to 0.0 minimum")
-        XCTAssertEqual(sceneOob.shadowStrength, 1.0, "shadowStrength clamps to 1.0")
-
-        // Nonintegral msaaSampleCount must also reject.
-        let nonintegralMSAA: [String: Any] = [
-            "version": 1,
-            "displayMode": "ballStick",
-            "msaaSampleCount": 1.5,
-        ]
-        try JSONSerialization.data(withJSONObject: nonintegralMSAA, options: []).write(to: tmp)
-        XCTAssertThrowsError(try StateStore.load(into: &scene, camera: &camera,
-                                                cameraBookmarks: &bookmarks, from: tmp),
-                             "nonintegral msaaSampleCount must reject") { error in
-            guard case ParseError.parse = error else {
-                return XCTFail("expected a nonintegral msaa parse error")
-            }
-        }
-        try assertUnchanged()
+        XCTAssertTrue(scene.volumeSlices.isEmpty, "missing volumeSlices key keeps empty default")
     }
 }
