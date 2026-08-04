@@ -21,7 +21,11 @@ Primary agent sends the issues back to relevant subagent sessions (if any) for f
 
 ## Subagent Dispatch
 
-Pi has no built-in subagent primitive. Launch isolated subagents as `pi` CLI subprocesses. Use `openai-codex/gpt-5.6-luna` with `max` reasoning unless the user requests another model.
+Pi has no built-in subagent primitive. Launch isolated subagents as `pi` CLI subprocesses.
+Prioritize using `longcat/LongCat-2.0` with `high` reasoning for subagent tasks.
+The `openai-codex/gpt-5.6-luna` model with `max` reasoning is also callable under user's permission.
+
+Do not use other model for subagent tasks unless explicit instruction.
 
 ### Subprocess invocation
 
