@@ -2,6 +2,18 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.41] — 2026-08-06
+
+### Added
+
+- Powder X-ray diffraction simulation for crystals: a sidebar Powder XRD section (crystal-only) computes 2θ peak positions from the reciprocal lattice, structure-factor intensities from Waasmaier–Kirfel atomic form factors (Z = 1…118; Z > 98 use the Cf shape renormalized to f(0) = Z), powder multiplicities from the spglib symmetry operations (orbit counting with the Friedel-pair factor; Laue-class fallback when symmetry is unavailable), Lorentz–polarization correction, and d-degeneracy merging with combined labels and intensities. Wavelength presets (Cu/Mo/Cr/Fe/Co/Mn/Ag Kα), max-2θ and FWHM controls, Miller-index peak labels, and Gaussian-broadened profile curve; a pop-out grapher window plus CSV (peaks and curve) export, and PNG/true-vector PDF export through the shared graph-export path.
+- Electron-density projection: with a volumetric file loaded, a "Use electron density" toggle computes the pattern from a separable 3D DFT of the scalar field projected onto reciprocal-lattice vectors (grid must be axis-aligned with the cell, capped at 128³ samples), replacing the atomic form-factor route; misaligned or oversized grids fail closed with a specific reason.
+- Engine is fully bounded and fail-closed (non-finite parameters, singular cells, invalid atomic numbers, and out-of-range wavelengths all yield explicit unavailable reasons rather than traps or partial results).
+
+### Changed
+
+- Test suite remains at exactly 32 focused tests; three new Powder XRD regressions (NaCl/Si/Mg peak positions, multiplicities, and systematic absences; wavelength and form-factor oracles; electron-density projection with a physical intensity pin) replaced consolidated volumetric cases.
+
 ## [1.1.40] — 2026-08-05
 
 ### Added

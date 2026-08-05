@@ -47,6 +47,7 @@ struct SideBar: View {
     @AppStorage(CollapsibleSidebarSection.electronicStructure.rawValue) private var electronicStructureExpanded = true
     @AppStorage(CollapsibleSidebarSection.clipping.rawValue) private var clippingExpanded = true
     @AppStorage(CollapsibleSidebarSection.region.rawValue) private var regionExpanded = true
+    @AppStorage(CollapsibleSidebarSection.xrd.rawValue) private var xrdExpanded = true
 
     var body: some View {
         Form {
@@ -431,6 +432,9 @@ struct SideBar: View {
                 }
                 CollapsibleSection(title: "K-Path", isExpanded: $kPathExpanded) {
                     kPathContent
+                }
+                CollapsibleSection(title: "Powder XRD", isExpanded: $xrdExpanded) {
+                    xrdContent
                 }
             }
             CollapsibleSection(title: "Supercell", isExpanded: $supercellExpanded) {
@@ -973,6 +977,39 @@ struct SideBar: View {
         .buttonStyle(.bordered).font(.caption)
         Stepper("Samples per segment \(state.kPathSampling)",
                 value: $state.kPathSampling, in: 2...200)
+    }
+
+    @ViewBuilder
+    private var xrdContent: some View {
+        Picker("Wavelength", selection: $state.xrdWavelengthIndex) {
+            ForEach(0..<PowderXRD.wavelengthOptions.count, id: \.self) { i in
+                Text("\(PowderXRD.wavelengthOptions[i].name) · \(PowderXRD.wavelengthOptions[i].wavelength, specifier: "%.4f") Å")
+            }
+        }
+        Slider(value: $state.xrdMaxTwoTheta, in: 10...160) {
+            Text("Max 2θ: \(state.xrdMaxTwoTheta, specifier: "%.0f")°")
+        }
+        Slider(value: $state.xrdFWHM, in: 0.05...2.0, step: 0.05) {
+            Text("FWHM: \(state.xrdFWHM, specifier: "%.2f")°")
+        }
+        Toggle("Peak labels", isOn: $state.xrdShowLabels)
+        Toggle("Use electron density", isOn: $state.xrdUseElectronDensity)
+            .disabled(!state.hasScalarField)
+        if !state.hasScalarField {
+            Text("Load a volumetric file to project its density")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        Text(state.xrdStatusText)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundColor(.secondary)
+        HStack {
+            Button("Show Pattern…") { state.onShowXRDWindow?() }
+            Button("Export CSV") { state.onExportXRDCSV?() }
+                .disabled(!(state.xrdPattern?.peaks.isEmpty == false))
+        }
+        .buttonStyle(.bordered)
+        .font(.caption)
     }
 
     /// One standard crystallographic orientation action. All three buttons share

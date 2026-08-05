@@ -371,6 +371,27 @@ final class SideBarState: ObservableObject {
     /// Export the electronic-analysis report as CSV. The controller presents a
     /// save panel and writes `csv`. Not a scene field.
     var onExportElectronicAnalysisCSV: ((ElectronicAnalysisReport) -> Void)?
+    // --- Powder XRD (view-state only, NOT persisted) -------------------------------
+    /// Index into PowderXRD.wavelengthOptions for the selected incident radiation.
+    @Published var xrdWavelengthIndex: Int = 0 { didSet { onChange?() } }
+    /// Maximum 2θ (degrees) computed and displayed.
+    @Published var xrdMaxTwoTheta: Float = 120 { didSet { onChange?() } }
+    /// Peak broadening FWHM (degrees 2θ) for the synthesized curve.
+    @Published var xrdFWHM: Float = 0.5 { didSet { onChange?() } }
+    /// Toggle Miller-index labels above peak sticks.
+    @Published var xrdShowLabels: Bool = true { didSet { onChange?() } }
+    /// When true and a volumetric field is present, project electron density
+    /// instead of using nuclear scattering factors.
+    @Published var xrdUseElectronDensity: Bool = false { didSet { onChange?() } }
+    /// Computed XRD pattern for the current scene/settings. Set by the controller;
+    /// nil when unavailable. Not a scene field.
+    @Published var xrdPattern: XRDPattern? = nil
+    /// Human-readable status text ("N peaks · source: ..."). Not a scene field.
+    @Published var xrdStatusText: String = ""
+    /// Present the standalone Powder XRD graph window.
+    var onShowXRDWindow: (() -> Void)?
+    /// Export the current XRD pattern as CSV.
+    var onExportXRDCSV: (() -> Void)?
 
     /// Apply a publication preset's quality settings to this state. The preset
     /// is an action (not document state): it sets multiple quality fields at
@@ -913,6 +934,7 @@ enum CollapsibleSidebarSection: String, CaseIterable {
     case region = "SideBarCollapsed.region"
     case volumeSlices = "SideBarCollapsed.volumeSlices"
     case stereo = "SideBarCollapsed.stereo"
+    case xrd = "SideBarCollapsed.xrd"
 
     var defaultsKey: String { rawValue }
 }

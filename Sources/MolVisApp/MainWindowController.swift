@@ -123,6 +123,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let labelOverlay: LabelOverlayView
     let bandGrapher: BandGrapherView    // 2D band-structure diagram (shown when bandStructure != nil)
     let dosGrapher: DOSGrapherView      // total/projected DOS graph (shown when densityOfStates != nil)
+    let xrdGrapher: PowderXRDGrapherView // powder XRD diagram (shown in its own auxiliary window)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
     /// Standalone atom table (search field + virtualized table). Owned by the
@@ -149,6 +150,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Lazily-created, reusable auxiliary window hosting `atomTable`. nil until the
     /// first `showAtomTable`; repeated calls reuse this same window.
     private(set) var atomTableWindow: NSWindow?
+    /// Lazily-created, reusable auxiliary window hosting `xrdGrapher`. nil until the
+    /// first `showPowderXRD`; repeated calls reuse this same window.
+    private(set) var xrdWindow: NSWindow?
     /// Last selection synced INTO the atom table — guards against redundant
     /// `setSelectedAtomIndices` work and selection-callback recursion.
     private var lastSyncedSelection: [Int] = []
@@ -386,6 +390,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         dosGrapher.autoresizingMask = [.width, .height]
         dosGrapher.isHidden = true
         viewport.addSubview(dosGrapher)
+        xrdGrapher = PowderXRDGrapherView(frame: .zero)
+        xrdGrapher.autoresizingMask = [.width, .height]
         let info = NSTextView(frame: .zero)
         info.isEditable = false
         info.isSelectable = true
@@ -489,6 +495,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             guard let self else { return }
             self.exportElectronicAnalysisCSV(report.csv)
         }
+        state.onShowXRDWindow = { [weak self] in self?.showPowderXRD() }
+        state.onExportXRDCSV = { [weak self] in self?.exportPowderXRDCSV() }
         // Cursor readouts for the electronic-structure graphs. Assigned after
         // super.init so the closures capture a fully-initialized self.
         bandGrapher.onCursor = { [weak self] info in
@@ -511,6 +519,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         dosGrapher.densityOfStates = scene.densityOfStates
         state.electronicStructureEnabled = initHasBands || scene.densityOfStates != nil
         updateElectronicStructureGraphs()
+        updatePowderXRD()
         atomTable.onSelectionChange = { [weak self] indices in
             guard let self else { return }
             // Map filtered rows back to original displayed indices; keep them
@@ -633,6 +642,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // persisting view-only availability into the scene.)
         state.electronicStructureEnabled = hasBands || scene.densityOfStates != nil
         updateElectronicStructureGraphs()
+        updatePowderXRD()
         // A 2D scalar grid: the color-plane is now drawn as a textured quad in the
         // Metal scene by the renderer (gated on scene.showColorPlane). No separate
         // canvas swap needed.
@@ -3133,6 +3143,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Electronic-structure graph interaction (energy window, Fermi shift) is
         // view-only state -> push it to the grapher views and recompute readouts.
         if state.electronicStructureEnabled { updateElectronicStructureGraphs() }
+        // Powder XRD is cheap (a few ms) and gated on isCrystal internally, so it
+        // recomputes on every sidebar/scene change without a debounce.
+        updatePowderXRD()
         setNeedsRender()
     }
 
@@ -4352,7 +4365,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 try text.write(to: url, atomically: true, encoding: .utf8)
             } catch {
                 print("[mcrysden] electronic-analysis text export failed: \(error)")
-                self.presentElectronicAnalysisExportError(error)
+                self.presentExportError(error, title: "Electronic analysis export failed")
             }
         }
     }
@@ -4367,19 +4380,91 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 try csv.write(to: url, atomically: true, encoding: .utf8)
             } catch {
                 print("[mcrysden] electronic-analysis CSV export failed: \(error)")
-                self.presentElectronicAnalysisExportError(error)
+                self.presentExportError(error, title: "Electronic analysis export failed")
             }
         }
     }
 
-    private func presentElectronicAnalysisExportError(_ error: Error) {
+    private func presentExportError(_ error: Error, title: String) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Electronic analysis export failed"
+        alert.messageText = title
         alert.informativeText = (error as? LocalizedError)?.errorDescription
             ?? error.localizedDescription
         alert.addButton(withTitle: "OK")
         alert.beginSheetModal(for: window)
+    }
+
+    // MARK: - Powder XRD
+
+    /// Lazily create (once) and show the auxiliary Powder XRD window.
+    func showPowderXRD() {
+        if xrdWindow == nil {
+            let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+                                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                backing: .buffered, defer: false)
+            win.title = "Powder XRD"
+            win.isReleasedWhenClosed = false
+            win.contentView = xrdGrapher
+            xrdWindow = win
+        }
+        xrdWindow?.makeKeyAndOrderFront(nil)
+        xrdGrapher.pattern = state.xrdPattern
+        xrdGrapher.showLabels = state.xrdShowLabels
+    }
+
+    /// Recompute the powder XRD pattern for the current scene and settings.
+    /// Cheap and gated on isCrystal, so it is called on every sidebar/scene change.
+    private func updatePowderXRD() {
+        guard scene.isCrystal else {
+            state.xrdPattern = nil
+            state.xrdStatusText = ""
+            return
+        }
+        let wavelengthIndex = max(0, min(state.xrdWavelengthIndex, PowderXRD.wavelengthOptions.count - 1))
+        let result = PowderXRD.analyze(
+            cell: scene.cell,
+            atoms: scene.baseAtoms.isEmpty ? scene.atoms : scene.baseAtoms,
+            periodicDim: scene.periodicDim,
+            wavelength: PowderXRD.wavelengthOptions[wavelengthIndex].wavelength,
+            maxTwoTheta: state.xrdMaxTwoTheta,
+            hklLimit: 8,
+            fwhm: state.xrdFWHM,
+            curveStep: 0.05,
+            symmetryOps: state.crystalSymmetry?.symmetry?.symmetryOperations,
+            electronDensity: state.xrdUseElectronDensity ? scene.scalarField : nil
+        )
+        state.xrdPattern = result
+        if result.isAvailable {
+            var text = "\(result.peaks.count) peaks · source: \(result.sourceDescription)"
+            if let strongest = result.peaks.max(by: { $0.relativeIntensity < $1.relativeIntensity }),
+               let label = strongest.hklLabels.first {
+                text += " · strongest \(label) at 2θ = \(String(format: "%.2f", strongest.twoTheta))°"
+            }
+            state.xrdStatusText = text
+        } else {
+            state.xrdStatusText = result.unavailableReason ?? "unavailable"
+        }
+        if let window = xrdWindow, window.isVisible {
+            xrdGrapher.pattern = result
+            xrdGrapher.showLabels = state.xrdShowLabels
+        }
+    }
+
+    private func exportPowderXRDCSV() {
+        guard let pattern = state.xrdPattern else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "xrd-pattern.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do {
+                try pattern.peaksCSV().write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                print("[mcrysden] XRD CSV export failed: \(error)")
+                self.presentExportError(error, title: "XRD CSV export failed")
+            }
+        }
     }
 
     private func colorFromHex(_ hex: String) -> (r: Double, g: Double, b: Double)? {

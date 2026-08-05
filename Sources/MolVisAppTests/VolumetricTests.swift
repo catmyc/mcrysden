@@ -15,35 +15,6 @@ final class VolumetricTests: XCTestCase {
 
     // MARK: - Colormap transfer + contour levels
 
-    /// Viridis rgb(0)/rgb(1) reproduce the polynomial endpoints, rgb8 rounding
-    /// matches the legacy UInt8(v*255.5) conversion, and ContourConfig.levels
-    /// replicates the legacy defaultContourLevels formula.
-    func testColormapTransferAndContourLevels() {
-        let cm = Colormap.viridis
-        let lo = cm.rgb(0)
-        XCTAssertEqual(lo.x, 0.267004, accuracy: 1e-5)
-        XCTAssertEqual(lo.y, 0.004874, accuracy: 1e-5)
-        XCTAssertEqual(lo.z, 0.329415, accuracy: 1e-5)
-        let (r8, g8, b8) = cm.rgb8(0.5)
-        let c = cm.rgb(0.5)
-        XCTAssertEqual(r8, UInt8(c.x * 255.5))
-        XCTAssertEqual(g8, UInt8(c.y * 255.5))
-        XCTAssertEqual(b8, UInt8(c.z * 255.5))
-
-        // ContourConfig.levels replicates legacy formula.
-        let legacy = ContourConfig.defaultLevels(min: -3, max: 7)
-        XCTAssertEqual(legacy.count, 5)
-        let expected = (1...5).map { -3.0 + (7.0 - (-3.0)) * Float($0) / 6 }
-        for (a, e) in zip(legacy, expected) { XCTAssertEqual(a, e, accuracy: 1e-5) }
-        XCTAssertTrue(ContourConfig.levels(min: 5, max: 5, count: 6).isEmpty)
-        XCTAssertTrue(ContourConfig.levels(min: 0, max: 10, count: 1).isEmpty)
-        XCTAssertEqual(ContourConfig.levels(min: 0, max: 1, count: 100).count, 23)
-
-        // Saddle cell produces 2 segments (bilinear asymptotic-decider).
-        let segs = ColorPlaneView.contourSegments(tl: 10, tr: -2, br: 0.1, bl: -2, level: 0)
-        XCTAssertEqual(segs.count, 2)
-    }
-
     // MARK: - Region integration constant/linear + malformed
 
     func testRegionIntegrationConstantLinearMalformed() {
@@ -64,20 +35,17 @@ final class VolumetricTests: XCTestCase {
         let zeroVol = IntegrationRegion(shape: .box, center: SIMD3<Float>(4, 4, 4),
                                         halfExtents: SIMD3<Float>(0, 2, 2), radius: 2)
         XCTAssertNil(RegionIntegration.integrate(field: field, region: zeroVol))
-    }
 
-    // MARK: - Slice sampling + diagonal-plane mask
-
-    func testSliceSamplingDiagonalPlaneMask() {
+        // Slice sampling + diagonal-plane mask (merged regression).
         let n = 5
         var vals = [Float]()
         for k in 0..<n { for j in 0..<n { for i in 0..<n { vals.append(Float(i + j + k)) } } }
-        let field = ScalarField(nx: n, ny: n, nz: n, origin: .zero,
-                                vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
-                                values: vals, minValue: 0, maxValue: Float(3 * (n - 1)))
+        let sliceField = ScalarField(nx: n, ny: n, nz: n, origin: .zero,
+                                     vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
+                                     values: vals, minValue: 0, maxValue: Float(3 * (n - 1)))
         let normal = simd_normalize(SIMD3<Float>(1, 1, 1))
         let plane = SlicePlane(origin: SIMD3(0.5, 0.5, 0.5), normal: normal)
-        guard let slice = FieldSlice.sample(field: field, plane: plane, resolution: 16) else {
+        guard let slice = FieldSlice.sample(field: sliceField, plane: plane, resolution: 16) else {
             return XCTFail("expected a slice")
         }
         guard let mask = slice.mask else { return XCTFail("expected non-nil mask") }
@@ -123,6 +91,37 @@ final class VolumetricTests: XCTestCase {
                                     applyToStructure: true, applyToIsosurfaces: true)
         renderer.scene = scene
         XCTAssertEqual(renderer.structureCullFlags(), [true, false, false])
+
+        // Composited color-plane render: a scene with grid2D + showColorPlane must
+        // render the plane in the Metal scene, changing the rendered output.
+        let tex = try XCTUnwrap(MTLCreateSystemDefaultDevice()?.makeTexture(descriptor: wtx(64, 64)))
+        let queue = try XCTUnwrap(MTLCreateSystemDefaultDevice()?.makeCommandQueue())
+        var cpScene = Scene()
+        cpScene.showStructure = false; cpScene.showAxes = false; cpScene.showCellFrame = false
+        cpScene.showBrillouinZone = false; cpScene.background = "#000000"
+        cpScene.grid2D = Grid2D(cols: 4, rows: 4, origin: .zero,
+                                vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0)],
+                                values: [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]],
+                                minValue: 0, maxValue: 15, ident: "test")
+        cpScene.showColorPlane = true
+        cpScene.colorPlaneColormap = .viridis
+        func encodeHash(_ value: Scene) -> UInt64 {
+            renderer.scene = value
+            let cb = queue.makeCommandBuffer()!
+            XCTAssertTrue(renderer.encode(to: cb, target: tex,
+                                           viewport: MTLViewport(originX: 0, originY: 0,
+                                                                 width: 64, height: 64, znear: 0, zfar: 1),
+                                           camera: renderer.currentCamera))
+            cb.commit(); cb.waitUntilCompleted()
+            return pixelHash(tex)
+        }
+        let withPlane = encodeHash(cpScene)
+        var withoutPlane = cpScene
+        withoutPlane.showColorPlane = false
+        let planeBytes = Renderer.colorPlaneTextureBytes(grid: cpScene.grid2D!, colormap: .viridis)
+        XCTAssertEqual(planeBytes.count, 4 * 4 * 4)
+        for i in stride(from: 3, to: planeBytes.count, by: 4) { XCTAssertEqual(planeBytes[i], 255) }
+        XCTAssertNotEqual(withPlane, encodeHash(withoutPlane), "color plane must change the rendered frame")
     }
 
     // MARK: - Multi-iso rebuild + color-distinct cache keys
@@ -172,7 +171,34 @@ final class VolumetricTests: XCTestCase {
 
     // MARK: - Color-plane/slice state round-trip
 
+    /// Color-plane/slice state round-trip, plus colormap transfer + contour
+    /// levels and the bilinear saddle-cell segment count (consolidated).
     func testColorPlaneAndSliceStateRoundTrip() throws {
+        // Colormap transfer + contour levels.
+        let cm = Colormap.viridis
+        let lo = cm.rgb(0)
+        XCTAssertEqual(lo.x, 0.267004, accuracy: 1e-5)
+        XCTAssertEqual(lo.y, 0.004874, accuracy: 1e-5)
+        XCTAssertEqual(lo.z, 0.329415, accuracy: 1e-5)
+        let (r8, g8, b8) = cm.rgb8(0.5)
+        let c = cm.rgb(0.5)
+        XCTAssertEqual(r8, UInt8(c.x * 255.5))
+        XCTAssertEqual(g8, UInt8(c.y * 255.5))
+        XCTAssertEqual(b8, UInt8(c.z * 255.5))
+
+        // ContourConfig.levels replicates legacy formula.
+        let legacy = ContourConfig.defaultLevels(min: -3, max: 7)
+        XCTAssertEqual(legacy.count, 5)
+        let expected = (1...5).map { -3.0 + (7.0 - (-3.0)) * Float($0) / 6 }
+        for (a, e) in zip(legacy, expected) { XCTAssertEqual(a, e, accuracy: 1e-5) }
+        XCTAssertTrue(ContourConfig.levels(min: 5, max: 5, count: 6).isEmpty)
+        XCTAssertTrue(ContourConfig.levels(min: 0, max: 10, count: 1).isEmpty)
+        XCTAssertEqual(ContourConfig.levels(min: 0, max: 1, count: 100).count, 23)
+
+        // Saddle cell produces 2 segments (bilinear asymptotic-decider).
+        let segs = ColorPlaneView.contourSegments(tl: 10, tr: -2, br: 0.1, bl: -2, level: 0)
+        XCTAssertEqual(segs.count, 2)
+
         var scene = Scene()
         scene.colorPlaneColormap = .turbo
         scene.colorPlaneContourEnabled = false
@@ -226,79 +252,16 @@ final class VolumetricTests: XCTestCase {
         try StateStore.load(into: &loaded3, camera: &camera, from: url)
         XCTAssertEqual(loaded3.volumeSlices.count, 3)
         try? FileManager.default.removeItem(at: url)
-    }
 
-    // MARK: - Slice texture generation (pure helper)
-
-    /// Renderer.sliceTextureBytes maps values + mask + colormap to RGBA8 with alpha
-    /// 0 on masked samples.
-    // MARK: - Slice state persistence round-trip + clamping
-
-
-    // MARK: - Composited color-plane render
-
-    /// A scene with grid2D + showColorPlane must render the plane in the Metal
-    /// scene. Assert via a renderer-side counter we expose for tests: a freshly
-    /// built scene with a 2D grid produces a non-empty frame, and toggling
-    /// showColorPlane off changes the rendered output.
-    func testCompositedColorPlaneRender() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
-        let renderer = try Renderer(device: device)
-        let texture = try XCTUnwrap(device.makeTexture(descriptor: wtx(64, 64)))
-        let queue = try XCTUnwrap(device.makeCommandQueue())
-
-        var scene = Scene()
-        scene.showStructure = false; scene.showAxes = false; scene.showCellFrame = false
-        scene.showBrillouinZone = false; scene.background = "#000000"
-        scene.grid2D = Grid2D(cols: 4, rows: 4, origin: .zero,
-                              vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0)],
-                              values: [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]],
-                              minValue: 0, maxValue: 15, ident: "test")
-        scene.showColorPlane = true
-        scene.colorPlaneColormap = .viridis
-
-        func encode(_ value: Scene) -> UInt64 {
-            renderer.scene = value
-            let cb = queue.makeCommandBuffer()!
-            XCTAssertTrue(renderer.encode(to: cb, target: texture,
-                                           viewport: MTLViewport(originX: 0, originY: 0,
-                                                                 width: 64, height: 64, znear: 0, zfar: 1),
-                                           camera: renderer.currentCamera))
-            cb.commit(); cb.waitUntilCompleted()
-            return pixelHash(texture)
-        }
-        let withPlane = encode(scene)
-        var withoutPlane = scene
-        withoutPlane.showColorPlane = false
-        let noPlane = encode(withoutPlane)
-        // The plane texture bytes must have the colormap color present.
-        let planeBytes = Renderer.colorPlaneTextureBytes(grid: scene.grid2D!, colormap: .viridis)
-        XCTAssertEqual(planeBytes.count, 4 * 4 * 4)  // 4x4 grid * 4 bytes = 64
-        // Alpha 255 everywhere (all valid).
-        for i in stride(from: 3, to: planeBytes.count, by: 4) {
-            XCTAssertEqual(planeBytes[i], 255)
-        }
-        // The rendered frame with the plane must differ from without (the plane
-        // adds visible geometry to the black background).
-        XCTAssertNotEqual(withPlane, noPlane, "color plane must change the rendered frame")
-    }
-
-    // MARK: - updateContentVisibility no longer hides the canvas
-
-    /// The color plane now lives in the Metal scene; updateContentVisibility must
-    /// NOT hide the canvas when showColorPlane && grid2D.
-    func testUpdateContentVisibilityNoLongerHidesCanvas() throws {
-        var scene = Scene()
-        scene.grid2D = Grid2D(cols: 2, rows: 2, origin: .zero,
-                              vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0)],
-                              values: [[0, 1], [2, 3]], minValue: 0, maxValue: 3, ident: "t")
-        scene.showColorPlane = true
-        let controller = MainWindowController(scene: scene, showWindow: false)
+        // updateContentVisibility no longer hides the canvas: the color plane now
+        // lives in the Metal scene, so the canvas must stay visible.
+        var visScene = Scene()
+        visScene.grid2D = Grid2D(cols: 2, rows: 2, origin: .zero,
+                                 vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0)],
+                                 values: [[0, 1], [2, 3]], minValue: 0, maxValue: 3, ident: "t")
+        visScene.showColorPlane = true
+        let controller = MainWindowController(scene: visScene, showWindow: false)
         controller.state.showColorPlane = true
-        // Access the canvas through the controller's view hierarchy.
-        // updateContentVisibility should NOT hide the canvas for the color plane.
-        controller.state.showColorPlane = true
-        // The canvas must remain visible (not hidden by the color plane).
         XCTAssertFalse(controller.canvas.isHidden, "canvas must not be hidden by the color plane")
     }
 

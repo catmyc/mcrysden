@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-05 (v1.1.40: volumetric data and rendering completed — true-vector PDF/SVG export for cells/BZs/k-paths/graphs with vector labels, image backgrounds, printing, and stereo/anaglyph rendering; 32 focused tests)**.
+Last updated: **2026-08-06 (v1.1.41: powder X-ray diffraction with wavelength presets, Miller-index peak labels, multiplicities, and optional electron-density projection — 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -105,7 +105,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] K-path-editor cumulative reciprocal distance display, candidate hover tooltips, viewport node labels, and automatic BZ framing (v1.1.25). Band plots already use cumulative reciprocal distance.
 - [x] Import k-paths from QE `K_POINTS crystal`, VASP line-mode `KPOINTS`, Wannier90 `kpoint_path`, and XCrySDen `.kpf` (v1.1.29): format sniffing, endpoint coalescing with break reconstruction, VASP-only sampling-density propagation (QE/Wannier90/KPF preserve the existing state/user preference), 1,024-node/16 MB bounds, provenance-safe user-edited routes, GUI Import panel, and CLI `--kpath`. Review hardening in v1.1.30: strict official Wannier90 begin/end parsing with inline comments, VASP label preservation, and BOM normalization.
 - [x] Export Wannier90 `kpoint_path` and QE `K_POINTS crystal_b`/`tpiba_b` card-body forms. Both QE band cards use official weight-0 break jumps and w=n−1 subdivisions; `tpiba_b` converts through the active cell using the documented `alat = |cell.a|` convention.
-- [ ] Powder X-ray diffraction with wavelength selection, peak labels, Miller indices, and optional electron/reciprocal-lattice projections.
+- [x] Powder X-ray diffraction (v1.1.41): sidebar section + pop-out grapher with wavelength presets (Cu/Mo/Cr/Fe/Co/Mn/Ag Kα), max-2θ/FWHM controls, Miller-index peak labels, CSV and PNG/true-vector-PDF export; Waasmaier–Kirfel form factors (Z=1–118), structure factors, multiplicity via spglib-op orbit counting with the Friedel-pair factor (Laue-class fallback), Lorentz–polarization correction, d-degeneracy merging, Gaussian broadening; optional electron-density projection through a separable 3D DFT of the loaded scalar field (axis-aligned grids capped at 128³, fail-closed otherwise).
 
 ### Crystal input completeness
 - [x] CIF declared-operation expansion and CRYSCAL completion (v1.1.35): numeric and unambiguous symbolic `CRYSTAL` groups 1–230 expand through convention-compatible spglib Hall settings with periodic species deduplication; `SLAB` builds bounded primitive hkl surface cells with requested layer/vacuum controls; and `POLYMER` is represented as a finite 1D-periodic crystal. Ambiguous/unknown symbols remain incomplete by design.
