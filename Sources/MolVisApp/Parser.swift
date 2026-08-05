@@ -55,6 +55,32 @@ internal func gunzipData(_ url: URL) throws -> Data {
     return data
 }
 
+/// Read a text file with a size cap, mirroring gunzipData's 200 MB bound.
+/// Pre-checks the on-disk size, then reads through FileHandle so a malformed
+/// file cannot allocate unbounded memory before the cap is detected.
+fileprivate func readCappedText(_ url: URL, cap: Int = 200 * 1024 * 1024) throws -> String {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    if let fileSize = attributes[.size] as? Int, fileSize > cap {
+        throw ParseError.io(path: url.path, reason: "file size \(fileSize) exceeds \(cap) byte limit")
+    }
+    guard let handle = try? FileHandle(forReadingFrom: url) else {
+        throw ParseError.io(path: url.path, reason: "could not open file for reading")
+    }
+    defer { try? handle.close() }
+    var data = Data()
+    while true {
+        guard let chunk = try? handle.read(upToCount: 8192), !chunk.isEmpty else { break }
+        data.append(chunk)
+        if data.count > cap {
+            throw ParseError.io(path: url.path, reason: "file exceeds \(cap) byte limit")
+        }
+    }
+    guard let text = String(data: data, encoding: .utf8) else {
+        throw ParseError.io(path: url.path, reason: "file is not valid UTF-8")
+    }
+    return text
+}
+
 /// Whether the loaded atom list is sufficient for a truthful space-group
 /// analysis. The C parser records per-file completeness (complete, asymmetric
 /// unit, or unknown) in `MolEnvScene.symmetry_completeness`; CIF files may
@@ -290,7 +316,7 @@ enum Parser {
         // Total/projected DOS text is parsed in Swift and displayed by the DOS
         // grapher; it intentionally carries no atom or cell geometry.
         if effective == .dos {
-            let text = try String(contentsOf: url, encoding: .utf8)
+            let text = try readCappedText(url)
             guard let densityOfStates = DOSParser.parse(text) else {
                 throw ParseError.parse(path: url.path, line: 0, reason: "invalid DOS data")
             }
@@ -555,7 +581,7 @@ enum Parser {
     /// a,b,c are converted Bohr->Angstrom. Fractional atoms are cartesianized via
     /// the cell; MULT replicates a site m times to consecutive atoms (all same Z).
     private static func loadWIEN2kStruct(_ url: URL) throws -> LoadedScene {
-        let raw = try String(contentsOf: url, encoding: .utf8)
+        let raw = try readCappedText(url)
         let lines = raw.components(separatedBy: "\n")
         enum E: Error { case malformed(String) }
         func tok(_ s: String) -> [String] {
@@ -687,7 +713,7 @@ enum Parser {
     // The space group -> crystal system -> lattice-param count + cell angles are the
     // standard crystallographic mapping. Lattice constants are already in Angstrom.
     private static func loadCRYSCALr1(_ url: URL) throws -> LoadedScene {
-        let raw = try String(contentsOf: url, encoding: .utf8)
+        let raw = try readCappedText(url)
         let lines = raw.components(separatedBy: "\n")
         func tok(_ s: String) -> [String] {
             s.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\r" }).map(String.init)
@@ -747,6 +773,10 @@ enum Parser {
                           "CRYSCAL space-group number \(numericSpaceGroup) is outside 1...230")
         }
         let spgNumber: Int = numericSpaceGroup ?? symbolicSpaceGroup ?? 0
+        guard isPolymer || (1...230).contains(spgNumber) else {
+            throw failure(spaceGroupLine,
+                          "unrecognized CRYSCAL space group '\(spgTok.joined(separator: " "))'")
+        }
 
         // crystal system -> lattice-param count + cell angles, per the standard
         // crystallographic convention (International Tables) that CRYSCAL's r1 line
@@ -1151,7 +1181,7 @@ enum Parser {
     private static let b2a: Float = 0.52917721067
 
     private static func loadCube(_ url: URL) throws -> LoadedScene {
-        let raw = try String(contentsOf: url, encoding: .utf8)
+        let raw = try readCappedText(url)
         let allLines = raw.components(separatedBy: "\n")
         guard allLines.count >= 2 else {
             throw ParseError.parse(path: url.path, line: 1, reason: "missing cube comments")
@@ -1364,7 +1394,7 @@ enum Parser {
     /// block is malformed. The whole LoadedScene (structure + forceSet) bridges to
     /// `Scene`, so a QE output can finally expose forces, energy and arrows.
     private static func loadPWO(_ url: URL, frameIndex: Int) throws -> LoadedScene {
-        let raw = try String(contentsOf: url, encoding: .utf8)
+        let raw = try readCappedText(url)
         let cPath = url.path.cString(using: .utf8)!
         guard let scene = parse_pwo(cPath, Int32(frameIndex)) else {
             let msg = String(cString: molenv_last_error())
@@ -1746,13 +1776,13 @@ enum OrcaParser {
 
     /// Count coordinate blocks (= optimization cycles).
     static func cycleCount(_ url: URL) -> Int {
-        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return 0 }
+        guard let raw = try? readCappedText(url) else { return 0 }
         return raw.components(separatedBy: "\n").filter { $0.contains(coordHeader) }.count
     }
 
     /// Parse one coordinate block into a molecule. frameIndex -1 => last block.
     static func load(_ url: URL, frameIndex: Int) throws -> LoadedScene {
-        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
+        guard let raw = try? readCappedText(url) else {
             enum E: Error { case io }
             throw E.io
         }
@@ -1785,6 +1815,7 @@ enum OrcaParser {
             atoms.append(Atom(coord: SIMD3<Float>(x, y, z), atomicNumber: Z, label: sym))
             idx += 1
         }
+        guard !atoms.isEmpty else { enum E: Error { case noAtoms }; throw E.noAtoms }
         var out = LoadedScene()
         out.atoms = atoms
         out.isCrystal = false
@@ -1819,7 +1850,7 @@ internal func orcaCycleCount(_ url: URL) -> Int {
 //       atom_frac       x y z Element   (fractional)
 //       atom            x y z Element   (Cartesian, Angstrom)
 internal func loadFHIaims(_ url: URL) throws -> LoadedScene {
-    let raw = try String(contentsOf: url, encoding: .utf8)
+    let raw = try readCappedText(url)
     let lines = raw.components(separatedBy: "\n")
     enum E: Error { case malformed(String) }
     func tok(_ s: String) -> [String] { s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init) }
@@ -1974,7 +2005,7 @@ internal func loadFHIaimsCoordOut(lines: [String]) throws -> LoadedScene {
 /// it in a band-only LoadedScene (no atoms/cell). The MainWindowController swaps
 /// the 3D canvas for the 2D Grapher when scene.bandStructure != nil.
 internal func loadBands(_ url: URL) throws -> LoadedScene {
-    let raw = try String(contentsOf: url, encoding: .utf8)
+    let raw = try readCappedText(url)
     guard let bands = BandParser.parse(raw) else {
         throw ParseError.parse(path: url.path, line: 0, reason: "no `bands (ev):` block found")
     }
@@ -2004,15 +2035,17 @@ private func fhiSpeciesZ(_ name: String) -> Int {
     let upper = letters.uppercased()
     // Exact full-name -> symbol is unambiguous.
     if let z = fhiNameTable[upper] { return z }
-    // Otherwise fall back to 2- then 1-letter symbol prefix.
-    if upper.count >= 2, Table.z(String(upper.prefix(2))) != 0 {
-        return Table.z(String(upper.prefix(2)))
+    // Otherwise fall back to 2- then 1-letter symbol prefix against the full
+    // 118-element table so heavy elements resolve instead of returning 0.
+    if upper.count >= 2 {
+        let z = ElementTable.atomicNumber(String(upper.prefix(2)))
+        if z != 0 { return z }
     }
-    return Table.z(String(upper.prefix(1)))
+    return ElementTable.atomicNumber(String(upper.prefix(1)))
 }
 
-/// FHI-aims element names (uppercased) -> atomic number. Covers the names that
-/// appear in the example set and common alternatives; built once.
+/// FHI-aims element names (uppercased) -> atomic number. Covers all 118
+/// elements plus common alternative spellings; built once.
 private let fhiNameTable: [String: Int] = {
     var t: [String: Int] = [:]
     let pairs: [(String,Int)] = [
@@ -2020,12 +2053,28 @@ private let fhiNameTable: [String: Int] = {
         ("CARBON",6),("NITROGEN",7),("OXYGEN",8),("FLUORINE",9),("NEON",10),
         ("SODIUM",11),("MAGNESIUM",12),("ALUMINIUM",13),("ALUMINUM",13),("SILICON",14),
         ("PHOSPHORUS",15),("SULFUR",16),("SULPHUR",16),("CHLORINE",17),("ARGON",18),
-        ("POTASSIUM",19),("CALCIUM",20),("TITANIUM",22),("VANADIUM",23),("CHROMIUM",24),
-        ("MANGANESE",25),("IRON",26),("COBALT",27),("NICKEL",28),("COPPER",29),("ZINC",30),
-        ("GALLIUM",31),("GERMANIUM",32),("ARSENIC",33),("SELENIUM",34),("BROMINE",35),
-        ("KRYPTON",36),("RUBIDIUM",37),("STRONTIUM",38),("ZIRCONIUM",40),("NIOBIUM",41),
-        ("MOLYBDENUM",42),("TIN",50),("ANTIMONY",51),("IODINE",53),("XENON",54),
-        ("CESIUM",55),("BARIUM",56),("LANTHANUM",57),("LEAD",82),("URANIUM",92)
+        ("POTASSIUM",19),("CALCIUM",20),("SCANDIUM",21),("TITANIUM",22),("VANADIUM",23),
+        ("CHROMIUM",24),("MANGANESE",25),("IRON",26),("COBALT",27),("NICKEL",28),
+        ("COPPER",29),("ZINC",30),("GALLIUM",31),("GERMANIUM",32),("ARSENIC",33),
+        ("SELENIUM",34),("BROMINE",35),("KRYPTON",36),("RUBIDIUM",37),("STRONTIUM",38),
+        ("YTTRIUM",39),("ZIRCONIUM",40),("NIOBIUM",41),("MOLYBDENUM",42),("TECHNETIUM",43),
+        ("RUTHENIUM",44),("RHODIUM",45),("PALLADIUM",46),("SILVER",47),("CADMIUM",48),
+        ("INDIUM",49),("TIN",50),("ANTIMONY",51),("TELLURIUM",52),("IODINE",53),
+        ("XENON",54),("CESIUM",55),("BARIUM",56),("LANTHANUM",57),("CERIUM",58),
+        ("PRASEODYMIUM",59),("NEODYMIUM",60),("PROMETHIUM",61),("SAMARIUM",62),
+        ("EUROPIUM",63),("GADOLINIUM",64),("TERBIUM",65),("DYSPROSIUM",66),("HOLMIUM",67),
+        ("ERBIUM",68),("THULIUM",69),("YTTERBIUM",70),("LUTETIUM",71),("HAFNIUM",72),
+        ("TANTALUM",73),("TUNGSTEN",74),("RHENIUM",75),("OSMIUM",76),("IRIDIUM",77),
+        ("PLATINUM",78),("GOLD",79),("MERCURY",80),("THALLIUM",81),("LEAD",82),
+        ("BISMUTH",83),("POLONIUM",84),("ASTATINE",85),("RADON",86),("FRANCIUM",87),
+        ("RADIUM",88),("ACTINIUM",89),("THORIUM",90),("PROTACTINIUM",91),("URANIUM",92),
+        ("NEPTUNIUM",93),("PLUTONIUM",94),("AMERICIUM",95),("CURIUM",96),("BERKELIUM",97),
+        ("CALIFORNIUM",98),("EINSTEINIUM",99),("FERMIUM",100),("MENDELEVIUM",101),
+        ("NOBELIUM",102),("LAWRENCIUM",103),("RUTHERFORDIUM",104),("DUBNIUM",105),
+        ("SEABORGIUM",106),("BOHRIUM",107),("HASSIUM",108),("MEITNERIUM",109),
+        ("DARMSTADTIUM",110),("ROENTGENIUM",111),("COPERNICIUM",112),("NIHONIUM",113),
+        ("FLEROVIUM",114),("MOSCOVIUM",115),("LIVERMORIUM",116),("TENNESSINE",117),
+        ("OGANESSON",118)
     ]
     for (n, z) in pairs { t[n] = z }
     return t

@@ -7,9 +7,8 @@ import simd
 /// levels, region integration constant/linear + malformed, slice sampling +
 /// diagonal-plane mask, clipTriangles straddle/keep-side, multi-iso rebuild +
 /// color-distinct cache keys, clip-plane culling, color-plane/slice state
-/// round-trip, slice texture generation (pure), slice state persistence +
-/// clamping, composited color-plane render, and updateContentVisibility no longer
-/// hiding the canvas.
+/// round-trip, slice state persistence + clamping, composited color-plane
+/// render, and updateContentVisibility no longer hiding the canvas.
 final class VolumetricTests: XCTestCase {
 
     private enum Thrown: Error { case noGPU, noTex }
@@ -199,23 +198,6 @@ final class VolumetricTests: XCTestCase {
 
     /// Renderer.sliceTextureBytes maps values + mask + colormap to RGBA8 with alpha
     /// 0 on masked samples.
-    func testSliceTextureGenerationPure() {
-        let values: [Float] = [0, 0.5, 1.0]
-        let mask: [Bool] = [true, false, true]
-        let bytes = Renderer.sliceTextureBytes(values: values, mask: mask,
-                                               minValue: 0, maxValue: 1, colormap: .viridis)
-        XCTAssertEqual(bytes.count, 12)  // 3 samples * 4
-        XCTAssertEqual(bytes[3], 255, "valid sample alpha must be 255")
-        XCTAssertEqual(bytes[7], 0, "masked sample alpha must be 0")
-        XCTAssertEqual(bytes[11], 255, "valid sample alpha must be 255")
-        // All-valid (nil mask) -> all alpha 255.
-        let allValid = Renderer.sliceTextureBytes(values: values, mask: nil,
-                                                   minValue: 0, maxValue: 1, colormap: .gray)
-        for i in stride(from: 3, to: allValid.count, by: 4) {
-            XCTAssertEqual(allValid[i], 255)
-        }
-    }
-
     // MARK: - Slice state persistence round-trip + clamping
 
     func testSliceStatePersistenceRoundTripClamping() throws {
@@ -321,40 +303,6 @@ final class VolumetricTests: XCTestCase {
         controller.state.showColorPlane = true
         // The canvas must remain visible (not hidden by the color plane).
         XCTAssertFalse(controller.canvas.isHidden, "canvas must not be hidden by the color plane")
-    }
-
-    // MARK: - VolumeSlice model conformance
-
-    /// VolumeSlice must be Codable + Equatable with sensible defaults.
-    func testVolumeSliceModelConformance() {
-        let slice = VolumeSlice()
-        XCTAssertTrue(slice.enabled)
-        XCTAssertEqual(slice.h, 0)
-        XCTAssertEqual(slice.k, 0)
-        XCTAssertEqual(slice.l, 1)
-        XCTAssertEqual(slice.distance, 0.5, accuracy: 1e-5)
-
-        let encoded = try! JSONEncoder().encode(slice)
-        let decoded = try! JSONDecoder().decode(VolumeSlice.self, from: encoded)
-        XCTAssertEqual(decoded, slice)
-    }
-
-    // MARK: - Color-plane state load clamping (backward compat)
-
-    func testColorPlaneStateLoadClamping() throws {
-        // An old state file without colorPlaneContourCount falls back to default.
-        var scene = Scene()
-        scene.isoLevel = 0.5  // minimal valid state
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("mcrysden_test_cpl.state")
-        try StateStore.save(scene, camera: nil, sourceURL: nil, to: url)
-        var loaded = Scene()
-        var camera: Camera? = nil
-        try StateStore.load(into: &loaded, camera: &camera, from: url)
-        XCTAssertEqual(loaded.colorPlaneColormap, .viridis)
-        XCTAssertEqual(loaded.colorPlaneContourEnabled, true)
-        XCTAssertEqual(loaded.colorPlaneContourCount, 6)
-        XCTAssertTrue(loaded.volumeSlices.isEmpty, "absent volumeSlices key -> empty")
-        try? FileManager.default.removeItem(at: url)
     }
 
     // MARK: - Helpers

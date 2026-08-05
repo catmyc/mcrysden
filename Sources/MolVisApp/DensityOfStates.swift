@@ -50,15 +50,22 @@ enum DOSParser {
             columnCounts[row.count, default: 0] += 1
         }
 
-        guard rows.count >= 2,
+        var monotonic: [[Float]] = []
+        columnCounts.removeAll()
+        for row in rows {
+            if let last = monotonic.last, row[0] <= last[0] {
+                if row[0] < last[0] { return nil }
+                continue
+            }
+            monotonic.append(row)
+            columnCounts[row.count, default: 0] += 1
+        }
+
+        guard monotonic.count >= 2,
               let modalCount = columnCounts.max(by: {
                   $0.value == $1.value ? $0.key > $1.key : $0.value < $1.value
               })?.key,
-              rows.allSatisfy({ $0.count == modalCount }) else { return nil }
-
-        for index in 1..<rows.count where rows[index][0] <= rows[index - 1][0] {
-            return nil
-        }
+              monotonic.allSatisfy({ $0.count == modalCount }) else { return nil }
 
         let header = headers.max(by: { headerScore($0) < headerScore($1) }) ?? ""
         let integratedIndex = hasTrailingIntegratedDOS(header) ? modalCount - 2 : nil
@@ -73,9 +80,9 @@ enum DOSParser {
         }
         uniquify(&labels)
 
-        let energies = rows.map { $0[0] }
+        let energies = monotonic.map { $0[0] }
         let series = zip(keptIndices, labels).map { sourceIndex, label in
-            DOSSeries(label: label, values: rows.map { $0[sourceIndex + 1] })
+            DOSSeries(label: label, values: monotonic.map { $0[sourceIndex + 1] })
         }
         return DensityOfStates(energies: energies, series: series, fermiEnergy: fermiEnergy)
     }

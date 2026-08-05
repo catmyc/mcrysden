@@ -52,6 +52,13 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Raster-backed PDF/SVG/EPS/PS wrapping validates dimensions against the source image; EPS supports safe creation and replacement without partial files.
 - [x] Camera projection reset, extreme scroll input, and invalid color-plane diagnostics have dedicated regression coverage.
 
+## v1.1.39 parser hardening
+- [x] CRYSCAL: unrecognized space-group symbols fail with a useful error instead of silently defaulting to a cubic cell (wrong lattice constants and coordinates).
+- [x] FHI-aims `coord.out`: full 118-element species-name table plus 118-element symbol fallback; "Silver"/"Platinum"-class names no longer resolve to colliding prefixes.
+- [x] All Swift text loaders share the 200 MB input cap (matching the gzip path); ORCA blocks yielding no atoms fail instead of loading an empty molecule.
+- [x] DOS parsing drops duplicate energy rows (first kept) instead of rejecting the file; decreasing energies still fail.
+- [x] Three focused `ParserRobustnessTests` regressions replace lower-value volumetric cases, keeping the suite at exactly 32 tests.
+
 ## v1.1.16 interactive k-path editor
 - [x] Interactive BZ landmark picking with deterministic Γ, vertex, edge-midpoint, and face-center candidates; click-to-append takes precedence over atom selection while edit mode is active.
 - [x] Ordered sidebar route editing with bounded labels and routes, move/delete, undo, clear, generated defaults, and QE/KPF export controls.

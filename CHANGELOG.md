@@ -2,6 +2,16 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.39] — 2026-08-05
+
+### Fixed
+
+- CRYSCAL files whose space group cannot be resolved (unknown or ambiguous symbol) now fail with a useful `ParseError` instead of silently defaulting to a cubic cell and misparsing the lattice constants and coordinates.
+- FHI-aims `coord.out` species names resolve through the complete 118-element name table plus the full element-symbol fallback, fixing wrong assignments such as "Silver" → Si (14) and "Platinum" → P (15) for names absent from the old table.
+- Swift text loaders (PWO, ORCA, bands, FHI-aims, cube, CRYSCAL, WIEN2k struct, DOS) now bound input size to 200 MB like the gzip path, instead of unbounded `String(contentsOf:)`.
+- ORCA coordinate blocks that yield no atoms now fail instead of silently loading an empty molecule.
+- DOS files with a duplicated energy row load with the duplicate dropped (first occurrence kept) instead of being rejected; genuinely decreasing energies still fail.
+
 ## [1.1.38] — 2026-08-04
 
 ### Added
