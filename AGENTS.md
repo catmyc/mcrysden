@@ -19,7 +19,10 @@ The subagents fix the issues from the review.
 
 Primary agent sends the issues back to relevant subagent sessions (if any) for fixing.
 
-## Subagent Dispatch
+## Subagent Dispatch in `Pi` CLI
+This subagent dispatch instruction is uniquely for `Pi` CLI agent tool. 
+
+Do not consider this if not running in `Pi`.
 
 Pi has no built-in subagent primitive. Launch isolated subagents as `pi` CLI subprocesses.
 Prioritize using `longcat/LongCat-2.0` with `high` reasoning for subagent tasks.
