@@ -220,9 +220,10 @@ final class HPKOTOracleTests: XCTestCase {
                                    expectedInputOrientedBasis: inputOrientedExpected,
                                    inputCell: cell, context: "\(name) input mapping")
         }
-    }
+    
+        // --- merged (isolated scope) ---
+        do {
 
-    func testRotatedBasisAndSafeFailureContracts() {
         assertTriclinicRotation(fixtureName: "aP2", angle: .pi / 4)
         assertTriclinicRotation(fixtureName: "aP3", angle: .pi / 6)
         assertCF1RotatedCellUsesCubicEquivalentFrame()
@@ -291,7 +292,8 @@ final class HPKOTOracleTests: XCTestCase {
             standardizedLattice: singular,
             transformation: .identity
         ))
-    }
+        }
+}
 
     private func rotationAroundZ(_ angle: Double) -> [[Double]] {
         let cosAngle = cos(angle)

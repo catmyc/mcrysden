@@ -131,9 +131,9 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(controller.scene.currentOrbital, 1)
         XCTAssertEqual(controller.scene.scalarField?.values.first, 4)
         XCTAssertEqual(controller.state.isoRange, 2...6)
-    }
+        // --- Supercell/slab/malformed-input safety (merged) ---
+        do {
 
-    func testSupercellSlabAndMalformedInputSafety() throws {
         let base = Scene(loaded: try Parser.load(fixture("si110.xsf")))
         let doubled = base.widenSuperCell(SuperCell(n1: 2, n2: 1, n3: 1))
         XCTAssertEqual(doubled.atoms.count, 4)
@@ -159,5 +159,7 @@ final class SceneTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: emptyURL) }
         try "atom 0 0 0 H\n".write(to: emptyURL, atomically: true, encoding: .utf8)
         XCTAssertNoThrow(try Parser.load(emptyURL, as: .fhi))
+        }   // end merged block
+
     }
 }

@@ -91,6 +91,47 @@ enum ProjectionMode: Codable { case perspective, ortho }
 enum BackgroundType: String, Codable {
     case solid         // single flat color (`background`)
     case gradient_top  // vertical gradient, `background` (top) → `backgroundBottom` (bottom)
+    case image         // fullscreen image (backgroundImagePath), fallback to solid/gradient
+}
+
+/// Anaglyph stereo rendering modes. `off` preserves the original single-view
+/// render exactly; the two active modes merge two eye views through per-channel
+/// masks. Persisted via rawValue.
+enum AnaglyphMode: Int, Codable {
+    case off = 0
+    case redCyan = 1
+    case greenMagenta = 2
+    var label: String {
+        switch self {
+        case .off: return "Off"
+        case .redCyan: return "Red-Cyan"
+        case .greenMagenta: return "Green-Magenta"
+        }
+    }
+}
+
+/// Per-mode channel selection masks for the anaglyph merge. The left eye
+/// contributes only the channels where leftMask is true; the right eye
+/// contributes only the channels where rightMask is true. Deterministic and
+/// unit-tested (BackgroundStereoTests.testAnaglyphChannelMasks).
+struct AnaglyphChannelMasks {
+    let left: SIMD3<Float>
+    let right: SIMD3<Float>
+    static func forMode(_ mode: AnaglyphMode) -> AnaglyphChannelMasks {
+        switch mode {
+        case .off:
+            return AnaglyphChannelMasks(left: SIMD3<Float>(1, 1, 1),
+                                        right: SIMD3<Float>(0, 0, 0))
+        case .redCyan:
+            // Red-Cyan: left eye contributes red; right eye contributes green+blue (cyan).
+            return AnaglyphChannelMasks(left: SIMD3<Float>(1, 0, 0),
+                                        right: SIMD3<Float>(0, 1, 1))
+        case .greenMagenta:
+            // Green-Magenta: left eye contributes green; right eye contributes red+blue (magenta).
+            return AnaglyphChannelMasks(left: SIMD3<Float>(0, 1, 0),
+                                        right: SIMD3<Float>(1, 0, 1))
+        }
+    }
 }
 
 /// Adjustable Phong-material lighting.  Kept in Scene so it can be driven by
@@ -256,6 +297,13 @@ struct Scene: Codable {
     var backgroundType: BackgroundType = .solid
     var background: String = "#101014"
     var backgroundBottom: String = "#000000"   // gradient end color
+    /// Optional path to a background image file. When backgroundType == .image
+    /// and this is non-nil, the renderer draws the image as a fullscreen quad.
+    /// nil (or an empty string on restore) means no image.
+    var backgroundImagePath: String? = nil
+    /// Anaglyph stereo rendering mode. Default .off preserves the original
+    /// single-view render exactly (byte-identical output).
+    var anaglyphMode: AnaglyphMode = .off
     /// The effective clear color derived from the background settings. Used as a
     /// fallback when no explicit export background override is supplied.
     var clearColor: (r: Double, g: Double, b: Double, a: Double) {

@@ -62,6 +62,11 @@ final class SideBarState: ObservableObject {
     @Published var backgroundBottomHex: String = "#000000" { didSet { onChange?() } }
     /// Solid vs vertical-gradient background. Synced to scene.backgroundType.
     @Published var backgroundType: BackgroundType = .solid { didSet { onChange?() } }
+    /// Optional path to a background image file. Synced to
+    /// scene.backgroundImagePath in syncFromState(). nil/empty = no image.
+    @Published var backgroundImagePath: String? = nil { didSet { onChange?() } }
+    /// Anaglyph stereo rendering mode. Synced to scene.anaglyphMode.
+    @Published var anaglyphMode: AnaglyphMode = .off { didSet { onChange?() } }
     /// Adjustable Phong lighting — mirrored from Scene.lighting so sliders bind
     /// straight through to the same Codable value the renderer/state file use.
     @Published var lighting: Lighting = Lighting() { didSet { onChange?() } }
@@ -278,6 +283,9 @@ final class SideBarState: ObservableObject {
     var regionComputeError: String? = nil
     /// Whole-field integral readout ("Whole field" button). Empty until computed.
     var regionWholeFieldSummary: String = ""
+    /// Invoked when the user taps the background-image "Choose…" button. The
+    /// controller presents an NSOpenPanel and sets backgroundImagePath.
+    var onPickBackgroundImage: (() -> Void)?
     /// Invoked when any region input changes. MainWindowController wires this to
     /// recompute the integral (guarded against unrelated sidebar changes).
     var onRegionChange: (() -> Void)?
@@ -416,6 +424,8 @@ final class SideBarState: ObservableObject {
         backgroundHex = scene.background
         backgroundBottomHex = scene.backgroundBottom
         backgroundType = scene.backgroundType
+        backgroundImagePath = scene.backgroundImagePath
+        anaglyphMode = scene.anaglyphMode
         lighting = scene.lighting
         n1 = scene.superCell.n1
         n2 = scene.superCell.n2
@@ -902,6 +912,7 @@ enum CollapsibleSidebarSection: String, CaseIterable {
     case clipping = "SideBarCollapsed.clipping"
     case region = "SideBarCollapsed.region"
     case volumeSlices = "SideBarCollapsed.volumeSlices"
+    case stereo = "SideBarCollapsed.stereo"
 
     var defaultsKey: String { rawValue }
 }

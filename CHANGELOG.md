@@ -2,6 +2,20 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.40] — 2026-08-05
+
+### Added
+
+- True-vector export for PDF and SVG: the scene renders once to a raster structure layer, then real vector primitives are overlaid for the cell frame, Cartesian axes (orientation gizmo), Brillouin-zone wireframe, k-path route (honoring breaks), displacement arrows, and labels (CoreText/`<text>`), projected with the same validated camera. Band/DOS/color-plane graphs export as true-vector PDF pages (view drawn directly into a CGContext PDF); any failure falls back to the previous raster wrap. EPS/PS remain raster-backed; PNG output is byte-identical.
+- Higher-resolution labels: exports re-project labels at the export size, and PDF/SVG labels are true vector text.
+- Image backgrounds: a third `Image` background style with a sidebar Choose… button, fullscreen scale-to-cover rendering through the shared textured-quad pipeline, silent fallback to the solid/gradient background on any load failure, suppression under explicit export background/transparency overrides, and `.mvis-state` persistence (empty path → nil; missing files do not fail the load).
+- Stereo/anaglyph rendering: Off / Red-Cyan / Green-Magenta modes render both eyes (lateral parallax at 3% of the scene radius) into per-eye textures — MSAA-resolved when multisampling — and merge through per-channel masks; applied uniformly in the live view and exports; off by default so existing rendering is byte-identical; persisted in state with malformed values failing transactionally.
+- Printing: File → Print… (⌘P) prints the currently visible layer — the Metal scene rendered at print resolution (2 px/pt, capped at 16 M pixels) with projected labels, or the displayed band/DOS graph — through `NSPrintOperation`, with validation errors surfaced as a sheet.
+
+### Changed
+
+- Test suite consolidated to exactly 32 focused tests; new regressions cover vector-format primitives and determinism, print representations and contracts, background-image rendering and fallbacks, and anaglyph channel masks/orientation.
+
 ## [1.1.39] — 2026-08-05
 
 ### Fixed

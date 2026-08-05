@@ -197,49 +197,9 @@ final class AnimationControllerTests: XCTestCase {
                        "edit must preserve asymmetric-unit completeness")
         XCTAssertNil(asuController.scene.crystalSymmetry?.symmetry,
                      "incomplete input must not gain symmetry after edit")
-    }
+        // --- Frame metadata sync (merged regression) ---
+        do {
 
-    /// Find a CRYSCAL fixture that parses as asymmetric-unit (incomplete).
-    /// The parser expands numeric space groups (1-230) to `.complete`; files
-    /// with space group 0 or unrecognized symbols stay `.asymmetricUnit`.
-    static func findAsymmetricUnitController() -> MainWindowController {
-        let candidates = [
-            "crystal_argonite.r1",
-            "crystal_calcite.r1",
-            "crystal_chabazite.r1",
-            "crystal_cluster.r1",
-            "crystal_corundum.r1",
-            "crystal_cuprite.r1",
-            "crystal_graphite.r1",
-            "crystal_mgo.r1",
-            "crystal_polymer.r1",
-            "crystal_pyrite.r1",
-            "crystal_rutile.r1",
-            "crystal_zro2.r1",
-        ]
-        for name in candidates {
-            let url = URL(fileURLWithPath: #file)
-                .deletingLastPathComponent()
-                .appendingPathComponent("Fixtures/\(name)")
-            let scene = try! Scene(loaded: Parser.load(url))
-            let completeness = scene.crystalSymmetry?.inputCompleteness ?? .complete
-            if completeness != .complete {
-                let controller = MainWindowController(scene: Scene(), showWindow: false)
-                controller.loadFile(scene, from: url, format: nil, frameIndex: 0)
-                return controller
-            }
-        }
-        fatalError("no asymmetric-unit CRYSCAL fixture found")
-    }
-
-    // MARK: - Per-frame metadata gates + orbital/iso selection must track the
-    // displayed frame. Before the reloadFrame fix only hasForceSet was refreshed;
-    // scrubbing onto a frame that lost its scalarField (or gained one) left the
-    // stale gate on the previous frame, and the orbitalCount/iso slider used
-    // the prior frame's values.
-
-    @MainActor
-    func testReloadFrameSynchronizesMetadataAndFieldPresence() throws {
         let url = URL(fileURLWithPath: #file)
             .deletingLastPathComponent()
             .appendingPathComponent("Fixtures/si.anim_grid.axsf")
@@ -301,7 +261,48 @@ final class AnimationControllerTests: XCTestCase {
         // The same reload transaction must also apply the preserved multi-orbital
         // selection and clamp the carried iso level against the selected field.
         try assertMultiOrbitalSelectionAppliedDuringReload()
+        }   // end merged block
+
     }
+
+    /// Find a CRYSCAL fixture that parses as asymmetric-unit (incomplete).
+    /// The parser expands numeric space groups (1-230) to `.complete`; files
+    /// with space group 0 or unrecognized symbols stay `.asymmetricUnit`.
+    static func findAsymmetricUnitController() -> MainWindowController {
+        let candidates = [
+            "crystal_argonite.r1",
+            "crystal_calcite.r1",
+            "crystal_chabazite.r1",
+            "crystal_cluster.r1",
+            "crystal_corundum.r1",
+            "crystal_cuprite.r1",
+            "crystal_graphite.r1",
+            "crystal_mgo.r1",
+            "crystal_polymer.r1",
+            "crystal_pyrite.r1",
+            "crystal_rutile.r1",
+            "crystal_zro2.r1",
+        ]
+        for name in candidates {
+            let url = URL(fileURLWithPath: #file)
+                .deletingLastPathComponent()
+                .appendingPathComponent("Fixtures/\(name)")
+            let scene = try! Scene(loaded: Parser.load(url))
+            let completeness = scene.crystalSymmetry?.inputCompleteness ?? .complete
+            if completeness != .complete {
+                let controller = MainWindowController(scene: Scene(), showWindow: false)
+                controller.loadFile(scene, from: url, format: nil, frameIndex: 0)
+                return controller
+            }
+        }
+        fatalError("no asymmetric-unit CRYSCAL fixture found")
+    }
+
+    // MARK: - Per-frame metadata gates + orbital/iso selection must track the
+    // displayed frame. Before the reloadFrame fix only hasForceSet was refreshed;
+    // scrubbing onto a frame that lost its scalarField (or gained one) left the
+    // stale gate on the previous frame, and the orbitalCount/iso slider used
+    // the prior frame's values.
 
     // Multi-orbital selection and iso clamp must agree on the selected orbital
     // BEFORE the frame is installed, so the renderer shows the orbital whose iso

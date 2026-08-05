@@ -183,9 +183,9 @@ final class StateStoreTests: XCTestCase {
         XCTAssertFalse(controller.recallCameraBookmark(at: 0), "empty recall must be a no-op")
         assertCamera(controller.camera, cameraAfterClear.center, cameraAfterClear.distance,
                      cameraAfterClear.rotation, cameraAfterClear.perspective)
-    }
+        // --- Backward compatibility and defaults (merged) ---
+        do {
 
-    func testStateBackwardCompatibilityAndDefaults() throws {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("mvis-legacy-state-\(UUID().uuidString).mvis-state")
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -227,5 +227,7 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(scene.aoQuality, 2, "missing aoQuality key keeps medium default")
         XCTAssertEqual(scene.shadowQuality, 2, "missing shadowQuality key keeps medium default")
         XCTAssertTrue(scene.volumeSlices.isEmpty, "missing volumeSlices key keeps empty default")
+        }   // end merged block
+
     }
 }

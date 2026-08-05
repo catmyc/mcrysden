@@ -63,9 +63,10 @@ final class PeriodicMeasurementTests: XCTestCase {
         // x wraps (1.0), z does not (80.0): sqrt(1^2 + 80^2).
         let expected = sqrtf(1.0 + 80.0 * 80.0)
         XCTAssertEqual(twoDimensionalResult!.value, expected, accuracy: 1e-3)
-    }
+    
+        // --- merged (isolated scope) ---
+        do {
 
-    func testSkewInvalidAndAngleMeasurementBehavior() {
         // A skew cell is checked against explicit enumeration of all 27 images.
         let skewCell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(3, 4, 0), c: SIMD3(0, 0, 10))
         let skewAtoms = [
@@ -412,7 +413,8 @@ final class PeriodicMeasurementTests: XCTestCase {
         ]
         tv.tableView(tv.tableView, sortDescriptorsDidChange: [])
         XCTAssertFalse(tv.tableView.sortDescriptors.first!.ascending)
-    }
+        }
+}
 
     /// Brute-force i<j minimum-image RDF oracle.
     private func bruteForceRDF(atoms: [Atom], cell: Cell, periodicDim: Int,

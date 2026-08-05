@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-04 (v1.1.38: volumetric data and rendering completed — multi-isovalues, clipping planes, region integration, colormaps/contours, volume slices, and color-plane compositing; 32 focused tests)**.
+Last updated: **2026-08-05 (v1.1.40: volumetric data and rendering completed — true-vector PDF/SVG export for cells/BZs/k-paths/graphs with vector labels, image backgrounds, printing, and stereo/anaglyph rendering; 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -138,7 +138,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Three document-scoped named camera bookmark slots with save, recall, and clear actions; exact validated presentation/projection restoration; disabled recalls for empty slots; and optional `.mvis-state` persistence.
 - [x] Adaptive scale indicators (v1.1.33): persisted opt-in Show Scale with an adaptive 1-2-5 Å/nm bar, orthographic-span and perspective camera-center-plane conventions, orbit/zoom/viewport-stable placement, shared live/raster/raster-backed-vector label compositing, and suppression for graph/color-plane views or invalid geometry.
 - [x] Rendering quality (v1.1.35): persisted configurable line widths, scene-object transparency, depth cueing, bounded ambient-occlusion and soft-shadow approximations with quality levels, publication presets and `--preset`, plus the v1.1.34 live/export MSAA controls and safe device fallback. Defaults preserve prior rendering.
-- [ ] Higher-resolution labels and true vector export for cells, BZs, k-paths, and graphs; image backgrounds, printing, and stereo/anaglyph rendering.
+- [x] Higher-resolution labels and true vector export for cells, BZs, k-paths, and graphs (v1.1.40: PDF/SVG exports carry real vector primitives for the cell frame, BZ wireframe, k-path route, axes, displacement arrows, and labels; band/DOS/color-plane graphs export as true-vector PDF; EPS/PS remain raster-backed); image backgrounds (v1.1.40: fullscreen image backdrop with sidebar picker, scale-to-cover, silent fallback, persistence); printing (v1.1.40: File → Print… for the Metal scene and graphs); and stereo/anaglyph rendering (v1.1.40: red-cyan / green-magenta dual-eye merge, MSAA-resolved, persisted, off by default).
 
 ### Animation, conversion, and extensibility
 - [ ] Timeline thumbnails, playback speed/looping, GIF/APNG/video export, trajectory alignment, displacement trails, interpolation, and per-frame energy/force/volume/distance plots.

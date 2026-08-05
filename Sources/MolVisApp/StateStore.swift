@@ -30,6 +30,8 @@ enum StateStore {
         payload["background"] = scene.background
         payload["backgroundBottom"] = scene.backgroundBottom
         payload["backgroundType"] = scene.backgroundType.rawValue
+        if let bgPath = scene.backgroundImagePath { payload["backgroundImagePath"] = bgPath }
+        payload["anaglyphMode"] = scene.anaglyphMode.rawValue
         payload["showCellFrame"] = scene.showCellFrame
         payload["showAxes"] = scene.showAxes
         payload["showLabels"] = scene.showLabels
@@ -236,6 +238,24 @@ enum StateStore {
         if let bg = obj["background"] as? String { candidate.background = bg }
         if let bb = obj["backgroundBottom"] as? String { candidate.backgroundBottom = bb }
         if let bt = obj["backgroundType"] as? String { candidate.backgroundType = BackgroundType(rawValue: bt) ?? .solid }
+        // Background image path (optional). An empty string is treated as nil.
+        // A missing or nonexistent file must NOT fail the load — the renderer
+        // falls back to the solid/gradient background.
+        if let bgPath = obj["backgroundImagePath"] as? String, !bgPath.isEmpty {
+            candidate.backgroundImagePath = bgPath
+        } else {
+            candidate.backgroundImagePath = nil
+        }
+        // Anaglyph mode (optional). Absent key → off. A malformed value rejects
+        // the whole load transactionally (matches the strict conventions used
+        // for other enum-backed fields).
+        if let raw = obj["anaglyphMode"] {
+            guard let mode = AnaglyphMode(rawValue: raw as? Int ?? -1) else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "invalid anaglyphMode: \(raw)")
+            }
+            candidate.anaglyphMode = mode
+        }
         if let v = obj["showCellFrame"] as? Bool { candidate.showCellFrame = v }
         if let v = obj["showAxes"] as? Bool { candidate.showAxes = v }
         if let v = obj["showLabels"] as? Bool { candidate.showLabels = v }

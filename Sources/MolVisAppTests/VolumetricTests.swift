@@ -87,7 +87,7 @@ final class VolumetricTests: XCTestCase {
 
     // MARK: - clipTriangles straddle/keep-side
 
-    func testClipTrianglesStraddleAndKeepSide() {
+    func testClipTrianglesAndPlaneCulling() throws {
         let v: [Float] = [
             0, 0, -1,   0, 0, 1,   1, 0, 0,
             1, 0, 1,    0, 0, 1,   0, 1, 0,
@@ -100,6 +100,29 @@ final class VolumetricTests: XCTestCase {
             let p = SIMD3<Float>(result[i], result[i + 1], result[i + 2])
             XCTAssertGreaterThanOrEqual(simd_dot(p - plane.origin, plane.normal), -1e-5)
         }
+
+        // Display-only clip-plane structure culling (merged regression).
+        let cell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(0, 5, 0), c: SIMD3(0, 0, 5))
+        var scene = Scene()
+        scene.cell = cell
+        scene.atoms = [
+            Atom(coord: SIMD3(0, 0, 0), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(2.5, 2.5, 2.5), atomicNumber: 6, label: "C"),
+            Atom(coord: SIMD3(5, 5, 5), atomicNumber: 6, label: "C"),
+        ]
+        scene.clipPlane = ClipPlane(enabled: true, h: 0, k: 1, l: 0, distance: 2.0,
+                                    applyToStructure: true, applyToIsosurfaces: true)
+        let renderer = try Renderer(device: MTLCreateSystemDefaultDevice()!)
+        renderer.scene = scene
+        XCTAssertEqual(renderer.structureCullFlags(), [true, true, true])
+        scene.clipPlane = ClipPlane(enabled: true, h: 0, k: 1, l: 0, distance: -1.0,
+                                    applyToStructure: true, applyToIsosurfaces: true)
+        renderer.scene = scene
+        XCTAssertEqual(renderer.structureCullFlags(), [false, false, false])
+        scene.clipPlane = ClipPlane(enabled: true, h: 0, k: 1, l: 0, distance: 0.4,
+                                    applyToStructure: true, applyToIsosurfaces: true)
+        renderer.scene = scene
+        XCTAssertEqual(renderer.structureCullFlags(), [true, false, false])
     }
 
     // MARK: - Multi-iso rebuild + color-distinct cache keys
@@ -146,33 +169,10 @@ final class VolumetricTests: XCTestCase {
 
     // MARK: - Clip-plane culling
 
-    func testClipPlaneCulling() throws {
-        let cell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(0, 5, 0), c: SIMD3(0, 0, 5))
-        var scene = Scene()
-        scene.cell = cell
-        scene.atoms = [
-            Atom(coord: SIMD3(0, 0, 0), atomicNumber: 6, label: "C"),
-            Atom(coord: SIMD3(2.5, 2.5, 2.5), atomicNumber: 6, label: "C"),
-            Atom(coord: SIMD3(5, 5, 5), atomicNumber: 6, label: "C"),
-        ]
-        scene.clipPlane = ClipPlane(enabled: true, h: 0, k: 1, l: 0, distance: 2.0,
-                                    applyToStructure: true, applyToIsosurfaces: true)
-        let renderer = try Renderer(device: MTLCreateSystemDefaultDevice()!)
-        renderer.scene = scene
-        XCTAssertEqual(renderer.structureCullFlags(), [true, true, true])
-        scene.clipPlane = ClipPlane(enabled: true, h: 0, k: 1, l: 0, distance: -1.0,
-                                    applyToStructure: true, applyToIsosurfaces: true)
-        renderer.scene = scene
-        XCTAssertEqual(renderer.structureCullFlags(), [false, false, false])
-        scene.clipPlane = ClipPlane(enabled: true, h: 0, k: 1, l: 0, distance: 0.4,
-                                    applyToStructure: true, applyToIsosurfaces: true)
-        renderer.scene = scene
-        XCTAssertEqual(renderer.structureCullFlags(), [true, false, false])
-    }
 
     // MARK: - Color-plane/slice state round-trip
 
-    func testColorPlaneContourStateRoundTrip() throws {
+    func testColorPlaneAndSliceStateRoundTrip() throws {
         var scene = Scene()
         scene.colorPlaneColormap = .turbo
         scene.colorPlaneContourEnabled = false
@@ -192,31 +192,21 @@ final class VolumetricTests: XCTestCase {
         XCTAssertEqual(defaults.colorPlaneColormap, .viridis)
         XCTAssertEqual(defaults.colorPlaneContourEnabled, true)
         XCTAssertEqual(defaults.colorPlaneContourCount, 6)
-    }
 
-    // MARK: - Slice texture generation (pure helper)
-
-    /// Renderer.sliceTextureBytes maps values + mask + colormap to RGBA8 with alpha
-    /// 0 on masked samples.
-    // MARK: - Slice state persistence round-trip + clamping
-
-    func testSliceStatePersistenceRoundTripClamping() throws {
-        var scene = Scene()
+        // Slice persistence round-trip + clamping (merged regression).
         scene.volumeSlices = [
             VolumeSlice(enabled: true, h: 1, k: 0, l: 0, distance: 0.5),
             VolumeSlice(enabled: false, h: 0, k: 2, l: -1, distance: -1.5),
         ]
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("mcrysden_test_vs.state")
         try StateStore.save(scene, camera: nil, sourceURL: nil, to: url)
-        var loaded = Scene()
-        var camera: Camera? = nil
-        try StateStore.load(into: &loaded, camera: &camera, from: url)
-        XCTAssertEqual(loaded.volumeSlices.count, 2)
-        XCTAssertEqual(loaded.volumeSlices[0].h, 1)
-        XCTAssertEqual(loaded.volumeSlices[0].distance, 0.5, accuracy: 1e-5)
-        XCTAssertFalse(loaded.volumeSlices[1].enabled)
-        XCTAssertEqual(loaded.volumeSlices[1].l, -1)
-        XCTAssertEqual(loaded.volumeSlices[1].distance, -1.5, accuracy: 1e-5)
+        var loadedSlices = Scene()
+        try StateStore.load(into: &loadedSlices, camera: &camera, from: url)
+        XCTAssertEqual(loadedSlices.volumeSlices.count, 2)
+        XCTAssertEqual(loadedSlices.volumeSlices[0].h, 1)
+        XCTAssertEqual(loadedSlices.volumeSlices[0].distance, 0.5, accuracy: 1e-5)
+        XCTAssertFalse(loadedSlices.volumeSlices[1].enabled)
+        XCTAssertEqual(loadedSlices.volumeSlices[1].l, -1)
+        XCTAssertEqual(loadedSlices.volumeSlices[1].distance, -1.5, accuracy: 1e-5)
         try? FileManager.default.removeItem(at: url)
 
         // Clamping: out-of-range h/k/l and distance are clamped.
@@ -237,6 +227,13 @@ final class VolumetricTests: XCTestCase {
         XCTAssertEqual(loaded3.volumeSlices.count, 3)
         try? FileManager.default.removeItem(at: url)
     }
+
+    // MARK: - Slice texture generation (pure helper)
+
+    /// Renderer.sliceTextureBytes maps values + mask + colormap to RGBA8 with alpha
+    /// 0 on masked samples.
+    // MARK: - Slice state persistence round-trip + clamping
+
 
     // MARK: - Composited color-plane render
 

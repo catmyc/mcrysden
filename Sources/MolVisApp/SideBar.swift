@@ -39,6 +39,7 @@ struct SideBar: View {
     @AppStorage(CollapsibleSidebarSection.slab.rawValue) private var slabExpanded = true
     @AppStorage(CollapsibleSidebarSection.animation.rawValue) private var animationExpanded = true
     @AppStorage(CollapsibleSidebarSection.isosurface.rawValue) private var isosurfaceExpanded = true
+    @AppStorage(CollapsibleSidebarSection.stereo.rawValue) private var stereoExpanded = true
     @AppStorage(CollapsibleSidebarSection.volumeSlices.rawValue) private var volumeSlicesExpanded = true
     @AppStorage(CollapsibleSidebarSection.fermiSurface.rawValue) private var fermiSurfaceExpanded = true
     @AppStorage(CollapsibleSidebarSection.symmetry.rawValue) private var symmetryExpanded = true
@@ -158,19 +159,31 @@ struct SideBar: View {
                 // which have no reciprocal lattice.
                 Toggle("Brillouin Zone", isOn: $state.showBrillouinZone)
 
-                // Background: solid vs gradient. The second hex field only appears
-                // for the gradient case (there is no second color to set otherwise).
+                // Background: solid vs gradient vs image. The hex fields only
+                // appear for solid/gradient; the image field only for .image.
                 Picker("Background", selection: $state.backgroundType) {
                     Text("Solid").tag(BackgroundType.solid)
                     Text("Gradient").tag(BackgroundType.gradient_top)
+                    Text("Image").tag(BackgroundType.image)
                 }
                 .pickerStyle(.segmented)
-                HStack {
-                    Text("Top"); TextField("hex", text: $state.backgroundHex).frame(width: 90)
-                }
-                if state.backgroundType == .gradient_top {
+                if state.backgroundType == .image {
                     HStack {
-                        Text("Bottom"); TextField("hex", text: $state.backgroundBottomHex).frame(width: 90)
+                        Text("File")
+                        Button("Choose…") { state.onPickBackgroundImage?() }
+                        Text(((state.backgroundImagePath as NSString?)?.lastPathComponent) ?? "(none)")
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                } else {
+                    HStack {
+                        Text("Top"); TextField("hex", text: $state.backgroundHex).frame(width: 90)
+                    }
+                    if state.backgroundType == .gradient_top {
+                        HStack {
+                            Text("Bottom"); TextField("hex", text: $state.backgroundBottomHex).frame(width: 90)
+                        }
                     }
                 }
 
@@ -229,6 +242,15 @@ struct SideBar: View {
                 .onChange(of: selectedPreset) { _, newValue in
                     state.applyPreset(newValue)
                 }
+            }
+            // --- Stereo / anaglyph -------------------------------------------
+            CollapsibleSection(title: "Stereo", isExpanded: $stereoExpanded) {
+                Picker("Mode", selection: $state.anaglyphMode) {
+                    ForEach([AnaglyphMode.off, .redCyan, .greenMagenta], id: \.self) {
+                        Text($0.label).tag($0)
+                    }
+                }
+                .pickerStyle(.segmented)
             }
             // --- Isosurface (volumetric scalar field) ---------------------------
             // Shown only when the loaded file carried a DATAGRID/.cube-style 3D

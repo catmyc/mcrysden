@@ -435,6 +435,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         window.delegate = self
         state.onChange = { [weak self] in self?.syncFromState() }
         state.onRegionChange = { [weak self] in self?.recomputeRegionIntegration() }
+        state.onPickBackgroundImage = { [weak self] in self?.pickBackgroundImage() }
         state.onComputeWholeField = { [weak self] in self?.computeWholeFieldIntegration() }
         state.onResetView = { [weak self] in self?.resetView() }
         state.onStandardCrystalView = { [weak self] view in
@@ -1380,6 +1381,54 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         alert.informativeText = "\(url.lastPathComponent): \(error.localizedDescription)"
         alert.alertStyle = .warning
         alert.beginSheetModal(for: window)
+    }
+
+    /// File > Print… — render the currently visible layer (Metal scene or graph)
+    /// through PrintSupport and run a print operation sheet on the main window.
+    @objc func printDocument(_ sender: Any?) {
+        // All AppKit work (panel, image views) must happen on the main thread.
+        guard Thread.isMainThread else {
+            print("[mcrysden] printDocument called off main thread — ignoring.")
+            return
+        }
+        let printInfo = NSPrintInfo.shared
+        let pageRect = PrintSupport.pageRect(for: printInfo)
+        // Print renders at scale (px/pt) — compute pixel dimensions first so the
+        // label projection viewport matches the render target exactly.
+        // renderMetalScene asserts pixelViewport == pixel dimensions in debug.
+        let pixelDimensions = try? PrintSupport.pixelDimensions(for: pageRect)
+        let pixelViewport = SIMD2<Float>(Float(pixelDimensions?.width ?? Int(pageRect.width)),
+                                         Float(pixelDimensions?.height ?? Int(pageRect.height)))
+        let nsImage: NSImage
+        do {
+            // Graph branches guard on the payload so an empty/hidden graph view
+            // does not supersede the Metal canvas.
+            if !dosGrapher.isHidden, scene.densityOfStates != nil {
+                nsImage = try PrintSupport.renderGraph(dosGrapher, pageRect: pageRect)
+            } else if !bandGrapher.isHidden, scene.bandStructure != nil {
+                nsImage = try PrintSupport.renderGraph(bandGrapher, pageRect: pageRect)
+            } else {
+                // Project labels for the PIXEL viewport (not points) so they land
+                // at the correct position in the print-resolution image.
+                let labels = persistentLabels(viewport: pixelViewport, camera: renderCamera())
+                nsImage = try PrintSupport.renderMetalScene(scene: scene, camera: renderCamera(),
+                                                            labels: labels, pixelViewport: pixelViewport,
+                                                            pageRect: pageRect)
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Print Failed"
+            alert.informativeText = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.beginSheetModal(for: window)
+            return
+        }
+        let view = NSImageView(frame: NSRect(origin: .zero, size: pageRect.size))
+        view.image = nsImage
+        let operation = NSPrintOperation(view: view, printInfo: printInfo)
+        operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
     }
 
     /// Present a save panel and write the distribution analysis as CSV.
@@ -2985,6 +3034,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.backgroundType = state.backgroundType
         scene.background = state.backgroundHex
         scene.backgroundBottom = state.backgroundBottomHex
+        scene.backgroundImagePath = state.backgroundImagePath
+        scene.anaglyphMode = state.anaglyphMode
         let reciprocalPresentationBefore = reciprocalPresentationSignature(for: scene)
         // supercell — compare the (n1,n2,n3) tuple, not just total, so changing
         // replication DIRECTION (e.g. 2×1×1 → 1×2×1, same total) re-widen happens.
@@ -3572,6 +3623,22 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // has no didSet onChange, so this does not re-enter syncFromState.
         if imported.format == .vasp {
             state.kPathSampling = min(200, max(2, path.pointsPerSegment))
+        }
+    }
+
+    /// Present an open panel for choosing a background image. On OK, sets
+    /// state.backgroundImagePath and state.backgroundType = .image so the
+    /// normal onChange propagation applies it to the scene.
+    private func pickBackgroundImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsOtherFileTypes = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.beginSheetModal(for: window) { [weak self] result in
+            guard let self, result == .OK, let url = panel.url else { return }
+            self.state.backgroundImagePath = url.path
+            self.state.backgroundType = .image
         }
     }
 

@@ -48,6 +48,9 @@ final class Renderer: NSObject {
     private var thickLinePipeline: MTLRenderPipelineState // expanded-NDC quad lines (configurable width)
     private var texQuadPipeline: MTLRenderPipelineState    // textured quad (volume slices + color plane compositing)
     private let texQuadSampler: MTLSamplerState            // linear/clamp sampler for slice/color-plane textures
+    private var bgImagePipeline: MTLRenderPipelineState    // fullscreen background image quad (screen-space NDC)
+    private var mergePipeline: MTLRenderPipelineState     // anaglyph dual-eye merge
+    private let bgQuadVB: MTLBuffer                       // NDC quad with uv for the anaglyph-merge pass (v-inverted; see makeBgQuadBuffer)
     private let library: MTLLibrary
 
     /// MSAA sample count for offscreen export rendering. nil → the scene's
@@ -71,6 +74,29 @@ final class Renderer: NSObject {
     private var msaaColorTextureKey: (w: Int, h: Int, samples: Int) = (0, 0, 0)
     private var msaaDepthTexture: MTLTexture?
     private var msaaDepthTextureKey: (w: Int, h: Int, samples: Int) = (0, 0, 0)
+
+    // MARK: - Background image cache
+
+    /// Loaded + decoded background image texture, cached per (path, device).
+    /// nil when no image is loaded or the load failed (the renderer falls back
+    /// to the solid/gradient background — never crashes, never fails the frame).
+    private var cachedBgImageTexture: MTLTexture?
+    private var cachedBgImagePath: String?
+    private var cachedBgImageDevice: MTLDevice?
+    /// Cached background-image quad buffer + the key it was built for, so the
+    /// per-frame draw does not allocate a new MTLBuffer every call. Key is
+    /// (image width, image height, view width, view height) — the uv crop
+    /// depends on both the image and viewport aspect ratios.
+    private var cachedBgQuadBuffer: MTLBuffer?
+    private var cachedBgQuadKey: (imgW: Int, imgH: Int, viewW: Int, viewH: Int) = (0, 0, 0, 0)
+
+    // MARK: - Anaglyph eye textures
+
+    /// Intermediate single-sample textures for the two anaglyph eye views.
+    /// Sized to the target; recreated when dimensions change.
+    private var leftEyeTexture: MTLTexture?
+    private var rightEyeTexture: MTLTexture?
+    private var eyeTextureSize: (w: Int, h: Int) = (0, 0)
 
     private let overlayDepthState: MTLDepthStencilState?
     private let depthStencilState: MTLDepthStencilState?
@@ -525,6 +551,45 @@ final class Renderer: NSObject {
         if (c.a < 1.0/255.0) discard_fragment();
         return c;
     }
+
+    // Background-image pipeline: screen-space NDC quad (no view/proj transform),
+    // uv passed straight through. Drawn first with depth write disabled so the
+    // image sits behind all geometry. The fragment samples an RGBA8 texture with
+    // a linear/clamp sampler — the image fully covers the frame (scale-to-cover
+    // uv mapping is applied on the CPU when building the quad verts).
+    struct BgImageIn { float2 position [[attribute(0)]]; float2 uv [[attribute(1)]]; };
+    struct BgImageOut { float4 position [[position]]; float2 uv; };
+    vertex BgImageOut bgImage_v(BgImageIn in [[stage_in]]) {
+        BgImageOut o; o.position = float4(in.position, 0.0, 1.0); o.uv = in.uv; return o;
+    }
+    fragment float4 bgImage_f(BgImageOut in [[stage_in]],
+                              texture2d<float> tex [[texture(0)]],
+                              sampler smp [[sampler(0)]]) {
+        return tex.sample(smp, in.uv);
+    }
+
+    // Anaglyph merge pipeline: combine two eye textures via per-channel masks.
+    // leftMask/rightMask are float4 (xyz = per-channel 0/1 mask, w unused).
+    // The merged result is what encode() writes to the target.
+    struct MergeIn { float2 position [[attribute(0)]]; float2 uv [[attribute(1)]]; };
+    struct MergeOut { float4 position [[position]]; float2 uv; };
+    vertex MergeOut merge_v(MergeIn in [[stage_in]]) {
+        MergeOut o; o.position = float4(in.position, 0.0, 1.0); o.uv = in.uv; return o;
+    }
+    fragment float4 merge_f(MergeOut in [[stage_in]],
+                            texture2d<float> leftEye [[texture(0)]],
+                            texture2d<float> rightEye [[texture(1)]],
+                            sampler smp [[sampler(0)]],
+                            constant float4 &leftMask [[buffer(1)]],
+                            constant float4 &rightMask [[buffer(2)]]) {
+        float3 l = leftEye.sample(smp, in.uv).rgb;
+        float3 r = rightEye.sample(smp, in.uv).rgb;
+        float3 out;
+        out.r = l.r * leftMask.r + r.r * rightMask.r;
+        out.g = l.g * leftMask.g + r.g * rightMask.g;
+        out.b = l.b * leftMask.b + r.b * rightMask.b;
+        return float4(out, 1.0);
+    }
     """
 
     init(device: MTLDevice) throws {
@@ -548,7 +613,11 @@ final class Renderer: NSObject {
             let tlv = lib.makeFunction(name: "thickLine_v"),
             let tlf = lib.makeFunction(name: "thickLine_f"),
             let _ = lib.makeFunction(name: "texQuad_v"),
-            let _ = lib.makeFunction(name: "texQuad_f")
+            let _ = lib.makeFunction(name: "texQuad_f"),
+            let bgv = lib.makeFunction(name: "bgImage_v"),
+            let bgf = lib.makeFunction(name: "bgImage_f"),
+            let mgv = lib.makeFunction(name: "merge_v"),
+            let mgf = lib.makeFunction(name: "merge_f")
         else { throw RenderError.makeFunction }
 
         // Atom/bond pipeline — lit instanced spheres/cylinders/cones.
@@ -637,6 +706,29 @@ final class Renderer: NSObject {
         Renderer.enableAlphaBlending(texQuadPD.colorAttachments[0])
         self.texQuadPipeline = try device.makeRenderPipelineState(descriptor: texQuadPD)
 
+        // Background-image pipeline: fullscreen screen-space NDC quad that
+        // samples the loaded image texture. Depth-tested (always-pass state is
+        // set at draw time) so it composites as the backdrop.
+        let bgVD = Renderer.makeBgQuadVertexDescriptor()
+        let bgPD = MTLRenderPipelineDescriptor()
+        bgPD.vertexFunction = bgv
+        bgPD.fragmentFunction = bgf
+        bgPD.vertexDescriptor = bgVD
+        bgPD.colorAttachments[0].pixelFormat = .rgba8Unorm
+        bgPD.depthAttachmentPixelFormat = depthPixelFormat
+        self.bgImagePipeline = try device.makeRenderPipelineState(descriptor: bgPD)
+
+        // Anaglyph merge pipeline: combines two eye textures via per-channel
+        // masks. Screen-space NDC quad, no depth test.
+        let mergeVD = Renderer.makeBgQuadVertexDescriptor()
+        let mergePD = MTLRenderPipelineDescriptor()
+        mergePD.vertexFunction = mgv
+        mergePD.fragmentFunction = mgf
+        mergePD.vertexDescriptor = mergeVD
+        mergePD.colorAttachments[0].pixelFormat = .rgba8Unorm
+        mergePD.depthAttachmentPixelFormat = depthPixelFormat
+        self.mergePipeline = try device.makeRenderPipelineState(descriptor: mergePD)
+
         // Linear/clamp sampler for slice/color-plane textures.
         let samplerDesc = MTLSamplerDescriptor()
         samplerDesc.minFilter = .linear
@@ -664,7 +756,8 @@ final class Renderer: NSObject {
             let gib = device.makeBuffer(bytes: coneMesh.indices,
                                        length: coneMesh.indices.count * MemoryLayout<UInt16>.stride,
                                        options: []),
-            let qvb = Renderer.makeQuadBuffer(device)
+            let qvb = Renderer.makeQuadBuffer(device),
+            let bqb = Renderer.makeBgQuadBuffer(device)
         else { throw RenderError.makeBuffer }
         self.sphereVB = svb
         self.sphereIB = sib
@@ -673,6 +766,7 @@ final class Renderer: NSObject {
         self.coneVB = gvb
         self.coneIB = gib
         self.quadVB = qvb
+        self.bgQuadVB = bqb
         self.overlayDepthState = Renderer.makeOverlayDepthState(device: device)
         self.depthStencilState = Renderer.makeDepthStencilState(device: device)
         // Transparent depth state: less-equal compare with NO depth write. Lets
@@ -783,6 +877,14 @@ final class Renderer: NSObject {
         // 8/4/2/1. A count of 1 preserves the exact original single-sample path
         // below; >1 routes through the MSAA resolve path.
         let effectiveCount = effectiveMSAACount
+
+        // Anaglyph stereo: render the scene twice from offset eye cameras and
+        // merge via per-channel masks. Off by default, so existing rendering is
+        // byte-identical. The anaglyph path is fully self-contained here.
+        if scene.anaglyphMode != .off {
+            return encodeAnaglyph(to: commandBuffer, target: target, viewport: viewport,
+                                  cam: cam, w: w, h: h, effectiveCount: effectiveCount)
+        }
         if effectiveCount > 1 {
             return encodeMSAA(to: commandBuffer, target: target, viewport: viewport,
                               cam: cam, frameBuffer: frameBuffer, w: w, h: h,
@@ -840,6 +942,15 @@ final class Renderer: NSObject {
         // Structure-cull flags for this frame (display-only; empty in 2D or when
         // no clip plane is active). Computed once and shared by the draw paths.
         frameStructureCull = scene.displayMode.is2D ? [] : structureCullFlags()
+
+        // Image backdrop: drawn FIRST, before all geometry, with no depth
+        // write so it sits behind everything. Suppressed during exports with an
+        // explicit clearColorOverride. Falls back silently to solid/gradient on
+        // any load failure (currentBackgroundImageTexture returns nil).
+        if scene.backgroundType == .image && clearColorOverride == nil,
+           let tex = currentBackgroundImageTexture() {
+            drawBackgroundImage(enc, texture: tex, w: w, h: h)
+        }
 
         // Vertical-gradient backdrop. Suppressed during exports with an explicit
         // clearColorOverride so transparent/custom backgrounds render as configured.
@@ -972,6 +1083,430 @@ final class Renderer: NSObject {
 
         enc.endEncoding()
         return true
+    }
+
+    // MARK: - Anaglyph stereo rendering
+
+    /// Deterministic eye separation for anaglyph rendering: a fixed fraction of
+    /// the scene's bounding-sphere radius, clamped to a sane range. Returns 0
+    /// for an empty scene (caller falls back to single-view render).
+    private func anaglyphEyeSeparation() -> Float {
+        let r = scene.boundingSphereRadius()
+        guard r > 1e-6 else { return 0 }
+        let sep = r * 0.03
+        return min(5.0, max(0.5, sep))
+    }
+
+    /// The camera's lateral (right) axis in world space. The view matrix is
+    /// R^T * translate(-eye), so the camera's right direction is the first
+    /// column of the rotation matrix R.
+    private func cameraRightAxis(_ cam: Camera) -> SIMD3<Float> {
+        let r = float4x4(cam.rotation)
+        return SIMD3<Float>(r[0][0], r[1][0], r[2][0])
+    }
+
+    /// Build an eye camera by shifting the orbit center along the camera's
+    /// lateral axis. Shifting the center (not just the eye) produces the
+    /// parallax effect while keeping the orbit target consistent.
+    private func anaglyphEyeCamera(_ cam: Camera, offset: Float) -> Camera {
+        var eye = cam
+        let right = cameraRightAxis(cam)
+        eye.center = cam.center + right * offset
+        return eye
+    }
+
+    /// Render one anaglyph eye into the given single-sample target texture.
+    /// Handles both the single-sample and MSAA-resolve paths transparently.
+    private func renderAnaglyphEye(to target: MTLTexture, commandBuffer: MTLCommandBuffer,
+                                   viewport: MTLViewport, cam: Camera,
+                                   w: Int, h: Int, clearColor: MTLClearColor,
+                                   sampleCount: Int) -> Bool {
+        // Build the per-eye frame buffer.
+        let aspect = h > 0 ? Float(w) / Float(h) : 1.0
+        let bgColor: SIMD3<Float>
+        if let override = clearColorOverride {
+            bgColor = SIMD3<Float>(Float(override.red), Float(override.green), Float(override.blue))
+        } else if scene.backgroundType == .gradient_top {
+            bgColor = Renderer.float3FromHex(scene.backgroundBottom)
+        } else {
+            bgColor = Renderer.float3FromHex(scene.background)
+        }
+        let sceneRadius = scene.boundingSphereRadius()
+        let camDist = simd_length(cam.eyePosition() - sceneCentroid())
+        let fogNear = max(0.1, camDist - sceneRadius * 1.5)
+        let fogFar = camDist + sceneRadius * 2.0
+        var frame = Renderer.makeFrame(view: cam.viewMatrix(),
+                                       proj: cam.projectionMatrix(aspect: aspect),
+                                       lighting: scene.lighting,
+                                       eye: cam.eyePosition(),
+                                       backgroundColor: bgColor)
+        frame.lineWidth = scene.lineWidth
+        frame.opacity = scene.opacity
+        frame.depthCueingStrength = scene.depthCueingStrength
+        frame.fogNear = fogNear
+        frame.fogFar = fogFar
+        frame.aoStrength = scene.aoStrength
+        frame.shadowStrength = scene.shadowStrength
+        guard let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
+
+        if sampleCount > 1 {
+            return renderAnaglyphEyeMSAA(to: target, commandBuffer: commandBuffer,
+                                          viewport: viewport, cam: cam,
+                                          frameBuffer: frameBuffer, w: w, h: h,
+                                          clearColor: clearColor, sampleCount: sampleCount)
+        }
+
+        guard ensureDepthTexture(width: w, height: h) else { return false }
+        let desc = MTLRenderPassDescriptor()
+        desc.colorAttachments[0].texture = target
+        desc.colorAttachments[0].loadAction = .clear
+        desc.colorAttachments[0].storeAction = .store
+        desc.colorAttachments[0].clearColor = clearColor
+        if let depthTexture {
+            desc.depthAttachment.texture = depthTexture
+            desc.depthAttachment.loadAction = .clear
+            desc.depthAttachment.storeAction = .dontCare
+            desc.depthAttachment.clearDepth = 1.0
+        }
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return false }
+        enc.setViewport(viewport)
+        enc.setCullMode(.none)
+        guard let depthStencilState else { enc.endEncoding(); return false }
+        enc.setDepthStencilState(depthStencilState)
+        // Draw the background image (if any) into the eye texture too, so the
+        // merge step composites a consistent backdrop for both eyes.
+        if scene.backgroundType == .image && clearColorOverride == nil,
+           let tex = currentBackgroundImageTexture() {
+            drawBackgroundImage(enc, texture: tex, w: w, h: h)
+        }
+        guard drawScene(enc: enc, frameBuffer: frameBuffer, w: w, h: h, cam: cam) else { enc.endEncoding(); return false }
+        enc.endEncoding()
+        return true
+    }
+
+    /// MSAA variant of the anaglyph eye render: render into a multisample
+    /// texture and resolve into the single-sample eye target.
+    private func renderAnaglyphEyeMSAA(to target: MTLTexture, commandBuffer: MTLCommandBuffer,
+                                        viewport: MTLViewport, cam: Camera,
+                                        frameBuffer: MTLBuffer, w: Int, h: Int,
+                                        clearColor: MTLClearColor, sampleCount: Int) -> Bool {
+        guard makeMSAAPipelines(sampleCount: sampleCount) else { return false }
+        let pipelines = msaaPipelineCache[sampleCount]!
+        guard let msaaColor = ensureMSAAColorTexture(width: w, height: h, sampleCount: sampleCount) else { return false }
+        guard let msaaDepth = ensureMSAADepthTexture(width: w, height: h, sampleCount: sampleCount) else { return false }
+        let saved = (atomPipeline, linePipeline, flat2DPipeline, polyPipeline, gradPipeline, thickLinePipeline, texQuadPipeline)
+        defer { atomPipeline = saved.0; linePipeline = saved.1; flat2DPipeline = saved.2; polyPipeline = saved.3; gradPipeline = saved.4; thickLinePipeline = saved.5; texQuadPipeline = saved.6 }
+        atomPipeline = pipelines.atom
+        linePipeline = pipelines.line
+        flat2DPipeline = pipelines.flat2D
+        polyPipeline = pipelines.poly
+        gradPipeline = pipelines.grad
+        thickLinePipeline = pipelines.thickLine
+        texQuadPipeline = pipelines.texQuad
+
+        let desc = MTLRenderPassDescriptor()
+        desc.colorAttachments[0].texture = msaaColor
+        desc.colorAttachments[0].resolveTexture = target
+        desc.colorAttachments[0].loadAction = .clear
+        desc.colorAttachments[0].storeAction = .multisampleResolve
+        desc.colorAttachments[0].clearColor = clearColor
+        desc.depthAttachment.texture = msaaDepth
+        desc.depthAttachment.loadAction = .clear
+        desc.depthAttachment.storeAction = .dontCare
+        desc.depthAttachment.clearDepth = 1.0
+
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return false }
+        enc.setViewport(viewport)
+        enc.setCullMode(.none)
+        guard let depthStencilState else { enc.endEncoding(); return false }
+        enc.setDepthStencilState(depthStencilState)
+        if scene.backgroundType == .image && clearColorOverride == nil,
+           let tex = currentBackgroundImageTexture() {
+            drawBackgroundImage(enc, texture: tex, w: w, h: h)
+        }
+        guard drawScene(enc: enc, frameBuffer: frameBuffer, w: w, h: h, cam: cam) else { enc.endEncoding(); return false }
+        enc.endEncoding()
+        return true
+    }
+
+    /// Ensure the intermediate single-sample anaglyph eye textures exist and
+    /// match the target size. Recreated when dimensions change.
+    private func ensureEyeTextures(w: Int, h: Int) -> Bool {
+        if eyeTextureSize.w == w, eyeTextureSize.h == h,
+           leftEyeTexture != nil, rightEyeTexture != nil { return true }
+        let desc = MTLTextureDescriptor()
+        desc.pixelFormat = .rgba8Unorm
+        desc.width = w
+        desc.height = h
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .shared
+        guard let left = device.makeTexture(descriptor: desc),
+              let right = device.makeTexture(descriptor: desc) else { return false }
+        leftEyeTexture = left
+        rightEyeTexture = right
+        eyeTextureSize = (w, h)
+        return true
+    }
+
+    /// Top-level anaglyph encode: render both eyes, then merge into the target.
+    @discardableResult
+    private func encodeAnaglyph(to commandBuffer: MTLCommandBuffer, target: MTLTexture,
+                                viewport: MTLViewport, cam: Camera,
+                                w: Int, h: Int, effectiveCount: Int) -> Bool {
+        // Fall back to single-view render if the scene is empty, the camera is
+        // invalid, or the geometry is degenerate (no meaningful parallax).
+        let sep = anaglyphEyeSeparation()
+        guard sep > 0, !scene.atoms.isEmpty else {
+            // Re-enter the normal single-view path with the original camera.
+            // Build a minimal frame and reuse the single-sample/MSAA path by
+            // temporarily disabling anaglyph.
+            let saved = scene.anaglyphMode
+            scene.anaglyphMode = .off
+            defer { scene.anaglyphMode = saved }
+            return encodeAnaglyphFallback(to: commandBuffer, target: target, viewport: viewport,
+                                          cam: cam, w: w, h: h, effectiveCount: effectiveCount)
+        }
+
+        guard ensureEyeTextures(w: w, h: h) else { return false }
+
+        let clearColor: MTLClearColor
+        if let override = clearColorOverride {
+            clearColor = override
+        } else {
+            clearColor = scene.backgroundType == .gradient_top
+                ? Renderer.MTLClearColorFromString(scene.backgroundBottom)
+                : Renderer.MTLClearColorFromString(scene.background)
+        }
+
+        let leftCam = anaglyphEyeCamera(cam, offset: -sep / 2)
+        let rightCam = anaglyphEyeCamera(cam, offset: sep / 2)
+
+        guard let leftTarget = leftEyeTexture, let rightTarget = rightEyeTexture else { return false }
+        guard renderAnaglyphEye(to: leftTarget, commandBuffer: commandBuffer,
+                                viewport: viewport, cam: leftCam,
+                                w: w, h: h, clearColor: clearColor,
+                                sampleCount: effectiveCount) else { return false }
+        guard renderAnaglyphEye(to: rightTarget, commandBuffer: commandBuffer,
+                                viewport: viewport, cam: rightCam,
+                                w: w, h: h, clearColor: clearColor,
+                                sampleCount: effectiveCount) else { return false }
+
+        return mergeAnaglyph(to: target, commandBuffer: commandBuffer,
+                             viewport: viewport, w: w, h: h)
+    }
+
+    /// Fallback single-view render for anaglyph when the scene is empty or
+    /// geometry is degenerate. Re-runs the normal encode path with anaglyph
+    /// temporarily disabled.
+    private func encodeAnaglyphFallback(to commandBuffer: MTLCommandBuffer, target: MTLTexture,
+                                        viewport: MTLViewport, cam: Camera,
+                                        w: Int, h: Int, effectiveCount: Int) -> Bool {
+        let aspect = h > 0 ? Float(w) / Float(h) : 1.0
+        let bgColor: SIMD3<Float>
+        if let override = clearColorOverride {
+            bgColor = SIMD3<Float>(Float(override.red), Float(override.green), Float(override.blue))
+        } else if scene.backgroundType == .gradient_top {
+            bgColor = Renderer.float3FromHex(scene.backgroundBottom)
+        } else {
+            bgColor = Renderer.float3FromHex(scene.background)
+        }
+        let sceneRadius = scene.boundingSphereRadius()
+        let camDist = simd_length(cam.eyePosition() - sceneCentroid())
+        let fogNear = max(0.1, camDist - sceneRadius * 1.5)
+        let fogFar = camDist + sceneRadius * 2.0
+        var frame = Renderer.makeFrame(view: cam.viewMatrix(),
+                                       proj: cam.projectionMatrix(aspect: aspect),
+                                       lighting: scene.lighting,
+                                       eye: cam.eyePosition(),
+                                       backgroundColor: bgColor)
+        frame.lineWidth = scene.lineWidth
+        frame.opacity = scene.opacity
+        frame.depthCueingStrength = scene.depthCueingStrength
+        frame.fogNear = fogNear
+        frame.fogFar = fogFar
+        frame.aoStrength = scene.aoStrength
+        frame.shadowStrength = scene.shadowStrength
+        guard let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
+        if effectiveCount > 1 {
+            return encodeMSAA(to: commandBuffer, target: target, viewport: viewport,
+                              cam: cam, frameBuffer: frameBuffer, w: w, h: h,
+                              sampleCount: effectiveCount)
+        }
+        guard ensureDepthTexture(width: w, height: h) else { return false }
+        let clearColor: MTLClearColor
+        if let override = clearColorOverride {
+            clearColor = override
+        } else {
+            clearColor = scene.backgroundType == .gradient_top
+                ? Renderer.MTLClearColorFromString(scene.backgroundBottom)
+                : Renderer.MTLClearColorFromString(scene.background)
+        }
+        let desc = MTLRenderPassDescriptor()
+        desc.colorAttachments[0].texture = target
+        desc.colorAttachments[0].loadAction = .clear
+        desc.colorAttachments[0].storeAction = .store
+        desc.colorAttachments[0].clearColor = clearColor
+        if let depthTexture {
+            desc.depthAttachment.texture = depthTexture
+            desc.depthAttachment.loadAction = .clear
+            desc.depthAttachment.storeAction = .dontCare
+            desc.depthAttachment.clearDepth = 1.0
+        }
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return false }
+        enc.setViewport(viewport)
+        enc.setCullMode(.none)
+        guard let depthStencilState else { enc.endEncoding(); return false }
+        enc.setDepthStencilState(depthStencilState)
+        guard drawScene(enc: enc, frameBuffer: frameBuffer, w: w, h: h, cam: cam) else { enc.endEncoding(); return false }
+        enc.endEncoding()
+        return true
+    }
+
+    /// Merge the two anaglyph eye textures into the final target using the
+    /// per-channel masks for the current anaglyph mode.
+    private func mergeAnaglyph(to target: MTLTexture, commandBuffer: MTLCommandBuffer,
+                               viewport: MTLViewport, w: Int, h: Int) -> Bool {
+        guard let left = leftEyeTexture, let right = rightEyeTexture else { return false }
+        let masks = AnaglyphChannelMasks.forMode(scene.anaglyphMode)
+        let desc = MTLRenderPassDescriptor()
+        desc.colorAttachments[0].texture = target
+        desc.colorAttachments[0].loadAction = .dontCare
+        desc.colorAttachments[0].storeAction = .store
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return false }
+        enc.setViewport(viewport)
+        enc.setRenderPipelineState(mergePipeline)
+        enc.setVertexBuffer(bgQuadVB, offset: 0, index: 0)
+        enc.setFragmentTexture(left, index: 0)
+        enc.setFragmentTexture(right, index: 1)
+        enc.setFragmentSamplerState(texQuadSampler, index: 0)
+        var leftMask = SIMD4<Float>(masks.left.x, masks.left.y, masks.left.z, 0)
+        var rightMask = SIMD4<Float>(masks.right.x, masks.right.y, masks.right.z, 0)
+        enc.setFragmentBytes(&leftMask, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+        enc.setFragmentBytes(&rightMask, length: MemoryLayout<SIMD4<Float>>.stride, index: 2)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        enc.endEncoding()
+        return true
+    }
+
+    // MARK: - Background image rendering
+
+    /// Load (or return the cached) background image texture. Lazily loads from
+    /// scene.backgroundImagePath; returns nil on any failure (missing file,
+    /// corrupt image, zero size) so the renderer falls back to solid/gradient.
+    /// Cached per (path, device); invalidated when the path or device changes.
+    private func currentBackgroundImageTexture() -> MTLTexture? {
+        let path = scene.backgroundImagePath
+        guard let path, !path.isEmpty else {
+            // Path nil/empty: clear any stale cache.
+            cachedBgImageTexture = nil
+            cachedBgImagePath = nil
+            return nil
+        }
+        if cachedBgImagePath == path, cachedBgImageDevice === device, let tex = cachedBgImageTexture {
+            return tex
+        }
+        // Path changed or first load: attempt to load.
+        guard let tex = Renderer.loadBackgroundImage(path: path, device: device) else {
+            cachedBgImageTexture = nil
+            cachedBgImagePath = nil
+            return nil
+        }
+        cachedBgImageTexture = tex
+        cachedBgImagePath = path
+        cachedBgImageDevice = device
+        return tex
+    }
+
+    /// Load an image file into an MTLPixelFormat .rgba8Unorm texture. Returns
+    /// nil on any failure (file missing, unreadable, zero dimensions, decode
+    /// error). Never throws — the renderer must never crash on a bad image.
+    private static func loadBackgroundImage(path: String, device: MTLDevice) -> MTLTexture? {
+        let url = URL(fileURLWithPath: path)
+        if let dataProvider = CGDataProvider(filename: url.path),
+           let cg = CGImage(pngDataProviderSource: dataProvider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+               ?? CGImage(jpegDataProviderSource: dataProvider, decode: nil, shouldInterpolate: true, intent: .defaultIntent) {
+            return cgImageToTexture(cg, device: device)
+        }
+        // Fallback for other formats (tiff, bmp, etc.).
+        if let nsImage = NSImage(contentsOf: url), let cg = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            return cgImageToTexture(cg, device: device)
+        }
+        return nil
+    }
+
+    /// Convert a CGImage to an RGBA8 MTLTexture. Returns nil on failure.
+    private static func cgImageToTexture(_ cgImage: CGImage, device: MTLDevice) -> MTLTexture? {
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width > 0, height > 0 else { return nil }
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
+        guard let context = CGContext(data: &pixels, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return nil
+        }
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let desc = MTLTextureDescriptor()
+        desc.pixelFormat = .rgba8Unorm
+        desc.width = width
+        desc.height = height
+        desc.usage = .shaderRead
+        desc.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+        tex.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
+                    withBytes: pixels, bytesPerRow: bytesPerRow)
+        return tex
+    }
+
+    /// Draw the background image as a fullscreen scale-to-cover quad FIRST
+    /// (before all other geometry, no depth write). Uses the screen-space
+    /// bgImage pipeline. The uv mapping implements scale-to-cover: the image
+    /// fills the frame, cropping overflow, centered.
+    private func drawBackgroundImage(_ enc: MTLRenderCommandEncoder, texture: MTLTexture, w: Int, h: Int) {
+        enc.setDepthStencilState(overlayDepthState)          // always-pass, never-write
+        enc.setRenderPipelineState(bgImagePipeline)
+        // Scale-to-cover uv mapping: compute the crop so the image fills the
+        // viewport, centered, cropping the overflow.
+        let imgAspect = Float(texture.width) / Float(texture.height)
+        let viewAspect = (h > 0) ? Float(w) / Float(h) : 1.0
+        var u0: Float = 0, v0: Float = 0, u1: Float = 1, v1: Float = 1
+        if imgAspect > viewAspect {
+            // Image wider than view: crop left/right.
+            let crop = viewAspect / imgAspect
+            u0 = (1.0 - crop) * 0.5
+            u1 = u0 + crop
+        } else {
+            // Image taller than view: crop top/bottom.
+            let crop = imgAspect / viewAspect
+            v0 = (1.0 - crop) * 0.5
+            v1 = v0 + crop
+        }
+        struct V { var pos: SIMD2<Float>; var uv: SIMD2<Float> }
+        let key = (imgW: texture.width, imgH: texture.height, viewW: w, viewH: h)
+        if cachedBgQuadKey != key || cachedBgQuadBuffer == nil {
+            let newVerts: [V] = [
+                V(pos: SIMD2(-1, -1), uv: SIMD2(u0, v1)),
+                V(pos: SIMD2( 1, -1), uv: SIMD2(u1, v1)),
+                V(pos: SIMD2(-1,  1), uv: SIMD2(u0, v0)),
+                V(pos: SIMD2(-1,  1), uv: SIMD2(u0, v0)),
+                V(pos: SIMD2( 1, -1), uv: SIMD2(u1, v1)),
+                V(pos: SIMD2( 1,  1), uv: SIMD2(u1, v0)),
+            ]
+            if let buf = device.makeBuffer(bytes: newVerts, length: newVerts.count * MemoryLayout<V>.stride, options: []) {
+                cachedBgQuadBuffer = buf
+                cachedBgQuadKey = key
+            } else {
+                return
+            }
+        }
+        guard let vb = cachedBgQuadBuffer else { return }
+        enc.setVertexBuffer(vb, offset: 0, index: 0)
+        enc.setFragmentTexture(texture, index: 0)
+        enc.setFragmentSamplerState(texQuadSampler, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        enc.setDepthStencilState(depthStencilState)           // restore for the scene
     }
 
     /// Resolve a requested MSAA count to the highest device-supported value
@@ -2929,6 +3464,15 @@ final class Renderer: NSObject {
             cachedColorPlaneTexture = nil
             cachedColorPlaneKey = nil
         }
+        // Background image: invalidate when the path changes so the next frame
+        // reloads (or clears) the texture AND the cached quad buffer.
+        if old.backgroundImagePath != scene.backgroundImagePath {
+            cachedBgImageTexture = nil
+            cachedBgImagePath = nil
+            cachedBgImageDevice = nil
+            cachedBgQuadBuffer = nil
+            cachedBgQuadKey = (0, 0, 0, 0)
+        }
     }
 
     private func colorPlaneInputsUnchanged(old: Scene) -> Bool {
@@ -3204,6 +3748,40 @@ final class Renderer: NSObject {
             SIMD2(-1,  1), SIMD2( 1, -1), SIMD2( 1,  1),
         ]
         return device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<SIMD2<Float>>.stride, options: [])
+    }
+
+    /// BgImageIn / MergeIn: float2 position @0 (NDC -1…1), float2 uv @1.
+    /// float2 is 8 bytes; stride = 16.
+    private static func makeBgQuadVertexDescriptor() -> MTLVertexDescriptor {
+        let vd = MTLVertexDescriptor()
+        vd.attributes[0].format = .float2
+        vd.attributes[0].offset = 0
+        vd.attributes[0].bufferIndex = 0
+        vd.attributes[1].format = .float2
+        vd.attributes[1].offset = MemoryLayout<SIMD2<Float>>.stride  // 8
+        vd.attributes[1].bufferIndex = 0
+        vd.layouts[0].stride = MemoryLayout<SIMD2<Float>>.stride * 2  // 16
+        return vd
+    }
+
+    /// Two triangles covering NDC (-1…1) with uv 0…1 for the anaglyph-merge
+    /// fullscreen pass. The v mapping is INVERTED relative to a naive 0…1: in
+    /// Metal, texture row 0 (v=0) is the TOP of the image, but NDC y=-1 is the
+    /// BOTTOM of the screen. So screen-bottom (NDC -1) must sample the texture's
+    /// bottom row (v=1), and screen-top (NDC +1) must sample the texture's top
+    /// row (v=0). Without this flip the merged anaglyph output would render
+    /// vertically upside-down.
+    private static func makeBgQuadBuffer(_ device: MTLDevice) -> MTLBuffer? {
+        struct V { var pos: SIMD2<Float>; var uv: SIMD2<Float> }
+        let verts: [V] = [
+            V(pos: SIMD2(-1, -1), uv: SIMD2(0, 1)),
+            V(pos: SIMD2( 1, -1), uv: SIMD2(1, 1)),
+            V(pos: SIMD2(-1,  1), uv: SIMD2(0, 0)),
+            V(pos: SIMD2(-1,  1), uv: SIMD2(0, 0)),
+            V(pos: SIMD2( 1, -1), uv: SIMD2(1, 1)),
+            V(pos: SIMD2( 1,  1), uv: SIMD2(1, 0)),
+        ]
+        return device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: [])
     }
 
     // MARK: - Buffers

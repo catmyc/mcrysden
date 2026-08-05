@@ -645,6 +645,11 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         let newWindowItem = file.addItem(withTitle: "New Window", action: #selector(newDocument), keyEquivalent: "N")
         newWindowItem.keyEquivalentModifierMask = [.command, .shift]
         newWindowItem.target = self
+        // File > Print… (Cmd-P) reaches the key window's controller through the
+        // responder chain (target nil); MainWindowController.printDocument handles
+        // the currently visible layer (Metal scene or graph).
+        let printItem = file.addItem(withTitle: "Print\u{2026}", action: #selector(MainWindowController.printDocument(_:)), keyEquivalent: "p")
+        printItem.target = nil
         // Edit — must precede View in the standard macOS menu ordering.
         let editItem = NSMenuItem(); main.addItem(editItem)
         let edit = NSMenu(title: "Edit")
@@ -971,8 +976,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
         switch url.pathExtension.lowercased() {
         case "pdf", "svg":
-            return try RasterExporter.export(scene: scene, camera: camera, to: url, size: size, options: effectiveOptions,
-                                              background: effectiveBackground)
+            return try TrueVectorExporter.export(scene: scene, camera: camera, to: url, size: size, options: effectiveOptions,
+                                                  background: effectiveBackground)
         case "eps", "ps":
             // EPS/PS have no alpha support: reject transparency and flatten.
             if exportOptions?.isTransparent == true {
@@ -1016,7 +1021,16 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         NSGraphicsContext.restoreGraphicsState()
         guard let image = bitmap.cgImage else { throw DOSExportError.noImage }
         switch url.pathExtension.lowercased() {
-        case "pdf", "svg", "eps", "ps":
+        case "pdf":
+            // True vector: draw the graph view directly into a CGContext PDF page so
+            // band/DOS/color-plane exports are real vector. Fall back to the raster
+            // wrap on any failure so export never crashes.
+            do {
+                try writeGraphVectorPDF(view, to: url, size: size, background: background)
+            } catch {
+                try RasterExporter.write(cgImage: image, to: url, size: size)
+            }
+        case "svg", "eps", "ps":
             try RasterExporter.write(cgImage: image, to: url, size: size)
         case "png":
             try PngExporter.write(cgImage: image, to: url)
@@ -1026,6 +1040,41 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             throw CLIError.invalid("unsupported export extension: \(url.pathExtension)")
         }
         return image
+    }
+
+    /// Draw a graph view directly into a CGContext PDF page for true vector output.
+    /// The view is drawn through a flipped NSGraphicsContext with the same
+    /// translate/scale convention as the bitmap branch in `exportGraph`.
+    private static func writeGraphVectorPDF<View: NSView>(_ view: View, to url: URL,
+                                                           size: CGSize,
+                                                           background: (r: Double, g: Double, b: Double, a: Double)?) throws {
+        let (width, height) = try validatedExportSize(size)
+        var mediaBox = CGRect(x: 0, y: 0, width: width, height: height)
+        let data = NSMutableData()
+        let info: [CFString: Any] = [kCGPDFContextCreator: "mcrysden"]
+        guard let consumer = CGDataConsumer(data: data),
+              let ctx = CGContext(consumer: consumer, mediaBox: &mediaBox, info as CFDictionary) else {
+            throw TrueVectorExportError.noContext
+        }
+        ctx.beginPDFPage(nil)
+        if let bg = background, bg.a > 0 {
+            ctx.setFillColor(red: bg.r, green: bg.g, blue: bg.b, alpha: bg.a)
+            ctx.fill(mediaBox)
+        }
+        NSGraphicsContext.saveGraphicsState()
+        let nsCtx = NSGraphicsContext(cgContext: ctx, flipped: false)
+        nsCtx.cgContext.translateBy(x: 0, y: CGFloat(height))
+        nsCtx.cgContext.scaleBy(x: 1, y: -1)
+        // Only the flipped context assignment is needed: the labels/graph
+        // expect a top-left-origin (isFlipped) coordinate system.
+        let flipped = NSGraphicsContext(cgContext: nsCtx.cgContext, flipped: true)
+        NSGraphicsContext.current = flipped
+        view.draw(view.bounds)
+        nsCtx.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        ctx.endPDFPage()
+        ctx.closePDF()
+        try (data as Data).write(to: url, options: .atomic)
     }
 
     /// Edit > Copy Current View — render the live viewport scene/camera to a CGImage
@@ -1112,7 +1161,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.39"
+    static let appVersion = "1.1.40"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -1126,7 +1175,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
           mcrysden <file>                             # open a structure (by extension)
           mcrysden <file> <state.mvis-state>           # open with saved state
           mcrysden <file> --export out.png             # headless raster render
-          mcrysden <file> --export out.pdf             # raster render in a vector container (pdf, svg, eps, ps)
+          mcrysden <file> --export out.pdf             # true vector export with a raster structure layer (pdf, svg); raster-backed container (eps, ps)
           mcrysden <file> --kpath route.kpf            # import a k-path (QE K_POINTS, VASP KPOINTS, Wannier90 kpoint_path, XCrySDen KPF)
           mcrysden --help
         Input formats are chosen by extension (\(exts)). Angstrom-based input
@@ -1135,7 +1184,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
           \(flags)
         For animated files (AXSF ANIMSTEPS, QE .pwo ionic steps, Orca opt cycles),
         open a specific frame with --frame N (0-based frame index).
-        Export format is chosen by extension: .png (raster) or .pdf/.svg/.eps/.ps (raster-backed containers).
+        Export format is chosen by extension: .png (raster) or .pdf/.svg (true vector with raster structure layer) or .eps/.ps (raster-backed containers).
         Control multisampled antialiasing with --msaa 1|2|4|8 (1 = explicit Off override; omit to use scene default).
         Apply rendering-quality settings with --preset default|journal|presentation|print.
         """)
