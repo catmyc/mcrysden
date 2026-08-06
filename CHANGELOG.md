@@ -2,6 +2,23 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.42] — 2026-08-06
+
+### Added
+
+- Structure Tools sidebar section (runtime-only, not persisted) covering the structure-editing backlog: primitive/conventional cell transformations, elastic cell deformation, cluster cutting, and Miller-index surface-cell generation with termination selection, multi-slab stacking, and vacuum control.
+- Primitive/conventional transformations: a Representation picker converts the displayed crystal to the spglib-standardized primitive or conventional cell (Cartesian-equivalent positions, labels preserved through the input-to-primitive mapping), or back to the input cell via the source file; user-edited k-paths are remapped through Cartesian reciprocal space, generated paths regenerate.
+- Elastic cell deformation: a 3×3 row-major deformation matrix applies v′ = M·v to the cell and all atom coordinates, with finite/±100-entry/singularity validation, reset-to-identity, and transactional application through the same install path as a file load.
+- Cluster cutting: keeps atoms within a user-set radius of a chosen center and converts the result into a non-periodic molecule (cell dropped, bonds recomputed); empty clusters and invalid centers/radii fail with explicit status text.
+- Miller-index surface-cell builder: exact integer-lattice construction (gcd reduction, extended-GCD step vector, Bezout in-plane kernel basis) shared with the CRYSCAL `SLAB` parser path, generating a 2D surface cell from any 3D crystal — h/k/l steppers, atomic-layer count, termination selection (which consecutive block of atomic planes to keep, with the available range reported), multi-slab stacking (contiguous repeats along the surface normal), and vacuum control that both parametrizes the build and live-adjusts the current slab's vacuum (c-length − slab extent), including a syncFromState mirror with derived-vacuum comparisons.
+- Surface builder reports built-plane count and slab extent to bound the termination stepper and confirm the result in status text; the old fractional-plane Slab filter remains unchanged.
+
+### Changed
+
+- `CRYSCALSlabBuilder` extracted from `Parser.swift` into the shared `SurfaceCellBuilder` engine (same algorithm and caps; file-level SLAB validation and error messages preserved); the `crystal_Pt322.r1` SLAB fixture remains byte-equivalent.
+- `loadFile` split into bookkeeping + `installScene(_:frameIndex:frameCount:)` so derived structures (transforms, clusters, slabs) install through the identical scene-install path without re-opening the source file; recent-document and file-watching semantics unchanged.
+- Test suite remains at exactly 32 focused tests; seven new structure-tool regressions (surface-cell construction + CRYSCAL extraction, termination/stacking, primitive/conventional round-trip, deformation/cluster, vacuum control, controller basis/surface/vacuum, controller deformation/cluster) replaced lower-value print, anaglyph-orientation, state-round-trip, and renderer-cache cases.
+
 ## [1.1.41] — 2026-08-06
 
 ### Added

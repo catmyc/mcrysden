@@ -37,6 +37,7 @@ struct SideBar: View {
     @AppStorage(CollapsibleSidebarSection.kPath.rawValue) private var kPathExpanded = true
     @AppStorage(CollapsibleSidebarSection.supercell.rawValue) private var supercellExpanded = true
     @AppStorage(CollapsibleSidebarSection.slab.rawValue) private var slabExpanded = true
+    @AppStorage(CollapsibleSidebarSection.structureTools.rawValue) private var structureToolsExpanded = true
     @AppStorage(CollapsibleSidebarSection.animation.rawValue) private var animationExpanded = true
     @AppStorage(CollapsibleSidebarSection.isosurface.rawValue) private var isosurfaceExpanded = true
     @AppStorage(CollapsibleSidebarSection.stereo.rawValue) private var stereoExpanded = true
@@ -456,6 +457,14 @@ struct SideBar: View {
                     Stepper("k = \(state.slabB_k)", value: $state.slabB_k, in: -8...8)
                     Stepper("l = \(state.slabB_l)", value: $state.slabB_l, in: -8...8)
                     Slider(value: $state.slabB_dist, in: -20...20) { Text("Slab B dist: \(state.slabB_dist, specifier: "%.1f")") }
+                }
+            }
+            // --- Structure tools: basis transform, deformation, cluster, surface ---
+            // Runtime-only (not persisted). The primitive/conventional transforms,
+            // elastic deformation, cluster cut, and Miller-index surface builder.
+            if state.structureSummary?.atomCount ?? 0 > 0 {
+                CollapsibleSection(title: "Structure Tools", isExpanded: $structureToolsExpanded) {
+                    structureToolsContent
                 }
             }
             // --- Coordination: opt-in covalent-radius neighbor analysis -----------
@@ -928,6 +937,117 @@ struct SideBar: View {
             Text("Distribution analysis unavailable")
             .font(.caption).foregroundColor(.secondary)
         }
+    }
+
+    // MARK: - Structure tools (runtime-only, not persisted)
+
+    @ViewBuilder
+    private var structureToolsContent: some View {
+        // Cell Basis
+        Text("Cell Basis").font(.subheadline).bold()
+        Picker("Representation", selection: Binding(
+            get: { state.cellRepresentation },
+            set: { state.onApplyBasisTransform?($0) }
+        )) {
+            ForEach(CellRepresentation.allCases, id: \.self) { rep in
+                Text(rep.label).tag(rep)
+            }
+        }
+        .pickerStyle(.menu)
+        if !state.basisTransformHelp.isEmpty {
+            Text(state.basisTransformHelp)
+                .font(.caption).foregroundColor(.secondary)
+        }
+        if !state.structureToolsStatusText.isEmpty {
+            Text(state.structureToolsStatusText)
+                .font(.caption).foregroundColor(.secondary)
+        }
+
+        // Deform Cell
+        Text("Deform Cell").font(.subheadline).bold()
+        deformationGrid
+        HStack {
+            Button("Apply") { state.onApplyDeformation?() }
+            Button("Reset") {
+                let saved = state.onChange
+                state.onChange = nil
+                state.deformationMatrix = [1,0,0, 0,1,0, 0,0,1]
+                state.onChange = saved
+            }
+        }
+
+        // Cut Cluster
+        Text("Cut Cluster").font(.subheadline).bold()
+        Slider(value: $state.clusterCenter.x, in: -20...20) { Text("Center X: \(state.clusterCenter.x, specifier: "%.1f")") }
+        Slider(value: $state.clusterCenter.y, in: -20...20) { Text("Center Y: \(state.clusterCenter.y, specifier: "%.1f")") }
+        Slider(value: $state.clusterCenter.z, in: -20...20) { Text("Center Z: \(state.clusterCenter.z, specifier: "%.1f")") }
+        Slider(value: $state.clusterRadius, in: 1...20) { Text("Radius: \(state.clusterRadius, specifier: "%.1f") Å") }
+        Button("Cut Cluster") { state.onCutCluster?() }
+
+        // Surface Builder
+        Text("Surface Builder").font(.subheadline).bold()
+        if state.surfaceBuilderAvailable {
+            Stepper("h = \(state.surfaceH)", value: $state.surfaceH, in: -8...8)
+            Stepper("k = \(state.surfaceK)", value: $state.surfaceK, in: -8...8)
+            Stepper("l = \(state.surfaceL)", value: $state.surfaceL, in: -8...8)
+            Stepper("Layers = \(state.surfaceLayers)", value: $state.surfaceLayers, in: 1...100)
+            Stepper("Termination = \(state.surfaceTermination)", value: $state.surfaceTermination,
+                    in: 0...max(0, state.surfaceTerminationOptions - 1))
+            Stepper("Stack count = \(state.surfaceStackCount)", value: $state.surfaceStackCount, in: 1...10)
+            Slider(value: Binding(
+                get: { state.surfaceVacuum },
+                set: { state.surfaceVacuum = $0; state.onSurfaceVacuumChange?() }
+            ), in: 0...50) { Text("Vacuum: \(state.surfaceVacuum, specifier: "%.1f") Å") }
+            if state.surfaceVacuumAdjustable {
+                Text("Current vacuum: \(state.surfaceVacuum, specifier: "%.2f") Å")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Button("Build Slab") { state.onBuildSurface?() }
+        } else {
+            Text("Surface builder requires a 3D periodic crystal.")
+                .font(.caption).foregroundColor(.secondary)
+        }
+        if !state.surfaceStatusText.isEmpty {
+            Text(state.surfaceStatusText)
+                .font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// 3x3 deformation matrix editor. Bounds-safe: each field reads/writes only
+    /// while the matrix has 9 elements (identity otherwise).
+    @ViewBuilder
+    private var deformationGrid: some View {
+        if state.deformationMatrix.count == 9 {
+            Grid(alignment: .leading, horizontalSpacing: 4, verticalSpacing: 2) {
+                GridRow {
+                    TextField("", value: deformationBinding(0), format: .number).frame(width: 56)
+                    TextField("", value: deformationBinding(1), format: .number).frame(width: 56)
+                    TextField("", value: deformationBinding(2), format: .number).frame(width: 56)
+                }
+                GridRow {
+                    TextField("", value: deformationBinding(3), format: .number).frame(width: 56)
+                    TextField("", value: deformationBinding(4), format: .number).frame(width: 56)
+                    TextField("", value: deformationBinding(5), format: .number).frame(width: 56)
+                }
+                GridRow {
+                    TextField("", value: deformationBinding(6), format: .number).frame(width: 56)
+                    TextField("", value: deformationBinding(7), format: .number).frame(width: 56)
+                    TextField("", value: deformationBinding(8), format: .number).frame(width: 56)
+                }
+            }
+        }
+    }
+
+    private func deformationBinding(_ i: Int) -> Binding<Float> {
+        Binding(
+            get: { state.deformationMatrix.indices.contains(i) ? state.deformationMatrix[i] : [1,0,0,0,1,0,0,0,1][i] },
+            set: {
+                if state.deformationMatrix.indices.contains(i) {
+                    state.deformationMatrix[i] = $0
+                }
+            }
+        )
     }
 
     @ViewBuilder

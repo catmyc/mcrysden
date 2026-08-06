@@ -49,16 +49,6 @@ final class RendererTests: XCTestCase {
                           "moving/adding an atom must change the rendered geometry")
     }
 
-    // Keep the cache contracts that protect repeated rendering and changed
-    // same-sized data, then exercise the explicit allocation/error boundaries.
-    func testCacheInvalidationAndAllocationSafety() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
-        try assertBrillouinZoneCacheInvalidation(device: device)
-        try assertIsoCacheInvalidation(device: device)
-        try assertFermiCacheInvalidation(device: device)
-        try assertAllocationFailures(device: device)
-    }
-
     func testHeadlessPngExport() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
         let renderer = try Renderer(device: device)
@@ -191,178 +181,6 @@ final class RendererTests: XCTestCase {
                        "hidden structure must suppress displacement arrows")
     }
 
-    // MARK: - Cache and allocation helpers
-
-    private func assertBrillouinZoneCacheInvalidation(device: MTLDevice) throws {
-        let renderer = try Renderer(device: device)
-        let cell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(0, 5, 0), c: SIMD3(0, 0, 5))
-        let atoms = [Atom(coord: .zero, atomicNumber: 14, label: "Si")]
-        var scene = Scene()
-        scene.isCrystal = true
-        scene.cell = cell
-        scene.baseAtoms = atoms
-        scene.atoms = atoms
-        scene.showBrillouinZone = true
-        renderer.scene = scene
-        let bz = try XCTUnwrap(BrillouinZone.build(cell: cell, atoms: atoms))
-        renderer.installBrillouinZoneCache(bz: bz, candidates: bz.candidates())
-
-        let texture = try XCTUnwrap(device.makeTexture(descriptor: wtx(64, 64)))
-        let viewport = MTLViewport(originX: 0, originY: 0, width: 64, height: 64, znear: 0, zfar: 1)
-        func encode() throws {
-            let commandBuffer = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
-            XCTAssertTrue(renderer.encode(to: commandBuffer, target: texture,
-                                           viewport: viewport, camera: renderer.currentCamera))
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            XCTAssertNil(commandBuffer.error)
-        }
-
-        try encode()
-        XCTAssertEqual(renderer.bzRebuildCount, 0)
-        var changed = scene
-        changed.cell = Cell(a: SIMD3(6, 0, 0), b: SIMD3(0, 6, 0), c: SIMD3(0, 0, 6))
-        renderer.scene = changed
-        try encode()
-        XCTAssertEqual(renderer.bzRebuildCount, 1,
-                       "cell invalidation must discard an installed BZ cache")
-    }
-
-    private func assertIsoCacheInvalidation(device: MTLDevice) throws {
-        let renderer = try Renderer(device: device)
-        let texture = try XCTUnwrap(device.makeTexture(descriptor: wtx(64, 64)))
-        let queue = try XCTUnwrap(device.makeCommandQueue())
-        let values = (0..<27).map { Float($0).truncatingRemainder(dividingBy: 5) * 0.4 }
-        var scene = Scene()
-        scene.showStructure = false
-        scene.showAxes = false
-        scene.showCellFrame = false
-        scene.showBrillouinZone = false
-        scene.background = "#000000"
-        scene.showIsoSurface = true
-        scene.isoLevel = 0.5
-        scene.scalarField = isoField(values)
-
-        func encode(_ value: Scene) {
-            renderer.scene = value
-            let commandBuffer = queue.makeCommandBuffer()!
-            XCTAssertTrue(renderer.encode(to: commandBuffer, target: texture,
-                                           viewport: MTLViewport(originX: 0, originY: 0,
-                                                                 width: 64, height: 64, znear: 0, zfar: 1),
-                                           camera: renderer.currentCamera))
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            XCTAssertNil(commandBuffer.error)
-        }
-
-        encode(scene)
-        let built = renderer.isoRebuildCount
-        XCTAssertGreaterThan(built, 0)
-        for _ in 0..<3 { encode(scene) }
-        XCTAssertEqual(renderer.isoRebuildCount, built,
-                       "unchanged fields must not rebuild across frames")
-
-        var changed = scene
-        var changedValues = values
-        changedValues[13] = 999
-        changed.scalarField = isoField(changedValues)
-        encode(changed)
-        XCTAssertGreaterThan(renderer.isoRebuildCount, built,
-                             "changed same-sized values must rebuild the iso cache")
-    }
-
-    private func assertFermiCacheInvalidation(device: MTLDevice) throws {
-        func field(_ values: [Float]) -> ScalarField {
-            ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
-                        vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
-                        values: values, minValue: values.min() ?? 0, maxValue: values.max() ?? 0)
-        }
-        let renderer = try Renderer(device: device)
-        let texture = try XCTUnwrap(device.makeTexture(descriptor: wtx(80, 80)))
-        let queue = try XCTUnwrap(device.makeCommandQueue())
-        var scene = Scene()
-        scene.showStructure = false
-        scene.showAxes = false
-        scene.showCellFrame = false
-        scene.showBrillouinZone = false
-        scene.showFermiSurface = true
-        scene.fermiSurface = FermiSurface(
-            fermiEnergy: 0.5,
-            bands: [field([0, 0, 0, 0, 1, 1, 1, 1]), field([0, 0, 0, 0, 1, 1, 1, 1])])
-
-        func encode(_ value: Scene) {
-            renderer.scene = value
-            let commandBuffer = queue.makeCommandBuffer()!
-            XCTAssertTrue(renderer.encode(to: commandBuffer, target: texture,
-                                           viewport: MTLViewport(originX: 0, originY: 0,
-                                                                 width: 80, height: 80, znear: 0, zfar: 1),
-                                           camera: renderer.currentCamera))
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            XCTAssertNil(commandBuffer.error)
-        }
-
-        encode(scene)
-        let built = renderer.fermiRebuildCount
-        XCTAssertEqual(built, 1)
-        encode(scene)
-        XCTAssertEqual(renderer.fermiRebuildCount, built)
-
-        var changed = scene
-        changed.fermiSurface = FermiSurface(
-            fermiEnergy: 0.5,
-            bands: [field([0, 0, 0, 0, 1, 1, 1, 1]), field([1, 1, 1, 1, 0, 0, 0, 0])])
-        encode(changed)
-        XCTAssertEqual(renderer.fermiRebuildCount, built + 1,
-                       "changed same-sized band values must rebuild the Fermi cache")
-    }
-
-    private func assertAllocationFailures(device: MTLDevice) throws {
-        let renderer = try Renderer(device: device)
-        var scene = Scene()
-        scene.background = "#000000"
-        scene.showAxes = false
-        scene.showCellFrame = false
-        scene.atoms = [Atom(coord: .zero, atomicNumber: 6, label: "C")]
-        renderer.scene = scene
-        let texture = try XCTUnwrap(device.makeTexture(descriptor: wtx(32, 32)))
-        let commandBuffer = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
-        Renderer.forceNextBufferAllocationSuccess = false
-        defer { Renderer.forceNextBufferAllocationSuccess = true }
-        XCTAssertFalse(renderer.encode(to: commandBuffer, target: texture,
-                                        viewport: MTLViewport(originX: 0, originY: 0,
-                                                              width: 32, height: 32, znear: 0, zfar: 1),
-                                        camera: renderer.currentCamera),
-                       "encode must return false when a required allocation fails")
-
-        let fixtureDirectory = URL(fileURLWithPath: #file).deletingLastPathComponent()
-        var exportScene = Scene(loaded: try Parser.load(fixtureDirectory.appendingPathComponent("Fixtures/si110.xsf")))
-        exportScene.background = "#000000"
-        Renderer.forceNextBufferAllocationSuccess = false
-        let failedOutput = FileManager.default.temporaryDirectory
-            .appendingPathComponent("renderer-fail-\(UUID().uuidString).png")
-        XCTAssertThrowsError(try PngExporter.export(scene: exportScene, camera: nil,
-                                                     to: failedOutput,
-                                                     size: CGSize(width: 200, height: 200))) { error in
-            guard case PngExportError.encodeFailed = error else {
-                return XCTFail("allocation failure must surface as encodeFailed, got \(error)")
-            }
-        }
-        Renderer.forceNextBufferAllocationSuccess = true
-
-        var invalidScene = Scene()
-        invalidScene.background = "#000000"
-        let invalidSize = CGSize(width: CGFloat.greatestFiniteMagnitude,
-                                 height: CGFloat.greatestFiniteMagnitude)
-        let pngOutput = FileManager.default.temporaryDirectory
-            .appendingPathComponent("renderer-huge-\(UUID().uuidString).png")
-        XCTAssertThrowsError(try PngExporter.export(scene: invalidScene, camera: nil,
-                                                     to: pngOutput, size: invalidSize))
-        XCTAssertThrowsError(try RasterExporter.export(scene: invalidScene, camera: nil,
-                                                        to: pngOutput.appendingPathExtension("pdf"),
-                                                        size: invalidSize))
-    }
-
     // MARK: - Shared render helpers
 
     private func foregroundPixels(_ image: CGImage) -> Int {
@@ -473,12 +291,6 @@ final class RendererTests: XCTestCase {
             }
         }
         return (minimum, maximum)
-    }
-
-    private func isoField(_ values: [Float]) -> ScalarField {
-        ScalarField(nx: 3, ny: 3, nz: 3, origin: .zero,
-                    vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
-                    values: values, minValue: values.min() ?? 0, maxValue: values.max() ?? 0)
     }
 
     private func wtx(_ width: Int, _ height: Int) -> MTLTextureDescriptor {

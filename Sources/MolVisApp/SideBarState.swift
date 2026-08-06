@@ -292,6 +292,33 @@ final class SideBarState: ObservableObject {
     /// Invoked when the user taps "Whole field". The controller computes
     /// RegionIntegration.integrateAll(field:) and writes the summary.
     var onComputeWholeField: (() -> Void)?
+    // --- Structure tools (runtime-only, not persisted) ---
+    @Published private(set) var cellRepresentation: CellRepresentation = .input
+    @Published private(set) var basisTransformHelp: String = ""
+    @Published private(set) var primitiveTransformAvailable = false
+    @Published private(set) var conventionalTransformAvailable = false
+    @Published var deformationMatrix: [Float] = [1,0,0, 0,1,0, 0,0,1] { didSet { onChange?() } }
+    @Published var clusterCenter: SIMD3<Float> = .zero { didSet { onChange?() } }
+    @Published var clusterRadius: Float = 5 { didSet { onChange?() } }
+    @Published var surfaceH: Int = 1 { didSet { onChange?() } }
+    @Published var surfaceK: Int = 0 { didSet { onChange?() } }
+    @Published var surfaceL: Int = 0 { didSet { onChange?() } }
+    @Published var surfaceLayers: Int = 4 { didSet { onChange?() } }
+    @Published var surfaceVacuum: Float = 10 { didSet { onChange?() } }
+    @Published var surfaceTermination: Int = 0 { didSet { onChange?() } }
+    @Published var surfaceStackCount: Int = 1 { didSet { onChange?() } }
+    @Published private(set) var surfaceTerminationOptions = 0
+    @Published private(set) var structureToolsStatusText = ""
+    @Published private(set) var surfaceStatusText = ""
+    @Published private(set) var surfaceBuilderAvailable = false
+    /// True when the current scene is a z-parallel 2D slab whose vacuum the
+    /// surface-vacuum slider can adjust live (not just at build time).
+    @Published private(set) var surfaceVacuumAdjustable = false
+    var onApplyBasisTransform: ((CellRepresentation) -> Void)?
+    var onApplyDeformation: (() -> Void)?
+    var onCutCluster: (() -> Void)?
+    var onBuildSurface: (() -> Void)?
+    var onSurfaceVacuumChange: (() -> Void)?
     /// True when a forceSet (parsed from a QE output) is present — the sidebar
     /// gates the Forces section on this so force-less files show no empty controls.
     var hasForceSet: Bool = false
@@ -505,7 +532,60 @@ final class SideBarState: ObservableObject {
         shadowStrength = scene.shadowStrength
         aoQuality = scene.aoQuality
         shadowQuality = scene.shadowQuality
+        // --- Structure tools (runtime-only, not persisted) ---
+        // Availability + help text follow the scene's symmetry analysis; the
+        // user-preference fields (deformation matrix, cluster, surface h/k/l, ...)
+        // deliberately keep their values across loads. cellRepresentation is owned
+        // by the controller (currentCellRepresentation) and mirrored separately.
+        let structureSym = scene.crystalSymmetry?.symmetry
+        let structure3D = scene.isCrystal && scene.periodicDim == 3
+            && scene.cell != nil && !scene.atoms.isEmpty
+        let structurePrimAvail = structure3D
+            && (structureSym?.primitiveStructure.atomCount ?? 0) < scene.atoms.count
+        let structureConvAvail = structure3D && structureSym != nil
+        primitiveTransformAvailable = structurePrimAvail
+        conventionalTransformAvailable = structureConvAvail
+        basisTransformHelp = structure3D && structureSym == nil
+            ? (scene.crystalSymmetry?.reasonDescription ?? "symmetry analysis unavailable")
+            : ""
+        surfaceBuilderAvailable = structure3D
+        surfaceTerminationOptions = 0
+        // Transient status lines describe the previous scene's actions.
+        structureToolsStatusText = ""
+        surfaceStatusText = ""
+        // The vacuum slider shows the derived vacuum (c length minus slab extent)
+        // for a z-parallel 2D slab, so the live-vacuum comparisons are consistent.
+        if scene.periodicDim == 2, let cell = scene.cell, cell.isCZParallel,
+           let extent = scene.surfaceSlabExtent {
+            surfaceVacuum = max(0, cell.cLength - extent)
+        }
+        surfaceVacuumAdjustable = scene.periodicDim == 2
+            && scene.cell?.isCZParallel == true && scene.surfaceSlabExtent != nil
         onChange = saved
+    }
+
+    /// Mirror the controller's basis-transform availability computation into state.
+    /// The controller owns the `currentCellRepresentation`; the scene owns the
+    /// symmetry result. Neither is settable from here, so the controller passes the
+    /// fully-resolved values in.
+    func applyBasisTransformAvailability(primitive: Bool, conventional: Bool,
+                                         help: String, representation: CellRepresentation) {
+        primitiveTransformAvailable = primitive
+        conventionalTransformAvailable = conventional
+        basisTransformHelp = help
+        cellRepresentation = representation
+    }
+
+    /// Set the runtime-only structure-tools status line (basis/deformation/cluster).
+    func setStructureToolsStatus(_ text: String) {
+        structureToolsStatusText = text
+    }
+
+    /// Set the runtime-only surface-builder status line + termination availability.
+    func setSurfaceStatus(_ text: String, terminationOptions: Int, termination: Int) {
+        surfaceStatusText = text
+        surfaceTerminationOptions = terminationOptions
+        surfaceTermination = termination
     }
 
     /// Replace the runtime-only camera-bookmark occupancy and names when a
@@ -927,6 +1007,7 @@ enum CollapsibleSidebarSection: String, CaseIterable {
     case kPath = "SideBarCollapsed.kPath"
     case supercell = "SideBarCollapsed.supercell"
     case slab = "SideBarCollapsed.slab"
+    case structureTools = "SideBarCollapsed.structureTools"
     case animation = "SideBarCollapsed.animation"
     case coordination = "SideBarCollapsed.coordination"
     case electronicStructure = "SideBarCollapsed.electronicStructure"
@@ -937,4 +1018,12 @@ enum CollapsibleSidebarSection: String, CaseIterable {
     case xrd = "SideBarCollapsed.xrd"
 
     var defaultsKey: String { rawValue }
+}
+
+extension Cell {
+    /// Length of the c lattice vector.
+    var cLength: Float { sqrt(c.x * c.x + c.y * c.y + c.z * c.z) }
+    /// True when the c lattice vector is parallel to the z-axis (its x and y
+    /// components are negligible) — the conventional embedding for a 2D slab.
+    var isCZParallel: Bool { abs(c.x) < 1e-5 && abs(c.y) < 1e-5 }
 }

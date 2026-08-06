@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-06 (v1.1.41: powder X-ray diffraction with wavelength presets, Miller-index peak labels, multiplicities, and optional electron-density projection — 32 focused tests)**.
+Last updated: **2026-08-06 (v1.1.42: structure tools — primitive/conventional transforms, elastic cell deformation, cluster cutting, Miller-index surface cells with termination/multi-slab/vacuum — 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -120,7 +120,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 
 ### Structure editing and generation
 - [~] Cartesian/fractional atom-coordinate editing with bounded undo/redo is implemented (v1.1.35). Insert/remove/substitute operations, bulk displacement tools, lattice-parameter editing, and a unified full editing history remain pending.
-- [ ] Primitive/conventional transformations, elastic cell deformation, cluster cutting, multi-slab construction, Miller-index surface-cell generation, termination selection, and vacuum control. Existing h/k/l slab controls only filter atoms between fractional planes.
+- [x] Primitive/conventional transformations, elastic cell deformation, cluster cutting, Miller-index surface-cell generation with termination selection and multi-slab stacking, and vacuum control (v1.1.42): a Structure Tools sidebar section converts the crystal to the spglib-standardized primitive/conventional cell (user k-paths remapped through Cartesian reciprocal space), applies a validated 3×3 elastic deformation matrix, cuts finite clusters into molecules, and builds 2D surface cells from any 3D crystal through the engine shared with CRYSCAL `SLAB` parsing (h/k/l steppers, atomic-layer count, termination block selection, contiguous slab stacking, and vacuum that both parametrizes the build and live-adjusts the current slab). The pre-existing h/k/l slab controls remain a fractional-plane display filter.
 - [ ] Defect workflows for vacancies, substitutions, and interstitials, with export to XSF, CIF, POSCAR, XYZ, and QE input.
 
 ### Electronic-structure analysis
@@ -157,7 +157,7 @@ All 10 original Tier A items complete: Gaussian Cube/G98, BXSF/Fermi surfaces, 3
 
 ## Tier C — validated by interaction, not files
 
-- [~] **Structure editing**: Cartesian/fractional coordinate edits and bounded undo/redo are implemented; cut cluster/molecule, substitute/remove/insert/displace workflows, elastic cell deformation, and multi-slab generation remain pending.
+- [~] **Structure editing**: Cartesian/fractional coordinate edits and bounded undo/redo are implemented; cut cluster/molecule, elastic cell deformation, and multi-slab generation are implemented (v1.1.42); substitute/remove/insert/displace workflows remain pending.
 - [x] **On-screen bond distance labels** — live distance text above each bond (v1.1.36).
 - [ ] **Image-background variant** — only `solid` + `gradient_top` exist.
 - [ ] **Print** of the view (`NSPrintOperation`).

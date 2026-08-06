@@ -8,7 +8,7 @@ struct Atom: Codable, Equatable { var coord: SIMD3<Float>; var atomicNumber: Int
     var force: SIMD3<Float>?
 }
 struct Bond:  Codable { var i: Int; var j: Int }
-struct Cell:  Codable { var a: SIMD3<Float>; var b: SIMD3<Float>; var c: SIMD3<Float> }
+struct Cell:  Codable, Equatable { var a: SIMD3<Float>; var b: SIMD3<Float>; var c: SIMD3<Float> }
 
 enum DisplayMode: String, Codable, CaseIterable {
     case ballStick, spaceFill, wireFrame, polyhedral, line2D, point2D, ballStick2D

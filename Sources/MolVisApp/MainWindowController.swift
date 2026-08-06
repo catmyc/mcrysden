@@ -258,6 +258,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// single-use). Nil for the empty opening viewer.
     private var sourceURL: URL?
     private var forcedFormat: ParseFormat?
+    /// Runtime-only cell representation for the structure-tools basis transform.
+    /// Session-only (not a Scene field); reset to .input on every fresh file open.
+    private var currentCellRepresentation: CellRepresentation = .input
     /// Editor BZ cache. `BrillouinZone.build` is expensive (cubic in the G-star for
     /// anisotropic cells), so the editor builds at most once per loaded/frame scene and
     /// reuses the result across clicks — including a negative cache of a failed build.
@@ -497,6 +500,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         state.onShowXRDWindow = { [weak self] in self?.showPowderXRD() }
         state.onExportXRDCSV = { [weak self] in self?.exportPowderXRDCSV() }
+        // Structure-tools callbacks (runtime-only transforms + surface builder).
+        state.onApplyBasisTransform = { [weak self] rep in self?.applyBasisTransform(rep) }
+        state.onApplyDeformation = { [weak self] in self?.applyDeformation() }
+        state.onCutCluster = { [weak self] in self?.cutCluster() }
+        state.onBuildSurface = { [weak self] in self?.buildSurfaceCell() }
+        state.onSurfaceVacuumChange = { [weak self] in self?.surfaceVacuumDidChange() }
         // Cursor readouts for the electronic-structure graphs. Assigned after
         // super.init so the closures capture a fully-initialized self.
         bandGrapher.onCursor = { [weak self] info in
@@ -614,8 +623,24 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             UserDefaults.standard.set(url.path, forKey: App.lastOpenedURLKey)
             startFileWatching(url)
         }
+        // Basis transforms are session-only; a fresh file open restores the input
+        // representation regardless of any transform applied to the previous scene.
+        currentCellRepresentation = .input
+        installScene(scene, frameIndex: frameIndex,
+                     frameCount: url.map { Parser.frameCount($0, as: format) } ?? 1)
+    }
+
+    /// Everything that follows the source/url bookkeeping in `loadFile`: installs the
+    /// scene, rebuilds the editor BZ, syncs the sidebar, reframes the camera, installs
+    /// graph data, and initialises the animation controls. Extracted so that in-scene
+    /// transforms (basis/deformation/cluster/surface) can reinstall a derived scene
+    /// through the exact same path without re-opening the source file. Byte-identical
+    /// to the former tail of `loadFile` for the primary open/revert/drop paths.
+    private func installScene(_ scene: Scene, frameIndex: Int, frameCount: Int) {
+        self.scene = scene
         bzEpoch += 1   // new scene: cell/baseAtoms may differ, rebuild the editor BZ
         state.syncFromScene(scene)
+        refreshBasisTransformAvailability()
         // syncFromScene exits edit mode (editKPathOnBZ -> false); mirror that into the
         // renderer so a freshly-loaded scene can't leave stale landmark crosses drawn.
         renderer?.showBZLandmarks = state.editKPathOnBZ
@@ -652,7 +677,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let saved = state.onChange
         state.onChange = nil
         state.frameIndex = frameIndex
-        state.frameCount = url.map { Parser.frameCount($0, as: format) } ?? 1
+        state.frameCount = frameCount
         state.isPlaying = false
         state.onChange = saved
         stopPlayback()
@@ -669,9 +694,139 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         guard let url = sourceURL else { return }
         do {
             let scene = Scene(loaded: try Parser.load(url, as: forcedFormat))
+            currentCellRepresentation = .input
             loadFile(scene, from: url, format: forcedFormat, frameIndex: 0)
         } catch {
             print("[mcrysden] revert failed: \(error)")
+        }
+    }
+
+    /// Refresh the runtime-only basis-transform availability + help text from the
+    /// current scene's symmetry analysis and the active cell representation. Called
+    /// from `installScene` after `syncFromScene`, so the sidebar's structure-tools
+    /// availability mirrors the just-installed scene.
+    private func refreshBasisTransformAvailability() {
+        let sym = scene.crystalSymmetry?.symmetry
+        let is3D = scene.isCrystal && scene.periodicDim == 3 && scene.cell != nil && !scene.atoms.isEmpty
+        let primAvail = is3D && (sym?.primitiveStructure.atomCount ?? 0) < scene.atoms.count
+        let convAvail = is3D && sym != nil && currentCellRepresentation != .conventional
+        state.applyBasisTransformAvailability(
+            primitive: primAvail || (is3D && sym != nil && currentCellRepresentation == .conventional),
+            conventional: convAvail,
+            help: is3D && sym == nil ? (scene.crystalSymmetry?.reasonDescription ?? "symmetry analysis unavailable") : "",
+            representation: currentCellRepresentation)
+    }
+
+    /// Apply a primitive/conventional basis transform, or restore the input cell.
+    func applyBasisTransform(_ representation: CellRepresentation) {
+        guard representation != currentCellRepresentation else { return }
+        if representation == .input {
+            // Session-only transform: restore by re-parsing the source file.
+            if sourceURL != nil {
+                revertToSource()
+            } else {
+                state.setStructureToolsStatus("No source file to revert to.")
+            }
+            return
+        }
+        guard representation != currentCellRepresentation else { return }
+        switch scene.transformed(to: representation) {
+        case .success(let next):
+            var next = next
+            next.transferKPathAcrossGeometryChange(from: scene)
+            currentCellRepresentation = representation
+            installScene(next, frameIndex: 0, frameCount: 1)
+            state.setStructureToolsStatus("Converted to \(representation.label): \(next.atoms.count) atoms")
+        case .failure(let error):
+            state.setStructureToolsStatus(error.description)
+        }
+    }
+
+    /// Apply the 3x3 elastic deformation matrix to the cell.
+    func applyDeformation() {
+        guard state.deformationMatrix.count == 9 else {
+            state.setStructureToolsStatus("Deformation matrix must have 9 elements.")
+            return
+        }
+        let rows = [
+            SIMD3<Float>(state.deformationMatrix[0], state.deformationMatrix[1], state.deformationMatrix[2]),
+            SIMD3<Float>(state.deformationMatrix[3], state.deformationMatrix[4], state.deformationMatrix[5]),
+            SIMD3<Float>(state.deformationMatrix[6], state.deformationMatrix[7], state.deformationMatrix[8]),
+        ]
+        switch scene.deformed(byRows: rows) {
+        case .success(let next):
+            var next = next
+            next.transferKPathAcrossGeometryChange(from: scene)
+            installScene(next, frameIndex: 0, frameCount: 1)
+            state.setStructureToolsStatus("Cell deformed: \(next.atoms.count) atoms")
+        case .failure(let error):
+            state.setStructureToolsStatus(error.description)
+        }
+    }
+
+    /// Cut a finite cluster of atoms within `clusterRadius` of `clusterCenter`.
+    func cutCluster() {
+        switch scene.cutCluster(center: state.clusterCenter, radius: state.clusterRadius) {
+        case .success(let next):
+            installScene(next, frameIndex: 0, frameCount: 1)
+            state.setStructureToolsStatus("Cluster cut: \(next.atoms.count) atoms")
+        case .failure(let error):
+            state.setStructureToolsStatus(error.description)
+        }
+    }
+
+    /// Build a Miller-index surface cell with termination selection + vacuum.
+    func buildSurfaceCell() {
+        guard state.surfaceBuilderAvailable else {
+            state.setSurfaceStatus("Surface builder requires a 3D periodic crystal.",
+                                  terminationOptions: 0, termination: 0)
+            return
+        }
+        let request = SurfaceCellRequest(
+            h: min(8, max(-8, state.surfaceH)),
+            k: min(8, max(-8, state.surfaceK)),
+            l: min(8, max(-8, state.surfaceL)),
+            layers: min(100, max(1, state.surfaceLayers)),
+            vacuum: min(50, max(0, state.surfaceVacuum)),
+            termination: max(0, state.surfaceTermination),
+            stackCount: min(10, max(1, state.surfaceStackCount))
+        )
+        switch scene.buildSurfaceCellWithInfo(request: request) {
+        case .success(let built):
+            let (next, info) = built
+            installScene(next, frameIndex: 0, frameCount: 1)
+            let options = max(0, info.planeCount - request.layers + 1)
+            let termination = options > 0 ? min(state.surfaceTermination, options - 1) : 0
+            let vacuum = max(0, (next.cell?.cLength ?? request.vacuum) - info.slabExtent)
+            state.setSurfaceStatus("Slab (\(request.h) \(request.k) \(request.l)): \(next.atoms.count) atoms, \(info.planeCount) planes, vacuum \(String(format: "%.2f", vacuum)) Å",
+                                 terminationOptions: options, termination: termination)
+        case .failure(let error):
+            state.setSurfaceStatus(error.description, terminationOptions: 0, termination: 0)
+        }
+    }
+
+    /// Vacuum thickness (c length minus slab extent) of the current scene when it
+    /// is a z-parallel 2D slab; nil otherwise. The sidebar's vacuum slider and the
+    /// live-vacuum mirrors compare against this derived value, not the c length.
+    private var currentSlabVacuum: Float? {
+        guard scene.periodicDim == 2, let cell = scene.cell,
+              let extent = scene.surfaceSlabExtent else { return nil }
+        return cell.cLength - extent
+    }
+
+    /// Live vacuum adjust for the current 2D slab via the build slider. Lightweight
+    /// (no full reinstall): just swaps the scene's c length, re-renders, and refresh
+    /// the atom table. No-op unless the scene is a z-parallel 2D slab.
+    func surfaceVacuumDidChange() {
+        guard let currentVacuum = currentSlabVacuum else { return }
+        guard state.surfaceVacuum != currentVacuum else { return }
+        switch scene.withVacuum(state.surfaceVacuum) {
+        case .success(let next):
+            scene = next
+            setNeedsRender()
+            refreshAtomTable()
+        case .failure:
+            state.surfaceVacuum = currentVacuum
         }
     }
 
@@ -3086,6 +3241,21 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             // renders later, so suppress the invalidation render.
             invalidateComparisonRequest(render: false)
             refreshAtomTable()
+        }
+        // Live-vacuum adjust for 2D slabs: the same slider doubles as the build
+        // parameter and a live vacuum control. When the scene is a z-parallel 2D
+        // slab and the slider value differs from the derived vacuum, apply it via
+        // withVacuum. Defensive (the slider's onChange also routes through
+        // onSurfaceVacuumChange); guards failures by mirroring the value back.
+        if let currentVacuum = currentSlabVacuum, state.surfaceVacuum != currentVacuum {
+            switch scene.withVacuum(state.surfaceVacuum) {
+            case .success(let next):
+                scene = next
+                setNeedsRender()
+                refreshAtomTable()
+            case .failure:
+                state.surfaceVacuum = currentVacuum
+            }
         }
         // Reframe when crossing the 2D↔3D boundary — after supercell/slab
         // mutations so the camera fits the final geometry.

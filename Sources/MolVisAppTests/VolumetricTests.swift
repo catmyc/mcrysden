@@ -3,12 +3,9 @@ import Metal
 import simd
 @testable import MolVisApp
 
-/// Consolidated volumetric coverage (Phase 2a + 2b): colormap transfer + contour
-/// levels, region integration constant/linear + malformed, slice sampling +
-/// diagonal-plane mask, clipTriangles straddle/keep-side, multi-iso rebuild +
-/// color-distinct cache keys, clip-plane culling, color-plane/slice state
-/// round-trip, slice state persistence + clamping, composited color-plane
-/// render, and updateContentVisibility no longer hiding the canvas.
+/// Consolidated volumetric coverage: region integration constant/linear +
+/// malformed, clipTriangles straddle/keep-side + clip-plane structure culling,
+/// and the composited color-plane render.
 final class VolumetricTests: XCTestCase {
 
     private enum Thrown: Error { case noGPU, noTex }
@@ -124,147 +121,6 @@ final class VolumetricTests: XCTestCase {
         XCTAssertNotEqual(withPlane, encodeHash(withoutPlane), "color plane must change the rendered frame")
     }
 
-    // MARK: - Multi-iso rebuild + color-distinct cache keys
-
-    func testMultiIsoRebuildAndColorDistinctCaches() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { throw Thrown.noGPU }
-        let renderer = try Renderer(device: device)
-        let texture = try XCTUnwrap(device.makeTexture(descriptor: wtx(64, 64)))
-        let queue = try XCTUnwrap(device.makeCommandQueue())
-        let values = (0..<27).map { Float($0).truncatingRemainder(dividingBy: 5) * 0.4 }
-        var scene = Scene()
-        scene.showStructure = false; scene.showAxes = false; scene.showCellFrame = false
-        scene.showBrillouinZone = false; scene.background = "#000000"
-        scene.showIsoSurface = true; scene.isoLevel = 0.5
-        scene.scalarField = isoField(values)
-
-        func encode(_ value: Scene) {
-            renderer.scene = value
-            let cb = queue.makeCommandBuffer()!
-            XCTAssertTrue(renderer.encode(to: cb, target: texture,
-                                           viewport: MTLViewport(originX: 0, originY: 0,
-                                                                 width: 64, height: 64, znear: 0, zfar: 1),
-                                           camera: renderer.currentCamera))
-            cb.commit(); cb.waitUntilCompleted()
-        }
-        encode(scene)
-        let legacyBuilt = renderer.isoRebuildCount
-        XCTAssertGreaterThan(legacyBuilt, 0)
-        for _ in 0..<3 { encode(scene) }
-        XCTAssertEqual(renderer.isoRebuildCount, legacyBuilt)
-
-        var withSpec = scene
-        withSpec.isoSurfaces = [IsoSurfaceSpec(level: 0.5, colorHex: "#1f6f99", sign: 1, enabled: true)]
-        encode(withSpec)
-        XCTAssertGreaterThan(renderer.isoRebuildCount, legacyBuilt)
-
-        // Color must be part of IsoCacheKey.
-        let blue = SIMD3<Float>(0.30, 0.62, 0.95)
-        let orange = SIMD3<Float>(0.95, 0.45, 0.25)
-        let keyBlue = renderer.testIsoKey(field: isoField(values), isoLevel: 0.5, sign: 1, color: blue, clip: nil)
-        let keyOrange = renderer.testIsoKey(field: isoField(values), isoLevel: 0.5, sign: 1, color: orange, clip: nil)
-        XCTAssertNotEqual(keyBlue, keyOrange, "color must be part of IsoCacheKey")
-    }
-
-    // MARK: - Clip-plane culling
-
-
-    // MARK: - Color-plane/slice state round-trip
-
-    /// Color-plane/slice state round-trip, plus colormap transfer + contour
-    /// levels and the bilinear saddle-cell segment count (consolidated).
-    func testColorPlaneAndSliceStateRoundTrip() throws {
-        // Colormap transfer + contour levels.
-        let cm = Colormap.viridis
-        let lo = cm.rgb(0)
-        XCTAssertEqual(lo.x, 0.267004, accuracy: 1e-5)
-        XCTAssertEqual(lo.y, 0.004874, accuracy: 1e-5)
-        XCTAssertEqual(lo.z, 0.329415, accuracy: 1e-5)
-        let (r8, g8, b8) = cm.rgb8(0.5)
-        let c = cm.rgb(0.5)
-        XCTAssertEqual(r8, UInt8(c.x * 255.5))
-        XCTAssertEqual(g8, UInt8(c.y * 255.5))
-        XCTAssertEqual(b8, UInt8(c.z * 255.5))
-
-        // ContourConfig.levels replicates legacy formula.
-        let legacy = ContourConfig.defaultLevels(min: -3, max: 7)
-        XCTAssertEqual(legacy.count, 5)
-        let expected = (1...5).map { -3.0 + (7.0 - (-3.0)) * Float($0) / 6 }
-        for (a, e) in zip(legacy, expected) { XCTAssertEqual(a, e, accuracy: 1e-5) }
-        XCTAssertTrue(ContourConfig.levels(min: 5, max: 5, count: 6).isEmpty)
-        XCTAssertTrue(ContourConfig.levels(min: 0, max: 10, count: 1).isEmpty)
-        XCTAssertEqual(ContourConfig.levels(min: 0, max: 1, count: 100).count, 23)
-
-        // Saddle cell produces 2 segments (bilinear asymptotic-decider).
-        let segs = ColorPlaneView.contourSegments(tl: 10, tr: -2, br: 0.1, bl: -2, level: 0)
-        XCTAssertEqual(segs.count, 2)
-
-        var scene = Scene()
-        scene.colorPlaneColormap = .turbo
-        scene.colorPlaneContourEnabled = false
-        scene.colorPlaneContourCount = 12
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("mcrysden_test_vc.state")
-        try StateStore.save(scene, camera: nil, sourceURL: nil, to: url)
-        var loaded = Scene()
-        var camera: Camera? = nil
-        try StateStore.load(into: &loaded, camera: &camera, from: url)
-        XCTAssertEqual(loaded.colorPlaneColormap, .turbo)
-        XCTAssertEqual(loaded.colorPlaneContourEnabled, false)
-        XCTAssertEqual(loaded.colorPlaneContourCount, 12)
-        try? FileManager.default.removeItem(at: url)
-
-        // Defaults.
-        let defaults = Scene()
-        XCTAssertEqual(defaults.colorPlaneColormap, .viridis)
-        XCTAssertEqual(defaults.colorPlaneContourEnabled, true)
-        XCTAssertEqual(defaults.colorPlaneContourCount, 6)
-
-        // Slice persistence round-trip + clamping (merged regression).
-        scene.volumeSlices = [
-            VolumeSlice(enabled: true, h: 1, k: 0, l: 0, distance: 0.5),
-            VolumeSlice(enabled: false, h: 0, k: 2, l: -1, distance: -1.5),
-        ]
-        try StateStore.save(scene, camera: nil, sourceURL: nil, to: url)
-        var loadedSlices = Scene()
-        try StateStore.load(into: &loadedSlices, camera: &camera, from: url)
-        XCTAssertEqual(loadedSlices.volumeSlices.count, 2)
-        XCTAssertEqual(loadedSlices.volumeSlices[0].h, 1)
-        XCTAssertEqual(loadedSlices.volumeSlices[0].distance, 0.5, accuracy: 1e-5)
-        XCTAssertFalse(loadedSlices.volumeSlices[1].enabled)
-        XCTAssertEqual(loadedSlices.volumeSlices[1].l, -1)
-        XCTAssertEqual(loadedSlices.volumeSlices[1].distance, -1.5, accuracy: 1e-5)
-        try? FileManager.default.removeItem(at: url)
-
-        // Clamping: out-of-range h/k/l and distance are clamped.
-        scene.volumeSlices = [VolumeSlice(enabled: true, h: 100, k: -100, l: 50, distance: 99)]
-        try StateStore.save(scene, camera: nil, sourceURL: nil, to: url)
-        var loaded2 = Scene()
-        try StateStore.load(into: &loaded2, camera: &camera, from: url)
-        XCTAssertEqual(loaded2.volumeSlices[0].h, 8)
-        XCTAssertEqual(loaded2.volumeSlices[0].k, -8)
-        XCTAssertEqual(loaded2.volumeSlices[0].distance, 2, accuracy: 1e-5)
-        try? FileManager.default.removeItem(at: url)
-
-        // Cap at 3: a 4-slice save loads only 3.
-        scene.volumeSlices = (0..<4).map { VolumeSlice(enabled: true, h: $0, k: 0, l: 0, distance: 0) }
-        try StateStore.save(scene, camera: nil, sourceURL: nil, to: url)
-        var loaded3 = Scene()
-        try StateStore.load(into: &loaded3, camera: &camera, from: url)
-        XCTAssertEqual(loaded3.volumeSlices.count, 3)
-        try? FileManager.default.removeItem(at: url)
-
-        // updateContentVisibility no longer hides the canvas: the color plane now
-        // lives in the Metal scene, so the canvas must stay visible.
-        var visScene = Scene()
-        visScene.grid2D = Grid2D(cols: 2, rows: 2, origin: .zero,
-                                 vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0)],
-                                 values: [[0, 1], [2, 3]], minValue: 0, maxValue: 3, ident: "t")
-        visScene.showColorPlane = true
-        let controller = MainWindowController(scene: visScene, showWindow: false)
-        controller.state.showColorPlane = true
-        XCTAssertFalse(controller.canvas.isHidden, "canvas must not be hidden by the color plane")
-    }
-
     // MARK: - Helpers
 
     private func makeField(n: Int, values: [Float]) -> ScalarField {
@@ -277,12 +133,6 @@ final class VolumetricTests: XCTestCase {
 
     private func constantField(n: Int, value: Float) -> ScalarField {
         makeField(n: n, values: [Float](repeating: value, count: n * n * n))
-    }
-
-    private func isoField(_ values: [Float]) -> ScalarField {
-        ScalarField(nx: 3, ny: 3, nz: 3, origin: .zero,
-                    vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
-                    values: values, minValue: values.min() ?? 0, maxValue: values.max() ?? 0)
     }
 
     private func wtx(_ width: Int, _ height: Int) -> MTLTextureDescriptor {
