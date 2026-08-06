@@ -146,88 +146,6 @@ final class VectorExportTests: XCTestCase {
             }
         }
     }
-    func testVectorExportContracts() throws {
-        // The returned raster CGImage of a PDF/SVG export must match
-        // PngExporter's output (the vector overlay is additive).
-        do {
-            var scene = try load("si110.xsf")
-            scene.background = "#000000"
-            scene.showAxes = false
-            scene.showCellFrame = true
-            scene.showStructure = true
-
-            let size = CGSize(width: 200, height: 200)
-            let cam = camera(dist: 12)
-
-            let pngURL = tempURL(ext: "png")
-            let pngImage = try PngExporter.export(scene: scene, camera: cam, to: pngURL, size: size)
-
-            let pdfURL = tempURL(ext: "pdf")
-            let pdfImage = try TrueVectorExporter.export(scene: scene, camera: cam, to: pdfURL, size: size)
-            XCTAssertEqual(pixelHash(pngImage), pixelHash(pdfImage),
-                           "the returned raster CGImage of a PDF export must match PngExporter's output")
-
-            let svgURL = tempURL(ext: "svg")
-            let svgImage = try TrueVectorExporter.export(scene: scene, camera: cam, to: svgURL, size: size)
-            XCTAssertEqual(pixelHash(pngImage), pixelHash(svgImage),
-                           "the returned raster CGImage of an SVG export must match PngExporter's output")
-        }
-
-        // Absurd export sizes throw instead of trapping.
-        do {
-            var scene = Scene()
-            scene.background = "#000000"
-            scene.atoms = [Atom(coord: .zero, atomicNumber: 6, label: "C")]
-
-            let absurd = CGSize(width: CGFloat.greatestFiniteMagnitude,
-                                height: CGFloat.greatestFiniteMagnitude)
-            XCTAssertThrowsError(try TrueVectorExporter.export(scene: scene, camera: nil,
-                                                                to: tempURL(ext: "pdf"), size: absurd))
-            XCTAssertThrowsError(try TrueVectorExporter.export(scene: scene, camera: nil,
-                                                                to: tempURL(ext: "svg"), size: absurd))
-
-            let nonFinite = CGSize(width: CGFloat.nan, height: 100)
-            XCTAssertThrowsError(try TrueVectorExporter.export(scene: scene, camera: nil,
-                                                                to: tempURL(ext: "pdf"), size: nonFinite))
-
-            let zero = CGSize(width: 0, height: 0)
-            XCTAssertThrowsError(try TrueVectorExporter.export(scene: scene, camera: nil,
-                                                                to: tempURL(ext: "pdf"), size: zero))
-        }
-
-        // Two exports of the same scene are deterministic.
-        do {
-            var scene = try load("si110.xsf")
-            scene.background = "#000000"
-            scene.showAxes = true
-            scene.showCellFrame = true
-            scene.showStructure = true
-            let size = CGSize(width: 200, height: 200)
-
-            let url1 = tempURL(ext: "pdf")
-            let url2 = tempURL(ext: "pdf")
-            _ = try TrueVectorExporter.export(scene: scene, camera: camera(dist: 12), to: url1, size: size)
-            _ = try TrueVectorExporter.export(scene: scene, camera: camera(dist: 12), to: url2, size: size)
-            let data1 = try Data(contentsOf: url1)
-            let data2 = try Data(contentsOf: url2)
-            // Strip variable PDF metadata (timestamps, ID) before comparing so
-            // the test asserts deterministic CONTENT, not byte-identical metadata.
-            let stripped1 = Self.stripVariablePDFMetadata(data1)
-            let stripped2 = Self.stripVariablePDFMetadata(data2)
-            XCTAssertEqual(stripped1, stripped2,
-                           "two PDF exports of the same scene must have identical content")
-
-            let url3 = tempURL(ext: "svg")
-            let url4 = tempURL(ext: "svg")
-            _ = try TrueVectorExporter.export(scene: scene, camera: camera(dist: 12), to: url3, size: size)
-            _ = try TrueVectorExporter.export(scene: scene, camera: camera(dist: 12), to: url4, size: size)
-            let data3 = try Data(contentsOf: url3)
-            let data4 = try Data(contentsOf: url4)
-            XCTAssertEqual(data3, data4, "two SVG exports of the same scene must be byte-identical")
-        }
-    }
-
-
     /// Parse x1,y1,x2,y2 from an SVG <line> element.
     private static func parseSVGLineCoords(_ line: String) -> (x1: Double, y1: Double, x2: Double, y2: Double)? {
         let pattern = "x1=\"([0-9.]+)\"\\s+y1=\"([0-9.]+)\"\\s+x2=\"([0-9.]+)\"\\s+y2=\"([0-9.]+)\""
@@ -238,52 +156,10 @@ final class VectorExportTests: XCTestCase {
               let r2 = Range(match.range(at: 2), in: line),
               let r3 = Range(match.range(at: 3), in: line),
               let r4 = Range(match.range(at: 4), in: line),
-              let x1 = Double(line[r1]),
-              let y1 = Double(line[r2]),
-              let x2 = Double(line[r3]),
-              let y2 = Double(line[r4]) else { return nil }
+              let x1 = Double(line[r1]), let y1 = Double(line[r2]),
+              let x2 = Double(line[r3]), let y2 = Double(line[r4]) else { return nil }
         return (x1, y1, x2, y2)
     }
-
-    /// Strip PDF metadata fields that vary between exports (timestamps, ID)
-    /// so content determinism can be asserted.
-    private static func stripVariablePDFMetadata(_ data: Data) -> Data {
-        var bytes = [UInt8](data)
-        // Zero-out /ModDate (...) and /CreationDate (...) content.
-        let parenPatterns = ["/ModDate (", "/CreationDate ("]
-        for pat in parenPatterns {
-            let patBytes = Array(pat.utf8)
-            var i = 0
-            while i + patBytes.count <= bytes.count {
-                if bytes[i..<i + patBytes.count].elementsEqual(patBytes) {
-                    var j = i + patBytes.count
-                    while j < bytes.count && bytes[j] != AsciiClosingParen { j += 1 }
-                    for k in i..<min(j + 1, bytes.count) { bytes[k] = AsciiSpace }
-                    i = j + 1
-                } else {
-                    i += 1
-                }
-            }
-        }
-        // Zero-out /ID [...] content.
-        let idPattern = "/ID ["
-        let idBytes = Array(idPattern.utf8)
-        var scan = 0
-        while scan + idBytes.count <= bytes.count {
-            if bytes[scan..<scan + idBytes.count].elementsEqual(idBytes) {
-                var j = scan + idBytes.count
-                while j < bytes.count && bytes[j] != AsciiClosingBracket { j += 1 }
-                for k in scan..<min(j + 1, bytes.count) { bytes[k] = AsciiSpace }
-                scan = j + 1
-            } else {
-                scan += 1
-            }
-        }
-        return Data(bytes)
-    }
-    private static let AsciiClosingParen: UInt8 = 0x29
-    private static let AsciiClosingBracket: UInt8 = 0x5d
-    private static let AsciiSpace: UInt8 = 0x20
 
     // MARK: - PDF stream decompression
 

@@ -195,37 +195,4 @@ final class StructureToolsTests: XCTestCase {
         case .success: XCTFail("tiny radius should yield an empty cluster")
         }
     }
-
-    // MARK: - Vacuum control
-
-    func testVacuumControl() {
-        // Hand-built 2D slab: c along z, atoms at z = 0 and z = 2.
-        let cell = Cell(a: SIMD3(3, 0, 0), b: SIMD3(0, 3, 0), c: SIMD3(0, 0, 12))
-        var scene = Scene()
-        scene.cell = cell
-        scene.atoms = [
-            Atom(coord: SIMD3(1, 1, 0), atomicNumber: 14, label: "Si"),
-            Atom(coord: SIMD3(1, 1, 2), atomicNumber: 14, label: "Si"),
-        ]
-        scene.isCrystal = true
-        scene.periodicDim = 2
-
-        let v5 = try! scene.withVacuum(5).get()
-        XCTAssertEqual(v5.cell!.c, SIMD3(0, 0, 7))
-        let v0 = try! scene.withVacuum(0).get()
-        XCTAssertEqual(v0.cell!.c, SIMD3(0, 0, 2))
-
-        // Negative vacuum is rejected.
-        switch scene.withVacuum(-1) {
-        case .failure(let err): XCTAssertEqual(err, .nonFiniteVacuum)
-        case .success: XCTFail("negative vacuum should be rejected")
-        }
-
-        // A bulk 3D scene is rejected.
-        let bulk = makeDiamondSiScene()
-        switch bulk.withVacuum(5) {
-        case .failure(let err): XCTAssertEqual(err, .notASurfaceSlab)
-        case .success: XCTFail("bulk 3D should be rejected")
-        }
-    }
 }

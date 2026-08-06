@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-06 (v1.1.42: structure tools — primitive/conventional transforms, elastic cell deformation, cluster cutting, Miller-index surface cells with termination/multi-slab/vacuum — 32 focused tests)**.
+Last updated: **2026-08-06 (v1.1.43: structure editing and generation — insert/remove/substitute/displace, lattice-parameter editing, unified editing history, defect workflows, and XSF/CIF/POSCAR/XYZ/QE structure export — 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -119,9 +119,9 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Atom filtering/highlighting by element, coordination, region, or selection expression, plus on-screen bond-distance labels (v1.1.36; hardened v1.1.37): fail-closed region/expression filtering (`x>0.5`, `a<=0.25`, `box:…`, `sphere:…`) joins the linked atom-table element/label/CN filters, and a persisted, bounded bond-distance label toggle draws clamped Å text at projected bond midpoints.
 
 ### Structure editing and generation
-- [~] Cartesian/fractional atom-coordinate editing with bounded undo/redo is implemented (v1.1.35). Insert/remove/substitute operations, bulk displacement tools, lattice-parameter editing, and a unified full editing history remain pending.
+- [x] Atom editing and generation (v1.1.43): insert/remove/substitute atom operations, bulk displacement (all atoms or selection), and lattice-parameter editing (a/b/c, α/β/γ) join the existing Cartesian/fractional coordinate editing behind one unified NSUndoManager editing history with per-operation action names. The Structure Tools sidebar hosts an Element field + fractional/Cartesian position sliders for interstitial insertion, "Remove Selected (Vacancy)" and "Substitute Selected" defect actions, and Δx/Δy/Δz displace controls; all operations are gated on pristine geometry within the 10 000-atom cap, validated transactionally through the shared `StructureEditing` engine, rebond, re-run symmetry analysis, and regenerate generated k-paths (user-edited routes are remapped through Cartesian reciprocal space on lattice edits).
 - [x] Primitive/conventional transformations, elastic cell deformation, cluster cutting, Miller-index surface-cell generation with termination selection and multi-slab stacking, and vacuum control (v1.1.42): a Structure Tools sidebar section converts the crystal to the spglib-standardized primitive/conventional cell (user k-paths remapped through Cartesian reciprocal space), applies a validated 3×3 elastic deformation matrix, cuts finite clusters into molecules, and builds 2D surface cells from any 3D crystal through the engine shared with CRYSCAL `SLAB` parsing (h/k/l steppers, atomic-layer count, termination block selection, contiguous slab stacking, and vacuum that both parametrizes the build and live-adjusts the current slab). The pre-existing h/k/l slab controls remain a fractional-plane display filter.
-- [ ] Defect workflows for vacancies, substitutions, and interstitials, with export to XSF, CIF, POSCAR, XYZ, and QE input.
+- [x] Defect workflows (v1.1.43): vacancies (remove selected atoms), substitutions (replace the species of a selection), and interstitials (insert an atom at a fractional/Cartesian position), with structure export to XSF, CIF, POSCAR, XYZ, and QE PWscf input via `File > Export Structure…` or the sidebar export buttons — each format matches its parser exactly so files round-trip.
 
 ### Electronic-structure analysis
 - [~] Interactive band/DOS cursor readout, energy windows, Fermi adjustment, and zoom/pan are implemented for both graphers; linked plots and projected species/orbital coloring remain pending.
@@ -157,7 +157,7 @@ All 10 original Tier A items complete: Gaussian Cube/G98, BXSF/Fermi surfaces, 3
 
 ## Tier C — validated by interaction, not files
 
-- [~] **Structure editing**: Cartesian/fractional coordinate edits and bounded undo/redo are implemented; cut cluster/molecule, elastic cell deformation, and multi-slab generation are implemented (v1.1.42); substitute/remove/insert/displace workflows remain pending.
+- [x] **Structure editing** (v1.1.43): Cartesian/fractional coordinate edits, cut cluster/molecule, elastic cell deformation, multi-slab generation, insert/remove/substitute/displace operations, lattice-parameter editing, defect workflows, and a unified editing history are all implemented.
 - [x] **On-screen bond distance labels** — live distance text above each bond (v1.1.36).
 - [ ] **Image-background variant** — only `solid` + `gradient_top` exist.
 - [ ] **Print** of the view (`NSPrintOperation`).

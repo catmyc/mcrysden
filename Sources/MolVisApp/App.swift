@@ -640,6 +640,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         saveStateAsItem.target = self
         let exportItem = file.addItem(withTitle: "Export\u{2026}", action: #selector(exportDocument), keyEquivalent: "e")
         exportItem.target = self
+        let exportStructureItem = file.addItem(withTitle: "Export Structure\u{2026}", action: #selector(exportStructureDocument), keyEquivalent: "")
+        exportStructureItem.target = self
         let exportOptionsItem = file.addItem(withTitle: "Export Options\u{2026}", action: #selector(showExportOptions), keyEquivalent: "")
         exportOptionsItem.target = self
         let newWindowItem = file.addItem(withTitle: "New Window", action: #selector(newDocument), keyEquivalent: "N")
@@ -750,6 +752,36 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 print("[mcrysden] export failed: \(error)")
                 self.presentFileOperationError(error, title: "export failed", for: wc)
             }
+        }
+    }
+
+    /// File > Export Structure…  Choose a format from an accessory popup, then
+    /// write the structure through the controller's direct-write path.
+    @MainActor
+    @objc private func exportStructureDocument(_ sender: Any?) {
+        guard let wc = mainWC else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "structure.xsf"
+        panel.canCreateDirectories = true
+
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 180, height: 25), pullsDown: false)
+        for format in StructureExportFormat.allCases {
+            popup.addItem(withTitle: format.label)
+            popup.lastItem?.representedObject = format
+            if format == .xsf { popup.select(popup.lastItem) }
+        }
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 36))
+        let label = NSTextField(labelWithString: "Format:")
+        label.frame = NSRect(x: 0, y: 12, width: 50, height: 20)
+        popup.frame = NSRect(x: 56, y: 10, width: 190, height: 25)
+        accessory.addSubview(label)
+        accessory.addSubview(popup)
+        panel.accessoryView = accessory
+
+        panel.beginSheetModal(for: wc.window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            let format = popup.selectedItem?.representedObject as? StructureExportFormat ?? .xsf
+            wc.exportStructure(format, to: url)
         }
     }
 
@@ -1161,7 +1193,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.42"
+    static let appVersion = "1.1.43"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

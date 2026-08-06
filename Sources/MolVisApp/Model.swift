@@ -112,8 +112,7 @@ enum AnaglyphMode: Int, Codable {
 
 /// Per-mode channel selection masks for the anaglyph merge. The left eye
 /// contributes only the channels where leftMask is true; the right eye
-/// contributes only the channels where rightMask is true. Deterministic and
-/// unit-tested (BackgroundStereoTests.testAnaglyphChannelMasks).
+/// contributes only the channels where rightMask is true. Deterministic.
 struct AnaglyphChannelMasks {
     let left: SIMD3<Float>
     let right: SIMD3<Float>

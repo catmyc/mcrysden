@@ -311,6 +311,30 @@ final class SideBarState: ObservableObject {
     @Published private(set) var structureToolsStatusText = ""
     @Published private(set) var surfaceStatusText = ""
     @Published private(set) var surfaceBuilderAvailable = false
+    // --- Structure editing (runtime-only, not persisted) ---
+    @Published private(set) var structureEditingAvailable = false
+    @Published private(set) var structureEditStatusText = ""
+    @Published var latticeA: Float = 0
+    @Published var latticeB: Float = 0
+    @Published var latticeC: Float = 0
+    @Published var latticeAlpha: Float = 0
+    @Published var latticeBeta: Float = 0
+    @Published var latticeGamma: Float = 0
+    @Published var defectElementSymbol: String = "Si"
+    @Published var interstitialFracX: Float = 0.5
+    @Published var interstitialFracY: Float = 0.5
+    @Published var interstitialFracZ: Float = 0.5
+    @Published var displaceDeltaX: Float = 0
+    @Published var displaceDeltaY: Float = 0
+    @Published var displaceDeltaZ: Float = 0
+    @Published var displaceAllAtoms = true
+    var onInsertInterstitial: (() -> Void)?
+    var onRemoveSelectedAtoms: (() -> Void)?
+    var onSubstituteSelected: (() -> Void)?
+    var onDisplaceAtoms: (() -> Void)?
+    var onApplyLattice: (() -> Void)?
+    var onResetLattice: (() -> Void)?
+    var onExportStructure: ((StructureExportFormat) -> Void)?
     /// True when the current scene is a z-parallel 2D slab whose vacuum the
     /// surface-vacuum slider can adjust live (not just at build time).
     @Published private(set) var surfaceVacuumAdjustable = false
@@ -550,9 +574,21 @@ final class SideBarState: ObservableObject {
             : ""
         surfaceBuilderAvailable = structure3D
         surfaceTerminationOptions = 0
+        // Structure editing availability mirrors the engine's editability gate
+        // (pristine geometry within the atom cap).
+        structureEditingAvailable = scene.isStructureEditable
+        if let params = scene.cellParameters {
+            latticeA = params.a
+            latticeB = params.b
+            latticeC = params.c
+            latticeAlpha = params.alpha
+            latticeBeta = params.beta
+            latticeGamma = params.gamma
+        }
         // Transient status lines describe the previous scene's actions.
         structureToolsStatusText = ""
         surfaceStatusText = ""
+        structureEditStatusText = ""
         // The vacuum slider shows the derived vacuum (c length minus slab extent)
         // for a z-parallel 2D slab, so the live-vacuum comparisons are consistent.
         if scene.periodicDim == 2, let cell = scene.cell, cell.isCZParallel,
@@ -579,6 +615,11 @@ final class SideBarState: ObservableObject {
     /// Set the runtime-only structure-tools status line (basis/deformation/cluster).
     func setStructureToolsStatus(_ text: String) {
         structureToolsStatusText = text
+    }
+
+    /// Set the runtime-only structure-editing status line (defects/lattice/export).
+    func setStructureEditStatus(_ text: String) {
+        structureEditStatusText = text
     }
 
     /// Set the runtime-only surface-builder status line + termination availability.

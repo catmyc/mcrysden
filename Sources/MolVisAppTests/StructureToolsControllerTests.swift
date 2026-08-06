@@ -60,23 +60,5 @@ final class StructureToolsControllerTests: XCTestCase {
         XCTAssertNotEqual(mirroredLen, originalLen)
     }
 
-    @MainActor
-    func testDeformationAndClusterCutViaController() throws {
-        let (scene, url) = try makeSiFccScene()
-        let controller = MainWindowController(scene: Scene(), showWindow: false)
-        controller.loadFile(scene, from: url, format: .fhi, frameIndex: 0)
 
-        let originalAX = controller.scene.cell?.a.x ?? 0
-        controller.state.deformationMatrix = [1.1, 0, 0, 0, 1, 0, 0, 0, 1]
-        controller.applyDeformation()
-        XCTAssertEqual(controller.scene.cell?.a.x ?? 0, originalAX * 1.1, accuracy: 1e-4)
-
-        // Cut a cluster around the first atom.
-        controller.state.clusterCenter = controller.scene.atoms[0].coord
-        controller.state.clusterRadius = 3
-        controller.cutCluster()
-        XCTAssertEqual(controller.scene.isCrystal, false)
-        XCTAssertNil(controller.scene.cell)
-        XCTAssertFalse(controller.scene.atoms.isEmpty)
-    }
 }

@@ -1012,6 +1012,108 @@ struct SideBar: View {
                 .font(.caption).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+
+        // --- Lattice ---
+        if state.isCrystal {
+            Text("Lattice").font(.subheadline).bold()
+            Grid(alignment: .leading, horizontalSpacing: 4, verticalSpacing: 2) {
+                GridRow {
+                    Text("a").font(.caption)
+                    TextField("", value: $state.latticeA, format: .number).frame(width: 64)
+                        .disabled(!state.structureEditingAvailable)
+                    Text("b").font(.caption)
+                    TextField("", value: $state.latticeB, format: .number).frame(width: 64)
+                        .disabled(!state.structureEditingAvailable)
+                    Text("c").font(.caption)
+                    TextField("", value: $state.latticeC, format: .number).frame(width: 64)
+                        .disabled(!state.structureEditingAvailable)
+                }
+                GridRow {
+                    Text("α").font(.caption)
+                    TextField("", value: $state.latticeAlpha, format: .number).frame(width: 64)
+                        .disabled(!state.structureEditingAvailable)
+                    Text("β").font(.caption)
+                    TextField("", value: $state.latticeBeta, format: .number).frame(width: 64)
+                        .disabled(!state.structureEditingAvailable)
+                    Text("γ").font(.caption)
+                    TextField("", value: $state.latticeGamma, format: .number).frame(width: 64)
+                        .disabled(!state.structureEditingAvailable)
+                }
+            }
+            HStack {
+                Button("Apply") { state.onApplyLattice?() }
+                    .disabled(!state.structureEditingAvailable)
+                Button("Reset") { state.onResetLattice?() }
+            }
+            .buttonStyle(.bordered)
+        }
+
+        // --- Atoms & Defects ---
+        if state.structureSummary?.atomCount ?? 0 > 0 {
+            Text("Atoms & Defects").font(.subheadline).bold()
+            HStack {
+                Text("Element").font(.caption)
+                TextField("Si", text: $state.defectElementSymbol).frame(width: 56)
+                    .disabled(!state.structureEditingAvailable)
+                Button("Insert Atom") { state.onInsertInterstitial?() }
+                    .disabled(!state.structureEditingAvailable)
+            }
+            Grid(alignment: .leading, horizontalSpacing: 4, verticalSpacing: 2) {
+                GridRow {
+                    Text(state.isCrystal ? "a (frac)" : "x (Å)").font(.caption)
+                    Slider(value: $state.interstitialFracX, in: 0...1, step: 0.01)
+                }
+                GridRow {
+                    Text(state.isCrystal ? "b (frac)" : "y (Å)").font(.caption)
+                    Slider(value: $state.interstitialFracY, in: 0...1, step: 0.01)
+                }
+                GridRow {
+                    Text(state.isCrystal ? "c (frac)" : "z (Å)").font(.caption)
+                    Slider(value: $state.interstitialFracZ, in: 0...1, step: 0.01)
+                }
+            }
+            .disabled(!state.structureEditingAvailable)
+            HStack {
+                Button("Remove Selected (Vacancy)") { state.onRemoveSelectedAtoms?() }
+                    .disabled(!state.structureEditingAvailable)
+                Button("Substitute Selected") { state.onSubstituteSelected?() }
+                    .disabled(!state.structureEditingAvailable)
+            }
+            .buttonStyle(.bordered)
+            Grid(alignment: .leading, horizontalSpacing: 4, verticalSpacing: 2) {
+                GridRow {
+                    Text("dx").font(.caption)
+                    TextField("", value: $state.displaceDeltaX, format: .number).frame(width: 56)
+                    Text("dy").font(.caption)
+                    TextField("", value: $state.displaceDeltaY, format: .number).frame(width: 56)
+                    Text("dz").font(.caption)
+                    TextField("", value: $state.displaceDeltaZ, format: .number).frame(width: 56)
+                }
+            }
+            .disabled(!state.structureEditingAvailable)
+            Toggle("All atoms", isOn: $state.displaceAllAtoms)
+                .disabled(!state.structureEditingAvailable)
+            Button("Displace") { state.onDisplaceAtoms?() }
+                .disabled(!state.structureEditingAvailable)
+                .buttonStyle(.bordered)
+            if !state.structureEditStatusText.isEmpty {
+                Text(state.structureEditStatusText)
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+
+        // --- Export Structure ---
+        if state.structureSummary?.atomCount ?? 0 > 0 {
+            Text("Export Structure").font(.subheadline).bold()
+            HStack {
+                ForEach(StructureExportFormat.allCases, id: \.self) { format in
+                    Button(format.label) { state.onExportStructure?(format) }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
+        }
     }
 
     /// 3x3 deformation matrix editor. Bounds-safe: each field reads/writes only

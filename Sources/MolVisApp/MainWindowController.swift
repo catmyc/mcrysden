@@ -506,6 +506,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onCutCluster = { [weak self] in self?.cutCluster() }
         state.onBuildSurface = { [weak self] in self?.buildSurfaceCell() }
         state.onSurfaceVacuumChange = { [weak self] in self?.surfaceVacuumDidChange() }
+        // Structure-editing callbacks.
+        state.onInsertInterstitial = { [weak self] in self?.insertInterstitialFromState() }
+        state.onRemoveSelectedAtoms = { [weak self] in self?.removeSelectedAtoms() }
+        state.onSubstituteSelected = { [weak self] in self?.substituteSelectedFromState() }
+        state.onDisplaceAtoms = { [weak self] in self?.displaceFromState() }
+        state.onApplyLattice = { [weak self] in self?.applyLatticeParameters() }
+        state.onResetLattice = { [weak self] in self?.resetLatticeParameters() }
+        state.onExportStructure = { [weak self] format in self?.exportStructure(format) }
         // Cursor readouts for the electronic-structure graphs. Assigned after
         // super.init so the closures capture a fully-initialized self.
         bandGrapher.onCursor = { [weak self] info in
@@ -1076,7 +1084,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
         // Register bounded undo: capture the pre-edit scene. Coalesced — one
         // entry per cell commit.
-        pushCoordinateUndo(preEditScene)
+        pushEditUndo(preEditScene, actionName: "Edit Atom Coordinate")
 
         // Run the remaining invalidation lifecycle.
         runCoordinateEditLifecycle()
@@ -1098,7 +1106,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// per commit; the redo stack (in NSUndoManager) is cleared automatically
     /// because a new edit invalidates redo history. Skipped (with a clear
     /// status) when the structure exceeds the undo atom cap.
-    private func pushCoordinateUndo(_ preEditScene: Scene) {
+    private func pushEditUndo(_ preEditScene: Scene, actionName: String) {
         if preEditScene.atoms.count > Self.coordinateUndoMaxAtoms {
             coordinateUndoDisabledReason = "Undo disabled: structure has \(preEditScene.atoms.count) atoms (cap \(Self.coordinateUndoMaxAtoms))."
             return
@@ -1110,23 +1118,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         guard let undoManager = window.undoManager else { return }
         undoManager.beginUndoGrouping()
         undoManager.registerUndo(withTarget: self) { [weak self] _ in
-            self?.restoreSceneForUndo(preEditScene)
+            self?.restoreSceneForUndo(preEditScene, actionName: actionName)
         }
-        undoManager.setActionName("Edit Atom Coordinate")
+        undoManager.setActionName(actionName)
         undoManager.endUndoGrouping()
     }
 
     /// Restore a pre- or post-edit scene as part of an undo/redo. Called by
     /// NSUndoManager. Registers the inverse action so undo and redo are
     /// symmetric, then runs the invalidation lifecycle.
-    func restoreSceneForUndo(_ targetScene: Scene) {
+    func restoreSceneForUndo(_ targetScene: Scene, actionName: String) {
         let currentScene = scene
         scene = targetScene
         // Register the inverse so the user can redo (or undo again).
         window.undoManager?.registerUndo(withTarget: self) { [weak self] _ in
-            self?.restoreSceneForUndo(currentScene)
+            self?.restoreSceneForUndo(currentScene, actionName: actionName)
         }
-        window.undoManager?.setActionName("Edit Atom Coordinate")
+        window.undoManager?.setActionName(actionName)
         runCoordinateEditLifecycle()
         syncAtomTableEditingState()
     }
@@ -1187,6 +1195,185 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         atomTable.editingDisabledReason = reason
         atomTable.tableView.toolTip = reason
         atomTable.tableView.setAccessibilityHelp(reason)
+    }
+
+    /// Apply a structure-edit engine result transactionally: capture the pre-edit
+    /// scene, install the new scene, register one undo group, and run the shared
+    /// invalidation lifecycle. Returns false (with status text) on failure.
+    @discardableResult
+    private func applyEditResult(_ result: Result<Scene, StructureEditError>,
+                                 actionName: String, status: (String) -> Void) -> Bool {
+        switch result {
+        case .failure(let error):
+            status(error.description)
+            return false
+        case .success(let newScene):
+            if scene.atoms.count > Self.coordinateUndoMaxAtoms {
+                status("Editing disabled: structure has \(scene.atoms.count) atoms (editable cap \(Self.coordinateUndoMaxAtoms)).")
+                return false
+            }
+            let preEdit = scene
+            scene = newScene
+            pushEditUndo(preEdit, actionName: actionName)
+            runCoordinateEditLifecycle()
+            syncAtomTableEditingState()
+            refreshAtomTable()
+            return true
+        }
+    }
+
+    /// Insert an atom at the given position (fractional when the scene is a crystal).
+    @discardableResult
+    func insertAtom(element: Int, position: SIMD3<Float>, fractional: Bool) -> Bool {
+        applyEditResult(scene.insertingAtom(element: element, label: nil, position: position, fractional: fractional),
+                        actionName: "Insert Atom") { [weak self] in self?.state.setStructureEditStatus($0) }
+    }
+
+    /// Remove the atoms at the current selection.
+    @discardableResult
+    func removeSelectedAtoms() -> Bool {
+        let indices = scene.selectedAtoms
+        let count = indices.count
+        let ok = applyEditResult(scene.removingAtoms(at: indices),
+                                 actionName: "Remove Atoms") { [weak self] in self?.state.setStructureEditStatus($0) }
+        if ok { state.setStructureEditStatus("Removed \(count) atoms") }
+        return ok
+    }
+
+    /// Substitute the species of the selected atoms.
+    @discardableResult
+    func substituteSelectedAtoms(element: Int) -> Bool {
+        let indices = scene.selectedAtoms
+        let count = indices.count
+        let ok = applyEditResult(scene.substitutingAtoms(at: indices, element: element, label: nil),
+                                 actionName: "Substitute Species") { [weak self] in self?.state.setStructureEditStatus($0) }
+        if ok { state.setStructureEditStatus("Substituted \(count) atoms to \(ElementTable.symbol(element))") }
+        return ok
+    }
+
+    /// Bulk-displace atoms by `delta` (Å, Cartesian). nil indices = all atoms.
+    @discardableResult
+    func displaceAtoms(indices: [Int]?, by delta: SIMD3<Float>) -> Bool {
+        applyEditResult(scene.displacingAtoms(at: indices, by: delta),
+                        actionName: "Displace Atoms") { [weak self] in self?.state.setStructureEditStatus($0) }
+    }
+
+    /// Edit the lattice parameters from the sidebar state. On success mirror the
+    /// new cell parameters back into the lattice fields. A cell change alters the
+    /// reciprocal basis, so user-edited k-paths are remapped through Cartesian
+    /// reciprocal space (generated routes were already regenerated by the engine).
+    @discardableResult
+    func applyLatticeParameters() -> Bool {
+        let preEdit = scene
+        let ok = applyEditResult(
+            scene.editingLattice(a: state.latticeA, b: state.latticeB, c: state.latticeC,
+                                     alpha: state.latticeAlpha, beta: state.latticeBeta, gamma: state.latticeGamma),
+            actionName: "Edit Lattice Parameters") { [weak self] in self?.state.setStructureEditStatus($0) }
+        if ok {
+            scene.transferKPathAcrossGeometryChange(from: preEdit)
+            // Re-mirror the (possibly remapped) route into the sidebar.
+            state.replaceKPath(points: scene.kPathPoints, breaks: scene.kPathBreaks,
+                               provenance: scene.kPathProvenance, signature: scene.kPathSignature)
+            if let params = scene.cellParameters {
+                let saved = state.onChange
+                state.onChange = nil
+                state.latticeA = params.a
+                state.latticeB = params.b
+                state.latticeC = params.c
+                state.latticeAlpha = params.alpha
+                state.latticeBeta = params.beta
+                state.latticeGamma = params.gamma
+                state.onChange = saved
+                state.refreshKPathMetrics(for: scene.cell)
+            }
+        }
+        return ok
+    }
+
+    /// Prefill the lattice fields from the current cell (no-op when non-crystalline).
+    func resetLatticeParameters() {
+        guard let params = scene.cellParameters else { return }
+        let saved = state.onChange
+        state.onChange = nil
+        state.latticeA = params.a
+        state.latticeB = params.b
+        state.latticeC = params.c
+        state.latticeAlpha = params.alpha
+        state.latticeBeta = params.beta
+        state.latticeGamma = params.gamma
+        state.onChange = saved
+    }
+
+    /// Insert an atom at the interstitial fractional/Cartesian position from state.
+    @discardableResult
+    func insertInterstitialFromState() -> Bool {
+        let symbol = state.defectElementSymbol
+        let element = ElementTable.atomicNumber(symbol)
+        guard element != 0 else {
+            state.setStructureEditStatus("Unknown element symbol \"\(symbol)\"")
+            return false
+        }
+        let fractional = scene.isCrystal && scene.cell != nil
+        let position = SIMD3(state.interstitialFracX, state.interstitialFracY, state.interstitialFracZ)
+        return insertAtom(element: element, position: position, fractional: fractional)
+    }
+
+    /// Substitute the selected atoms to the element from state.
+    @discardableResult
+    func substituteSelectedFromState() -> Bool {
+        let symbol = state.defectElementSymbol
+        let element = ElementTable.atomicNumber(symbol)
+        guard element != 0 else {
+            state.setStructureEditStatus("Unknown element symbol \"\(symbol)\"")
+            return false
+        }
+        return substituteSelectedAtoms(element: element)
+    }
+
+    /// Displace atoms from the sidebar delta/selection state.
+    @discardableResult
+    func displaceFromState() -> Bool {
+        let delta = SIMD3(state.displaceDeltaX, state.displaceDeltaY, state.displaceDeltaZ)
+        let indices = state.displaceAllAtoms ? nil : scene.selectedAtoms
+        return displaceAtoms(indices: indices, by: delta)
+    }
+
+    /// Serialize the current scene to the given export format (used by tests).
+    func structureExportText(_ format: StructureExportFormat) throws -> String {
+        try StructureWriter.write(scene, as: format)
+    }
+
+    /// Present a save panel and write the structure in the chosen format.
+    func exportStructure(_ format: StructureExportFormat) {
+        guard !scene.atoms.isEmpty else {
+            state.setStructureEditStatus("No atoms to export.")
+            return
+        }
+        let panel = NSSavePanel()
+        let base = scene.title.isEmpty ? "structure" : scene.title
+        panel.nameFieldStringValue = "\(base).\(format.fileExtension)"
+        panel.allowedContentTypes = [UTType(filenameExtension: format.fileExtension) ?? .plainText]
+        panel.canCreateDirectories = true
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            self.exportStructure(format, to: url)
+        }
+    }
+
+    /// Write the structure in `format` directly to `url` (used by the File menu).
+    func exportStructure(_ format: StructureExportFormat, to url: URL) {
+        do {
+            let text = try structureExportText(format)
+            try text.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Structure Export Failed"
+            alert.informativeText = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.beginSheetModal(for: window)
+        }
     }
 
     /// Lazily create (once) and show the auxiliary neighbor-table panel.

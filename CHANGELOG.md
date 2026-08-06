@@ -2,6 +2,20 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.43] — 2026-08-06
+
+### Added
+
+- Structure editing and generation backlog: insert/remove/substitute atom operations, bulk displacement, lattice-parameter editing, a unified full editing history, defect workflows (vacancies, substitutions, interstitials), and structure export to XSF/CIF/POSCAR/XYZ/QE PWscf input.
+- Atom editing in the Structure Tools sidebar: an Element field plus fractional/Cartesian position sliders insert atoms (interstitial workflow); "Remove Selected (Vacancy)" and "Substitute Selected" act on the linked viewport/atom-table selection; displace controls move all atoms or the selection by a Δx/Δy/Δz vector. All operations are gated on pristine geometry (no supercell/slab) within the 10 000-atom edit cap, validated transactionally through a shared `StructureEditing` engine (finite positions, element range 1…118, displacement ≤ 1000 Å, non-empty selection), rebond, mirror the base/preslab snapshots, re-run symmetry analysis, regenerate generated k-paths, and surface rejection reasons as status text.
+- Lattice-parameter editing: a/b/c and α/β/γ text fields prefilled from the current cell rebuild the cell in the standard convention (a along x, b in the xy-plane) with all atoms repositioned to their preserved fractional coordinates; Apply is transactional, Reset refills the fields, and user-edited k-paths are remapped through Cartesian reciprocal space when the cell changes.
+- Unified full editing history: the scene-snapshot undo stack that previously covered only atom-coordinate edits now covers every editing operation (coordinate edit, insert, remove, substitute, displace, lattice) through one NSUndoManager with per-operation action names ("Insert Atom", "Remove Atoms", "Substitute Species", "Displace Atoms", "Edit Lattice Parameters", "Edit Atom Coordinate"), bounded to 64 levels and the 10 000-atom cap.
+- Structure export: `File > Export Structure…` (format popup accessory) and five sidebar export buttons write the current structure as XSF (CRYSTAL/PRIMVEC/PRIMCOORD, or ATOMS for molecules), CIF (P1, fractional sites), POSCAR (VASP5 symbol+counts, Direct), XYZ, or QE PWscf input (ibrav=0, ATOMIC_SPECIES with masses, ATOMIC_POSITIONS crystal, CELL_PARAMETERS angstrom, K_POINTS gamma) — each matching its parser exactly so files round-trip; failures are reported with explicit errors and empty/singular geometry is rejected.
+
+### Changed
+
+- Test suite remains at exactly 32 focused tests; six new regressions (structure-edit engine insert/remove/substitute/displace + lattice editing, structure-writer round-trips and validation, controller editing/lattice/gating/export workflow) replaced lower-value anaglyph-mask, vector-export-contract, region-integration, controller deformation/cluster, and engine vacuum cases.
+
 ## [1.1.42] — 2026-08-06
 
 ### Added
