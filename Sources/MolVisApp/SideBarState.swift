@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import AppKit
 
 /// A point-in-time snapshot of the full k-path identity captured before a mutation,
 /// so the "Undo" control can restore geometry AND provenance/signature exactly.
@@ -379,7 +380,52 @@ final class SideBarState: ObservableObject {
     @Published var isPlaying: Bool = false { didSet { onChange?() } }
     @Published var frameIndex: Int = 0 { didSet { onChange?() } }
     @Published var frameCount: Int = 0 { didSet { onChange?() } }
+    /// Per-frame playback multiplier. View-only (not persisted). The playback
+    /// timer's interval is `0.1 / max(0.1, playbackSpeed)` (clamped 0.1...20
+    /// defensively in the controller).
+    @Published var playbackSpeed: Float = 1.0 { didSet { onChange?() } }
+    /// When true the playback timer wraps from the last frame back to 0 instead
+    /// of stopping. View-only (not persisted).
+    @Published var loopPlayback: Bool = false { didSet { onChange?() } }
+    /// Whether to draw the trajectory-trail line strip through each atom's
+    /// per-frame positions. View-only; the controller computes the vertex strip
+    /// from the loaded frames and pushes it to the renderer.
+    @Published var showTrajectoryTrails: Bool = false { didSet { onChange?() } }
+    /// Evenly-sampled thumbnail images for the timeline strip (at most
+    /// TimelineThumbnails.maxCount, always including frame 0). Runtime-only;
+    /// populated by the controller on a background queue, never persisted.
+    @Published private(set) var timelineThumbnails: [CGImage] = []
+    /// Per-frame derived metrics (volume, energy, force, RMSD). Runtime-only;
+    /// populated by the controller, never persisted.
+    @Published var frameMetrics: [FrameMetric] = []
     var onChange: (() -> Void)?
+    /// Invoked when the user taps a timeline thumbnail; the controller sets
+    /// state.frameIndex to the thumbnail's source frame index.
+    var onSeekToThumbnail: ((Int) -> Void)?
+    /// Invoked to present a save panel and write the per-frame metrics CSV.
+    var onExportFrameMetricsCSV: ((String) -> Void)?
+    /// Invoked (with the chosen save URL) to export the animation as GIF/APNG/MP4.
+    var onExportAnimation: ((URL) -> Void)?
+    /// Invoked (with the chosen save URL) to save the current project.
+    var onSaveProject: ((URL) -> Void)?
+    /// Whether the trajectory-trail overlay has been computed for the current
+    /// animation (so the controller can avoid redundant frame loads).
+    var trajectoryTrailsAvailable = false
+
+    /// Pure frame-stepping logic shared by the playback timer. Returns the next
+    /// frame index, or nil when playback should stop (no loop and past the end).
+    /// `count` <= 0 is treated as "no animation" (returns nil).
+    static func nextFrame(after current: Int, count: Int, loop: Bool) -> Int? {
+        guard count > 0 else { return nil }
+        if current + 1 < count { return current + 1 }
+        return loop ? 0 : nil
+    }
+
+    /// Replace the cached timeline thumbnails. The property is `private(set)`
+    /// so the controller sets it through this method rather than directly.
+    func setTimelineThumbnails(_ images: [CGImage]) {
+        timelineThumbnails = images
+    }
     /// Invoked when the user taps "Reset View" in the sidebar.
     var onResetView: (() -> Void)?
     /// Invoked when the user chooses one of the standard crystallographic

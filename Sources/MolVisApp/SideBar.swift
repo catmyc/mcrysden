@@ -559,8 +559,118 @@ struct SideBar: View {
                     ), in: 0...Double(state.frameCount - 1), step: 1) {
                         Text("Frame: \(state.frameIndex + 1) / \(state.frameCount)")
                     }
+                    timelineContent
+                    playbackControls
+                    metricsContent
+                    actionButtons
                 }
             }
+    }
+
+    // MARK: - Animation helpers
+
+    /// Map the index of a displayed thumbnail to its source frame index. Mirrors
+    /// TimelineThumbnails sampling: identity when count <= maxCount, else an
+    /// even stride = ceil(count/maxCount) starting at 0.
+    private func timelineFrameIndex(_ i: Int) -> Int {
+        let count = state.frameCount
+        guard count > 0 else { return i }
+        if count <= TimelineThumbnails.maxCount { return i }
+        let stride = Int((Double(count) / Double(TimelineThumbnails.maxCount)).rounded(.up))
+        return min(i * stride, count - 1)
+    }
+
+    @ViewBuilder
+    private var timelineContent: some View {
+        if !state.timelineThumbnails.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(Array(state.timelineThumbnails.enumerated()), id: \.offset) { index, cg in
+                        let frame = timelineFrameIndex(index)
+                        Image(decorative: cg, scale: 1.0)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(height: 64)
+                            .padding(2)
+                            .background(frame == state.frameIndex ? Color.accentColor.opacity(0.3) : Color.clear)
+                            .cornerRadius(4)
+                            .onTapGesture { state.onSeekToThumbnail?(frame) }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var playbackControls: some View {
+        Toggle("Loop", isOn: $state.loopPlayback)
+        Slider(value: $state.playbackSpeed, in: 0.1...20, step: 0.1) {
+            Text("Speed: \(state.playbackSpeed, specifier: "%.1f")×")
+        }
+    }
+
+    @ViewBuilder
+    private var metricsContent: some View {
+        if !state.frameMetrics.isEmpty {
+            HStack {
+                Text(metricsSummary)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button("Export Metrics CSV") {
+                    state.onExportFrameMetricsCSV?(FrameMetrics.csv(state.frameMetrics))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+    }
+
+    /// Compact summary of the last two frames' RMSD (Δ from previous frame) and
+    /// volume, guarding against nil. Empty when unavailable.
+    private var metricsSummary: String {
+        guard state.frameMetrics.count >= 2 else { return "" }
+        let last = state.frameMetrics[state.frameMetrics.count - 1]
+        var parts: [String] = []
+        if let rmsd = last.rmsdFromPrevious {
+            parts.append("ΔRMSD " + String(format: "%.3f", rmsd) + " Å")
+        }
+        if let vol = last.volume {
+            parts.append("V " + String(format: "%.1f", vol) + " Å³")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    @ViewBuilder
+    private var actionButtons: some View {
+        Toggle("Show Trails", isOn: $state.showTrajectoryTrails)
+        HStack {
+            Button("Export Animation…") { exportAnimation() }
+                .buttonStyle(.bordered)
+            Button("Save Project…") { saveProject() }
+                .buttonStyle(.bordered)
+        }
+        .font(.caption)
+    }
+
+    private func exportAnimation() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "animation.gif"
+        panel.allowsOtherFileTypes = true
+        panel.begin { result in
+            guard result == .OK, let url = panel.url else { return }
+            state.onExportAnimation?(url)
+        }
+    }
+
+    private func saveProject() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "project.mvis"
+        panel.allowsOtherFileTypes = true
+        panel.begin { result in
+            guard result == .OK, let url = panel.url else { return }
+            state.onSaveProject?(url)
+        }
     }
 
     // MARK: - Camera bookmarks

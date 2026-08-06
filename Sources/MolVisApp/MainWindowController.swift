@@ -259,6 +259,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// single-use). Nil for the empty opening viewer.
     private var sourceURL: URL?
     private var forcedFormat: ParseFormat?
+    /// Monotonic token gating async timeline-thumbnail and frame-metric
+    /// generation. A new request bumps the token so a stale background
+    /// completion (after a scene/frame reload) can never publish into the
+    /// freshly-installed state.
+    private var animationDataGeneration = 0
+    /// Cache key (sourceURL + frameCount) for the last thumbnail/metric build,
+    /// so re-entrant installScene calls for the same document don't re-decode.
+    private var lastAnimationDataKey: (url: URL, count: Int)?
     /// Runtime-only cell representation for the structure-tools basis transform.
     /// Session-only (not a Scene field); reset to .input on every fresh file open.
     private var currentCellRepresentation: CellRepresentation = .input
@@ -694,6 +702,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.isPlaying = false
         state.onChange = saved
         stopPlayback()
+        // A fresh scene may have a different source/frame count — invalidate the
+        // cached thumbnails/metrics so the next refresh rebuilds for this document.
+        lastAnimationDataKey = nil
+        state.trajectoryTrailsAvailable = false
+        refreshAnimationData()
         coordinationGeometryDidChange()
         refreshAtomTable()
         // The readout stays hidden until the user selects an atom.
@@ -4501,13 +4514,15 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// we stop at the end and clear isPlaying for predictability).
     private func startPlayback() {
         stopPlayback()
-        playTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        let clamped = min(20.0, max(0.1, state.playbackSpeed))
+        playTimer = Timer.scheduledTimer(withTimeInterval: 0.1 / Double(clamped), repeats: true) { [weak self] _ in
             guard let self else { return }
-            if self.state.frameIndex + 1 >= self.state.frameCount {
-                // Reached the last frame — stop rather than wrap.
-                self.state.isPlaying = false
+            if let next = SideBarState.nextFrame(after: self.state.frameIndex,
+                                                count: self.state.frameCount,
+                                                loop: self.state.loopPlayback) {
+                self.state.frameIndex = next
             } else {
-                self.state.frameIndex += 1
+                self.state.isPlaying = false
             }
         }
     }
@@ -4515,6 +4530,177 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private func stopPlayback() {
         playTimer?.invalidate()
         playTimer = nil
+    }
+
+    /// True while a playback timer is installed and not yet invalidated. Test
+    /// seam for playback-lifecycle assertions.
+    var hasActivePlayTimer: Bool { playTimer != nil }
+
+    /// Pure interval math for the playback timer, exposed for testing. 10 Hz
+    /// scaled by `speed`, clamped to the 0.1...20 defensive range.
+    static func playbackInterval(speed: Float) -> TimeInterval {
+        let clamped = min(20.0, max(0.1, speed))
+        return 0.1 / Double(clamped)
+    }
+
+    // MARK: - Animation timeline + per-frame metrics
+
+    /// Decode every frame of the current animation from sourceURL via Parser.
+    /// Returns nil when there is no multi-frame source or any frame fails to load.
+    private func loadAllFrames() -> [Scene]? {
+        guard let url = sourceURL, state.frameCount > 1 else { return nil }
+        let count = state.frameCount
+        var frames: [Scene] = []
+        frames.reserveCapacity(count)
+        for i in 0..<count {
+            guard let loaded = try? Parser.load(url, frameIndex: i, as: forcedFormat) else {
+                return nil
+            }
+            frames.append(Scene(loaded: loaded))
+        }
+        return frames
+    }
+
+    /// Flatten each atom's per-frame coordinates into a line-strip vertex array:
+    /// for atom k the strip is [frame0.coord, frame1.coord, ...], concatenated
+    /// for every atom index. Empty when frames have differing atom counts.
+    private func trajectoryTrailVertices(frames: [Scene]) -> [SIMD3<Float>] {
+        guard let atomCount = frames.first?.atoms.count, atomCount > 0,
+              frames.allSatisfy({ $0.atoms.count == atomCount }) else { return [] }
+        var verts: [SIMD3<Float>] = []
+        verts.reserveCapacity(atomCount * frames.count)
+        for k in 0..<atomCount {
+            for frame in frames {
+                verts.append(frame.atoms[k].coord)
+            }
+        }
+        return verts
+    }
+
+    /// Build timeline thumbnails and per-frame metrics for the current
+    /// multi-frame source on a background queue, then publish on main. Cached by
+    /// sourceURL + frameCount; stale generations are discarded by token.
+    private func refreshAnimationData() {
+        guard let url = sourceURL, state.frameCount > 1 else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.state.timelineThumbnails.isEmpty
+                    || !self.state.frameMetrics.isEmpty else { return }
+                self.state.setTimelineThumbnails([])
+                self.state.frameMetrics = []
+                self.state.trajectoryTrailsAvailable = false
+            }
+            return
+        }
+        let key = (url: url, count: state.frameCount)
+        if let existing = lastAnimationDataKey, existing == key { return }
+        lastAnimationDataKey = key
+
+        animationDataGeneration += 1
+        let token = animationDataGeneration
+        let thumbSize = CGSize(width: 128, height: 96)
+        let cam = camera
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, self.animationDataGeneration == token else { return }
+            guard let frames = self.loadAllFrames() else { return }
+            var images: [CGImage] = []
+            var metrics: [FrameMetric] = []
+            var trails: [SIMD3<Float>] = []
+            var ok = true
+            do {
+                images = try TimelineThumbnails.render(frames: frames, camera: cam, size: thumbSize)
+            } catch {
+                ok = false
+            }
+            if ok {
+                metrics = FrameMetrics.compute(frames: frames)
+                if self.state.showTrajectoryTrails {
+                    trails = self.trajectoryTrailVertices(frames: frames)
+                }
+            }
+            let stillValid = self.animationDataGeneration == token
+            let publishTrails = trails
+            DispatchQueue.main.async {
+                guard stillValid else { return }
+                self.state.setTimelineThumbnails(images)
+                self.state.frameMetrics = metrics
+                if self.state.showTrajectoryTrails {
+                    self.state.trajectoryTrailsAvailable = true
+                    self.renderer?.trajectoryTrails = publishTrails
+                }
+            }
+        }
+    }
+
+    /// Recompute the trajectory-trail strip from the loaded frames and push it
+    /// to the renderer. Called when the user toggles the trail overlay on.
+    private func refreshTrajectoryTrails() {
+        guard state.showTrajectoryTrails else {
+            renderer?.showTrajectoryTrails = false
+            return
+        }
+        guard let url = sourceURL, state.frameCount > 1 else { return }
+        if state.trajectoryTrailsAvailable { return }
+        animationDataGeneration += 1
+        let token = animationDataGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, self.animationDataGeneration == token else { return }
+            guard let frames = self.loadAllFrames() else { return }
+            let trails = self.trajectoryTrailVertices(frames: frames)
+            let stillValid = self.animationDataGeneration == token
+            DispatchQueue.main.async {
+                guard stillValid else { return }
+                self.state.trajectoryTrailsAvailable = true
+                self.renderer?.trajectoryTrails = trails
+                self.renderer?.showTrajectoryTrails = true
+            }
+        }
+    }
+
+    private func exportFrameMetricsCSV(_ csv: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "frame_metrics.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do { try csv.write(to: url, atomically: true, encoding: .utf8) }
+            catch { print("[mcrysden] frame metrics CSV export failed: \(error)") }
+        }
+    }
+
+    private func exportAnimation(to url: URL) {
+        let ext = url.pathExtension.lowercased()
+        let format: AnimationExportFormat
+        switch ext {
+        case "apng": format = .apng
+        case "mp4": format = .mp4
+        default: format = .gif
+        }
+        animationDataGeneration += 1
+        let token = animationDataGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, self.animationDataGeneration == token else { return }
+            do {
+                guard let frames = self.loadAllFrames() else {
+                    throw ParseError.io(path: url.path, reason: "failed to load animation frames")
+                }
+                try AnimationExporter.export(frames: frames, camera: self.camera,
+                                             size: CGSize(width: 640, height: 480),
+                                             fps: 10, format: format, to: url)
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.animationDataGeneration == token else { return }
+                    self.presentExportError(error, title: "Animation export failed")
+                }
+            }
+        }
+    }
+
+    private func saveProject(to url: URL) {
+        do {
+            try ProjectStore.save(scene, to: url)
+        } catch {
+            presentExportError(error, title: "Save project failed")
+        }
     }
 
     // MARK: - File watching
@@ -4886,5 +5072,17 @@ extension NSSplitView {
         guard let controller = window?.delegate as? MainWindowController else { return false }
         controller.loadDroppedFile(url)
         return true
+    }
+}
+
+// TEMP STUB — parallel agent D lands ProjectStore.save/load on integration.
+enum ProjectStore {
+    static func save(_ scene: Scene, to url: URL) throws {
+        throw NSError(domain: "mcrysden", code: 0,
+                      userInfo: [NSLocalizedDescriptionKey: "ProjectStore.save not yet implemented"])
+    }
+    static func load(from url: URL) throws -> Scene {
+        throw NSError(domain: "mcrysden", code: 0,
+                      userInfo: [NSLocalizedDescriptionKey: "ProjectStore.load not yet implemented"])
     }
 }
