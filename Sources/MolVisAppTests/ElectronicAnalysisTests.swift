@@ -69,9 +69,10 @@ final class ElectronicAnalysisTests: XCTestCase {
                                fermiEnergy: 0)
     }
 
-    // MARK: - Linked band+DOS report
+    // MARK: - Linked band+DOS report and QE projwfc DOS label enrichment
 
-    func testLinkedReportCrossChecksBandAndDOS() {
+    func testLinkedReportAndDOSLabelEnrichment() {
+        // --- Linked band+DOS report ---
         let band = makeInsulatorBandPath()
 
         // Confirm the band gap the report will summarize: ~1.0 eV.
@@ -145,11 +146,8 @@ final class ElectronicAnalysisTests: XCTestCase {
             XCTAssertNotEqual(noFermiReport.rows[idx].status, .available,
                               "cross-check row \(idx) must not be available without a Fermi level")
         }
-    }
 
-    // MARK: - QE projwfc DOS label enrichment
-
-    func testDOSParserProjectedLabelsFromSourceName() {
+        // --- QE projwfc DOS label enrichment ---
         let text = """
          #  E (eV)        l     DOS(E)     PDOS(E)     PDOS(E)
           -10.0       0    0.5        0.1        0.1
@@ -190,9 +188,10 @@ final class ElectronicAnalysisTests: XCTestCase {
         }
     }
 
-    // MARK: - Orbital coloring classification
+    // MARK: - Orbital coloring classification and linked-cursor guide-line energy
 
-    func testOrbitalColoringClassification() {
+    func testOrbitalColoringAndLinkedCursorGuideLine() {
+        // --- Orbital coloring classification ---
         XCTAssertEqual(DOSOrbitalColoring.orbitalCharacter(of: "Fe s"), Character("s"))
         XCTAssertEqual(DOSOrbitalColoring.orbitalCharacter(of: "Si p up"), Character("p"))
         XCTAssertEqual(DOSOrbitalColoring.orbitalCharacter(of: "O d"), Character("d"))
@@ -214,11 +213,8 @@ final class ElectronicAnalysisTests: XCTestCase {
         // Unclassified label => falls back to the caller's palette by index.
         XCTAssertEqual(DOSOrbitalColoring.color(for: "Total DOS", index: 0, palette: palette), .black)
         XCTAssertEqual(DOSOrbitalColoring.color(for: "Total DOS", index: 1, palette: palette), .white)
-    }
 
-    // MARK: - Linked-cursor guide-line energy
-
-    func testLinkedCursorGuideLineEnergy() {
+        // --- Linked-cursor guide-line energy ---
         let size = CGSize(width: 400, height: 300)
         let band = makeShortBandPath()
         let dos = makeSmallDOS()

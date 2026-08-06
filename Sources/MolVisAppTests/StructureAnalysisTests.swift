@@ -8,9 +8,7 @@ import XCTest
 /// displacement.
 final class StructureAnalysisTests: XCTestCase {
 
-    // MARK: - Polyhedron volume / distortion metrics
-
-    func testPolyhedronVolumeAndDistortionMetrics() {
+    func testPolyhedronMetricsAndStructureComparison() {
         // A regular tetrahedron around the origin (CN 4): hull volume must equal
         // the ideal tetrahedron volume for the mean bond length, and the bond
         // distortion must be ~0. The ideal angle is 109.47°.
@@ -71,11 +69,8 @@ final class StructureAnalysisTests: XCTestCase {
         XCTAssertEqual(dMetrics.neighborCount, 4)
         XCTAssertNotNil(dMetrics.bondLengthDistortion)
         XCTAssertGreaterThan(dMetrics.bondLengthDistortion!, 0)
-    }
 
-    // MARK: - Two-structure comparison with RMS displacement
-
-    func testStructureComparisonRMSDAndUnmatchedAtoms() {
+        // --- Two-structure comparison with RMS displacement ---
         // Periodic: every source atom displaced by (0.1, -0.2, 0.3) → RMSD equals
         // that vector's length and displacements match exactly.
         let cell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(0, 10, 0), c: SIMD3(0, 0, 10))

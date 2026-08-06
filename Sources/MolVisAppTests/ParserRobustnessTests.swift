@@ -8,7 +8,7 @@ import XCTest
 /// and FHI-aims COORD.OUT species names resolve through the full element table.
 final class ParserRobustnessTests: XCTestCase {
 
-    func testDOSParserDuplicateEnergyDropped() {
+    func testParserRobustnessRejectionAndResolution() throws {
         let text = """
          # Fermi energy: -5.0000 eV
            -10.000  1.0  0.5
@@ -27,9 +27,7 @@ final class ParserRobustnessTests: XCTestCase {
         // Genuinely decreasing energies are still rejected.
         let decreasing = "1.0 2.0\n0.5 2.1\n"
         XCTAssertNil(DOSParser.parse(decreasing))
-    }
 
-    func testParserRobustnessTempFiles() throws {
         // --- CRYSTAL space-group rejection ---
         let url1 = FileManager.default.temporaryDirectory
             .appendingPathComponent("mcrysden-test-\(UUID().uuidString).r1")

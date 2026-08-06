@@ -2,6 +2,19 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.45] — 2026-08-06
+
+### Added
+
+- Animation playback and timeline: a playback-speed slider (0.1–20×) and Loop toggle drive the frame timer (interval `0.1/speed`, wrapping at the end when looping); a timeline thumbnail strip (≤24 frames, evenly sampled, click-to-seek) renders every frame offscreen via `TimelineThumbnails`; per-frame energy/force/volume/RMSD metrics (`FrameMetrics`) feed a sidebar summary, a CSV export, and a pop-out `FrameMetricsPlotView` with a metric picker; `FrameMetrics.interpolate` produces linearly interpolated intermediate frames and `FrameMetrics.alignCentroid` centroid-aligns trajectories to a reference frame, composing with the new per-atom displacement-trail line strip drawn by the renderer (Show Trails toggle).
+- Animation export: `AnimationExporter` renders each frame offscreen (`PngExporter.render` — a new memory-only render path extracted from `export`) and writes animated GIF (ImageIO), APNG (hand-written PNG chunks IHDR/acTL/fcTL/IDAT/fdAT/IEND with zlib deflate and table CRC32), and MP4 (AVFoundation H.264 from pixel buffers). Wired to the sidebar "Export Animation…" button and the headless `--export-anim` CLI flag (`.gif`/`.apng`/`.mp4`, optional `--fps N` and `--anim-size WxH`).
+- Batch conversion and external-code converters: `Converter` loads any supported structure input and writes XSF/CIF/POSCAR/XYZ/QE-PWscf through the round-trip-tested `StructureWriter` with atomic temp+replace writes. New headless flags: `--convert <out>` (output format inferred from the extension), `--convert-all <dir> --format <xsf|cif|poscar|xyz|qe>` (directory batch; skips unparseable and target-incompatible files, capped at 200 inputs), and the XCrySDen-style verbs `--pwi2xsf <out>`, `--pwo2xsf <out>`, `--struct2xsf <out>` (forced source format, XSF output required).
+- Embedded scripting, plugins, and project files: `ScriptRunner` runs line-based scripts headlessly via `--script` (quoted args, `#` comments, `help`/`quit`, line-numbered errors) with `echo`/`load`/`convert`/`export-anim`/`project-save`/`project-load`/`plugins` commands; `PluginRegistry` registers named analysis plugins (deterministic order, first-name-wins) with built-in `band-gap` and `dos-gap` plugins; `ProjectStore` saves/loads `.mvis-project` JSON envelopes (versioned `ProjectBundle`) combining the structure, bands, DOS, and volumetric datasets, with a sidebar "Save Project…" action.
+
+### Changed
+
+- Test suite remains at exactly 32 focused tests; eight new regressions (animation playback speed/loop/stepping, frame metrics + interpolation + thumbnails + alignment + plot view, GIF/APNG/MP4 export + memory render, headless conversion + CLI verbs, batch conversion, project round-trip, script runner + plugin registry) replaced consolidated lower-value cases (two parser-robustness checks, four powder-XRD cases into two, four electronic-analysis cases into two, polyhedron+comparison, writer round-trip+validation, renderer geometry+headless export — all assertions preserved).
+
 ## [1.1.44] — 2026-08-06
 
 ### Added

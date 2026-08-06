@@ -143,6 +143,11 @@ final class Renderer: NSObject {
     /// (start, vector in Å), installed by the controller; drawn at 1:1 scale.
     var displacementArrows: [(start: SIMD3<Float>, vector: SIMD3<Float>)] = []
     var showDisplacementArrows: Bool = false
+    /// Runtime-only trajectory trail vertices in Å. When `showTrajectoryTrails` is
+    /// true and the array is non-empty, consecutive pairs of vertices are drawn as
+    /// thin line segments (a magenta trail). Non-persisted render-only state.
+    var trajectoryTrails: [SIMD3<Float>] = []
+    var showTrajectoryTrails: Bool = false
 
     /// Discrete, colorblind-readable colors indexed by coordination number. Values
     /// below zero and zero map to the first color; values >= the maximum valid
@@ -996,6 +1001,7 @@ final class Renderer: NSObject {
             // Displacement arrows draw in every display mode (including 2D)
             // using the shared line pipeline; still gated by showStructure above.
             guard drawDisplacementArrows(enc, frameBuffer: frameBuffer) else { return false }
+            guard drawTrajectoryTrails(enc, frameBuffer: frameBuffer) else { return false }
         }
 
         guard drawCell(enc, frameBuffer: frameBuffer) else { return false }
@@ -2046,6 +2052,28 @@ final class Renderer: NSObject {
             let right = back - perp * side * headSpread
             verts.append(tip); verts.append(left)
             verts.append(tip); verts.append(right)
+        }
+        if verts.isEmpty { return true }
+        return drawLineBuffer(verts, color: SIMD3<Float>(1.0, 0.2, 0.9), enc: enc, frameBuffer: frameBuffer)
+    }
+
+    /// Runtime-only trajectory trail: draws consecutive pairs of `trajectoryTrails`
+    /// vertices as thin magenta line segments using the shared line pipeline.
+    /// Gated on `showTrajectoryTrails` and non-empty vertices; non-finite
+    /// vertices are skipped. Mirrors the displacement-arrow draw path.
+    @discardableResult
+    private func drawTrajectoryTrails(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard showTrajectoryTrails, !trajectoryTrails.isEmpty else { return true }
+        var verts: [SIMD3<Float>] = []
+        let count = trajectoryTrails.count
+        guard count >= 2 else { return true }
+        var prev = trajectoryTrails[0]
+        for i in 1..<count {
+            let cur = trajectoryTrails[i]
+            if prev.isFinite && cur.isFinite {
+                verts.append(prev); verts.append(cur)
+            }
+            prev = cur
         }
         if verts.isEmpty { return true }
         return drawLineBuffer(verts, color: SIMD3<Float>(1.0, 0.2, 0.9), enc: enc, frameBuffer: frameBuffer)

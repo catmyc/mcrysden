@@ -67,6 +67,22 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         /// Publication preset override. nil = flag omitted (use scene/default).
         var preset: PublicationPreset? = nil
         var help = false
+        /// Headless single-file conversion target (--convert / --pwi2xsf / --pwo2xsf / --struct2xsf).
+        var convertURL: URL?
+        /// Headless batch conversion output directory (--convert-all).
+        var convertAllURL: URL?
+        /// Target structure format for --convert-all (--format <xsf|cif|poscar|xyz|qe>).
+        var convertFormat: StructureExportFormat?
+        /// Headless script file (--script).
+        var scriptURL: URL?
+        /// Headless animation export target (--export-anim).
+        var exportAnimationURL: URL?
+        /// Frames per second for --export-anim (default 10).
+        var animFPS: Int = 10
+        /// Frame count for --export-anim: 0 = all frames, >0 = first N frames.
+        var animFrameCount: Int = 0
+        /// Explicit viewport size for --export-anim (--anim-size WxH).
+        var animSize: CGSize?
     }
 
     enum CLIError: Error, CustomStringConvertible {
@@ -155,12 +171,102 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var forced: ParseFormat?
         var index = 0
         var optionsEnded = false
+        var convertVerbSeen = false
+        var convertRequiresXSF = false
+        var fpsSeen = false
+        var animSizeSeen = false
         while index < args.count {
             let argument = args[index]
             if !optionsEnded && argument == "--" {
                 optionsEnded = true
             } else if !optionsEnded && (argument == "--help" || argument == "-h") {
                 options.help = true
+            } else if !optionsEnded && argument == "--convert" {
+                guard !convertVerbSeen, options.convertURL == nil,
+                      index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--convert requires exactly one output path")
+                }
+                convertVerbSeen = true
+                index += 1
+                options.convertURL = URL(fileURLWithPath: args[index])
+            } else if !optionsEnded && argument == "--convert-all" {
+                guard options.convertAllURL == nil,
+                      index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--convert-all requires exactly one output directory")
+                }
+                index += 1
+                options.convertAllURL = URL(fileURLWithPath: args[index])
+            } else if !optionsEnded && argument == "--format" {
+                guard options.convertFormat == nil,
+                      index + 1 < args.count, !args[index + 1].hasPrefix("--"),
+                      let fmt = parseConvertFormat(args[index + 1]) else {
+                    throw CLIError.invalid("--format requires one of: " + convertFormatFlags.joined(separator: ", "))
+                }
+                index += 1
+                options.convertFormat = fmt
+            } else if !optionsEnded && argument == "--script" {
+                guard options.scriptURL == nil,
+                      index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--script requires exactly one file path")
+                }
+                index += 1
+                options.scriptURL = URL(fileURLWithPath: args[index])
+            } else if !optionsEnded && argument == "--export-anim" {
+                guard options.exportAnimationURL == nil,
+                      index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--export-anim requires exactly one output path")
+                }
+                index += 1
+                options.exportAnimationURL = URL(fileURLWithPath: args[index])
+            } else if !optionsEnded && argument == "--fps" {
+                guard !fpsSeen, index + 1 < args.count,
+                      let value = Int(args[index + 1]), value >= 1 else {
+                    throw CLIError.invalid("--fps requires a positive integer")
+                }
+                fpsSeen = true
+                index += 1
+                options.animFPS = value
+            } else if !optionsEnded && argument == "--anim-size" {
+                guard !animSizeSeen, index + 1 < args.count,
+                      let size = parseAnimSize(args[index + 1]) else {
+                    throw CLIError.invalid("--anim-size requires WxH (e.g. 640x480)")
+                }
+                animSizeSeen = true
+                index += 1
+                options.animSize = size
+            } else if !optionsEnded && argument == "--pwi2xsf" {
+                guard !convertVerbSeen, options.convertURL == nil,
+                      index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--pwi2xsf requires exactly one .xsf output path")
+                }
+                convertVerbSeen = true
+                index += 1
+                options.convertURL = URL(fileURLWithPath: args[index])
+                guard forced == nil else { throw CLIError.invalid("multiple force-format flags are not allowed") }
+                forced = .pwi
+                convertRequiresXSF = true
+            } else if !optionsEnded && argument == "--pwo2xsf" {
+                guard !convertVerbSeen, options.convertURL == nil,
+                      index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--pwo2xsf requires exactly one .xsf output path")
+                }
+                convertVerbSeen = true
+                index += 1
+                options.convertURL = URL(fileURLWithPath: args[index])
+                guard forced == nil else { throw CLIError.invalid("multiple force-format flags are not allowed") }
+                forced = .pwo
+                convertRequiresXSF = true
+            } else if !optionsEnded && argument == "--struct2xsf" {
+                guard !convertVerbSeen, options.convertURL == nil,
+                      index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    throw CLIError.invalid("--struct2xsf requires exactly one .xsf output path")
+                }
+                convertVerbSeen = true
+                index += 1
+                options.convertURL = URL(fileURLWithPath: args[index])
+                guard forced == nil else { throw CLIError.invalid("multiple force-format flags are not allowed") }
+                forced = .struct_
+                convertRequiresXSF = true
             } else if !optionsEnded && argument == "--export" {
                 guard options.exportURL == nil, index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
                     throw CLIError.invalid("--export requires exactly one output path")
@@ -239,7 +345,62 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 throw CLIError.invalid("--kpath file aliases the input or state file: \(protected.path)")
             }
         }
+        // Single action per invocation: --export, --convert, --convert-all, --script
+        // and --export-anim are mutually exclusive.
+        let actionCount = [options.exportURL, options.convertURL, options.convertAllURL,
+                           options.scriptURL, options.exportAnimationURL].compactMap { $0 }.count
+        guard actionCount <= 1 else {
+            throw CLIError.invalid("only one of --export, --convert, --convert-all, --script, --export-anim may be used at once")
+        }
+        if let convertURL = options.convertURL {
+            guard options.inputURL != nil else { throw CLIError.invalid("--convert requires an input file") }
+            if convertRequiresXSF {
+                guard convertURL.pathExtension.lowercased() == "xsf" else {
+                    throw CLIError.invalid("--pwi2xsf/--pwo2xsf/--struct2xsf require an .xsf output path")
+                }
+            }
+            for protected in [options.inputURL, options.stateURL].compactMap({ $0 }) where sameFile(convertURL, protected) {
+                throw CLIError.invalid("--convert output aliases the input or state file: \(protected.path)")
+            }
+        }
+        if let convertAllURL = options.convertAllURL {
+            guard options.inputURL != nil else { throw CLIError.invalid("--convert-all requires an input directory as the positional argument") }
+            guard options.convertFormat != nil else {
+                throw CLIError.invalid("--convert-all requires --format <\(convertFormatFlags.joined(separator: "|"))>")
+            }
+            for protected in [options.inputURL, options.stateURL].compactMap({ $0 }) where sameFile(convertAllURL, protected) {
+                throw CLIError.invalid("--convert-all output directory aliases the input: \(protected.path)")
+            }
+        }
+        if options.exportAnimationURL != nil {
+            guard options.inputURL != nil else { throw CLIError.invalid("--export-anim requires an input file") }
+            guard ["gif", "apng", "mp4"].contains(options.exportAnimationURL!.pathExtension.lowercased()) else {
+                throw CLIError.invalid("--export-anim requires a .gif, .apng, or .mp4 output path")
+            }
+        }
         return options
+    }
+
+    /// Maps the `--format <xsf|cif|poscar|xyz|qe>` value to a structure format.
+    private static func parseConvertFormat(_ raw: String) -> StructureExportFormat? {
+        switch raw.lowercased() {
+        case "xsf": return .xsf
+        case "cif": return .cif
+        case "poscar": return .poscar
+        case "xyz": return .xyz
+        case "qe": return .qeInput
+        default: return nil
+        }
+    }
+    private static let convertFormatFlags = ["xsf", "cif", "poscar", "xyz", "qe"]
+
+    /// Parse a `--anim-size WxH` value into a CGSize. Returns nil on any malformed input.
+    private static func parseAnimSize(_ raw: String) -> CGSize? {
+        let parts = raw.lowercased().split(separator: "x").map(String.init)
+        guard parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w > 0, h > 0 else {
+            return nil
+        }
+        return CGSize(width: w, height: h)
     }
 
     private static let supportedExportExtensions: Set<String> = ["png", "pdf", "svg", "eps", "ps"]
@@ -519,6 +680,167 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                                      options: renderOptions)
             } catch {
                 print("[mcrysden] export failed: \(error)")
+                exit(EXIT_FAILURE)
+            }
+            NSApp.terminate(nil)
+            return
+        }
+        // headless single-file conversion (--convert / --pwi2xsf / --pwo2xsf / --struct2xsf).
+        if let outURL = options.convertURL, let inURL = options.inputURL {
+            do {
+                try Converter.convert(url: inURL, to: outURL, forcedFormat: options.format,
+                                      frameIndex: options.frame >= 0 ? options.frame : 0)
+            } catch {
+                print("[mcrysden] convert failed: \(error)")
+                exit(EXIT_FAILURE)
+            }
+            NSApp.terminate(nil)
+            return
+        }
+        // headless batch conversion (--convert-all).
+        if let outDir = options.convertAllURL, let inURL = options.inputURL {
+            do {
+                let count = try Converter.convertAll(
+                    inputDirectory: inURL,
+                    outputDirectory: outDir,
+                    targetFormat: options.convertFormat ?? .xsf,
+                    forcedFormat: options.format
+                )
+                print("[mcrysden] converted \(count) file(s) to \(outDir.path)")
+            } catch {
+                print("[mcrysden] convert-all failed: \(error)")
+                exit(EXIT_FAILURE)
+            }
+            NSApp.terminate(nil)
+            return
+        }
+        // headless animation export (--export-anim).
+        if let animURL = options.exportAnimationURL, let inURL = options.inputURL {
+            do {
+                let fc = Parser.frameCount(inURL, as: options.format)
+                let total = fc > 0 ? fc : 1
+                let limit = options.animFrameCount > 0 ? min(options.animFrameCount, total) : total
+                var scenes: [Scene] = []
+                scenes.reserveCapacity(limit)
+                for i in 0..<limit {
+                    scenes.append(Scene(loaded: try Parser.load(inURL, as: options.format, frameIndex: i)))
+                }
+                let size = options.animSize ?? CGSize(width: 640, height: 480)
+                let ext = animURL.pathExtension.lowercased()
+                let aformat: AnimationExportFormat = ext == "gif" ? .gif : (ext == "mp4" ? .mp4 : .apng)
+                try AnimationExporter.export(frames: scenes, camera: nil, size: size, fps: options.animFPS,
+                                             format: aformat, to: animURL)
+            } catch {
+                print("[mcrysden] export-anim failed: \(error)")
+                exit(EXIT_FAILURE)
+            }
+            NSApp.terminate(nil)
+            return
+        }
+        // headless script (--script).
+        if let scriptURL = options.scriptURL {
+            do {
+                let content = try String(contentsOf: scriptURL, encoding: .utf8)
+                let workingDirectory = scriptURL.deletingLastPathComponent()
+                func resolve(_ arg: String) -> URL {
+                    if arg.hasPrefix("/") { return URL(fileURLWithPath: arg) }
+                    return workingDirectory.appendingPathComponent(arg)
+                }
+                final class Holder<T> { var value: T?; init() {} }
+                let currentScene = Holder<Scene>()
+                var commands: [String: ([String]) throws -> String] = [:]
+
+                commands["echo"] = { args in
+                    args.joined(separator: " ")
+                }
+
+                commands["convert"] = { args in
+                    guard args.count == 2 else {
+                        throw CLIError.invalid("convert requires <input> <output>")
+                    }
+                    let inURL = resolve(args[0])
+                    let outURL = resolve(args[1])
+                    try Converter.convert(url: inURL, to: outURL, forcedFormat: nil)
+                    return "converted \(inURL.path) -> \(outURL.path)"
+                }
+
+                commands["export-anim"] = { args in
+                    guard args.count == 2 || args.count == 3 else {
+                        throw CLIError.invalid("export-anim requires <input> <output> [fps]")
+                    }
+                    let inURL = resolve(args[0])
+                    let outURL = resolve(args[1])
+                    let fps = args.count == 3 ? (Int(args[2]) ?? 10) : 10
+                    let fc = Parser.frameCount(inURL, as: nil)
+                    let total = fc > 0 ? fc : 1
+                    var scenes: [Scene] = []
+                    scenes.reserveCapacity(total)
+                    for i in 0..<total {
+                        scenes.append(Scene(loaded: try Parser.load(inURL, as: nil, frameIndex: i)))
+                    }
+                    let ext = outURL.pathExtension.lowercased()
+                    guard let format = AnimationExportFormat(rawValue: ext) else {
+                        throw CLIError.invalid("unsupported animation format: \(ext)")
+                    }
+                    try AnimationExporter.export(frames: scenes, camera: nil,
+                                                 size: CGSize(width: 640, height: 480),
+                                                 fps: fps, format: format, to: outURL)
+                    return "exported animation -> \(outURL.path)"
+                }
+
+                commands["load"] = { args in
+                    guard args.count == 1 else {
+                        throw CLIError.invalid("load requires <input>")
+                    }
+                    let scene = Scene(loaded: try Parser.load(resolve(args[0]), as: nil))
+                    currentScene.value = scene
+                    return "loaded \(args[0])"
+                }
+
+                commands["project-save"] = { args in
+                    guard args.count == 1 else {
+                        throw CLIError.invalid("project-save requires <output>")
+                    }
+                    guard let scene = currentScene.value else {
+                        throw CLIError.invalid("project-save requires a loaded scene (run load first)")
+                    }
+                    let outURL = resolve(args[0])
+                    try ProjectStore.save(scene, to: outURL)
+                    return "saved project -> \(outURL.path)"
+                }
+
+                commands["project-load"] = { args in
+                    guard args.count == 1 else {
+                        throw CLIError.invalid("project-load requires <input>")
+                    }
+                    let scene = try ProjectStore.load(from: resolve(args[0]))
+                    currentScene.value = scene
+                    return "loaded project \(args[0])"
+                }
+
+                commands["plugins"] = { args in
+                    if args.count == 1 {
+                        currentScene.value = Scene(loaded: try Parser.load(resolve(args[0]), as: nil))
+                    }
+                    var out = PluginRegistry.listText()
+                        .split(separator: "\n", omittingEmptySubsequences: false)
+                        .map(String.init)
+                    if let scene = currentScene.value {
+                        for (name, output) in PluginRegistry.runAll(scene: scene) {
+                            out.append("\(name): \(output ?? "<unavailable>")")
+                        }
+                    }
+                    return out.joined(separator: "\n")
+                }
+
+                let ctx = ScriptContext(
+                    workingDirectory: workingDirectory,
+                    onOutput: { print($0) },
+                    commands: commands
+                )
+                try ScriptRunner.run(script: content, context: ctx)
+            } catch {
+                print("[mcrysden] script failed: \(error)")
                 exit(EXIT_FAILURE)
             }
             NSApp.terminate(nil)
@@ -1207,7 +1529,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.44"
+    static let appVersion = "1.1.45"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -1223,6 +1545,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
           mcrysden <file> --export out.png             # headless raster render
           mcrysden <file> --export out.pdf             # true vector export with a raster structure layer (pdf, svg); raster-backed container (eps, ps)
           mcrysden <file> --kpath route.kpf            # import a k-path (QE K_POINTS, VASP KPOINTS, Wannier90 kpoint_path, XCrySDen KPF)
+          mcrysden <file> --convert out.xsf             # headless structure conversion (format by output extension)
+          mcrysden <file> --convert-all dir --format xsf # headless batch conversion of a directory
+          mcrysden <file> --pwi2xsf out.xsf             # convert a QE input to XSF
+          mcrysden <file> --pwo2xsf out.xsf             # convert QE output to XSF
+          mcrysden <file> --struct2xsf out.xsf          # convert WIEN2k .struct to XSF
+          mcrysden <file> --export-anim out.gif         # headless animation export (.gif/.apng/.mp4)
+          mcrysden <file> --script script.mvs           # run a headless script
           mcrysden --help
         Input formats are chosen by extension (\(exts)). Angstrom-based input
         (.cube/.bxsf/.struct) is kept in Angstrom; Bohr-based input is converted.
@@ -1233,6 +1562,11 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         Export format is chosen by extension: .png (raster) or .pdf/.svg (true vector with raster structure layer) or .eps/.ps (raster-backed containers).
         Control multisampled antialiasing with --msaa 1|2|4|8 (1 = explicit Off override; omit to use scene default).
         Apply rendering-quality settings with --preset default|journal|presentation|print.
+        Structure conversion formats are chosen by the --convert output extension:
+          .xsf .cif .poscar/.contcar/.vasp .xyz .pwi/.in/.inp/.qe
+        Batch --convert-all requires --format <xsf|cif|poscar|xyz|qe>.
+        Animation --export-anim takes optional --fps N (default 10) and --anim-size WxH (default 640x480).
+        Only one of --export, --convert, --convert-all, --export-anim, --script may be used at once.
         """)
     }
 }

@@ -45,9 +45,10 @@ final class StructureWriterTests: XCTestCase {
                 ang(cell.b, cell.c), ang(cell.a, cell.c), ang(cell.a, cell.b))
     }
 
-    // MARK: - Round-trip
+    // MARK: - Round-trip, validation, and molecule formats
 
-    func testWritersRoundTripThroughParsers() throws {
+    func testWritersRoundTripValidationAndMoleculeFormats() throws {
+        // --- Round-trip ---
         let scene = makeSiScene()
         let cases: [(StructureExportFormat, ParseFormat)] = [
             (.xsf, .xsf),
@@ -81,11 +82,8 @@ final class StructureWriterTests: XCTestCase {
             XCTAssertEqual(o.beta, b.beta, accuracy: 1e-2, "\(format) angle beta")
             XCTAssertEqual(o.gamma, b.gamma, accuracy: 1e-2, "\(format) angle gamma")
         }
-    }
 
-    // MARK: - Validation + molecule formats
-
-    func testWriterValidationAndMoleculeFormats() throws {
+        // --- Validation + molecule formats ---
         let h2o = [
             Atom(coord: SIMD3(0, 0, 0), atomicNumber: 8, label: "O"),
             Atom(coord: SIMD3(0.757, 0.586, 0), atomicNumber: 1, label: "H"),

@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-06 (v1.1.44: electronic-structure analysis — linked band/DOS plots with cross-graph cursor guide lines, side-by-side linked viewport and export, QE projwfc species/orbital label enrichment, orbital-character coloring, and a combined band+DOS analysis report — 32 focused tests)**.
+Last updated: **2026-08-06 (v1.1.45: animation, conversion, and extensibility — playback speed/looping, timeline thumbnails, GIF/APNG/MP4 export, trajectory alignment, displacement trails, interpolation, per-frame metrics plots, headless conversion + pwi2xsf/pwo2xsf/struct2xsf converters, scripts, plugins, and project files — 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -142,9 +142,10 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Higher-resolution labels and true vector export for cells, BZs, k-paths, and graphs (v1.1.40: PDF/SVG exports carry real vector primitives for the cell frame, BZ wireframe, k-path route, axes, displacement arrows, and labels; band/DOS/color-plane graphs export as true-vector PDF; EPS/PS remain raster-backed); image backgrounds (v1.1.40: fullscreen image backdrop with sidebar picker, scale-to-cover, silent fallback, persistence); printing (v1.1.40: File → Print… for the Metal scene and graphs); and stereo/anaglyph rendering (v1.1.40: red-cyan / green-magenta dual-eye merge, MSAA-resolved, persisted, off by default).
 
 ### Animation, conversion, and extensibility
-- [ ] Timeline thumbnails, playback speed/looping, GIF/APNG/video export, trajectory alignment, displacement trails, interpolation, and per-frame energy/force/volume/distance plots.
-- [ ] Batch conversion/rendering and external-code converters such as `pwi2xsf`, `pwo2xsf`, and `struct2xsf`.
-- [ ] Embedded scripting, parser/analysis plugins, and project/session files combining structures, bands, DOS, and volumetric datasets.
+- [x] Animation playback and timeline (v1.1.45): playback speed slider (0.1–20×) and loop toggle drive the existing frame timer; timeline thumbnails (≤24, evenly sampled, click-to-seek) render every frame offscreen; per-frame energy/force/volume/RMSD metrics are computed for multi-frame files with a summary line, CSV export, and a pop-out plot view with a metric picker; linear interpolation between frames (`FrameMetrics.interpolate`) and centroid trajectory alignment (`FrameMetrics.alignCentroid`) compose with the displacement-trail overlay (per-atom line strips in the Metal renderer).
+- [x] Animation export (v1.1.45): `AnimationExporter` renders each frame offscreen and writes animated GIF (ImageIO), APNG (hand-written PNG chunks: IHDR/acTL/fcTL/IDAT/fdAT/IEND with zlib + CRC32), and MP4 (AVFoundation H.264 from pixel buffers); wired to the sidebar "Export Animation…" button and the headless `--export-anim` CLI flag (`.gif`/`.apng`/`.mp4`, optional `--fps` and `--anim-size WxH`).
+- [x] Batch conversion and external-code converters (v1.1.45): `Converter` loads any supported input and writes XSF/CIF/POSCAR/XYZ/QE-PWscf through the round-trip-tested `StructureWriter` (atomic temp+replace); headless `--convert <out>` (format by output extension), `--convert-all <dir> --format <fmt>` (batch, skips unparseable and target-incompatible files, `maxFiles` cap), and the XCrySDen-style verbs `--pwi2xsf`, `--pwo2xsf`, `--struct2xsf`.
+- [x] Embedded scripting, plugins, and project files (v1.1.45): `ScriptRunner` executes line-based scripts (quoted args, `#` comments, `help`/`quit`, line-numbered errors) headlessly via `--script` with `echo`/`load`/`convert`/`export-anim`/`project-save`/`project-load`/`plugins` commands; `PluginRegistry` registers named analysis plugins with two built-ins (band-gap, dos-gap); `ProjectStore` saves/loads `.mvis-project` JSON envelopes combining the structure, bands, DOS, and volumetric datasets, with a sidebar "Save Project…" action.
 
 ## Tier A — implementation status
 
@@ -161,10 +162,10 @@ All 10 original Tier A items complete: Gaussian Cube/G98, BXSF/Fermi surfaces, 3
 - [x] **Structure editing** (v1.1.43): Cartesian/fractional coordinate edits, cut cluster/molecule, elastic cell deformation, multi-slab generation, insert/remove/substitute/displace operations, lattice-parameter editing, defect workflows, and a unified editing history are all implemented.
 - [x] **On-screen bond distance labels** — live distance text above each bond (v1.1.36).
 - [ ] **Image-background variant** — only `solid` + `gradient_top` exist.
-- [ ] **Print** of the view (`NSPrintOperation`).
-- [ ] **Stereo / anaglyph** rendering.
-- [ ] **Tcl scripting engine** — validating an interpreter needs a written test suite.
-- [ ] **External-code converters** (`pwi2xsf`, `pwo2xsf`, `struct2xsf`, …).
+- [x] **Print** of the view (`NSPrintOperation`) (v1.1.40).
+- [x] **Stereo / anaglyph** rendering (v1.1.40).
+- [ ] **Tcl scripting engine** — a Tcl interpreter is not bundled; embedded scripting is provided by the `--script` line interpreter and `PluginRegistry` (v1.1.45) instead.
+- [x] **External-code converters** (`pwi2xsf`, `pwo2xsf`, `struct2xsf`, …) as CLI verbs (v1.1.45).
 
 ## Reference: what XCrySDen implements
 
