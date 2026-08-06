@@ -267,6 +267,15 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Cache key (sourceURL + frameCount) for the last thumbnail/metric build,
     /// so re-entrant installScene calls for the same document don't re-decode.
     private var lastAnimationDataKey: (url: URL, count: Int)?
+    /// Centroid-aligned copy of the loaded frames, cached while
+    /// `state.alignTrajectory` is on. nil when alignment is off. Invalidated on
+    /// scene/frame reload by `installScene`.
+    private var alignedFrames: [Scene]?
+    /// Window hosting the per-frame metrics plot; nil until first shown.
+    private var framePlotsWindow: NSWindow?
+    /// The plot view inside `framePlotsWindow`, retained so the metric picker can
+    /// switch its displayed field without rebuilding the window.
+    private var framePlotsView: FrameMetricsPlotView?
     /// Runtime-only cell representation for the structure-tools basis transform.
     /// Session-only (not a Scene field); reset to .input on every fresh file open.
     private var currentCellRepresentation: CellRepresentation = .input
@@ -508,6 +517,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         state.onShowXRDWindow = { [weak self] in self?.showPowderXRD() }
         state.onExportXRDCSV = { [weak self] in self?.exportPowderXRDCSV() }
+        state.onSeekToThumbnail = { [weak self] index in
+            guard let self else { return }
+            self.seekToFrame(index)
+        }
+        state.onExportFrameMetricsCSV = { [weak self] csv in
+            guard let self else { return }
+            self.exportFrameMetricsCSV(csv)
+        }
+        state.onExportAnimation = { [weak self] url in
+            guard let self else { return }
+            self.exportAnimation(to: url)
+        }
+        state.onSaveProject = { [weak self] url in
+            guard let self else { return }
+            self.saveProject(to: url)
+        }
+        state.onShowFramePlots = { [weak self] in self?.showFramePlots() }
         // Structure-tools callbacks (runtime-only transforms + surface builder).
         state.onApplyBasisTransform = { [weak self] rep in self?.applyBasisTransform(rep) }
         state.onApplyDeformation = { [weak self] in self?.applyDeformation() }
@@ -703,9 +729,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.onChange = saved
         stopPlayback()
         // A fresh scene may have a different source/frame count — invalidate the
-        // cached thumbnails/metrics so the next refresh rebuilds for this document.
+        // cached thumbnails/metrics/alignment so the next refresh rebuilds for this document.
         lastAnimationDataKey = nil
         state.trajectoryTrailsAvailable = false
+        alignedFrames = nil
+        state.alignTrajectory = false
         refreshAnimationData()
         coordinationGeometryDidChange()
         refreshAtomTable()
@@ -3521,6 +3549,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // torn down on pause or when not animating at all.
         if state.isPlaying && playTimer == nil { startPlayback() }
         if !state.isPlaying && playTimer != nil { stopPlayback() }
+        // Trajectory-trail overlay follows its toggle. refreshTrajectoryTrails()
+        // handles both the on (load frames, publish strip) and off (disable
+        // renderer flag) cases, so just drive it whenever state and renderer
+        // disagree.
+        if state.showTrajectoryTrails != renderer?.showTrajectoryTrails {
+            refreshTrajectoryTrails()
+        }
+        // Trajectory-centroid alignment follows its toggle. When turned on, load
+        // and cache the aligned frames and immediately reload the current frame so
+        // the displayed trajectory is aligned; when turned off, clear the cache
+        // and reload to restore the original coordinates.
+        if state.alignTrajectory {
+            if alignedFrames == nil { refreshAlignedFrames() }
+        } else if alignedFrames != nil {
+            alignedFrames = nil
+            reloadFrame(state.frameIndex)
+        }
         // Electronic-structure graph interaction (energy window, Fermi shift) is
         // view-only state -> push it to the grapher views and recompute readouts.
         if state.electronicStructureEnabled { updateElectronicStructureGraphs() }
@@ -4317,6 +4362,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // (not state.*, which lags by one onChange) so scrolling frames never
         // resets the view, supercell, slab, or appearance settings.
         var next = Scene(loaded: loaded)
+        // When trajectory alignment is on, substitute the centroid-aligned atom
+        // coordinates for this frame (applied before supercell/slab so the
+        // expanded structure stays aligned). Other Scene fields come from the
+        // freshly parsed frame below.
+        if state.alignTrajectory, let aligned = alignedFrames, aligned.indices.contains(index) {
+            next.atoms = aligned[index].atoms
+        }
         let restoredDisplayMode = wasReciprocalEditing
             ? (reciprocalStructureDisplayMode ?? scene.displayMode)
             : scene.displayMode
@@ -4512,7 +4564,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Begin (or restart) the playback timer. Repeating at ~10 Hz; each tick
     /// advances frameIndex by one, wrapping to 0 at the end (or stopping — here
     /// we stop at the end and clear isPlaying for predictability).
-    private func startPlayback() {
+    func startPlayback() {
         stopPlayback()
         let clamped = min(20.0, max(0.1, state.playbackSpeed))
         playTimer = Timer.scheduledTimer(withTimeInterval: 0.1 / Double(clamped), repeats: true) { [weak self] _ in
@@ -4527,7 +4579,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
     }
 
-    private func stopPlayback() {
+    func stopPlayback() {
         playTimer?.invalidate()
         playTimer = nil
     }
@@ -4536,11 +4588,20 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// seam for playback-lifecycle assertions.
     var hasActivePlayTimer: Bool { playTimer != nil }
 
+    /// Clamp `index` into the valid frame range and jump to it. Mirrors the
+    /// sidebar Prev/Next buttons, which simply assign `state.frameIndex`; the
+    /// resulting `onChange` → `syncFromState` → `reloadFrame` advances the scene.
+    func seekToFrame(_ index: Int) {
+        guard state.frameCount > 0 else { return }
+        let clamped = min(max(0, index), state.frameCount - 1)
+        state.frameIndex = clamped
+    }
+
     /// Pure interval math for the playback timer, exposed for testing. 10 Hz
     /// scaled by `speed`, clamped to the 0.1...20 defensive range.
     static func playbackInterval(speed: Float) -> TimeInterval {
-        let clamped = min(20.0, max(0.1, speed))
-        return 0.1 / Double(clamped)
+        let clamped = min(20.0, max(0.1, Double(speed)))
+        return 0.1 / clamped
     }
 
     // MARK: - Animation timeline + per-frame metrics
@@ -4631,20 +4692,47 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
     }
 
-    /// Recompute the trajectory-trail strip from the loaded frames and push it
-    /// to the renderer. Called when the user toggles the trail overlay on.
+    /// Load all frames, centroid-align them to frame 0, and cache the result in
+    /// `alignedFrames`. Then reload the currently-displayed frame so the aligned
+    /// coordinates take effect immediately. No-op (leaving the cache nil) when
+    /// there is no multi-frame source.
+    private func refreshAlignedFrames() {
+        guard let url = sourceURL, state.frameCount > 1 else {
+            alignedFrames = nil
+            return
+        }
+        guard let frames = loadAllFrames() else {
+            alignedFrames = nil
+            return
+        }
+        alignedFrames = FrameMetrics.alignCentroid(frames: frames, to: 0)
+        // Take effect on the currently displayed frame without disturbing playback.
+        reloadFrame(state.frameIndex)
+    }
+
+    /// Recompute the trajectory-trail strip and push it to the renderer. Called
+    /// when the user toggles the trail overlay on. Uses the centroid-aligned
+    /// frames when alignment is on, so trails and alignment compose.
     private func refreshTrajectoryTrails() {
         guard state.showTrajectoryTrails else {
             renderer?.showTrajectoryTrails = false
             return
         }
         guard let url = sourceURL, state.frameCount > 1 else { return }
-        if state.trajectoryTrailsAvailable { return }
+        if state.trajectoryTrailsAvailable {
+            renderer?.showTrajectoryTrails = true
+            return
+        }
         animationDataGeneration += 1
         let token = animationDataGeneration
+        // Prefer the centroid-aligned frames when alignment is on so trails follow
+        // the aligned trajectory; fall back to the raw frames otherwise. The
+        // cached aligned frames are picked synchronously (no disk I/O); the raw
+        // path reads frames off the main thread below.
+        let prealigned = state.alignTrajectory ? alignedFrames : nil
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self, self.animationDataGeneration == token else { return }
-            guard let frames = self.loadAllFrames() else { return }
+            guard let frames = prealigned ?? self.loadAllFrames() else { return }
             let trails = self.trajectoryTrailVertices(frames: frames)
             let stillValid = self.animationDataGeneration == token
             DispatchQueue.main.async {
@@ -4974,6 +5062,77 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         xrdGrapher.showLabels = state.xrdShowLabels
     }
 
+    /// Lazily create and show the per-frame metrics plot window. Hosts a
+    /// `FrameMetricsPlotView` with a metric picker (NSSegmentedControl) and a CSV
+    /// export button. The plot is repopulated from `state.frameMetrics` each time
+    /// the window is shown.
+    func showFramePlots() {
+        if framePlotsWindow == nil {
+            let plot = FrameMetricsPlotView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+            plot.autoresizingMask = [.width, .height]
+            plot.metrics = state.frameMetrics
+            plot.metric = .volume
+            framePlotsView = plot
+
+            // Metric picker (one segment per FrameMetricField).
+            let seg = NSSegmentedControl(frame: NSRect(x: 8, y: 4, width: 320, height: 24))
+            seg.segmentCount = FrameMetricField.allCases.count
+            for (i, field) in FrameMetricField.allCases.enumerated() {
+                seg.setLabel(field.label, forSegment: i)
+                seg.setWidth(80, forSegment: i)
+            }
+            seg.selectedSegment = FrameMetricField.volume.rawValue
+            seg.autoresizingMask = .maxXMargin
+            seg.target = self
+            seg.action = #selector(framePlotMetricChanged(_:))
+
+            // CSV export button.
+            let exportButton = NSButton(frame: NSRect(x: 340, y: 4, width: 96, height: 24))
+            exportButton.title = "Export CSV"
+            exportButton.bezelStyle = .rounded
+            exportButton.autoresizingMask = .maxXMargin
+            exportButton.target = self
+            exportButton.action = #selector(framePlotExportCSV(_:))
+
+            // Container: picker + export on top, plot filling below.
+            let container = NSView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+            container.addSubview(plot)
+            container.addSubview(seg)
+            container.addSubview(exportButton)
+            plot.frame = NSRect(x: 0, y: 32, width: 640, height: 328)
+
+            let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 360),
+                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                               backing: .buffered, defer: false)
+            win.title = "Frame Metrics"
+            win.isReleasedWhenClosed = false
+            win.contentView = container
+            framePlotsWindow = win
+        }
+        framePlotsView?.metrics = state.frameMetrics
+        framePlotsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Switch the displayed metric of the live plot window.
+    @objc private func framePlotMetricChanged(_ sender: NSSegmentedControl) {
+        let field = FrameMetricField(rawValue: sender.selectedSegment) ?? .volume
+        framePlotsView?.metric = field
+        framePlotsView?.setNeedsDisplay(framePlotsView?.bounds ?? .zero)
+    }
+
+    /// Export the displayed metrics CSV via a save panel.
+    @objc private func framePlotExportCSV(_ sender: Any) {
+        guard let csv = framePlotsView?.csv(), !csv.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "frame_metrics.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do { try csv.write(to: url, atomically: true, encoding: .utf8) }
+            catch { self.presentExportError(error, title: "Frame metrics export failed") }
+        }
+    }
+
     /// Recompute the powder XRD pattern for the current scene and settings.
     /// Cheap and gated on isCrystal, so it is called on every sidebar/scene change.
     private func updatePowderXRD() {
@@ -5072,17 +5231,5 @@ extension NSSplitView {
         guard let controller = window?.delegate as? MainWindowController else { return false }
         controller.loadDroppedFile(url)
         return true
-    }
-}
-
-// TEMP STUB — parallel agent D lands ProjectStore.save/load on integration.
-enum ProjectStore {
-    static func save(_ scene: Scene, to url: URL) throws {
-        throw NSError(domain: "mcrysden", code: 0,
-                      userInfo: [NSLocalizedDescriptionKey: "ProjectStore.save not yet implemented"])
-    }
-    static func load(from url: URL) throws -> Scene {
-        throw NSError(domain: "mcrysden", code: 0,
-                      userInfo: [NSLocalizedDescriptionKey: "ProjectStore.load not yet implemented"])
     }
 }

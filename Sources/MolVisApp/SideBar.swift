@@ -644,6 +644,7 @@ struct SideBar: View {
     @ViewBuilder
     private var actionButtons: some View {
         Toggle("Show Trails", isOn: $state.showTrajectoryTrails)
+        Toggle("Align Trajectory", isOn: $state.alignTrajectory)
         HStack {
             Button("Export Animation…") { exportAnimation() }
                 .buttonStyle(.bordered)
@@ -651,6 +652,9 @@ struct SideBar: View {
                 .buttonStyle(.bordered)
         }
         .font(.caption)
+        Button("Plots…") { state.onShowFramePlots?() }
+            .buttonStyle(.bordered)
+            .disabled(state.frameMetrics.isEmpty)
     }
 
     private func exportAnimation() {

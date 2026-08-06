@@ -398,7 +398,13 @@ final class SideBarState: ObservableObject {
     /// Per-frame derived metrics (volume, energy, force, RMSD). Runtime-only;
     /// populated by the controller, never persisted.
     @Published var frameMetrics: [FrameMetric] = []
+    /// When true, playback scrubs through centroid-aligned frames so the
+    /// trajectory's center of mass stays fixed. View-only; the controller loads
+    /// and caches the aligned frames (cleared when toggled off).
+    @Published var alignTrajectory: Bool = false { didSet { onChange?() } }
     var onChange: (() -> Void)?
+    /// Invoked to present the per-frame metrics plot window.
+    var onShowFramePlots: (() -> Void)?
     /// Invoked when the user taps a timeline thumbnail; the controller sets
     /// state.frameIndex to the thumbnail's source frame index.
     var onSeekToThumbnail: ((Int) -> Void)?
