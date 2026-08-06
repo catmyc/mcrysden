@@ -107,10 +107,11 @@ final class StructureToolsTests: XCTestCase {
                       file: file, line: line)
     }
 
-    // MARK: - Primitive / conventional transforms
+    // MARK: - Primitive / conventional transforms, deformation, cluster cut
 
-    func testPrimitiveConventionalTransforms() {
+    func testStructureToolsTransformsAndDeformation() {
         let scene = makeDiamondSiScene()
+        let a: Float = 5.43
         let inputVolume = cellVolume(scene.cell!)
         let inputCoords = sortedCoords(scene.atoms)
 
@@ -144,13 +145,8 @@ final class StructureToolsTests: XCTestCase {
         case .failure(let err): XCTAssertEqual(err, .notThreeDimensionalCrystal)
         case .success: XCTFail("molecule should be rejected")
         }
-    }
 
-    // MARK: - Elastic deformation and cluster cut
-
-    func testElasticDeformationAndClusterCut() {
-        let scene = makeDiamondSiScene()
-        let a: Float = 5.43
+        // --- Elastic deformation and cluster cut ---
 
         // Uniaxial +10% along x.
         let rows: [SIMD3<Float>] = [SIMD3(1.1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)]

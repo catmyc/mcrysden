@@ -978,6 +978,20 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         if let msaa = exportOptions?.msaaSampleCount {
             effectiveOptions.msaaSampleCount = msaa
         }
+        if let dos = scene.densityOfStates, let bands = scene.bandStructure {
+            // Both present: one side-by-side image containing both panels. exportGraph
+            // routes PDF through writeGraphVectorPDF (true vector for both graphs) and
+            // raster-backed SVG/EPS/PS/PNG through the bitmap branch.
+            return try exportGraph(
+                LinkedGraphsView(frame: NSRect(origin: .zero, size: size),
+                                bandView: BandGrapherView(frame: .zero),
+                                dosView: DOSGrapherView(frame: .zero),
+                                band: bands, dos: dos, bandPresent: true, dosPresent: true),
+                configure: {
+                    $0.exportBackground = graphBackground
+                    $0.isExportTransparent = isTransparent
+                }, to: url, size: size)
+        }
         if let dos = scene.densityOfStates {
             return try exportGraph(DOSGrapherView(frame: NSRect(origin: .zero, size: size)), configure: {
                 $0.densityOfStates = dos
@@ -1193,7 +1207,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.1.43"
+    static let appVersion = "1.1.44"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

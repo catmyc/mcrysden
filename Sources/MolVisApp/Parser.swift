@@ -317,7 +317,7 @@ enum Parser {
         // grapher; it intentionally carries no atom or cell geometry.
         if effective == .dos {
             let text = try readCappedText(url)
-            guard let densityOfStates = DOSParser.parse(text) else {
+            guard let densityOfStates = DOSParser.parse(text, sourceName: url.lastPathComponent) else {
                 throw ParseError.parse(path: url.path, line: 0, reason: "invalid DOS data")
             }
             var out = LoadedScene()

@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-06 (v1.1.43: structure editing and generation — insert/remove/substitute/displace, lattice-parameter editing, unified editing history, defect workflows, and XSF/CIF/POSCAR/XYZ/QE structure export — 32 focused tests)**.
+Last updated: **2026-08-06 (v1.1.44: electronic-structure analysis — linked band/DOS plots with cross-graph cursor guide lines, side-by-side linked viewport and export, QE projwfc species/orbital label enrichment, orbital-character coloring, and a combined band+DOS analysis report — 32 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -124,8 +124,9 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 - [x] Defect workflows (v1.1.43): vacancies (remove selected atoms), substitutions (replace the species of a selection), and interstitials (insert an atom at a fractional/Cartesian position), with structure export to XSF, CIF, POSCAR, XYZ, and QE PWscf input via `File > Export Structure…` or the sidebar export buttons — each format matches its parser exactly so files round-trip.
 
 ### Electronic-structure analysis
-- [~] Interactive band/DOS cursor readout, energy windows, Fermi adjustment, and zoom/pan are implemented for both graphers; linked plots and projected species/orbital coloring remain pending.
-- [~] Band VBM/CBM, direct/indirect gap, metallicity, and effective masses plus DOS center, width, gap estimate, spin moment, and electron-count consistency are surfaced with explicit unavailable/insufficient-data states and text/CSV export. Band extrema and estimated DOS gap edges are linked to graph markers. Linked band/DOS analysis and projected species/orbital coloring remain pending.
+- [x] Interactive band/DOS cursor readout, energy windows, Fermi adjustment, and zoom/pan for both graphers; linked plots (v1.1.44) show BOTH graphs side-by-side when a scene carries band + DOS data, with a dashed cross-graph cursor guide line at the hovered energy, a combined report, and linked print/export (one image with both panels, true-vector PDF).
+- [x] Band VBM/CBM, direct/indirect gap, metallicity, and effective masses plus DOS center, width, gap estimate, spin moment, and electron-count consistency are surfaced with explicit unavailable/insufficient-data states and text/CSV export. Band extrema and estimated DOS gap edges are linked to graph markers. The combined band+DOS report (v1.1.44) adds "Gap agreement" and "Band-edge agreement" cross-check rows.
+- [x] Projected species/orbital coloring (v1.1.44): QE projwfc filenames (`pdos_atm#N(Species)_wfc#M(orbital)`, `pdos_tot` + spin suffixes) enrich DOS series labels with species+orbital character, and the DOS grapher colors projected series by orbital (s/p/d/f fixed palette) with the legend showing the projection labels. Band-side projected coloring stays unavailable because QE `.out` band tables carry no projection weights.
 
 ### Volumetric data and rendering
 - [x] Multiple independent isovalues (v1.1.38): additive spec list with per-level color/sign/enabled controls, capped at 8, persisted with backward-compatible legacy `isoLevel` fallback; classic ± pair remains the default.

@@ -29,10 +29,11 @@ final class ParserRobustnessTests: XCTestCase {
         XCTAssertNil(DOSParser.parse(decreasing))
     }
 
-    func testUnrecognizedCrystalSpaceGroupRejected() throws {
-        let url = FileManager.default.temporaryDirectory
+    func testParserRobustnessTempFiles() throws {
+        // --- CRYSTAL space-group rejection ---
+        let url1 = FileManager.default.temporaryDirectory
             .appendingPathComponent("mcrysden-test-\(UUID().uuidString).r1")
-        defer { try? FileManager.default.removeItem(at: url) }
+        defer { try? FileManager.default.removeItem(at: url1) }
         try """
         test
         CRYSTAL
@@ -42,20 +43,19 @@ final class ParserRobustnessTests: XCTestCase {
         2
         6 0.0 0.0 0.0
         8 0.5 0.5 0.5
-        """.write(to: url, atomically: true, encoding: .utf8)
-        XCTAssertThrowsError(try Parser.load(url)) { error in
+        """.write(to: url1, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(url1)) { error in
             guard case ParseError.parse(_, _, let reason) = error else {
                 return XCTFail("expected ParseError.parse, got \(error)")
             }
             XCTAssertTrue(reason.contains("space group"),
                           "reason should mention the space group, got: \(reason)")
         }
-    }
 
-    func testFHIaimsCoordOutSilverResolvesTo47() throws {
-        let url = FileManager.default.temporaryDirectory
+        // --- FHI-aims COORD.OUT species resolution: "Silver" -> Ag (47) ---
+        let url2 = FileManager.default.temporaryDirectory
             .appendingPathComponent("mcrysden-test-\(UUID().uuidString).out")
-        defer { try? FileManager.default.removeItem(at: url) }
+        defer { try? FileManager.default.removeItem(at: url2) }
         // XCrySDen-style coord.out: 3 lattice rows (Bohr), species count, then
         // per-species count/name and Cartesian rows (Bohr). "Silver" must
         // resolve to Ag (47), not the 2-letter prefix "SI" (Silicon, 14).
@@ -67,8 +67,8 @@ final class ParserRobustnessTests: XCTestCase {
         1
         Silver
         0.0 0.0 0.0 T
-        """.write(to: url, atomically: true, encoding: .utf8)
-        let scene = try Parser.load(url, as: .fhi)
+        """.write(to: url2, atomically: true, encoding: .utf8)
+        let scene = try Parser.load(url2, as: .fhi)
         XCTAssertEqual(scene.atoms.count, 1)
         XCTAssertEqual(scene.atoms[0].atomicNumber, 47)
         XCTAssertEqual(scene.atoms[0].label, "Ag")

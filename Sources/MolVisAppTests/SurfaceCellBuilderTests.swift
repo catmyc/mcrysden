@@ -46,7 +46,8 @@ final class SurfaceCellBuilderTests: XCTestCase {
         return (atoms, cell)
     }
 
-    func testMillerIndexSlabConstruction() throws {
+    func testSurfaceSlabConstruction() throws {
+        // --- (I) Core (1 1 1) Si slab + CRYSCAL SLAB extraction regression ---
         let (atoms, cell) = siFccBulk()
         let request = SurfaceCellRequest(h: 1, k: 1, l: 1, layers: 4, vacuum: 12,
                                           termination: 0, stackCount: 1)
@@ -70,26 +71,25 @@ final class SurfaceCellBuilderTests: XCTestCase {
         // planeCount should exceed the requested layers.
         XCTAssertGreaterThan(built.planeCount, 0)
 
-        // --- CRYSCAL SLAB extraction regression (merged) ---
+        // --- CRYSCAL SLAB extraction regression ---
         // SLAB 3 2 2 / 1 10 in the .r1 fixture reduces the 3D crystal to a 2D
         // surface cell through the same builder the GUI uses.
         let loaded = try Parser.load(fixture("crystal_Pt322.r1"))
-        let scene = Scene(loaded: loaded)
-        XCTAssertEqual(scene.periodicDim, 2)
-        XCTAssertTrue(scene.isCrystal)
-        XCTAssertNotNil(scene.cell)
-        XCTAssertGreaterThan(scene.atoms.count, 0)
-        XCTAssertTrue(scene.atoms.allSatisfy { $0.atomicNumber == 78 })
-    }
+        let ptScene = Scene(loaded: loaded)
+        XCTAssertEqual(ptScene.periodicDim, 2)
+        XCTAssertTrue(ptScene.isCrystal)
+        XCTAssertNotNil(ptScene.cell)
+        XCTAssertGreaterThan(ptScene.atoms.count, 0)
+        XCTAssertTrue(ptScene.atoms.allSatisfy { $0.atomicNumber == 78 })
 
-    func testTerminationAndStacking() {
-        let (atoms, cell) = naClBulk()
+        // --- (II) Termination and stacking on a rock-salt NaCl-like bulk ---
+        let (naClAtoms, naClCell) = naClBulk()
         let a = SurfaceCellBuilderTests.naClA
 
         // (a) layers=2 vs layers=4 give different atom counts.
-        let r2 = SurfaceCellBuilder.build(atoms: atoms, cell: cell,
+        let r2 = SurfaceCellBuilder.build(atoms: naClAtoms, cell: naClCell,
                                           request: SurfaceCellRequest(h: 0, k: 0, l: 1, layers: 2, vacuum: 10, termination: 0, stackCount: 1))
-        let r4 = SurfaceCellBuilder.build(atoms: atoms, cell: cell,
+        let r4 = SurfaceCellBuilder.build(atoms: naClAtoms, cell: naClCell,
                                           request: SurfaceCellRequest(h: 0, k: 0, l: 1, layers: 4, vacuum: 10, termination: 0, stackCount: 1))
         guard case .success(let b2) = r2, case .success(let b4) = r4 else {
             return XCTFail("expected both slabs to succeed: \(r2), \(r4)")
@@ -99,9 +99,9 @@ final class SurfaceCellBuilderTests: XCTestCase {
         // (b) termination=1 vs termination=0 yield different species profiles.
         // NaCl (111) planes alternate pure Na / pure Cl, so adjacent planes
         // differ in composition and the chosen block changes the slab makeup.
-        let t0 = SurfaceCellBuilder.build(atoms: atoms, cell: cell,
+        let t0 = SurfaceCellBuilder.build(atoms: naClAtoms, cell: naClCell,
                                           request: SurfaceCellRequest(h: 1, k: 1, l: 1, layers: 2, vacuum: 10, termination: 0, stackCount: 1))
-        let t1 = SurfaceCellBuilder.build(atoms: atoms, cell: cell,
+        let t1 = SurfaceCellBuilder.build(atoms: naClAtoms, cell: naClCell,
                                           request: SurfaceCellRequest(h: 1, k: 1, l: 1, layers: 2, vacuum: 10, termination: 1, stackCount: 1))
         guard case .success(let bt0) = t0, case .success(let bt1) = t1 else {
             return XCTFail("expected termination slabs to succeed: \(t0), \(t1)")
@@ -115,7 +115,7 @@ final class SurfaceCellBuilderTests: XCTestCase {
                           "different termination must change the species-vs-height profile")
 
         // (c) termination out of range fails.
-        let outOfRange = SurfaceCellBuilder.build(atoms: atoms, cell: cell,
+        let outOfRange = SurfaceCellBuilder.build(atoms: naClAtoms, cell: naClCell,
                                                   request: SurfaceCellRequest(h: 0, k: 0, l: 1, layers: 2, vacuum: 10, termination: 100, stackCount: 1))
         guard case .failure(let err) = outOfRange else {
             return XCTFail("expected termination out of range to fail")
@@ -124,9 +124,9 @@ final class SurfaceCellBuilderTests: XCTestCase {
                       "expected out-of-range message, got \(err)")
 
         // (d) stackCount=3 yields 3x the atom count and tripled slabExtent.
-        let s1 = SurfaceCellBuilder.build(atoms: atoms, cell: cell,
+        let s1 = SurfaceCellBuilder.build(atoms: naClAtoms, cell: naClCell,
                                           request: SurfaceCellRequest(h: 0, k: 0, l: 1, layers: 2, vacuum: 10, termination: 0, stackCount: 1))
-        let s3 = SurfaceCellBuilder.build(atoms: atoms, cell: cell,
+        let s3 = SurfaceCellBuilder.build(atoms: naClAtoms, cell: naClCell,
                                           request: SurfaceCellRequest(h: 0, k: 0, l: 1, layers: 2, vacuum: 10, termination: 0, stackCount: 3))
         guard case .success(let bs1) = s1, case .success(let bs3) = s3 else {
             return XCTFail("expected stacked slabs to succeed: \(s1), \(s3)")
@@ -137,7 +137,7 @@ final class SurfaceCellBuilderTests: XCTestCase {
         XCTAssertEqual(bs3.cell.c.z - 10, (bs1.cell.c.z - 10) * 3, accuracy: 1e-2)
 
         // (e) degenerate (0 0 0) fails.
-        let deg = SurfaceCellBuilder.build(atoms: atoms, cell: cell,
+        let deg = SurfaceCellBuilder.build(atoms: naClAtoms, cell: naClCell,
                                            request: SurfaceCellRequest(h: 0, k: 0, l: 0, layers: 2))
         guard case .failure(let derr) = deg else {
             return XCTFail("expected degenerate Miller to fail")

@@ -42,6 +42,10 @@ final class BandGrapherView: NSView {
     }
     /// Fires on mouse move with the data-coordinate under the cursor, or nil on exit.
     var onCursor: ((BandCursorInfo?) -> Void)?
+    /// Energy (in ORIGINAL eV) at which the OTHER graph's cursor is hovering; a dashed
+    /// horizontal guide line is drawn here. Driven by the linked DOS grapher. Skipped
+    /// during export.
+    var linkedCursorEnergy: Float? { didSet { needsDisplay = true } }
 
     private let axisFont = NSFont.systemFont(ofSize: 11)
     private let titleFont = NSFont.boldSystemFont(ofSize: 13)
@@ -241,6 +245,18 @@ final class BandGrapherView: NSView {
             fermiPath.move(to: f0); fermiPath.line(to: f1)
             fermiPath.stroke()
             drawLabel("Ef", at: NSPoint(x: f1.x + 3, y: f1.y), font: axisFont, color: .red, rightAligned: false)
+        }
+
+        // Linked-cursor guide line (driven by the other graph). Skipped during
+        // export so the snapshot matches the pre-interaction renderer. proj() converts
+        // the original-eV energy through dE (the shift) to the displayed frame.
+        if let linked = linkedCursorEnergy, !isExport {
+            NSColor.systemOrange.setStroke()
+            let guide = NSBezierPath()
+            fermiStyle(guide)
+            let g0 = proj(0, linked), g1 = proj(bs.nKPoints - 1, linked)
+            guide.move(to: g0); guide.line(to: g1)
+            guide.stroke()
         }
 
         // --- high-symmetry k-point gridlines + labels ---

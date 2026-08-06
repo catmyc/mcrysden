@@ -31,6 +31,10 @@ final class DOSGrapherView: NSView {
     }
     /// Fires on mouse move with the data-coordinate under the cursor, or nil on exit.
     var onCursor: ((DOSCursorInfo?) -> Void)?
+    /// Energy (in ORIGINAL eV) at which the OTHER graph's cursor is hovering; a dashed
+    /// horizontal guide line is drawn here. Driven by the linked band grapher. Skipped
+    /// during export.
+    var linkedCursorEnergy: Float? { didSet { needsDisplay = true } }
 
     private let axisFont = NSFont.systemFont(ofSize: 11)
     private let titleFont = NSFont.boldSystemFont(ofSize: 13)
@@ -261,9 +265,22 @@ final class DOSGrapherView: NSView {
                      color: .systemRed, horizontal: .right, vertical: .bottom)
         }
 
+        // Linked-cursor guide line (driven by the other graph). Skipped during
+        // export so the snapshot matches the pre-interaction renderer.
+        if let linked = linkedCursorEnergy, !isExport {
+            let y = project(0, linked).y
+            NSColor.systemOrange.setStroke()
+            let line = NSBezierPath()
+            line.move(to: NSPoint(x: plotRect.minX, y: y))
+            line.line(to: NSPoint(x: plotRect.maxX, y: y))
+            line.lineWidth = 1
+            line.setLineDash([4, 3], count: 2, phase: 0)
+            line.stroke()
+        }
+
         NSBezierPath(rect: plotRect).addClip()
         for (index, points) in samples.enumerated() where !points.isEmpty {
-            palette[index % palette.count].setStroke()
+            DOSOrbitalColoring.color(for: dos.series[index].label, index: index, palette: palette).setStroke()
             let path = NSBezierPath()
             path.lineWidth = index == 0 ? 1.8 : 1.25
             path.lineJoinStyle = .round
@@ -359,7 +376,7 @@ final class DOSGrapherView: NSView {
         for row in 0..<visibleCount {
             let entry = entries[row]
             let y = rect.minY + 7 + CGFloat(row) * rowHeight + rowHeight / 2
-            let color = palette[entry.offset % palette.count]
+            let color = DOSOrbitalColoring.color(for: entry.element.label, index: entry.offset, palette: palette)
             color.setStroke()
             let swatch = NSBezierPath()
             swatch.move(to: NSPoint(x: rect.minX + 7, y: y))

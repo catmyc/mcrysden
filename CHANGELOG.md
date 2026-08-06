@@ -2,6 +2,19 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.44] — 2026-08-06
+
+### Added
+
+- Linked band/DOS plots: a scene carrying both band-structure and DOS data now shows both graphs side by side (band left, DOS right, 1 px divider) instead of DOS taking precedence; hovering either graph draws a dashed cross-graph cursor guide line at the same energy on the other, and the sidebar cursor readout keeps working. Print and export render the linked view as one image with both panels (true-vector PDF via the shared graph export path).
+- Combined band+DOS analysis report: `ElectronicAnalysisPresentation.linkedReport(band:dos:)` appends "Gap agreement (bands vs DOS)" and "Band-edge agreement (bands vs DOS)" cross-check rows (Δ ≤ 0.5 eV → agree, else disagree; explicit unavailable/insufficient states) to the 7 band rows and 5 DOS rows; the sidebar uses it whenever both datasets are present, with the same text/CSV export buttons.
+- Projected species/orbital coloring: `DOSParser.parse(_:sourceName:)` recognizes QE projwfc filenames (`pdos_atm#N(Species)_wfc#M(orbital)`, `pdos_tot[_up|_down]`) and enriches PDOS series labels with species+orbital character ("Fe p", "Si s up"); the DOS grapher colors projected series by orbital via a fixed s/p/d/f palette (blue/red/green/purple) with the legend showing the projection labels. `DOSOrbitalColoring` classifies labels word-wise (last single-letter s/p/d/f token, so single-letter species S/P/F never shadow the orbital) and is exported through the standard graph path.
+- `LinkedGraphsView`: reusable side-by-side container rendering one or both graphers, with live AppKit child drawing and an explicit export/print path that paints children manually (including transparent exports) — used by the viewport, print, and `App.exportScene`.
+
+### Changed
+
+- Test suite remains at exactly 32 focused tests; four new electronic-analysis regressions (linked-report cross-checks, projwfc label enrichment, orbital coloring, linked-cursor/export rendering) replaced consolidated lower-value cases (two parser-robustness temp-file checks merged, structure-editing lattice test merged into the editing test, structure-tools deformation merged into transforms, surface-builder termination/stacking merged into slab construction — all assertions preserved).
+
 ## [1.1.43] — 2026-08-06
 
 ### Added

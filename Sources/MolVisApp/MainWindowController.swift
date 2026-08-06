@@ -123,6 +123,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let labelOverlay: LabelOverlayView
     let bandGrapher: BandGrapherView    // 2D band-structure diagram (shown when bandStructure != nil)
     let dosGrapher: DOSGrapherView      // total/projected DOS graph (shown when densityOfStates != nil)
+    let linkedGraphs: LinkedGraphsView   // side-by-side band+DOS container (or single child)
     let xrdGrapher: PowderXRDGrapherView // powder XRD diagram (shown in its own auxiliary window)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
@@ -386,13 +387,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         canvas.addSubview(labelOverlay)
         labelOverlay.autoresizingMask = [.width, .height]
         bandGrapher = BandGrapherView(frame: .zero)
-        bandGrapher.autoresizingMask = [.width, .height]
-        bandGrapher.isHidden = true
-        viewport.addSubview(bandGrapher)
         dosGrapher = DOSGrapherView(frame: .zero)
-        dosGrapher.autoresizingMask = [.width, .height]
-        dosGrapher.isHidden = true
-        viewport.addSubview(dosGrapher)
+        linkedGraphs = LinkedGraphsView(frame: .zero, bandView: bandGrapher, dosView: dosGrapher,
+                                        band: nil, dos: nil, bandPresent: false, dosPresent: false)
+        linkedGraphs.autoresizingMask = [.width, .height]
+        linkedGraphs.isHidden = true
+        viewport.addSubview(linkedGraphs)
         xrdGrapher = PowderXRDGrapherView(frame: .zero)
         xrdGrapher.autoresizingMask = [.width, .height]
         let info = NSTextView(frame: .zero)
@@ -518,12 +518,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // super.init so the closures capture a fully-initialized self.
         bandGrapher.onCursor = { [weak self] info in
             guard let self else { return }
+            self.linkedGraphs.dosView.linkedCursorEnergy = info?.energy
             self.state.electronicStructureCursorText = info.map {
                 String(format: "E = %.3f eV", $0.energy)
             } ?? ""
         }
         dosGrapher.onCursor = { [weak self] info in
             guard let self else { return }
+            self.linkedGraphs.bandView.linkedCursorEnergy = info?.energy
             self.state.electronicStructureCursorText = info.map {
                 String(format: "E = %.3f eV, DOS = %.3f", $0.energy, $0.dosValue)
             } ?? ""
@@ -534,7 +536,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let initHasBands = scene.bandStructure != nil
         bandGrapher.bandStructure = scene.bandStructure
         dosGrapher.densityOfStates = scene.densityOfStates
+        linkedGraphs.bandView.bandStructure = scene.bandStructure
+        linkedGraphs.dosView.densityOfStates = scene.densityOfStates
         state.electronicStructureEnabled = initHasBands || scene.densityOfStates != nil
+        updateContentVisibility()
         updateElectronicStructureGraphs()
         updatePowderXRD()
         atomTable.onSelectionChange = { [weak self] indices in
@@ -1754,11 +1759,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let nsImage: NSImage
         do {
             // Graph branches guard on the payload so an empty/hidden graph view
-            // does not supersede the Metal canvas.
-            if !dosGrapher.isHidden, scene.densityOfStates != nil {
-                nsImage = try PrintSupport.renderGraph(dosGrapher, pageRect: pageRect)
-            } else if !bandGrapher.isHidden, scene.bandStructure != nil {
-                nsImage = try PrintSupport.renderGraph(bandGrapher, pageRect: pageRect)
+            // does not supersede the Metal canvas. When the linked container is
+            // visible, print it so both panels (or the single present one) render.
+            if !linkedGraphs.isHidden {
+                let printView = LinkedGraphsView(
+                    frame: NSRect(origin: .zero, size: pageRect.size),
+                    bandView: BandGrapherView(frame: .zero),
+                    dosView: DOSGrapherView(frame: .zero),
+                    band: scene.bandStructure, dos: scene.densityOfStates,
+                    bandPresent: linkedGraphs.bandPresent, dosPresent: linkedGraphs.dosPresent)
+                printView.exportBackground = .white
+                nsImage = try PrintSupport.renderGraph(printView, pageRect: pageRect)
             } else {
                 // Project labels for the PIXEL viewport (not points) so they land
                 // at the correct position in the print-resolution image.
@@ -4172,8 +4183,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     internal func exportCurrentView(to url: URL, size: CGSize, options: ExportOptions? = nil) throws -> CGImage {
         let renderOptions = try exportRenderOptions(for: size)
         var visibleScene = scene
-        if dosGrapher.isHidden { visibleScene.densityOfStates = nil }
-        if bandGrapher.isHidden { visibleScene.bandStructure = nil }
+        if linkedGraphs.isHidden || !linkedGraphs.dosPresent { visibleScene.densityOfStates = nil }
+        if linkedGraphs.isHidden || !linkedGraphs.bandPresent { visibleScene.bandStructure = nil }
         // The color plane is now drawn by the renderer in the Metal scene, so the
         // exported scene keeps grid2D intact (the renderer gates on showColorPlane).
         // Apply export options: if the caller passes explicit options, use them;
@@ -4663,13 +4674,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // the renderer), so it no longer swaps the canvas — the canvas stays visible
         // and the plane composites with the structure via depth testing.
         let editingReciprocal = state.editKPathOnBZ && scene.isCrystal
-        let showDOS = !editingReciprocal && scene.densityOfStates != nil
-        let showBands = !editingReciprocal && !showDOS && scene.bandStructure != nil
-        dosGrapher.isHidden = !showDOS
-        bandGrapher.isHidden = !showBands
-        canvas.isHidden = !editingReciprocal && (showDOS || showBands)
-        if showDOS { dosGrapher.needsDisplay = true }
-        if showBands { bandGrapher.needsDisplay = true }
+        let hasDOS = scene.densityOfStates != nil
+        let hasBands = scene.bandStructure != nil
+        let showGraphs = !editingReciprocal && (hasDOS || hasBands)
+        linkedGraphs.isHidden = !showGraphs
+        if showGraphs {
+            linkedGraphs.bandPresent = hasBands
+            linkedGraphs.dosPresent = hasDOS
+            linkedGraphs.needsDisplay = true
+        }
+        // Hiding the canvas never hides a visible graph (canvas yields to graphs).
+        canvas.isHidden = editingReciprocal ? false : showGraphs
     }
 
     /// Push the sidebar's electronic-structure interaction state into the grapher
@@ -4698,10 +4713,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             state.bandGapSummary = ""
         }
 
-        // Electronic-analysis report: prefer the actually-displayed DOS (viewport
+        // Electronic-analysis report: when BOTH datasets are present use the combined
+        // linked report; otherwise prefer the actually-displayed DOS (viewport
         // precedence — see updateContentVisibility), otherwise bands. No expected
         // electron count is inferred because Scene/DOS metadata lacks it.
-        if let dos = scene.densityOfStates {
+        if let dos = scene.densityOfStates, let bs = scene.bandStructure {
+            state.electronicAnalysisReport = ElectronicAnalysisPresentation.linkedReport(band: bs, dos: dos)
+        } else if let dos = scene.densityOfStates {
             state.electronicAnalysisReport = ElectronicAnalysisPresentation.dosReport(dos)
         } else if let bs = scene.bandStructure {
             state.electronicAnalysisReport = ElectronicAnalysisPresentation.bandReport(bs)

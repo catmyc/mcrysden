@@ -42,9 +42,9 @@ final class StructureEditingTests: XCTestCase {
         abs(simd_dot(cell.a, simd_cross(cell.b, cell.c)))
     }
 
-    // MARK: - Insert / remove / substitute / displace
+    // MARK: - Insert / remove / substitute / displace / lattice editing
 
-    func testInsertRemoveSubstituteDisplace() {
+    func testStructureEditingOperations() {
         let scene = makeDiamondSiScene()
         let a: Float = 5.43
 
@@ -150,13 +150,8 @@ final class StructureEditingTests: XCTestCase {
                 + "Reset the supercell to 1×1×1 to edit atom coordinates."))
         case .success: XCTFail("supercell should not be editable")
         }
-    }
 
-    // MARK: - Lattice parameter editing
-
-    func testLatticeParameterEditing() {
-        let scene = makeDiamondSiScene()
-        let a: Float = 5.43
+        // --- Lattice parameter editing ---
         let oldVolume = cellVolume(scene.cell!)
 
         // Edit a only: new a = 6.0, b/c unchanged, fractional coords preserved.

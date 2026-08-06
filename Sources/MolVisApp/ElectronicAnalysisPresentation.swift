@@ -85,6 +85,51 @@ enum ElectronicAnalysisPresentation {
         return ElectronicAnalysisReport(rows: rows)
     }
 
+    // MARK: - Linked band + DOS report
+
+    /// Combined band + DOS report: the 7 band rows, then the 5 DOS rows, then two
+    /// cross-check rows ("Gap agreement", "Band-edge agreement"). Deterministic.
+    static func linkedReport(band: BandStructure, dos: DensityOfStates) -> ElectronicAnalysisReport {
+        var rows: [ElectronicAnalysisRow] = []
+        rows.append(contentsOf: bandReport(band).rows)
+        rows.append(contentsOf: dosReport(dos).rows)
+        rows.append(gapAgreementRow(band: band, dos: dos))
+        rows.append(bandEdgeAgreementRow(band: band, dos: dos))
+        return ElectronicAnalysisReport(rows: rows)
+    }
+
+    private static func gapAgreementRow(band: BandStructure, dos: DensityOfStates) -> ElectronicAnalysisRow {
+        if band.isMesh {
+            return ElectronicAnalysisRow(metric: "Gap agreement (bands vs DOS)", value: "Mesh data (not a band path)", status: .insufficientData)
+        }
+        guard let bandGap = BandAnalysis.bandGap(band) else {
+            let reason = band.fermiEnergy == nil ? "No Fermi level" : "No band gap determined"
+            return ElectronicAnalysisRow(metric: "Gap agreement (bands vs DOS)", value: reason, status: band.fermiEnergy == nil ? .insufficientData : .unavailable)
+        }
+        guard let dosGap = DOSAnalysis.dosGap(dos) else {
+            return ElectronicAnalysisRow(metric: "Gap agreement (bands vs DOS)", value: "No DOS gap detected", status: .unavailable)
+        }
+        let delta = abs(bandGap.gap - dosGap.gapWidth)
+        if delta <= 0.5 {
+            return ElectronicAnalysisRow(metric: "Gap agreement (bands vs DOS)", value: String(format: "agree (Δ %.3f eV)", delta), status: .available)
+        }
+        return ElectronicAnalysisRow(metric: "Gap agreement (bands vs DOS)", value: String(format: "disagree (Δ %.3f eV)", delta), status: .available)
+    }
+
+    private static func bandEdgeAgreementRow(band: BandStructure, dos: DensityOfStates) -> ElectronicAnalysisRow {
+        guard let bandGap = BandAnalysis.bandGap(band), bandGap.vbm.isFinite else {
+            return ElectronicAnalysisRow(metric: "Band-edge agreement (bands vs DOS)", value: "No band gap determined", status: .unavailable)
+        }
+        guard let dosGap = DOSAnalysis.dosGap(dos), dosGap.vbmEstimate.isFinite else {
+            return ElectronicAnalysisRow(metric: "Band-edge agreement (bands vs DOS)", value: "No DOS gap detected", status: .unavailable)
+        }
+        let delta = abs(bandGap.vbm - dosGap.vbmEstimate)
+        if delta <= 0.5 {
+            return ElectronicAnalysisRow(metric: "Band-edge agreement (bands vs DOS)", value: String(format: "agree (Δ %.3f eV)", delta), status: .available)
+        }
+        return ElectronicAnalysisRow(metric: "Band-edge agreement (bands vs DOS)", value: String(format: "disagree (Δ %.3f eV)", delta), status: .available)
+    }
+
     // MARK: - Band row factories
 
     private static func assessBandQuality(_ bs: BandStructure) -> (insufficient: Bool, reason: String) {
