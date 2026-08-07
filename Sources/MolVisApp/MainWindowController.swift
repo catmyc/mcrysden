@@ -6,89 +6,9 @@ import simd
 import SwiftUI
 import UniformTypeIdentifiers
 
-private struct RouteLabelBucket: Hashable {
-    let x: Int
-    let y: Int
-}
-
 private struct RouteLabelMeasurementKey: Hashable {
     let text: String
     let style: LabelOverlayView.Label.Style
-}
-
-/// Spatial index for the bounded route-label set. A label is inserted into every
-/// bucket its rectangle spans, so labels crossing bucket boundaries are not missed.
-private struct RouteLabelSpatialIndex {
-    private static let bucketSize: CGFloat = 64
-    private static let maximumIndexedBuckets = 4096
-    private var rectangles: [NSRect] = []
-    private var buckets: [RouteLabelBucket: [Int]] = [:]
-    private var broadRectangles: [Int] = []
-
-    mutating func intersects(_ rect: NSRect) -> Bool {
-        for index in broadRectangles where rectangles[index].intersects(rect) {
-            return true
-        }
-
-        var visited = Set<Int>()
-        for bucket in buckets(for: rect) {
-            for index in buckets[bucket, default: []] {
-                guard visited.insert(index).inserted else { continue }
-                if rectangles[index].intersects(rect) { return true }
-            }
-        }
-        return false
-    }
-
-    mutating func insert(_ rect: NSRect) {
-        let index = rectangles.count
-        rectangles.append(rect)
-        let keys = buckets(for: rect)
-        guard !keys.isEmpty, keys.count <= Self.maximumIndexedBuckets else {
-            broadRectangles.append(index)
-            return
-        }
-        for bucket in keys {
-            buckets[bucket, default: []].append(index)
-        }
-    }
-
-    private func buckets(for rect: NSRect) -> [RouteLabelBucket] {
-        guard rect.minX.isFinite, rect.maxX.isFinite,
-              rect.minY.isFinite, rect.maxY.isFinite,
-              let minX = bucketCoordinate(rect.minX),
-              let maxX = bucketCoordinate(rect.maxX),
-              let minY = bucketCoordinate(rect.minY),
-              let maxY = bucketCoordinate(rect.maxY),
-              maxX >= minX, maxY >= minY else { return [] }
-
-        let (xDifference, xOverflow) = maxX.subtractingReportingOverflow(minX)
-        let (yDifference, yOverflow) = maxY.subtractingReportingOverflow(minY)
-        guard !xOverflow, !yOverflow else { return [] }
-        let (xCount, xCountOverflow) = xDifference.addingReportingOverflow(1)
-        let (yCount, yCountOverflow) = yDifference.addingReportingOverflow(1)
-        guard xCount > 0, yCount > 0,
-              !xCountOverflow, !yCountOverflow,
-              xCount <= Self.maximumIndexedBuckets,
-              yCount <= Self.maximumIndexedBuckets,
-              xCount <= Self.maximumIndexedBuckets / yCount else { return [] }
-
-        var result: [RouteLabelBucket] = []
-        result.reserveCapacity(xCount * yCount)
-        for y in minY...maxY {
-            for x in minX...maxX {
-                result.append(RouteLabelBucket(x: x, y: y))
-            }
-        }
-        return result
-    }
-
-    private func bucketCoordinate(_ value: CGFloat) -> Int? {
-        let scaled = value / Self.bucketSize
-        guard scaled.isFinite,
-              scaled >= CGFloat(Int.min), scaled <= CGFloat(Int.max) else { return nil }
-        return Int(floor(scaled))
-    }
 }
 
 final class MainWindowController: NSObject, World, NSWindowDelegate {
@@ -2525,38 +2445,37 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             _ = candidates // The cache is intentionally shared with picking/framing.
             let selected = selectedRouteNodeIndex ?? renderer?.selectedKPathNode
             let labelBounds = NSRect(x: 0, y: 0, width: CGFloat(viewport.x), height: CGFloat(viewport.y))
-            var projected: [(index: Int, label: LabelOverlayView.Label, rect: NSRect, selected: Bool)] = []
+            var projected: [(index: Int, label: LabelOverlayView.Label, rect: NSRect, selected: Bool, depth: Float)] = []
             for (index, point) in scene.kPathPoints.prefix(1024).enumerated() {
                 guard finite(point.frac),
-                      let screen = projectLabelPoint(presentation.world(frac: point.frac),
-                                                     camera: camera, viewport: viewport) else {
+                      let proj = Self.projectRouteLabelPoint(presentation.world(frac: point.frac),
+                                                             camera: camera, viewport: viewport) else {
                     continue
                 }
                 let isSelected = selected == index
                 let style: LabelOverlayView.Label.Style = isSelected ? .selectedRouteNode : .routeNode
                 let symbol = point.label.isEmpty ? "K\(index + 1)" : String(point.label.prefix(64))
                 let rawLabel = LabelOverlayView.Label(symbol: symbol,
-                                                      x: screen.x + 6, y: screen.y - 6,
+                                                      x: proj.point.x + 6, y: proj.point.y - 6,
                                                       style: style)
                 let measuredSize = measuredRouteLabelSize(text: symbol, style: style)
                 let label = Self.clampedRouteLabel(rawLabel, in: labelBounds, measuredSize: measuredSize)
                 projected.append((index, label,
                                   LabelOverlayView.drawingRect(for: label, measuredSize: measuredSize),
-                                  isSelected))
+                                  isSelected, proj.depth))
             }
 
-            // Select the highlighted node first, then retain the lowest route index
-            // for ordinary overlaps. Expanding each rect makes near-coincident
-            // projections deterministic without considering atom labels.
+            // Draw EVERY route label. No label is dropped for overlapping a
+            // neighbour (that made labels vanish during rotation). Instead the
+            // labels are layered by view depth so points nearer the camera draw
+            // on top of farther ones, and the sidebar-selected node always draws
+            // on top. This keeps the depth ordering consistent with the 3D view
+            // while never hiding a label automatically.
             let ordered = projected.sorted { lhs, rhs in
-                if lhs.selected != rhs.selected { return lhs.selected }
-                return lhs.index < rhs.index
+                if lhs.selected != rhs.selected { return rhs.selected }
+                return lhs.depth > rhs.depth
             }
-            var occupied = RouteLabelSpatialIndex()
             for item in ordered {
-                let collisionRect = item.rect.insetBy(dx: -4, dy: -4)
-                guard !occupied.intersects(collisionRect) else { continue }
-                occupied.insert(collisionRect)
                 labels.append(item.label)
             }
         }
@@ -2772,6 +2691,49 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private func projectLabelPoint(_ world: SIMD3<Float>, camera: Camera,
                                    viewport: SIMD2<Float>) -> CGPoint? {
         Self.projectPoint(world, camera: camera, viewport: viewport)
+    }
+
+    /// Project a route-node label point, returning both the screen point and a
+    /// depth sort key. Points behind the near plane are clamped to just in front
+    /// of it so the label stays visible as the BZ rotates (the parallel
+    /// projection keeps the screen position stable), and report a large depth so
+    /// they layer beneath labels for points actually in front of the camera.
+    static func projectRouteLabelPoint(_ world: SIMD3<Float>, camera: Camera,
+                                        viewport: SIMD2<Float>) -> (point: CGPoint, depth: Float)? {
+        guard world.x.isFinite, world.y.isFinite, world.z.isFinite,
+              validViewport(viewport) else { return nil }
+        var viewPosition = camera.viewMatrix() * SIMD4<Float>(world.x, world.y, world.z, 1)
+        let depth = -viewPosition.z
+        let behindCamera: Bool
+        let sortDepth: Float
+        if depth.isFinite, depth > 0.01 {
+            behindCamera = false
+            sortDepth = depth
+        } else {
+            // Clamp just in front of the near plane so the projection keeps the
+            // label's screen position stable as it passes behind the camera;
+            // report it as farthest so it layers beneath in-front labels.
+            viewPosition.z = -0.01
+            behindCamera = true
+            sortDepth = 1000
+        }
+        let aspect = viewport.x / viewport.y
+        guard aspect.isFinite, aspect > 0 else { return nil }
+        let clip = camera.projectionMatrix(aspect: aspect) * viewPosition
+        guard clip.x.isFinite, clip.y.isFinite, clip.z.isFinite, clip.w.isFinite,
+              clip.w > 1e-10 else { return nil }
+        let ndc = clip / clip.w
+        guard ndc.x.isFinite, ndc.y.isFinite, ndc.z.isFinite else { return nil }
+        // Behind-camera points project with the near-plane z so they pass the
+        // range check; in-front points keep the strict viewport check.
+        guard ndc.x >= -1, ndc.x <= 1, ndc.y >= -1, ndc.y <= 1 else { return nil }
+        if !behindCamera {
+            guard ndc.z >= 0, ndc.z <= 1 else { return nil }
+        }
+        let x = (ndc.x * 0.5 + 0.5) * viewport.x
+        let y = (1 - (ndc.y * 0.5 + 0.5)) * viewport.y
+        guard x.isFinite, y.isFinite else { return nil }
+        return (CGPoint(x: CGFloat(x), y: CGFloat(y)), sortDepth)
     }
 
     /// Project a world point into top-origin viewport pixels with the given

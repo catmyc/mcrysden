@@ -777,11 +777,17 @@ struct BZPresentation {
         return max(0.06, displayedHalfExtent * 0.10)
     }
 
+    /// Fixed display half-extent for the BZ overlay, independent of the
+    /// real-space structure size. The BZ lives in k-space; tying its on-screen
+    /// size to the real-space bounding sphere makes it tiny for small cells
+    /// and huge for large ones. A fixed extent keeps it a consistent, decently
+    /// large cage centered on the structure for visualization and picking.
+    static let fixedDisplayHalfExtent: Double = 2.0
+
     init(bz: BrillouinZone, scene: Scene) {
         var extent: Double = 0
         for face in bz.faces { for v in face { extent = max(extent, scaleSafeLength(v)) } }
-        let (_, radius) = scene.boundingSphere()
-        let targetExtent = max(1.0, radius) * 0.45
+        let targetExtent = BZPresentation.fixedDisplayHalfExtent
         self.center = scene.centroid
         let scale = extent.isFinite && extent > 0 ? Double(targetExtent) / extent : 0
         let floatScale = Float(scale)

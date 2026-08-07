@@ -189,6 +189,90 @@ final class RendererTests: XCTestCase {
         }
     }
 
+    // MARK: - Orientation gizmo lighting regression
+    //
+    // The orientation gizmo must be lit from the same lighting basis as the
+    // main scene. The gizmo renders in camera space (view = identity), with
+    // arrows pointing along `dir = R^T * axis` (the camera-space direction of
+    // each world axis). A naive `rotation(fromYTo: dir)` rotates the cylinder's
+    // +Y to `dir`, but the resulting surface normals are
+    // `rot(Y->dir) * n_local`, which do NOT match the main scene's
+    // `R^T * rot(Y->axis) * n_local` in general — rotation composition does not
+    // commute with `R^T`. The mismatch makes the gizmo's diffuse shading
+    // disagree with the structure's: the dark side appears to rotate with the
+    // arrow instead of staying viewer-fixed.
+    //
+    // `gizmoArrowRotation(worldToView:dir:)` pre-composes with `R^T` so the
+    // arrow still points along `dir` (since `R^T * axis = dir`), but the
+    // normals become `R^T * rot(Y->axis) * n_local`, whose dot product with the
+    // camera-space light `viewLight` equals the main scene's
+    // `dot(rot(Y->axis)*n_local, R * viewLight)`. This test verifies that
+    // equality across camera rotations, world axes, and lighting directions.
+    // It FAILS if `gizmoArrowRotation` reverts to the naive `rot(Y->dir)`.
+    func testGizmoArrowLightingMatchesMainScene() {
+        struct LightCfg { let name: String; let az: Float; let el: Float }
+        struct RotCfg { let name: String; let q: simd_quatf }
+        let rotations: [RotCfg] = [
+            RotCfg(name: "identity", q: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)),
+            RotCfg(name: "90Y", q: simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(0, 1, 0))),
+            RotCfg(name: "180Y", q: simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))),
+            RotCfg(name: "45X", q: simd_quatf(angle: .pi / 4, axis: SIMD3<Float>(1, 0, 0))),
+            RotCfg(name: "arb", q: simd_quatf(angle: 1.2, axis: normalize(SIMD3<Float>(1, 2, 3)))),
+        ]
+        let lightings: [LightCfg] = [
+            LightCfg(name: "front", az: 0, el: 45),
+            LightCfg(name: "side", az: 90, el: 30),
+            LightCfg(name: "back", az: 180, el: 60),
+            LightCfg(name: "high", az: 45, el: 75),
+        ]
+        let axes: [SIMD3<Float>] = [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)]
+        // Local normals on the cylinder surface (perpendicular to the cylinder's
+        // local +Y axis). These exercise the full range of surface orientations.
+        let localNormals: [SIMD3<Float>] = [
+            SIMD3(1, 0, 0), SIMD3(0, 0, 1), SIMD3(-1, 0, 0), SIMD3(0, 0, -1),
+            normalize(SIMD3<Float>(1, 0, 1)), normalize(SIMD3<Float>(1, 0, -1)),
+        ]
+
+        for rot in rotations {
+            let R = float4x4(rot.q)
+            let worldToView = R.transpose
+            for light in lightings {
+                // Camera-space light direction — same formula as Renderer.makeFrame.
+                let azRad = light.az * .pi / 180
+                let elRad = light.el * .pi / 180
+                let cel = cos(elRad)
+                let viewLight = SIMD3<Float>(cel * cos(azRad), cel * sin(azRad), sin(elRad))
+                // Main scene's world-space light: L_world = R * viewLight.
+                let L_world = (R * SIMD4<Float>(viewLight, 0)).xyz
+                for axis in axes {
+                    let dir = (worldToView * SIMD4<Float>(axis, 0)).xyz
+                    let gizmoRot = Renderer.gizmoArrowRotation(worldToView: worldToView, dir: dir)
+
+                    // The gizmo arrow must still point along dir.
+                    let gizmoDir = (gizmoRot * SIMD4<Float>(0, 1, 0, 0)).xyz
+                    XCTAssertEqual(gizmoDir.x, dir.x, accuracy: 1e-5,
+                        "\(rot.name)/\(light.name)/axis\(axis): dir.x")
+                    XCTAssertEqual(gizmoDir.y, dir.y, accuracy: 1e-5,
+                        "\(rot.name)/\(light.name)/axis\(axis): dir.y")
+                    XCTAssertEqual(gizmoDir.z, dir.z, accuracy: 1e-5,
+                        "\(rot.name)/\(light.name)/axis\(axis): dir.z")
+
+                    // Main scene's arrow rotation for the same world axis.
+                    let mainRot = float4x4.rotation(fromYTo: axis)
+                    for nLocal in localNormals {
+                        let gizmoNormal = (gizmoRot * SIMD4<Float>(nLocal, 0)).xyz
+                        let mainNormal = (mainRot * SIMD4<Float>(nLocal, 0)).xyz
+                        // Shader diffuse = max(dot(N, L), 0).
+                        let gizmoDiffuse = max(dot(gizmoNormal, viewLight), 0)
+                        let mainDiffuse = max(dot(mainNormal, L_world), 0)
+                        XCTAssertEqual(gizmoDiffuse, mainDiffuse, accuracy: 1e-5,
+                            "\(rot.name)/\(light.name)/axis\(axis)/n\(nLocal): gizmo \(gizmoDiffuse) != main \(mainDiffuse)")
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Shared render helpers
 
     private func foregroundPixels(_ image: CGImage) -> Int {

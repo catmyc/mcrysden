@@ -323,9 +323,10 @@ final class Renderer: NSObject {
     /// true after use. Not consulted anywhere except the frame-buffer allocation.
     static var forceNextBufferAllocationSuccess = true
 
-    /// Last computed world-space light direction — exposed so the orientation
-    /// gizmo (a mini-scene drawn with its own FrameData) can light its arrows
-    /// from the same direction as the main scene for visual consistency.
+    /// Last computed world-space light direction, cached from the most recent
+    /// `encode()` frame. Used as the light vector for the AO/shadow neighbor
+    /// search in `computeAOShadowFactors()` and as part of that cache's key (so
+    /// the AO/shadow field is rebuilt when the light orbit changes).
     private var currentLightDir: SIMD3<Float> = normalize(SIMD3<Float>(0.3, 0.8, 0.5))
 
     /// Fill a FrameData from the current scene's lighting + camera. Centralised so
@@ -2533,11 +2534,11 @@ final class Renderer: NSObject {
         let shaftLen: Float = 0.62, shaftR: Float = 0.05
         let headLen: Float = 0.22, headR: Float = 0.13
         func shaftModel(_ dir: SIMD3<Float>) -> float4x4 {
-            float4x4(translation: dir * shaftLen * 0.5) * .rotation(fromYTo: dir) *
+            float4x4(translation: dir * shaftLen * 0.5) * Renderer.gizmoArrowRotation(worldToView: worldToView, dir: dir) *
             float4x4(scale: SIMD3<Float>(shaftR, shaftLen, shaftR))
         }
         func headModel(_ dir: SIMD3<Float>) -> float4x4 {
-            float4x4(translation: dir * shaftLen) * .rotation(fromYTo: dir) *
+            float4x4(translation: dir * shaftLen) * Renderer.gizmoArrowRotation(worldToView: worldToView, dir: dir) *
             float4x4(scale: SIMD3<Float>(headR, headLen, headR))
         }
         struct Axis { let dir: SIMD3<Float>; let color: SIMD3<Float> }
@@ -2604,6 +2605,29 @@ final class Renderer: NSObject {
         return [world - ax, world + ax, world - ay, world + ay, world - az, world + az]
     }
 
+    /// Generate line segments for a star-shaped marker: a 3-axis cross plus
+    /// diagonal "sparkle" lines in every octant. More visually prominent than
+    /// a plain cross, so high-symmetry k-path nodes read clearly against the
+    /// BZ faces and structure. The sparkle lines use a shorter half-length so
+    /// the central cross still dominates. Returns [] for a non-finite center.
+    static func starMarkerSegments(_ world: SIMD3<Float>, half: Float) -> [SIMD3<Float>] {
+        guard world.x.isFinite && world.y.isFinite && world.z.isFinite else { return [] }
+        guard half.isFinite, half > 0 else { return [] }
+        // Primary cross axes.
+        let ax = SIMD3<Float>(half, 0, 0), ay = SIMD3<Float>(0, half, 0), az = SIMD3<Float>(0, 0, half)
+        var segs = [world - ax, world + ax, world - ay, world + ay, world - az, world + az]
+        // Diagonal sparkle lines (shortened to 45% of the primary half-length)
+        // in the XY, XZ, and YZ planes — 3 extra line segments total.
+        let s = half * 0.45
+        let dxy = SIMD3<Float>(s, s, 0), dxz = SIMD3<Float>(s, 0, s), dyz = SIMD3<Float>(0, s, s)
+        segs.append(contentsOf: [
+            world - dxy, world + dxy,   // XY-plane diagonals
+            world - dxz, world + dxz,   // XZ-plane diagonals
+            world - dyz, world + dyz,   // YZ-plane diagonals
+        ])
+        return segs
+    }
+
     /// Expand world-space line segments into NDC-space quads for configurable
     /// line width. Each segment (p0,p1) becomes 4 vertices (2 triangles) expanded
     /// perpendicular to the line direction in NDC by half the pixel width.
@@ -2650,9 +2674,33 @@ final class Renderer: NSObject {
         return result.isEmpty ? nil : result
     }
 
+    /// Compute the model rotation for a gizmo arrow. The gizmo renders in
+    /// camera space (view = identity), with arrows pointing along
+    /// `dir = worldToView * axis` (the camera-space direction of a world axis).
+    /// A naive `rotation(fromYTo: dir)` rotates the cylinder's +Y to `dir`, but
+    /// the resulting surface normals are `rot(Y→dir) * n_local`, which do NOT
+    /// match the main scene's normals `R^T * rot(Y→axis) * n_local` in general —
+    /// rotation composition does not commute with `R^T`. The mismatch makes the
+    /// gizmo's diffuse shading disagree with the structure's: the dark side
+    /// appears to rotate with the arrow instead of staying viewer-fixed.
+    ///
+    /// Pre-composing with `worldToView = R^T` fixes this: the arrow still points
+    /// along `dir` (since `R^T * axis = dir`), but the normals become
+    /// `R^T * rot(Y→axis) * n_local`, whose dot product with the camera-space
+    /// light `viewLight` equals the main scene's `dot(rot(Y→axis)*n_local,
+    /// R * viewLight)`. The gizmo then shares the main scene's lighting basis.
+    static func gizmoArrowRotation(worldToView: float4x4, dir: SIMD3<Float>) -> float4x4 {
+        let worldAxis = (worldToView.transpose * SIMD4<Float>(dir, 0)).xyz
+        return worldToView * .rotation(fromYTo: worldAxis)
+    }
+
+    /// Draw a line buffer with an optional explicit line width. When `lineWidth`
+    /// is nil, the scene's global `lineWidth` is used. Callers that need a
+    /// specific width (e.g. the BZ k-path) pass an explicit value.
     private func drawLineBuffer(_ verts: [SIMD3<Float>], color: SIMD3<Float>,
-                                enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
-        let width = scene.lineWidth
+                                enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?,
+                                lineWidth: Float? = nil) -> Bool {
+        let width = lineWidth ?? scene.lineWidth
         if width <= 1.0 {
             guard let lineVB = device.makeBuffer(bytes: verts,
                                                  length: verts.count * MemoryLayout<SIMD3<Float>>.stride,
@@ -2797,8 +2845,12 @@ final class Renderer: NSObject {
                 segVerts.append(mapped[i + 1])
             }
         }
+        // Thicker line width for the k-path route segments so the path reads
+        // clearly against the BZ faces and structure. MSAA (applied during the
+        // render pass) anti-aliases the edges.
+        let routeLineWidth: Float = 3.0
         let amber = SIMD3<Float>(1.0, 0.55, 0.1)
-        let segOK = segVerts.isEmpty ? true : drawLineBuffer(segVerts, color: amber, enc: enc, frameBuffer: frameBuffer)
+        let segOK = segVerts.isEmpty ? true : drawLineBuffer(segVerts, color: amber, enc: enc, frameBuffer: frameBuffer, lineWidth: routeLineWidth)
 
         // Defense in depth against a stale controller index: validate against the
         // rendered node count and treat an out-of-range value as "no selection".
@@ -2810,18 +2862,20 @@ final class Renderer: NSObject {
         var highlightVerts: [SIMD3<Float>] = []
         for i in 0..<mapped.count where valid[i] {
             if let sel, i == sel {
-                // Highlighted (sidebar-selected) node: larger cross in a vivid
-                // green so it reads against the cyan nodes, amber segments, and
-                // purple BZ faces.
-                highlightVerts.append(contentsOf: Renderer.crossLineSegments(mapped[i], half: routeNodeHalf * 1.5))
+                // Highlighted (sidebar-selected) node: larger star marker in a
+                // vivid green so it reads against the cyan nodes, amber segments,
+                // and purple BZ faces.
+                highlightVerts.append(contentsOf: Renderer.starMarkerSegments(mapped[i], half: routeNodeHalf * 1.6))
             } else {
-                nodeVerts.append(contentsOf: Renderer.crossLineSegments(mapped[i], half: routeNodeHalf))
+                // Standard node: a star marker (cross + diagonals) for a more
+                // prominent, beautiful readout than a plain 3-axis cross.
+                nodeVerts.append(contentsOf: Renderer.starMarkerSegments(mapped[i], half: routeNodeHalf))
             }
         }
         let cyan = SIMD3<Float>(0.2, 0.8, 1.0)
-        let nodeOK = nodeVerts.isEmpty ? true : drawLineBuffer(nodeVerts, color: cyan, enc: enc, frameBuffer: frameBuffer)
+        let nodeOK = nodeVerts.isEmpty ? true : drawLineBuffer(nodeVerts, color: cyan, enc: enc, frameBuffer: frameBuffer, lineWidth: routeLineWidth)
         let highlight = SIMD3<Float>(0.2, 1.0, 0.3)
-        let highlightOK = highlightVerts.isEmpty ? true : drawLineBuffer(highlightVerts, color: highlight, enc: enc, frameBuffer: frameBuffer)
+        let highlightOK = highlightVerts.isEmpty ? true : drawLineBuffer(highlightVerts, color: highlight, enc: enc, frameBuffer: frameBuffer, lineWidth: routeLineWidth)
         return segOK && nodeOK && highlightOK
     }
 
