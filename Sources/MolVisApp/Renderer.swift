@@ -2533,26 +2533,26 @@ final class Renderer: NSObject {
 
         let shaftLen: Float = 0.62, shaftR: Float = 0.05
         let headLen: Float = 0.22, headR: Float = 0.13
-        func shaftModel(_ dir: SIMD3<Float>) -> float4x4 {
-            float4x4(translation: dir * shaftLen * 0.5) * Renderer.gizmoArrowRotation(worldToView: worldToView, dir: dir) *
+        struct Axis { let worldAxis: SIMD3<Float>; let dir: SIMD3<Float>; let color: SIMD3<Float> }
+        let axes = [
+            Axis(worldAxis: SIMD3<Float>(1, 0, 0), dir: (worldToView * SIMD4<Float>(1, 0, 0, 0)).xyz, color: SIMD3<Float>(1, 0.2, 0.2)),
+            Axis(worldAxis: SIMD3<Float>(0, 1, 0), dir: (worldToView * SIMD4<Float>(0, 1, 0, 0)).xyz, color: SIMD3<Float>(0.2, 1, 0.2)),
+            Axis(worldAxis: SIMD3<Float>(0, 0, 1), dir: (worldToView * SIMD4<Float>(0, 0, 1, 0)).xyz, color: SIMD3<Float>(0.2, 0.2, 1)),
+        ]
+        func shaftModel(_ a: Axis) -> float4x4 {
+            float4x4(translation: a.dir * shaftLen * 0.5) * Renderer.gizmoArrowRotation(worldToView: worldToView, worldAxis: a.worldAxis) *
             float4x4(scale: SIMD3<Float>(shaftR, shaftLen, shaftR))
         }
-        func headModel(_ dir: SIMD3<Float>) -> float4x4 {
-            float4x4(translation: dir * shaftLen) * Renderer.gizmoArrowRotation(worldToView: worldToView, dir: dir) *
+        func headModel(_ a: Axis) -> float4x4 {
+            float4x4(translation: a.dir * shaftLen) * Renderer.gizmoArrowRotation(worldToView: worldToView, worldAxis: a.worldAxis) *
             float4x4(scale: SIMD3<Float>(headR, headLen, headR))
         }
-        struct Axis { let dir: SIMD3<Float>; let color: SIMD3<Float> }
-        let axes = [
-            Axis(dir: (worldToView * SIMD4<Float>(1, 0, 0, 0)).xyz, color: SIMD3<Float>(1, 0.2, 0.2)),
-            Axis(dir: (worldToView * SIMD4<Float>(0, 1, 0, 0)).xyz, color: SIMD3<Float>(0.2, 1, 0.2)),
-            Axis(dir: (worldToView * SIMD4<Float>(0, 0, 1, 0)).xyz, color: SIMD3<Float>(0.2, 0.2, 1)),
-        ]
 
         func drawInstances(_ meshVB: MTLBuffer, _ meshIB: MTLBuffer,
-                           _ model: (SIMD3<Float>) -> float4x4) -> Bool {
+                           _ model: (Axis) -> float4x4) -> Bool {
             var inst: [InstanceData] = []
             for a in axes {
-                inst.append(InstanceData(model: model(a.dir), color: SIMD4(a.color, 1),
+                inst.append(InstanceData(model: model(a), color: SIMD4(a.color, 1),
                                          radius: 1.0, metalness: 0.0,
                                          aoFactor: 1.0, shadowFactor: 1.0))
             }
@@ -2675,22 +2675,28 @@ final class Renderer: NSObject {
     }
 
     /// Compute the model rotation for a gizmo arrow. The gizmo renders in
-    /// camera space (view = identity), with arrows pointing along
-    /// `dir = worldToView * axis` (the camera-space direction of a world axis).
-    /// A naive `rotation(fromYTo: dir)` rotates the cylinder's +Y to `dir`, but
-    /// the resulting surface normals are `rot(Y→dir) * n_local`, which do NOT
-    /// match the main scene's normals `R^T * rot(Y→axis) * n_local` in general —
-    /// rotation composition does not commute with `R^T`. The mismatch makes the
-    /// gizmo's diffuse shading disagree with the structure's: the dark side
-    /// appears to rotate with the arrow instead of staying viewer-fixed.
+    /// camera space (view = identity), with arrows pointing along the
+    /// camera-space direction of a world axis.
     ///
-    /// Pre-composing with `worldToView = R^T` fixes this: the arrow still points
-    /// along `dir` (since `R^T * axis = dir`), but the normals become
-    /// `R^T * rot(Y→axis) * n_local`, whose dot product with the camera-space
-    /// light `viewLight` equals the main scene's `dot(rot(Y→axis)*n_local,
-    /// R * viewLight)`. The gizmo then shares the main scene's lighting basis.
-    static func gizmoArrowRotation(worldToView: float4x4, dir: SIMD3<Float>) -> float4x4 {
-        let worldAxis = (worldToView.transpose * SIMD4<Float>(dir, 0)).xyz
+    /// A naive `rotation(fromYTo: dir)` rotates the cylinder's +Y to `dir`, but
+    /// the resulting surface normals `rot(Y->dir) * n_local` do NOT match the
+    /// main scene's normals `worldToView * rot(Y->worldAxis) * n_local` in
+    /// general -- rotation composition does not commute with `worldToView`.
+    /// The mismatch makes the gizmo's diffuse shading disagree with the
+    /// structure's: the dark side appears to rotate with the arrow instead of
+    /// staying viewer-fixed.
+    ///
+    /// Pre-composing with `worldToView` fixes this while the arrow still points
+    /// along `dir = worldToView * worldAxis`: the normals become
+    /// `worldToView * rot(Y->worldAxis) * n_local`, whose dot product with the
+    /// camera-space light `viewLight` equals the main scene's
+    /// `dot(rot(Y->worldAxis)*n_local, worldToView^T * viewLight)`. The gizmo
+    /// then shares the main scene's lighting basis.
+    ///
+    /// `worldAxis` is passed directly rather than recovered by inverting
+    /// `worldToView * worldAxis = dir`; it is already known (a coordinate
+    /// axis), so no inversion/reconstruction is needed.
+    static func gizmoArrowRotation(worldToView: float4x4, worldAxis: SIMD3<Float>) -> float4x4 {
         return worldToView * .rotation(fromYTo: worldAxis)
     }
 

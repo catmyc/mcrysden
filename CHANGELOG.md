@@ -2,6 +2,16 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.46] - 2026-08-08
+
+### Fixed
+
+- Orientation-gizmo arrow normals now retain their world-space rotation before being transformed into camera space, so light and dark regions move across the gizmo during camera rotation in agreement with the structure.
+
+### Changed
+
+- The test suite now contains 33 focused tests, including a gizmo-lighting coordinate-space and rotation-sensitivity regression.
+
 ## [1.1.45] — 2026-08-06
 
 ### Added

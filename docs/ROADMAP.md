@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-06 (v1.1.45: animation, conversion, and extensibility — playback speed/looping, timeline thumbnails, GIF/APNG/MP4 export, trajectory alignment, displacement trails, interpolation, per-frame metrics plots, headless conversion + pwi2xsf/pwo2xsf/struct2xsf converters, scripts, plugins, and project files — 32 focused tests, cap raised to 64)**.
+Last updated: **2026-08-08 (v1.1.46: orientation-gizmo shading now rotates consistently with the structure under camera-relative lighting; 33 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -18,7 +18,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 
 ### Display & appearance
 - [x] All 7 display modes: ball-stick, space-fill (CPK), wireframe, polyhedral (Voronoi-like half-space intersection via `Geometry.polyhedronFaces`), 2D line / 2D point / 2D ball-stick
-- [x] Blinn-Phong lighting + material sliders (ambient/diffuse/specular/shininess/light azimuth/elevation); camera-relative controls converted to a world-space light each frame
+- [x] Blinn-Phong lighting + material sliders (ambient/diffuse/specular/shininess/light azimuth/elevation); camera-relative controls converted to a world-space light each frame, including matching rotation-sensitive orientation-gizmo shading (v1.1.46)
 - [x] Solid + vertical-gradient background (`gradient_top`); CPK element table H–Og (Z=1–118)
 - [x] Atom scale + bond radius sliders, element labels (`⌘L`), cell frame, axes, orientation gizmo
 - [x] Polyhedral mode exposed in the sidebar picker
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 32 focused tests (cap raised to 64): consolidated parser-family and scene workflows, renderer/raster/vector export, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements and coordination distributions, atom-coordinate editing, animation-frame lifecycle, all-system CRYSCAL expansion, rendering quality, QE `tpiba_b` export, polyhedron volume/distortion oracles, two-structure RMSD matching, atom-table region/expression filters, and bond-distance labels. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 33 focused tests (cap raised to 64): consolidated parser-family and scene workflows, renderer/raster/vector export, orientation-gizmo lighting, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements and coordination distributions, atom-coordinate editing, animation-frame lifecycle, all-system CRYSCAL expansion, rendering quality, QE `tpiba_b` export, polyhedron volume/distortion oracles, two-structure RMSD matching, atom-table region/expression filters, and bond-distance labels. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.

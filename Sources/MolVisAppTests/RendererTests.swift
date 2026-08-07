@@ -202,13 +202,15 @@ final class RendererTests: XCTestCase {
     // disagree with the structure's: the dark side appears to rotate with the
     // arrow instead of staying viewer-fixed.
     //
-    // `gizmoArrowRotation(worldToView:dir:)` pre-composes with `R^T` so the
-    // arrow still points along `dir` (since `R^T * axis = dir`), but the
-    // normals become `R^T * rot(Y->axis) * n_local`, whose dot product with the
+    // `gizmoArrowRotation(worldToView:worldAxis:)` pre-composes with
+    // `worldToView` so the arrow still points along `dir` (since
+    // `worldToView * worldAxis = dir`), but the normals become
+    // `worldToView * rot(Y->worldAxis) * n_local`, whose dot product with the
     // camera-space light `viewLight` equals the main scene's
-    // `dot(rot(Y->axis)*n_local, R * viewLight)`. This test verifies that
-    // equality across camera rotations, world axes, and lighting directions.
-    // It FAILS if `gizmoArrowRotation` reverts to the naive `rot(Y->dir)`.
+    // `dot(rot(Y->worldAxis)*n_local, worldToView^T * viewLight)`. This test
+    // verifies that equality across camera rotations, world axes, and lighting
+    // directions. It FAILS if `gizmoArrowRotation` reverts to the naive
+    // `rot(Y->dir)`.
     func testGizmoArrowLightingMatchesMainScene() {
         struct LightCfg { let name: String; let az: Float; let el: Float }
         struct RotCfg { let name: String; let q: simd_quatf }
@@ -246,7 +248,7 @@ final class RendererTests: XCTestCase {
                 let L_world = (R * SIMD4<Float>(viewLight, 0)).xyz
                 for axis in axes {
                     let dir = (worldToView * SIMD4<Float>(axis, 0)).xyz
-                    let gizmoRot = Renderer.gizmoArrowRotation(worldToView: worldToView, dir: dir)
+                    let gizmoRot = Renderer.gizmoArrowRotation(worldToView: worldToView, worldAxis: axis)
 
                     // The gizmo arrow must still point along dir.
                     let gizmoDir = (gizmoRot * SIMD4<Float>(0, 1, 0, 0)).xyz
@@ -270,6 +272,37 @@ final class RendererTests: XCTestCase {
                     }
                 }
             }
+        }
+
+        // Camera-rotation sensitivity: under a fixed camera-relative light, the
+        // diffuse intensity for a fixed local normal MUST change when the camera
+        // rotates. If the rotation lost world-space roll (naive rot(Y->dir)),
+        // the arrow's lit side would track the arrow instead of the viewer.
+        //
+        // For the X-axis arrow (axis = (1,0,0)) with local normal (0,0,1),
+        // rot(Y->X) leaves Z unchanged, so gizmoNormal = R^T * e_z. A light at
+        // azimuth 0, elevation 45 has viewLight.z = cos(45 deg), so the diffuse
+        // is cos(45 deg) when R is identity but clamps to 0 after a 90 deg Y
+        // rotation (which sends R^T * e_z to -e_x, facing away from the light).
+        do {
+            let el45: Float = 45 * .pi / 180
+            let viewLight = SIMD3<Float>(cos(el45), 0, sin(el45))
+            let axis = SIMD3<Float>(1, 0, 0)
+            let nLocal = SIMD3<Float>(0, 0, 1)
+            func diffuse(_ q: simd_quatf) -> Float {
+                let R = float4x4(q)
+                let gizmoRot = Renderer.gizmoArrowRotation(worldToView: R.transpose, worldAxis: axis)
+                let gizmoNormal = (gizmoRot * SIMD4<Float>(nLocal, 0)).xyz
+                return max(dot(gizmoNormal, viewLight), 0)
+            }
+            let dIdentity = diffuse(simd_quatf(ix: 0, iy: 0, iz: 0, r: 1))
+            let d90Y = diffuse(simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(0, 1, 0)))
+            XCTAssertEqual(dIdentity, cos(el45), accuracy: 1e-5,
+                "identity camera must light the +Z local normal at viewLight.z")
+            XCTAssertEqual(d90Y, 0, accuracy: 1e-5,
+                "90 deg Y rotation must face the normal away from the light (diffuse=\(d90Y))")
+            XCTAssertNotEqual(dIdentity, d90Y, accuracy: 1e-4,
+                "gizmo diffuse must respond to camera rotation under a fixed light")
         }
     }
 
