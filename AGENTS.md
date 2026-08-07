@@ -134,7 +134,7 @@ Key rules:
   MCRYSDEN_REGENERATE=1 swift test --filter SnapshotTests
   ```
   Review the changed hashes, then rerun snapshots without the environment variable.
-- The tracked suite contains 32 tests. Keep exactly 32 focused tests; consolidate or replace a lower-value case before adding new coverage.
+- The tracked suite contains 32 tests. Keep at most 64 focused tests; consolidate or replace a lower-value case before adding new coverage. When approaching the cap, prefer merging related lower-value cases into broader consolidated tests.
 - Parser failures must become `ParseError` with a useful path/reason; malformed user files must not trap. C parsers report details through thread-local `molenv_last_error`.
 
 ## References

@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-06 (v1.1.45: animation, conversion, and extensibility — playback speed/looping, timeline thumbnails, GIF/APNG/MP4 export, trajectory alignment, displacement trails, interpolation, per-frame metrics plots, headless conversion + pwi2xsf/pwo2xsf/struct2xsf converters, scripts, plugins, and project files — 32 focused tests)**.
+Last updated: **2026-08-06 (v1.1.45: animation, conversion, and extensibility — playback speed/looping, timeline thumbnails, GIF/APNG/MP4 export, trajectory alignment, displacement trails, interpolation, per-frame metrics plots, headless conversion + pwi2xsf/pwo2xsf/struct2xsf converters, scripts, plugins, and project files — 32 focused tests, cap raised to 64)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -36,7 +36,7 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 - [x] Export: raster PNG plus raster-backed PDF/SVG/EPS/PS containers
 
 ### Tests
-- [x] 32 focused tests: consolidated parser-family and scene workflows, renderer/raster/vector export, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements and coordination distributions, atom-coordinate editing, animation-frame lifecycle, all-system CRYSCAL expansion, rendering quality, QE `tpiba_b` export, polyhedron volume/distortion oracles, two-structure RMSD matching, atom-table region/expression filters, and bond-distance labels. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+- [x] 32 focused tests (cap raised to 64): consolidated parser-family and scene workflows, renderer/raster/vector export, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements and coordination distributions, atom-coordinate editing, animation-frame lifecycle, all-system CRYSCAL expansion, rendering quality, QE `tpiba_b` export, polyhedron volume/distortion oracles, two-structure RMSD matching, atom-table region/expression filters, and bond-distance labels. `MCRYSDEN_REGENERATE=1` regenerates goldens.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.
