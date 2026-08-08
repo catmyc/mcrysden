@@ -2,6 +2,12 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.47] — 2026-08-08
+
+### Changed
+
+- Image-background variant completed: decoded background images are capped at a 4096 px maximum dimension with aspect-preserving, fail-closed downsampling (no unbounded memory or Metal texture-limit risk), and the fullscreen backdrop quad now alpha-blends so transparent PNGs composite over the solid/gradient background instead of painting black. The sidebar Image background section gains a Clear button to remove the chosen image (falling back to the solid/gradient background), and two regressions cover the downsample cap and transparent compositing (35 focused tests).
+
 ## [1.1.46] - 2026-08-08
 
 ### Fixed

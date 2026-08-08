@@ -722,6 +722,7 @@ final class Renderer: NSObject {
         bgPD.vertexDescriptor = bgVD
         bgPD.colorAttachments[0].pixelFormat = .rgba8Unorm
         bgPD.depthAttachmentPixelFormat = depthPixelFormat
+        Renderer.enableAlphaBlending(bgPD.colorAttachments[0])
         self.bgImagePipeline = try device.makeRenderPipelineState(descriptor: bgPD)
 
         // Anaglyph merge pipeline: combines two eye textures via per-channel
@@ -1424,6 +1425,38 @@ final class Renderer: NSObject {
         return tex
     }
 
+    /// Maximum decoded background image dimension (px). Caps memory use
+    /// (RGBA8 = w*h*4 bytes) and keeps the texture within Metal's size limits;
+    /// a large photo can otherwise allocate hundreds of MB.
+    static let backgroundMaxDimension = 4096
+
+    /// Return a CGImage whose largest dimension is at most `maxDimension`,
+    /// downsampled aspect-preserving when either original dimension exceeds the
+    /// cap (the largest dimension becomes exactly maxDimension), returned unchanged
+    /// when within the cap, or nil on any failure.
+    static func cappedBackgroundImage(_ cgImage: CGImage, maxDimension: Int) -> CGImage? {
+        let w = cgImage.width
+        let h = cgImage.height
+        guard w > 0, h > 0, maxDimension > 0 else { return nil }
+        if max(w, h) <= maxDimension {
+            return cgImage
+        }
+        let scale = CGFloat(maxDimension) / CGFloat(max(w, h))
+        let newW = max(1, Int(CGFloat(w) * scale))
+        let newH = max(1, Int(CGFloat(h) * scale))
+        let bytesPerRow = newW * 4
+        var pixels = [UInt8](repeating: 0, count: newH * bytesPerRow)
+        guard let context = CGContext(data: &pixels, width: newW, height: newH,
+                                      bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return nil
+        }
+        context.interpolationQuality = .high
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: newW, height: newH))
+        return context.makeImage()
+    }
+
     /// Load an image file into an MTLPixelFormat .rgba8Unorm texture. Returns
     /// nil on any failure (file missing, unreadable, zero dimensions, decode
     /// error). Never throws — the renderer must never crash on a bad image.
@@ -1431,12 +1464,14 @@ final class Renderer: NSObject {
         let url = URL(fileURLWithPath: path)
         if let dataProvider = CGDataProvider(filename: url.path),
            let cg = CGImage(pngDataProviderSource: dataProvider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
-               ?? CGImage(jpegDataProviderSource: dataProvider, decode: nil, shouldInterpolate: true, intent: .defaultIntent) {
-            return cgImageToTexture(cg, device: device)
+                ?? CGImage(jpegDataProviderSource: dataProvider, decode: nil, shouldInterpolate: true, intent: .defaultIntent),
+           let capped = Renderer.cappedBackgroundImage(cg, maxDimension: Renderer.backgroundMaxDimension) {
+            return cgImageToTexture(capped, device: device)
         }
         // Fallback for other formats (tiff, bmp, etc.).
-        if let nsImage = NSImage(contentsOf: url), let cg = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-            return cgImageToTexture(cg, device: device)
+        if let nsImage = NSImage(contentsOf: url), let cg = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil),
+           let capped = Renderer.cappedBackgroundImage(cg, maxDimension: Renderer.backgroundMaxDimension) {
+            return cgImageToTexture(capped, device: device)
         }
         return nil
     }
@@ -1447,6 +1482,9 @@ final class Renderer: NSObject {
         let height = cgImage.height
         guard width > 0, height > 0 else { return nil }
         let bytesPerRow = width * 4
+        // Belt-and-braces: width is capped at backgroundMaxDimension (4096),
+        // so this product cannot overflow, but guard the allocation count anyway.
+        guard bytesPerRow > 0, height > 0, bytesPerRow <= Int.max / height else { return nil }
         var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
         guard let context = CGContext(data: &pixels, width: width, height: height,
                                       bitsPerComponent: 8, bytesPerRow: bytesPerRow,

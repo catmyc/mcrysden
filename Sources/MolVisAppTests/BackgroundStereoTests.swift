@@ -56,14 +56,14 @@ final class BackgroundStereoTests: XCTestCase {
         }
     }
 
-    /// Generate a small solid-color PNG file and return its path.
-    private func makeTempPNG(r: UInt8, g: UInt8, b: UInt8) throws -> String {
+    /// Generate a small PNG file of a solid color and return its path.
+    private func makeTempPNG(r: UInt8, g: UInt8, b: UInt8, a: CGFloat = 1.0) throws -> String {
         let width = 16
         let height = 16
         let size = NSSize(width: width, height: height)
         let nsImage = NSImage(size: size, flipped: false) { _ in
             NSColor(red: CGFloat(r) / 255.0, green: CGFloat(g) / 255.0,
-                    blue: CGFloat(b) / 255.0, alpha: 1.0).setFill()
+                    blue: CGFloat(b) / 255.0, alpha: a).setFill()
             NSRect(origin: .zero, size: size).fill()
             return true
         }
@@ -77,7 +77,66 @@ final class BackgroundStereoTests: XCTestCase {
         return path
     }
 
+    /// Build a synthetic CGImage of a solid color.
+    private func makeSyntheticCGImage(w: Int, h: Int, r: UInt8 = 200, g: UInt8 = 50, b: UInt8 = 50) -> CGImage? {
+        let bytesPerRow = w * 4
+        var pixels = [UInt8](repeating: 0, count: h * bytesPerRow)
+        guard let context = CGContext(data: &pixels, width: w, height: h,
+                                      bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return nil
+        }
+        context.setFillColor(CGColor(red: CGFloat(r) / 255.0, green: CGFloat(g) / 255.0,
+                                     blue: CGFloat(b) / 255.0, alpha: 1.0))
+        context.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        return context.makeImage()
+    }
+
     // MARK: - Background image rendering
+
+    func testBackgroundImageDownsampleCap() throws {
+        // Over-cap image (8192x32) is downsampled so the largest dimension is
+        // exactly the cap, preserving aspect.
+        guard let over = makeSyntheticCGImage(w: 8192, h: 32) else {
+            throw TestError.noTexture
+        }
+        let capped = Renderer.cappedBackgroundImage(over, maxDimension: Renderer.backgroundMaxDimension)
+        XCTAssertNotNil(capped)
+        XCTAssertEqual(max(capped!.width, capped!.height), Renderer.backgroundMaxDimension)
+        XCTAssertEqual(capped!.width, 4096)
+        XCTAssertEqual(capped!.height, 16)
+
+        // Within-cap image is returned unchanged.
+        guard let within = makeSyntheticCGImage(w: 256, h: 128) else {
+            throw TestError.noTexture
+        }
+        let unchanged = Renderer.cappedBackgroundImage(within, maxDimension: Renderer.backgroundMaxDimension)
+        XCTAssertNotNil(unchanged)
+        XCTAssertEqual(unchanged!.width, 256)
+        XCTAssertEqual(unchanged!.height, 128)
+    }
+
+    func testTransparentBackgroundImageFallsBackToSolid() throws {
+        // A fully-transparent PNG must composite to the solid background.
+        let imagePath = try makeTempPNG(r: 200, g: 50, b: 50, a: 0.0)
+        defer { try? FileManager.default.removeItem(at: URL(fileURLWithPath: imagePath)) }
+
+        var scene = Scene()
+        scene.background = "#102030"
+        scene.showAxes = false
+        scene.showCellFrame = false
+        scene.atoms = [Atom(coord: .zero, atomicNumber: 6, label: "C")]
+
+        let solidHash = pixelHash(try render(scene: scene, dist: 6))
+
+        scene.backgroundType = .image
+        scene.backgroundImagePath = imagePath
+        let transparentHash = pixelHash(try render(scene: scene, dist: 6))
+
+        XCTAssertEqual(solidHash, transparentHash,
+                       "fully-transparent background image must not paint black")
+    }
 
     func testBackgroundImageRendering() throws {
         let imagePath = try makeTempPNG(r: 200, g: 50, b: 50)

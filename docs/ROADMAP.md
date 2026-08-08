@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-08 (v1.1.46: orientation-gizmo shading now rotates consistently with the structure under camera-relative lighting; 33 focused tests)**.
+Last updated: **2026-08-08 (v1.1.47: image-background variant completed — 4096 px decode cap, alpha compositing, Clear button; 35 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -161,7 +161,7 @@ All 10 original Tier A items complete: Gaussian Cube/G98, BXSF/Fermi surfaces, 3
 
 - [x] **Structure editing** (v1.1.43): Cartesian/fractional coordinate edits, cut cluster/molecule, elastic cell deformation, multi-slab generation, insert/remove/substitute/displace operations, lattice-parameter editing, defect workflows, and a unified editing history are all implemented.
 - [x] **On-screen bond distance labels** — live distance text above each bond (v1.1.36).
-- [ ] **Image-background variant** — only `solid` + `gradient_top` exist.
+- [x] **Image-background variant** — fullscreen image backdrop with sidebar picker/Choose/Clear, scale-to-cover, silent fallback, `.mvis-state` persistence (v1.1.40), completed in v1.1.47 with a 4096 px decode cap + fail-closed aspect-preserving downsampling, alpha compositing over the solid/gradient background, and a Clear button (35 focused tests).
 - [x] **Print** of the view (`NSPrintOperation`) (v1.1.40).
 - [x] **Stereo / anaglyph** rendering (v1.1.40).
 - [ ] **Tcl scripting engine** — a Tcl interpreter is not bundled; embedded scripting is provided by the `--script` line interpreter and `PluginRegistry` (v1.1.45) instead.

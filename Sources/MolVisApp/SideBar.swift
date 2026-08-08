@@ -177,6 +177,9 @@ struct SideBar: View {
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                        if state.backgroundImagePath != nil {
+                            Button("Clear") { state.backgroundImagePath = nil }
+                        }
                     }
                 } else {
                     HStack {
