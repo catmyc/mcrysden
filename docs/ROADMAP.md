@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-08 (v1.1.47: image-background variant completed — 4096 px decode cap, alpha compositing, Clear button; 35 focused tests)**.
+Last updated: **2026-08-08 (v1.2.0: image-background variant completed — 4096 px decode cap, alpha compositing, Clear button; 35 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
