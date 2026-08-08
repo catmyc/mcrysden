@@ -72,8 +72,15 @@ static const struct { const char* sym; int z; } el[] = {
   {"Og",118}
 };
 static int molenv_symbol_to_z(const char *s) {
-    char t[4]={0}; for(int i=0;i<3 && s[i]; i++) t[i]=s[i];
-    for (size_t i=0;i<sizeof(el)/sizeof(el[0]);i++) if(strcmp(t,el[i].sym)==0) return el[i].z;
+    /* Fold the input to lowercase (ASCII only) so "Fe"/"fe"/"FE" all match.
+       The stored tables are title-cased ("Fe"); lowercase each on the fly for
+       comparison without modifying them. */
+    char t[4]={0}; for(int i=0;i<3 && s[i]; i++) t[i]=tolower((unsigned char)s[i]);
+    for (size_t i=0;i<sizeof(el)/sizeof(el[0]);i++) {
+        char u[4]={0};
+        for (int j=0;j<3 && el[i].sym[j];j++) u[j]=tolower((unsigned char)el[i].sym[j]);
+        if (strcmp(t,u)==0) return el[i].z;
+    }
     return 0;
 }
 

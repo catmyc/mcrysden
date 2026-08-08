@@ -414,6 +414,83 @@ struct Scene: Codable {
     /// It is intentionally excluded from synthesized Scene persistence.
     @NonPersisted var crystalSymmetry: CrystalSymmetryAnalysis?
 
+    // A custom decoder so that project files produced by older builds — which are
+    // missing any field added since they were written — decode to each field's
+    // declared default instead of throwing `keyNotFound`. Encoding is left to
+    // the synthesized `encode(to:)` (camelCase keys, byte-identical output).
+    // Matches the synthesized memberwise `init()` that this custom decoder
+    // otherwise suppresses; all stored properties default-initialize correctly.
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+
+        atoms = try c.decodeIfPresent([Atom].self, forKey: .atoms) ?? []
+        bonds = try c.decodeIfPresent([Bond].self, forKey: .bonds) ?? []
+        cell = try c.decodeIfPresent(Cell.self, forKey: .cell) ?? nil
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        displayMode = try c.decodeIfPresent(DisplayMode.self, forKey: .displayMode) ?? .ballStick
+        isCrystal = try c.decodeIfPresent(Bool.self, forKey: .isCrystal) ?? false
+        periodicDim = try c.decodeIfPresent(Int.self, forKey: .periodicDim) ?? 3
+        superCell = try c.decodeIfPresent(SuperCell.self, forKey: .superCell) ?? SuperCell()
+        baseAtoms = try c.decodeIfPresent([Atom].self, forKey: .baseAtoms) ?? []
+        baseBonds = try c.decodeIfPresent([Bond].self, forKey: .baseBonds) ?? []
+        preslabAtoms = try c.decodeIfPresent([Atom].self, forKey: .preslabAtoms) ?? []
+        slab = try c.decodeIfPresent(Slab.self, forKey: .slab) ?? nil
+        clipPlane = try c.decodeIfPresent(ClipPlane.self, forKey: .clipPlane) ?? nil
+        scalarField = try c.decodeIfPresent(ScalarField.self, forKey: .scalarField) ?? nil
+        fermiSurface = try c.decodeIfPresent(FermiSurface.self, forKey: .fermiSurface) ?? nil
+        selectedAtoms = try c.decodeIfPresent([Int].self, forKey: .selectedAtoms) ?? []
+        measurementMode = try c.decodeIfPresent(MeasurementMode.self, forKey: .measurementMode) ?? .none
+        measurementResult = try c.decodeIfPresent(MeasurementResult.self, forKey: .measurementResult) ?? nil
+        backgroundType = try c.decodeIfPresent(BackgroundType.self, forKey: .backgroundType) ?? .solid
+        background = try c.decodeIfPresent(String.self, forKey: .background) ?? "#101014"
+        backgroundBottom = try c.decodeIfPresent(String.self, forKey: .backgroundBottom) ?? "#000000"
+        backgroundImagePath = try c.decodeIfPresent(String.self, forKey: .backgroundImagePath) ?? nil
+        anaglyphMode = try c.decodeIfPresent(AnaglyphMode.self, forKey: .anaglyphMode) ?? .off
+        lighting = try c.decodeIfPresent(Lighting.self, forKey: .lighting) ?? Lighting()
+        showCellFrame = try c.decodeIfPresent(Bool.self, forKey: .showCellFrame) ?? true
+        showAxes = try c.decodeIfPresent(Bool.self, forKey: .showAxes) ?? true
+        showLabels = try c.decodeIfPresent(Bool.self, forKey: .showLabels) ?? false
+        showBondDistances = (try c.decode(DefaultFalse.self, forKey: .showBondDistances)).wrappedValue
+        showScaleIndicator = (try c.decode(DefaultFalse.self, forKey: .showScaleIndicator)).wrappedValue
+        showStructure = try c.decodeIfPresent(Bool.self, forKey: .showStructure) ?? true
+        showBrillouinZone = try c.decodeIfPresent(Bool.self, forKey: .showBrillouinZone) ?? false
+        atomScale = try c.decodeIfPresent(Float.self, forKey: .atomScale) ?? 0.35
+        bondRadius = try c.decodeIfPresent(Float.self, forKey: .bondRadius) ?? 0.10
+        currentFrame = try c.decodeIfPresent(Int.self, forKey: .currentFrame) ?? 0
+        camera = try c.decodeIfPresent(Camera.self, forKey: .camera) ?? Camera()
+        showIsoSurface = try c.decodeIfPresent(Bool.self, forKey: .showIsoSurface) ?? true
+        isoLevel = try c.decodeIfPresent(Float.self, forKey: .isoLevel) ?? 0
+        isoSurfaces = try c.decodeIfPresent([IsoSurfaceSpec].self, forKey: .isoSurfaces) ?? []
+        showFermiSurface = try c.decodeIfPresent(Bool.self, forKey: .showFermiSurface) ?? true
+        bandStructure = try c.decodeIfPresent(BandStructure.self, forKey: .bandStructure) ?? nil
+        densityOfStates = try c.decodeIfPresent(DensityOfStates.self, forKey: .densityOfStates) ?? nil
+        multiOrbitalFields = try c.decodeIfPresent([ScalarField].self, forKey: .multiOrbitalFields) ?? []
+        currentOrbital = try c.decodeIfPresent(Int.self, forKey: .currentOrbital) ?? 0
+        grid2D = try c.decodeIfPresent(Grid2D.self, forKey: .grid2D) ?? nil
+        forceSet = try c.decodeIfPresent(ForceSet.self, forKey: .forceSet) ?? nil
+        showForces = try c.decodeIfPresent(Bool.self, forKey: .showForces) ?? false
+        showColorPlane = (try c.decode(DefaultTrue.self, forKey: .showColorPlane)).wrappedValue
+        colorPlaneColormap = try c.decodeIfPresent(Colormap.self, forKey: .colorPlaneColormap) ?? .viridis
+        colorPlaneContourEnabled = try c.decodeIfPresent(Bool.self, forKey: .colorPlaneContourEnabled) ?? true
+        colorPlaneContourCount = try c.decodeIfPresent(Int.self, forKey: .colorPlaneContourCount) ?? 6
+        volumeSlices = try c.decodeIfPresent([VolumeSlice].self, forKey: .volumeSlices) ?? []
+        forceScale = try c.decodeIfPresent(Float.self, forKey: .forceScale) ?? 50.0
+        msaaSampleCount = try c.decodeIfPresent(Int.self, forKey: .msaaSampleCount) ?? 1
+        kPathPoints = try c.decodeIfPresent([KPoint].self, forKey: .kPathPoints) ?? []
+        kPathBreaks = try c.decodeIfPresent(Set<Int>.self, forKey: .kPathBreaks) ?? []
+        kPathProvenance = try c.decodeIfPresent(KPathProvenance.self, forKey: .kPathProvenance) ?? .generated
+        kPathSignature = try c.decodeIfPresent(String.self, forKey: .kPathSignature) ?? nil
+        opacity = try c.decodeIfPresent(Float.self, forKey: .opacity) ?? 1.0
+        lineWidth = try c.decodeIfPresent(Float.self, forKey: .lineWidth) ?? 1.0
+        depthCueingStrength = try c.decodeIfPresent(Float.self, forKey: .depthCueingStrength) ?? 0.0
+        aoStrength = try c.decodeIfPresent(Float.self, forKey: .aoStrength) ?? 0.0
+        shadowStrength = try c.decodeIfPresent(Float.self, forKey: .shadowStrength) ?? 0.0
+        aoQuality = try c.decodeIfPresent(Int.self, forKey: .aoQuality) ?? 2
+        shadowQuality = try c.decodeIfPresent(Int.self, forKey: .shadowQuality) ?? 2
+    }
+
     // MARK: - Rendering quality controls
     // These drive configurable line widths, transparency, depth cueing, and
     // ambient-occlusion / soft-shadow approximations. All default to values that

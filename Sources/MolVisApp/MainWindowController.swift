@@ -269,6 +269,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Cancellation-only teardown: do not mutate published UI state or the
         // installed result from deinit (no alive view/window to render into).
         cancelComparisonRequestOnly()
+        // Tear down the repeating playback timer and the file watcher (DispatchSource
+        // + its POSIX fd + debounce timer). Both helpers are cancellation-only
+        // (invalidate/cancel + nil) and touch no published state, so they are safe
+        // here; without this, a controller released without a window close (tests with
+        // showWindow:false, rapid window replacement) leaks the timer, the source,
+        // the fd and the debounce timer forever.
+        stopPlayback()
+        stopFileWatching()
     }
 
     // MARK: - File watching
@@ -3406,6 +3414,14 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // supercell — compare the (n1,n2,n3) tuple, not just total, so changing
         // replication DIRECTION (e.g. 2×1×1 → 1×2×1, same total) re-widen happens.
         let sc = SuperCell(n1: state.n1, n2: state.n2, n3: state.n3)
+        // Snapshot the pre-change framing BEFORE any geometry mutation so the
+        // center/ratio fixup below tracks the geometry the user actually sees.
+        // Snapshotting outside the superCell branch (and applying the fixup
+        // AFTER applySlab) lets a combined supercell+slab change frame the final
+        // post-slab geometry, and a slab-only change — which also alters the
+        // displayed set — trigger a reframe too. The isReloadingFrame guard at
+        // the top of syncFromState already keeps playback/frame-slide from here.
+        let oldRadius = scene.boundingSphereRadius()
         var superCellChanged = false
         if sc != scene.superCell {
             let previous = scene.superCell
@@ -3429,6 +3445,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             scene = scene.applySlab(slab)
         }
         let slabChanged = scene.slab != oldSlab
+        if superCellChanged || slabChanged {
+            // The displayed geometry changed: recenter on the new framing-sphere
+            // centroid and scale the distance by the radius ratio. Preserve the
+            // user's orbit quaternion exactly — only zoom/center drift is
+            // corrected, no rotation/perspective jump. (applyCameraForNewScene-
+            // IfNeeded() is intentionally NOT used: it rebuilds the camera from
+            // scratch and would reset orientation.) Guard an empty pre-change
+            // scene (oldRadius 0) with the new radius as a safe reference so the
+            // ratio is 1 and we never divide by zero.
+            let newCenter = scene.framingSphere().center
+            let newRadius = scene.boundingSphereRadius()
+            camera.center = newCenter
+            let referenceRadius = oldRadius > 0 ? oldRadius : newRadius
+            if referenceRadius > 0 {
+                camera.distance *= newRadius / referenceRadius
+            }
+        }
         let reciprocalPresentationAfter = reciprocalPresentationSignature(for: scene)
         if (superCellChanged || slabChanged), reciprocalPresentationChanged(
             from: reciprocalPresentationBefore, to: reciprocalPresentationAfter) {

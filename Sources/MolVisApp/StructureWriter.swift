@@ -59,31 +59,40 @@ enum StructureWriter {
     static func write(atoms: [Atom], cell: Cell?, title: String, isCrystal: Bool,
                       periodicDim: Int, as format: StructureExportFormat) throws -> String {
         guard !atoms.isEmpty else { throw StructureWriteError.emptyAtoms }
-        for (i, a) in atoms.enumerated() {
-            guard a.atomicNumber >= 1 && a.atomicNumber <= 118 else {
-                throw StructureWriteError.invalidElement(i)
-            }
+        // Skip atoms with an invalid atomic number (Z outside 1...118 — e.g. a
+        // dummy "X" atom with Z=0 or an unrecognized symbol) rather than fail the
+        // whole export. Every writer below derives its species/count lines from the
+        // atom list it receives, so passing the filtered list keeps all headers
+        // (PRIMCOORD count, XYZ lead number, POSCAR/QE species counts) consistent.
+        // Warn once per export reporting how many were dropped.
+        let exportAtoms = atoms.filter { $0.atomicNumber >= 1 && $0.atomicNumber <= 118 }
+        let skipped = atoms.count - exportAtoms.count
+        if skipped > 0 {
+            print("[mcrysden] warning: skipped \(skipped) atom(s) with invalid atomic number during export")
+        }
+        guard !exportAtoms.isEmpty else { throw StructureWriteError.emptyAtoms }
+        for a in exportAtoms {
             guard a.coord.x.isFinite && a.coord.y.isFinite && a.coord.z.isFinite else {
                 throw StructureWriteError.nonFiniteGeometry
             }
         }
         switch format {
         case .xsf:
-            return writeXSF(atoms, cell: cell)
+            return writeXSF(exportAtoms, cell: cell)
         case .xyz:
-            return writeXYZ(atoms, title: title)
+            return writeXYZ(exportAtoms, title: title)
         case .cif:
             let cell = try requireCell(cell, format)
             try validateCell(cell)
-            return writeCIF(atoms, cell: cell, title: title)
+            return writeCIF(exportAtoms, cell: cell, title: title)
         case .poscar:
             let cell = try requireCell(cell, format)
             try validateCell(cell)
-            return writePOSCAR(atoms, cell: cell, title: title)
+            return writePOSCAR(exportAtoms, cell: cell, title: title)
         case .qeInput:
             let cell = try requireCell(cell, format)
             try validateCell(cell)
-            return writeQE(atoms, cell: cell)
+            return writeQE(exportAtoms, cell: cell)
         }
     }
 

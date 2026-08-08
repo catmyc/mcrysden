@@ -76,9 +76,13 @@ final class ExportOptions: ObservableObject {
 
     var backgroundHex: String {
         let rgb = backgroundColor.usingColorSpace(.deviceRGB) ?? backgroundColor
-        let r = Int((rgb.redComponent * 255).rounded())
-        let g = Int((rgb.greenComponent * 255).rounded())
-        let b = Int((rgb.blueComponent * 255).rounded())
+        // Clamp each component to [0,1] before scaling: wide-gamut (Display P3 /
+        // extended-range) colors can exceed 1.0, which would otherwise format to a
+        // >2-digit hex value and produce a corrupt export header.
+        func clamp01(_ v: CGFloat) -> CGFloat { min(1, max(0, v)) }
+        let r = Int((clamp01(rgb.redComponent) * 255).rounded())
+        let g = Int((clamp01(rgb.greenComponent) * 255).rounded())
+        let b = Int((clamp01(rgb.blueComponent) * 255).rounded())
         return String(format: "#%02X%02X%02X", r, g, b)
     }
 

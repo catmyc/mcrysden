@@ -42,11 +42,33 @@ enum PluginRegistry {
         return storage.first { $0.name == name }
     }
 
-    static func runAll(scene: Scene) -> [(name: String, output: String?)] {
+    /// Remove a registered plugin by name. Returns true when an entry was
+    /// removed. Built-ins are materialized first, so unregistering one of them
+    /// behaves exactly like unregistering a caller-supplied plugin (and it stays
+    /// removed: `ensureBuiltins` runs at most once).
+    @discardableResult
+    static func unregister(named name: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         ensureBuiltins()
-        return storage.map { ($0.name, $0.run(scene: scene)) }
+        let before = storage.count
+        storage.removeAll { $0.name == name }
+        return storage.count != before
+    }
+
+    /// Run every registered plugin against `scene`.
+    ///
+    /// The plugin array is snapshotted UNDER the lock and executed AFTER it is
+    /// released: `NSLock` is not reentrant, so a plugin whose `run(scene:)`
+    /// calls back into `plugins()`/`plugin(named:)`/`listText()` would deadlock
+    /// if the registry lock were still held while it ran.
+    static func runAll(scene: Scene) -> [(name: String, output: String?)] {
+        let snapshot: [any AnalysisPlugin]
+        lock.lock()
+        ensureBuiltins()
+        snapshot = storage
+        lock.unlock()
+        return snapshot.map { ($0.name, $0.run(scene: scene)) }
     }
 
     static func listText() -> String {

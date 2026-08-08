@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-08 (v1.2.0: image-background variant completed — 4096 px decode cap, alpha compositing, Clear button; 35 focused tests)**.
+Last updated: **2026-08-08 (v1.2.1: review-fix hardening — color-plane cache pointer safety, slab/supercell reframe ordering, Finder/CLI dedup and flag validation, Wannier90 import bounds; 36 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -37,6 +37,13 @@ Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an exampl
 
 ### Tests
 - [x] 33 focused tests (cap raised to 64): consolidated parser-family and scene workflows, renderer/raster/vector export, orientation-gizmo lighting, snapshot (FNV-1a pixel hash vs. committed goldens), state and camera-bookmark persistence, HPKOT's 29-variant oracle, periodic measurements and coordination distributions, atom-coordinate editing, animation-frame lifecycle, all-system CRYSCAL expansion, rendering quality, QE `tpiba_b` export, polyhedron volume/distortion oracles, two-structure RMSD matching, atom-table region/expression filters, and bond-distance labels. `MCRYSDEN_REGENERATE=1` regenerates goldens.
+
+## v1.2.1 review-fix hardening
+- [x] Color-plane texture cache no longer keys on a transient array base address; content changes (including in-place mutations) always rebuild, stable content always hits.
+- [x] Slice textures rebuild on lattice changes; supercell/slab camera reframe runs once, post-slab, for both supercell- and slab-only geometry changes.
+- [x] Finder/CLI double-open prevention via resolved file identity; `--fps`/`--anim-size`/`--format` flag-validation symmetry with `--frames`; `--frames 0` accepted as documented default.
+- [x] Wannier90 6/7-token import bounds-guarded; coordination duplicate removal always active; HPKOT reciprocal-cell singularity threshold scale-relative; `FieldSlice.clipTriangles` doc/API contract corrected.
+- [x] Suite at 36 focused tests: color-plane rebuild, Wannier90 count-guard, and coordination-dedupe regressions; exporter assertions hardened for CI.
 
 ## v1.1.14 hardening
 - [x] Parser safety: malformed and truncated XSF/AXSF, Quantum Espresso, CIF, FHI-aims, PDB, WIEN2k, and CRYSCAL input fails with useful errors instead of traps or ambiguous fallback.

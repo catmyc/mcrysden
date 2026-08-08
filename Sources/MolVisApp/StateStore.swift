@@ -220,11 +220,17 @@ enum StateStore {
         // widened set that the slab should filter.
         if let slab = obj["slab"] as? [String: Any],
            let a = slab["planeA"] as? [String: Any], let b = slab["planeB"] as? [String: Any] {
-            let distanceA = try finiteFloat(a["distance"], field: "slab.planeA.distance") ?? 0
-            let distanceB = try finiteFloat(b["distance"], field: "slab.planeB.distance") ?? 0
-            // Miller indices mirror the sidebar stepper contract exactly (-8...8),
-            // so valid negatives (e.g. the default planeB k = -1) round-trip intact.
-            func clampSlabIndex(_ v: Any?) -> Int { min(8, max(-8, v as? Int ?? 0)) }
+             // Clamp to the sidebar slider bounds (±20, matching SideBar slab
+             // distance sliders) so a malformed state file cannot feed a huge
+             // distance into applySlab and emit an empty structure. finiteFloat
+             // already rejects non-finite (NaN/Inf) values; a missing key falls
+             // back to 0, consistent with sibling fields.
+             let slabDistanceMin: Float = -20, slabDistanceMax: Float = 20
+             let distanceA = min(slabDistanceMax, max(slabDistanceMin, try finiteFloat(a["distance"], field: "slab.planeA.distance") ?? 0))
+             let distanceB = min(slabDistanceMax, max(slabDistanceMin, try finiteFloat(b["distance"], field: "slab.planeB.distance") ?? 0))
+             // Miller indices mirror the sidebar stepper contract exactly (-8...8),
+             // so valid negatives (e.g. the default planeB k = -1) round-trip intact.
+             func clampSlabIndex(_ v: Any?) -> Int { min(8, max(-8, v as? Int ?? 0)) }
             let sl = Slab(
                 planeA: Plane(h: clampSlabIndex(a["h"]), k: clampSlabIndex(a["k"]), l: clampSlabIndex(a["l"]),
                               distance: distanceA),
@@ -718,11 +724,18 @@ enum StateStore {
             throw ParseError.parse(path: url.path, line: 0, reason: "\(field) must be an integer")
         }
         let decimal = number.doubleValue
-        guard decimal.isFinite, decimal.rounded(.towardZero) == decimal,
-              decimal > Double(Int.min), decimal < Double(Int.max) else {
+        // Reject non-finite and non-integral tokens first...
+        guard decimal.isFinite, decimal.rounded(.towardZero) == decimal else {
             throw ParseError.parse(path: url.path, line: 0, reason: "\(field) must be an integer")
         }
-        return Int(decimal)
+        // ...then convert via Int(exactly:), which accepts any whole f64 in the
+        // closed Int.min...Int.max range (the boundary f64 2^63 rounds up and a
+        // strict "< Double(Int.max)" would wrongly refuse Int.max) and rejects
+        // everything outside it.
+        guard let value = Int(exactly: decimal) else {
+            throw ParseError.parse(path: url.path, line: 0, reason: "\(field) must be an integer")
+        }
+        return value
     }
 
     /// MSAA sample count: accept any mathematically integral numeric token

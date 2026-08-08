@@ -28,11 +28,15 @@ struct BandGapResult {
 }
 
 /// Electron (conduction) and hole (valence) effective masses at the band edges,
-/// in units of the free-electron rest mass m0.
+/// in units of the free-electron rest mass m0. Values are signed exactly as
+/// `effectiveMass` returns: `electronMass` > 0 (CBM is a minimum), `holeMass` <
+/// 0 (VBM is a maximum, d2E/dk2 < 0). A physical (positive) hole mass is
+/// `-holeMass`; `ElectronicAnalysisPresentation` negates at display.
 struct GapMassResult {
-    /// Electron effective mass at the CBM (m*_e / m0).
+    /// Electron effective mass at the CBM (m*_e / m0); always positive.
     let electronMass: Float
-    /// Hole effective mass at the VBM (m*_h / m0).
+    /// Hole effective mass at the VBM (m*_h / m0); ALWAYS NEGATIVE — the raw
+    /// signed hbar^2/(d2E/dk2) at a band maximum. Physical hole mass = -holeMass.
     let holeMass: Float
     /// Band index (within the k-point energies array) of the CBM.
     let electronBand: Int
@@ -177,6 +181,13 @@ enum BandAnalysis {
     /// the caller is responsible for the lattice-scale conversion; the returned mass
     /// is then in corresponding (2pi/a)^-2 units. If the distances are not in
     /// Ang^-1 the caller must rescale.
+    ///
+    /// **Sign contract:** this returns the raw signed value hbar^2/d2 — NOT a
+    /// magnitude. At a band MINIMUM (CBM, d2E/dk2 > 0) the result is positive; at
+    /// a band MAXIMUM (VBM, d2E/dk2 < 0) it is negative. `GapMassResult` stores the
+    /// value exactly as signed: `electronMass` is positive and `holeMass` is
+    /// negative. Callers wanting a physical (positive) hole mass for display must
+    /// negate `holeMass`; `ElectronicAnalysisPresentation` does this and labels it.
     static func effectiveMass(_ bs: BandStructure, band: Int, atKIndex k: Int, channel: Int = 0) -> Float? {
         guard !bs.isMesh else { return nil }
         guard bs.hasValidChannelLayout else { return nil }
@@ -214,8 +225,9 @@ enum BandAnalysis {
     /// Electron (CBM) and hole (VBM) effective masses at the band edges of .
     ///
     /// Uses  to locate the VBM and CBM k-points, identifies the band
-    /// indices at those points, and computes the effective mass at each via
-    /// . Returns nil if the band gap is undefined.
+    /// indices at those points via deterministic curvature-aware tie-breaking,
+    /// and computes the effective mass at each via . Returns nil if the band gap
+    /// is undefined.
     static func effectiveMassesNearGap(_ bs: BandStructure) -> GapMassResult? {
         guard let g = bandGap(bs) else { return nil }
 
@@ -223,25 +235,70 @@ enum BandAnalysis {
         let vbmEnergies = bs.kPoints[g.vbmKPointIndex].energies
         let cbmEnergies = bs.kPoints[g.cbmKPointIndex].energies
 
-        // VBM band: highest energy <= Ef at the VBM k-point.
+        // Degenerate bands at the gap edge share the extremum energy; the
+        // historical "first band at that energy" pick is arbitrary in curvature.
+        // For a deterministic, physically meaningful choice, gather every band at
+        // the edge within `degeneracyTolerance` of the extremum energy and compute
+        // each band's curvature at that k-point via `effectiveMass`. The band with
+        // the SMALLEST |effective mass| (largest curvature |d2E/dk2|) is the most
+        // strongly dispersive and dominates transport; that is the physical edge
+        // band. If no band yields a valid curvature (edge of the path, zero step),
+        // fall back to the deterministic first-band-at-extremum so the result
+        // stays stable across calls.
         let ef = bs.fermiEnergy!
-        var holeBand = -1
-        var holeEnergy: Float = -.infinity
-        for (i, e) in vbmEnergies.enumerated() {
-            if e <= ef && e > holeEnergy { holeEnergy = e; holeBand = i }
-        }
-        // CBM band: lowest energy > Ef at the CBM k-point.
-        var electronBand = -1
-        var electronEnergy: Float = .infinity
-        for (i, e) in cbmEnergies.enumerated() {
-            if e > ef && e < electronEnergy { electronEnergy = e; electronBand = i }
-        }
-        guard holeBand >= 0, electronBand >= 0 else { return nil }
-
-        // k indices within the channel for the finite-difference call.
         let perSpin = bs.kPointsPerSpin
         let vbmLocalK = g.vbmKPointIndex - g.spinChannel * perSpin
         let cbmLocalK = g.cbmKPointIndex - g.spinChannel * perSpin
+        let degeneracyTolerance: Float = 1e-4  // eV
+
+        func selectEdgeBand(
+            energies: [Float],
+            isHole: Bool,
+            kIndex: Int
+        ) -> (band: Int, energy: Float)? {
+            // Step 1: the deterministic extremum energy (highest occupied for VBM,
+            // lowest unoccupied for CBM) and the first band attaining it.
+            var extremumEnergy: Float = isHole ? -.infinity : .infinity
+            var firstBand = -1
+            for (i, e) in energies.enumerated() {
+                let valid = isHole ? (e <= ef) : (e > ef)
+                guard valid else { continue }
+                if isHole ? (e > extremumEnergy) : (e < extremumEnergy) {
+                    extremumEnergy = e
+                    firstBand = i
+                }
+            }
+            guard firstBand >= 0 else { return nil }
+
+            // Step 2: among bands degenerate with the extremum, keep the one with
+            // the smallest |effective mass| (largest curvature).
+            var bestBand = firstBand
+            var bestCurvature: Float = 0
+            var foundCurvature = false
+            for (i, e) in energies.enumerated() {
+                let valid = isHole ? (e <= ef) : (e > ef)
+                guard valid else { continue }
+                guard abs(e - extremumEnergy) <= degeneracyTolerance else { continue }
+                guard let m = effectiveMass(bs, band: i, atKIndex: kIndex, channel: g.spinChannel),
+                      m.isFinite, m != 0 else { continue }
+                let curvature = abs(BandAnalysis.hbarSquaredOverM0 / m)  // |d2E/dk2|
+                if !foundCurvature || curvature > bestCurvature {
+                    bestCurvature = curvature
+                    bestBand = i
+                    foundCurvature = true
+                }
+            }
+            return (band: bestBand, energy: extremumEnergy)
+        }
+
+        guard let hole = selectEdgeBand(energies: vbmEnergies, isHole: true, kIndex: vbmLocalK),
+              let electron = selectEdgeBand(energies: cbmEnergies, isHole: false, kIndex: cbmLocalK) else {
+            return nil
+        }
+        let (holeBand, holeEnergy) = (hole.band, hole.energy)
+        let (electronBand, electronEnergy) = (electron.band, electron.energy)
+        _ = holeEnergy
+        _ = electronEnergy
 
         guard let holeMass = effectiveMass(bs, band: holeBand, atKIndex: vbmLocalK, channel: g.spinChannel),
               let electronMass = effectiveMass(bs, band: electronBand, atKIndex: cbmLocalK, channel: g.spinChannel) else {

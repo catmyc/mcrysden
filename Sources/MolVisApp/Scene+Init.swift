@@ -367,6 +367,18 @@ extension Scene {
         let nat = atoms.count
         guard nat > 0 else { return [] }
 
+        // The C covalent-radii bond heuristic (make_bonds) is O(n^2) and refuses
+        // structures above MOLENV_BOND_MAX_ATOMS (8000) — it returns no bonds and
+        // sets a thread-local error. For big supercells/slabs this would silently
+        // drop ALL bonds. Keep that degradation analytic: skip the expensive pass
+        // above the cap, leave bonds empty (atoms and cell are untouched, so the
+        // scene still renders), and warn rather than render a legal large
+        // structure with zero bonds and no explanation.
+        if nat > 8000 {
+            print("[mcrysden] warning: \(nat)-atom structure exceeds the 8000-atom bond-heuristic cap; bonds omitted")
+            return []
+        }
+
         // Build a temporary MolEnvScene so we can call the C bond heuristic.
         let cAtoms = UnsafeMutablePointer<MolEnvAtom>.allocate(capacity: nat)
         for (i, a) in atoms.enumerated() {

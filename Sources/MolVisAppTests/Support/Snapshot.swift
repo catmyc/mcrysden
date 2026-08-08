@@ -11,7 +11,7 @@ class Snapshotter: XCTestCase {
     static let hashSize = CGSize(width: 64, height: 64)
 
     func hashImage(_ scene: Scene, camera: Camera, name: String) throws {
-        let device = MTLCreateSystemDefaultDevice()!
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal not available") }
         let renderer = try Renderer(device: device)
         renderer.scene = scene
         let w = Int(Self.hashSize.width), h = Int(Self.hashSize.height)
@@ -20,8 +20,9 @@ class Snapshotter: XCTestCase {
         desc.width = w; desc.height = h
         desc.usage = [.renderTarget, .shaderRead]
         desc.storageMode = .shared
-        let tex = device.makeTexture(descriptor: desc)!
-        let cb = device.makeCommandQueue()!.makeCommandBuffer()!
+        guard let tex = device.makeTexture(descriptor: desc) else { throw XCTSkip("Metal texture unavailable") }
+        guard let queue = device.makeCommandQueue() else { throw XCTSkip("Metal command queue unavailable") }
+        let cb = queue.makeCommandBuffer()!
         renderer.encode(to: cb, target: tex, viewport: MTLViewport(originX:0,originY:0,width:Double(w),height:Double(h),znear:0,zfar:1), camera: camera)
         cb.commit(); cb.waitUntilCompleted()
         var px = [UInt8](repeating: 0, count: w*h*4)

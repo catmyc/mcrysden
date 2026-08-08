@@ -238,7 +238,11 @@ enum ElectronicAnalysisPresentation {
         guard let masses = BandAnalysis.effectiveMassesNearGap(bs), masses.holeMass.isFinite else {
             return ElectronicAnalysisRow(metric: "Hole effective mass", value: "Could not be determined", status: .unavailable)
         }
-        return ElectronicAnalysisRow(metric: "Hole effective mass", value: String(format: "%.3f m0", masses.holeMass), status: .available)
+        // `holeMass` is the raw signed hbar^2/(d2E/dk2) at the VBM — negative there
+        // because the VBM is a maximum (d2E/dk2 < 0). The physical hole mass is the
+        // magnitude; negate for display and label the sign convention.
+        let physicalHoleMass = -masses.holeMass
+        return ElectronicAnalysisRow(metric: "Hole effective mass", value: String(format: "%.3f m0", physicalHoleMass), status: .available)
     }
 
     // MARK: - DOS row factories

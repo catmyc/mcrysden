@@ -476,14 +476,17 @@ enum DistributionAnalyzer {
         for atom in atoms {
             let p = SIMD3<Double>(Double(atom.coord.x), Double(atom.coord.y), Double(atom.coord.z))
             let f = inv * p
-            // Wrap to [0,1) then scale to bin index.
+            // Wrap to [0,1) then scale to bin index. A wrapped fractional that
+            // rounds up to exactly 1.0 (fp edge: f.x - floor(f.x) ≈ 1-eps scaled
+            // and rounded) would yield index == nA, silently dropping the atom out
+            // of the bin array. Clamp to [0, nA-1] so every atom lands in-range.
             let fa = f.x - floor(f.x)
             let fb = f.y - floor(f.y)
             let fc = f.z - floor(f.z)
             binIndices.append(BinKey(
-                a: Int(floor(fa * Double(nA))),
-                b: Int(floor(fb * Double(nB))),
-                c: Int(floor(fc * Double(nC)))))
+                a: min(nA - 1, Int(floor(fa * Double(nA)))),
+                b: min(nB - 1, Int(floor(fb * Double(nB)))),
+                c: min(nC - 1, Int(floor(fc * Double(nC))))))
         }
 
         // Group atoms by bin.

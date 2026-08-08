@@ -1474,15 +1474,38 @@ enum VariantSelect {
 
 // MARK: - aP helper functions
 
+/// Scale-relative singularity threshold for a 3x3 row-major lattice. Uses the
+/// largest row magnitude so huge real cells (tiny reciprocal) and tiny cells (huge
+/// reciprocal) are judged by |det|/scale^3, not an absolute cutoff that would
+/// false-reject the small-determinant case. Returns 0 when the matrix has no scale
+/// (all-zero rows), which correctly fails the subsequent `abs(det) > threshold`
+/// guard as singular.
+func singularityThreshold(_ rows: [Double]) -> Double {
+    // Largest row magnitude (manual norm: file-local to avoid depending on a
+    // `length` overload that is private to other files).
+    var scale = 0.0
+    for i in 0..<3 {
+        let x = rows[i * 3], y = rows[i * 3 + 1], z = rows[i * 3 + 2]
+        scale = max(scale, sqrt(x * x + y * y + z * z))
+    }
+    return 1e-12 * scale * scale * scale
+}
+
 /// Compute reciprocal cell rows (2π convention) from a row-vector direct lattice.
 func reciprocalCellRows(_ lattice: CrystalSymmetryMatrix) -> [Double]? {
+    let rows = [
+        lattice[0, 0], lattice[0, 1], lattice[0, 2],
+        lattice[1, 0], lattice[1, 1], lattice[1, 2],
+        lattice[2, 0], lattice[2, 1], lattice[2, 2],
+    ]
+    let threshold = singularityThreshold(rows)
     let v = simd_double3x3(rows: (
-        SIMD3(lattice[0, 0], lattice[0, 1], lattice[0, 2]),
-        SIMD3(lattice[1, 0], lattice[1, 1], lattice[1, 2]),
-        SIMD3(lattice[2, 0], lattice[2, 1], lattice[2, 2])
+        SIMD3(rows[0], rows[1], rows[2]),
+        SIMD3(rows[3], rows[4], rows[5]),
+        SIMD3(rows[6], rows[7], rows[8])
     ))
     let det = v.determinant
-    guard det.isFinite, abs(det) > 1e-12 else { return nil }
+    guard det.isFinite, threshold > 0, abs(det) > threshold else { return nil }
     let inv = v.inverse
     let scale = 2.0 * Double.pi
     // Reciprocal rows = columns of 2π * inv, stored as row-major [a*, b*, c*].
@@ -1495,13 +1518,14 @@ func reciprocalCellRows(_ lattice: CrystalSymmetryMatrix) -> [Double]? {
 
 /// Compute direct cell rows from reciprocal cell rows (inverse of reciprocalCellRows).
 func directCellFromReciprocalRows(_ recipRows: [Double]) -> [Double]? {
+    let threshold = singularityThreshold(recipRows)
     let v = simd_double3x3(rows: (
         SIMD3(recipRows[0], recipRows[1], recipRows[2]),
         SIMD3(recipRows[3], recipRows[4], recipRows[5]),
         SIMD3(recipRows[6], recipRows[7], recipRows[8])
     ))
     let det = v.determinant
-    guard det.isFinite, abs(det) > 1e-12 else { return nil }
+    guard det.isFinite, threshold > 0, abs(det) > threshold else { return nil }
     let inv = v.inverse
     let scale = 2.0 * Double.pi
     return [
@@ -1513,13 +1537,18 @@ func directCellFromReciprocalRows(_ recipRows: [Double]) -> [Double]? {
 
 /// Compute reciprocal cell rows from direct cell rows (non-optional path for known-good data).
 func reciprocalCellRowsDirect(_ directRows: [Double]) -> [Double]? {
+    // Same scale-relative singularity test as reciprocalCellRows /
+    // directCellFromReciprocalRows: this path consumes known-good standardized
+    // rows, but an absolute 1e-12 cutoff would still false-reject huge real cells
+    // (tiny reciprocal). Normal cells are unaffected (relative == absolute there).
+    let threshold = singularityThreshold(directRows)
     let v = simd_double3x3(rows: (
         SIMD3(directRows[0], directRows[1], directRows[2]),
         SIMD3(directRows[3], directRows[4], directRows[5]),
         SIMD3(directRows[6], directRows[7], directRows[8])
     ))
     let det = v.determinant
-    guard det.isFinite, abs(det) > 1e-12 else { return nil }
+    guard det.isFinite, threshold > 0, abs(det) > threshold else { return nil }
     let inv = v.inverse
     let scale = 2.0 * Double.pi
     return [
@@ -1538,9 +1567,12 @@ func cellParams(_ rows: [Double]) -> (a: Double, b: Double, c: Double,
     let a = sqrt(dot(va, va))
     let b = sqrt(dot(vb, vb))
     let c = sqrt(dot(vc, vc))
-    let cosalpha = dot(vb, vc) / (b * c)
-    let cosbeta = dot(va, vc) / (a * c)
-    let cosgamma = dot(va, vb) / (a * b)
+    // Guard the denominators: a zero-length axis (degenerate cell) would otherwise
+    // produce NaN via 0/0. validCellParams rejects non-finite cosines, so a sentinel
+    // 0 here cleanly fails validation rather than propagating NaN into a route.
+    let cosalpha = (b * c > 0) ? (dot(vb, vc) / (b * c)) : 0
+    let cosbeta = (a * c > 0) ? (dot(va, vc) / (a * c)) : 0
+    let cosgamma = (a * b > 0) ? (dot(va, vb) / (a * b)) : 0
     return (a, b, c, cosalpha, cosbeta, cosgamma)
 }
 

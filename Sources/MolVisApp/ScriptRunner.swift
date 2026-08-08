@@ -27,6 +27,34 @@ enum ScriptError: Error, LocalizedError {
 /// split into `command args...` by whitespace; surrounding double quotes are
 /// stripped from each argument. `help` is built in; `quit` halts execution.
 enum ScriptRunner {
+    /// Resolve a script path argument against `workingDirectory`.
+    ///
+    /// A leading `~/` (or a bare `~`) and a leading `$HOME/` (or bare `$HOME`)
+    /// expand to the user's home directory; absolute paths are taken as-is;
+    /// everything else stays relative to the script's directory. This is pure
+    /// string/URL work — no shell is ever spawned, so `$HOME` is the only
+    /// variable recognized and no other shell syntax is interpreted.
+    static func resolvePath(_ argument: String, workingDirectory: URL) -> URL {
+        if let expanded = expandHome(argument) {
+            return URL(fileURLWithPath: expanded).standardizedFileURL
+        }
+        if argument.hasPrefix("/") { return URL(fileURLWithPath: argument) }
+        return workingDirectory.appendingPathComponent(argument)
+    }
+
+    /// Expand a leading `~`/`$HOME` prefix; nil when the argument has none.
+    private static func expandHome(_ argument: String) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if argument == "~" || argument == "$HOME" { return home }
+        if argument.hasPrefix("~/") {
+            return home + "/" + String(argument.dropFirst(2))
+        }
+        if argument.hasPrefix("$HOME/") {
+            return home + "/" + String(argument.dropFirst(6))
+        }
+        return nil
+    }
+
     static func run(script: String, context: ScriptContext) throws -> String {
         var outputs: [String] = []
         for (index, line) in script.components(separatedBy: "\n").enumerated() {

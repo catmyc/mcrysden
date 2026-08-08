@@ -475,9 +475,18 @@ enum CoordinationAnalyzer {
                                                      targetQuotient: targetPoint.quotient,
                                                      canonicalOffset: record.canonicalOffset,
                                                      dimension: basis.dimension),
-                      let offset32 = int32Vector(offset64, dimension: basis.dimension),
                       let lattice = basis.lattice(offset64) else {
                     invalid = true
+                    return nil
+                }
+                // An offset outside Int32 range cannot be recorded in the
+                // SIMD3<Int32> imageOffset field. The old code set invalid=true on
+                // conversion failure, which aborted the WHOLE analysis for one huge
+                // offset. Treat such an image as "not a candidate" instead: skip the
+                // record (return nil without setting invalid). The lattice above is
+                // still valid; only the 32-bit offset can't round-trip, so this
+                // periodic image is simply dropped from the neighbor list.
+                guard let offset32 = int32Vector(offset64, dimension: basis.dimension) else {
                     return nil
                 }
                 imageOffset = offset32
@@ -621,8 +630,21 @@ enum CoordinationAnalyzer {
             guard !cancelled(isCancelled) else { return nil }
         }
         guard !cancelled(isCancelled) else { return nil }
-        return CoordinationAnalysis(records: flatNeighbors, offsets: offsets,
-                                    counts: coordinationNumbers,
+
+        // Same-atom deduplication: a lattice vector shorter than the cutoff can
+        // place the SAME target atom (different periodic images) inside the cutoff
+        // several times; the two passes above count each image independently,
+        // inflating coordination numbers. Within each source's neighbor run (already
+        // sorted by distance via `neighborPrecedes`), keep only the first — hence
+        // minimum-distance — image per unique target atom. This keeps `coordination`
+        // counting unique atoms and makes the stored displacement the minimum-image
+        // one that downstream consumers (neighbor tables, bond-angle distribution)
+        // rely on. The offsets/counts arrays are rebuilt to match the deduped list.
+        let deduped = deduplicateSameAtomNeighbors(
+            flatNeighbors, offsets: offsets, counts: coordinationNumbers)
+
+        return CoordinationAnalysis(records: deduped.neighbors, offsets: deduped.offsets,
+                                    counts: deduped.counts,
                                     candidateChecks: candidateChecks)
     }
 
@@ -976,6 +998,47 @@ enum CoordinationAnalyzer {
 
     private static func cancelled(_ isCancelled: (() -> Bool)?) -> Bool {
         isCancelled?() == true
+    }
+
+    /// Per-source, drop all but the first (minimum-distance) image of each unique
+    /// target atom. `neighbors` must be grouped by source with each group sorted by
+    /// distance ascending — which the caller guarantees via `neighborPrecedes`.
+    /// Returns the compacted neighbor list plus offsets/counts that describe it,
+    /// so the CoordinationAnalysis API surface (offsets/counts arrays) is preserved.
+    private static func deduplicateSameAtomNeighbors(
+        _ neighbors: [CoordinationNeighbor],
+        offsets: [Int],
+        counts: [Int]
+    ) -> (neighbors: [CoordinationNeighbor], offsets: [Int], counts: [Int]) {
+        // No early-out on cardinality: in a sparse system a single source with a
+        // few periodic-image neighbors amid N other atoms (all zero-count) yields
+        // neighbors.count < offsets.count-1 and would otherwise skip dedupe,
+        // leaving the same-target double-count in place. Dedupe is O(n); always run.
+        var out: [CoordinationNeighbor] = []
+        out.reserveCapacity(neighbors.count)
+        var newOffsets = Array(repeating: 0, count: offsets.count)
+        var newCounts = Array(repeating: 0, count: counts.count)
+        var writeIndex = 0
+        let sourceCount = offsets.count - 1
+        for source in 0..<sourceCount {
+            let start = offsets[source]
+            let end = offsets[source + 1]
+            var seen = Set<Int>()
+            seen.reserveCapacity(end - start)
+            for i in start..<end {
+                let n = neighbors[i]
+                guard seen.insert(n.atomIndex).inserted else { continue }
+                out.append(n)
+                writeIndex += 1
+            }
+            newCounts[source] = seen.count
+            newOffsets[source + 1] = writeIndex
+        }
+        for source in sourceCount..<counts.count {
+            newOffsets[source + 1] = writeIndex
+            newCounts[source] = 0
+        }
+        return (out, newOffsets, newCounts)
     }
 
     private static func imageRecordPrecedes(_ lhs: ImageRecord, _ rhs: ImageRecord) -> Bool {

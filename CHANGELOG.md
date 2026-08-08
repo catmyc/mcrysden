@@ -2,6 +2,26 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] — 2026-08-08
+
+### Fixed
+
+- Color-plane texture cache no longer keys on a transient array base address (dangling pointer could serve a stale texture or rebuild every frame); cache hits require CoW-storage identity with an exact element-wise content fallback, and cache invalidation clears the retained flat copy.
+- `colorPlaneInputsUnchanged` now detects in-place grid mutations (storage identity plus full content comparison) instead of trusting per-row CoW base pointers alone.
+- Slice textures rebuild when the cell changes (lattice-only edits no longer keep the old slice).
+- Supercell/slab camera reframing happens once, after the slab is applied, for both supercell and slab-only geometry changes; a zero-radius (empty) pre-change scene is handled without division by zero.
+- `application(_:openFiles:)` dedupes CLI-owned paths by resolved file identity (standardized path + symlink/hardlink inode) instead of raw string equality, so `./data.xyz` relaunched as an odoc event no longer opens the document twice; internally delivered duplicates open once.
+- CLI validation is now symmetric: `--fps` and `--anim-size` require `--export-anim`, and `--format` requires `--convert`/`--convert-all`, matching the existing `--frames` contract; `--frames 0` is accepted and treated as "every remaining frame" per its documentation.
+- Wannier90 k-path import no longer indexes out of bounds on 6/7-token rows: 8-token branches are guarded by exact token counts, the dedicated 6-token branch handles only its format, and malformed lines fail with the existing useful error.
+- Coordination-analysis duplicate removal always runs (a sparse-system guard previously skipped it, letting same-atom periodic images be double-counted).
+- HPKOT `reciprocalCellRowsDirect` uses the scale-relative singularity threshold like its siblings, so tiny reciprocal cells are no longer falsely rejected.
+- Legacy `FieldSlice.clipTriangles` doc corrected (the renderer migrated to `clipTrianglesWithOverflow`; the wrapper is retained for tests).
+- `StateStore` comment corrected for the exact accepted `Int` range.
+
+### Changed
+
+- Suite at 36 focused tests: added a color-plane rebuild regression, Wannier90-import count-guard regressions, and coordination dedupe coverage; existing MP4/GIF/APNG assertions hardened for CI.
+
 ## [1.2.0] — 2026-08-08
 
 ### Changed

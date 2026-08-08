@@ -366,12 +366,33 @@ enum KPathImport {
                                                      reason: "malformed kpoint_path row: '\(line)'")
                 }
             }
-            guard tokens.count == 8 else {
+            // Wannier90's kpoint_path row is the ENDPOINT PAIR:
+            //   label1 x1 y1 z1  label2 x2 y2 z2     (8 tokens, documented interleaved)
+            //   label1 label2 x1 y1 z1 x2 y2 z2      (8 tokens, legacy two-labels-first)
+            //   x1 y1 z1  x2 y2 z2                   (6 tokens, labels omitted — legal)
+            // Tolerate 6+ tokens (missing labels → empty); keep the two strict
+            // 8-token shapes and reject anything that is neither.
+            if tokens.count != 8, tokens.count < 6 {
                 throw KPathImportError.malformed(path: path,
-                                                 reason: "kpoint_path row must have 8 tokens (label x y z label x y z): '\(line)'")
+                                                 reason: "kpoint_path row must have at least 6 tokens (x y z x y z): '\(line)'")
+            }
+            // 6-token: coordinates only, no labels.
+            if tokens.count == 6,
+               let kx1 = Float(tokens[0]), kx1.isFinite,
+               let ky1 = Float(tokens[1]), ky1.isFinite,
+               let kz1 = Float(tokens[2]), kz1.isFinite,
+               let kx2 = Float(tokens[3]), kx2.isFinite,
+               let ky2 = Float(tokens[4]), ky2.isFinite,
+               let kz2 = Float(tokens[5]), kz2.isFinite {
+                segments.append((KPoint(SIMD3<Float>(kx1, ky1, kz1), ""),
+                                 KPoint(SIMD3<Float>(kx2, ky2, kz2), "")))
+                continue
             }
             // Documented interleaved: label1 x1 y1 z1 label2 x2 y2 z2.
-            if !isNumeric(tokens[0]), !isNumeric(tokens[4]),
+            // Guard with tokens.count == 8: a 6/7-token row must NOT enter the
+            // 8-token branches, which index tokens[5]...tokens[7] — indexing past
+            // the end on a shorter row traps Index out of range.
+            if tokens.count == 8, !isNumeric(tokens[0]), !isNumeric(tokens[4]),
                let kx1 = Float(tokens[1]), kx1.isFinite,
                let ky1 = Float(tokens[2]), ky1.isFinite,
                let kz1 = Float(tokens[3]), kz1.isFinite,
@@ -385,7 +406,8 @@ enum KPathImport {
                 continue
             }
             // Legacy two-labels-first: label1 label2 x1 y1 z1 x2 y2 z2.
-            if !isNumeric(tokens[0]), !isNumeric(tokens[1]),
+            // Same 8-token guard as the interleaved branch above.
+            if tokens.count == 8, !isNumeric(tokens[0]), !isNumeric(tokens[1]),
                let x1 = Float(tokens[2]), x1.isFinite,
                let y1 = Float(tokens[3]), y1.isFinite,
                let z1 = Float(tokens[4]), z1.isFinite,

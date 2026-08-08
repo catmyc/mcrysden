@@ -391,15 +391,25 @@ enum FieldSlice {
 
     // MARK: Clip triangles
 
+    /// Result of clipping a triangle mesh against a plane. Mirrors IsoMesh.overflow:
+    /// when `overflow` is true the clipped mesh hit the 5M-triangle output cap and
+    /// `vertices` is empty (a partial, discarded result); callers should treat this
+    /// as a frame failure like `IsoMesh.overflow`, not a valid empty surface.
+    struct ClippedMesh {
+        let vertices: [Float]
+        let overflow: Bool
+    }
+
     /// Clip a packed IsoMesh-style triangle list (9 floats/vertex:
     /// px,py,pz, nx,ny,nz, r,g,b) against `plane`. Keeps the half-space where
     /// dot(p - origin, normal) * keepSide >= -1e-6. Interpolates position, normal
-    /// (renormalized; zero-length → (0,0,1)), and color linearly. Returns the
-    /// packed clipped list (may be empty; always a multiple of 9 floats).
-    /// Malformed input (count % 9 != 0) → empty. Output capped at 5M triangles.
-    static func clipTriangles(_ vertices: [Float], plane: SlicePlane, keepSide: Float = 1) -> [Float] {
-        guard plane.isValid else { return [] }
-        guard vertices.count % 9 == 0 else { return [] }
+    /// (renormalized; zero-length → (0,0,1)), and color linearly. Output capped at
+    /// 5M triangles: exceeding the cap sets `overflow = true` and returns an empty
+    /// mesh (a truncated surface is never a valid partial result). Malformed input
+    /// (count % 9 != 0) → empty, non-overflowing mesh.
+    static func clipTrianglesWithOverflow(_ vertices: [Float], plane: SlicePlane, keepSide: Float = 1) -> ClippedMesh {
+        guard plane.isValid else { return ClippedMesh(vertices: [], overflow: false) }
+        guard vertices.count % 9 == 0 else { return ClippedMesh(vertices: [], overflow: false) }
         let maxTriangles = 5_000_000
         let epsilon: Float = -1e-6
 
@@ -473,7 +483,11 @@ enum FieldSlice {
             guard n >= 3 else { continue }
             let newTris = n - 2
             totalTriangles += newTris
-            if totalTriangles > maxTriangles { return [] }
+            // Like IsoMesh, a truncated surface is never a valid partial result:
+            // signal overflow so the caller can fail the frame rather than silently
+            // drawing an empty/truncated slice. This mirrors the iso path where
+            // `mesh.overflow` returns false from the render entry point.
+            if totalTriangles > maxTriangles { return ClippedMesh(vertices: [], overflow: true) }
 
             // Fan-triangulate the clipped polygon.
             for i in 1..<(n - 1) {
@@ -483,6 +497,15 @@ enum FieldSlice {
             }
         }
 
-        return output
+        return ClippedMesh(vertices: output, overflow: false)
+    }
+
+    /// Legacy clip that discards the overflow signal, returning only the vertex
+    /// array. Kept for API and test compatibility (the snapshot/Volumetric tests
+    /// still exercise it); it cannot distinguish a legitimately-empty clip from a
+    /// cap-hit truncation. Prefer `clipTrianglesWithOverflow` for new code so a
+    /// truncated slice fails loudly like the iso path.
+    static func clipTriangles(_ vertices: [Float], plane: SlicePlane, keepSide: Float = 1) -> [Float] {
+        clipTrianglesWithOverflow(vertices, plane: plane, keepSide: keepSide).vertices
     }
 }

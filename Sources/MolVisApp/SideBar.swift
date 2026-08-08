@@ -441,25 +441,32 @@ struct SideBar: View {
                     xrdContent
                 }
             }
-            CollapsibleSection(title: "Supercell", isExpanded: $supercellExpanded) {
-                Stepper("n1 = \(state.n1)", value: $state.n1, in: 1...6)
-                Stepper("n2 = \(state.n2)", value: $state.n2, in: 1...6)
-                Stepper("n3 = \(state.n3)", value: $state.n3, in: 1...6)
-            }
-            // --- Slab: enable + two Miller planes (h/k/l + distance each) ----------
-            CollapsibleSection(title: "Slab", isExpanded: $slabExpanded) {
-                Toggle("Enable", isOn: $state.slabEnabled)
-                if state.slabEnabled {
-                    Text("Plane A (h k l)").font(.subheadline).bold()
-                    Stepper("h = \(state.slabA_h)", value: $state.slabA_h, in: -8...8)
-                    Stepper("k = \(state.slabA_k)", value: $state.slabA_k, in: -8...8)
-                    Stepper("l = \(state.slabA_l)", value: $state.slabA_l, in: -8...8)
-                    Slider(value: $state.slabA_dist, in: -20...20) { Text("Slab A dist: \(state.slabA_dist, specifier: "%.1f")") }
-                    Text("Plane B (h k l)").font(.subheadline).bold()
-                    Stepper("h = \(state.slabB_h)", value: $state.slabB_h, in: -8...8)
-                    Stepper("k = \(state.slabB_k)", value: $state.slabB_k, in: -8...8)
-                    Stepper("l = \(state.slabB_l)", value: $state.slabB_l, in: -8...8)
-                    Slider(value: $state.slabB_dist, in: -20...20) { Text("Slab B dist: \(state.slabB_dist, specifier: "%.1f")") }
+            // --- Supercell + Slab (crystal only) ----------------------------------
+            // Both operate on lattice vectors / Miller planes, so for a molecule
+            // with no cell they are inert: the scene refuses the expansion and the
+            // slab cut, leaving controls that silently do nothing. Gate them on
+            // isCrystal exactly like Clipping/Symmetry/K-Path above.
+            if state.isCrystal {
+                CollapsibleSection(title: "Supercell", isExpanded: $supercellExpanded) {
+                    Stepper("n1 = \(state.n1)", value: $state.n1, in: 1...6)
+                    Stepper("n2 = \(state.n2)", value: $state.n2, in: 1...6)
+                    Stepper("n3 = \(state.n3)", value: $state.n3, in: 1...6)
+                }
+                // --- Slab: enable + two Miller planes (h/k/l + distance each) ------
+                CollapsibleSection(title: "Slab", isExpanded: $slabExpanded) {
+                    Toggle("Enable", isOn: $state.slabEnabled)
+                    if state.slabEnabled {
+                        Text("Plane A (h k l)").font(.subheadline).bold()
+                        Stepper("h = \(state.slabA_h)", value: $state.slabA_h, in: -8...8)
+                        Stepper("k = \(state.slabA_k)", value: $state.slabA_k, in: -8...8)
+                        Stepper("l = \(state.slabA_l)", value: $state.slabA_l, in: -8...8)
+                        Slider(value: $state.slabA_dist, in: -20...20) { Text("Slab A dist: \(state.slabA_dist, specifier: "%.1f")") }
+                        Text("Plane B (h k l)").font(.subheadline).bold()
+                        Stepper("h = \(state.slabB_h)", value: $state.slabB_h, in: -8...8)
+                        Stepper("k = \(state.slabB_k)", value: $state.slabB_k, in: -8...8)
+                        Stepper("l = \(state.slabB_l)", value: $state.slabB_l, in: -8...8)
+                        Slider(value: $state.slabB_dist, in: -20...20) { Text("Slab B dist: \(state.slabB_dist, specifier: "%.1f")") }
+                    }
                 }
             }
             // --- Structure tools: basis transform, deformation, cluster, surface ---

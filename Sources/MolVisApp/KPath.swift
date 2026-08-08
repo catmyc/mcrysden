@@ -180,10 +180,25 @@ extension KPath {
     /// edge gets exactly 2 samples (start+end).
     ///
     /// A global cap of 1,000,000 output points prevents unbounded allocation.
-    func interpolated() -> [SIMD3<Float>] {
+    ///
+    /// `metric` optionally overrides the per-segment length and per-point
+    /// cumulative-distance computation. When nil (the default) sampling is by
+    /// fractional Euclidean distance — preserving the exact historical behavior
+    /// so all existing callers are unchanged. When non-nil, `metric(from, to)`
+    /// returns the physical distance between two fractional k-points (e.g. via the
+    /// reciprocal metric tensor) and is used both to apportion samples across
+    /// edges and to position points so physical k-space sampling is uniform even
+    /// for non-orthogonal cells. The returned array layout is identical either
+    /// way, so downstream consumers need no change.
+    func interpolated(metric: ((SIMD3<Float>, SIMD3<Float>) -> Float)? = nil) -> [SIMD3<Float>] {
         let pts = points.map { $0.frac }
         guard pts.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { return [] }
         guard pts.count >= 2 else { return pts }
+
+        let distance: (SIMD3<Float>, SIMD3<Float>) -> Float = metric ?? { lhs, rhs in
+            let d = rhs - lhs
+            return sqrt(dot(d, d))
+        }
 
         let segs = segments()
         guard !segs.isEmpty else { return [] }
@@ -193,7 +208,7 @@ extension KPath {
         for range in segs {
             var segLen: Float = 0
             for i in range.lowerBound..<(range.upperBound - 1) {
-                let d = sqrt(dot(pts[i+1] - pts[i], pts[i+1] - pts[i]))
+                let d = distance(pts[i], pts[i+1])
                 guard d.isFinite else { return [] }
                 segLen += d
             }
@@ -254,7 +269,7 @@ extension KPath {
             var desiredExtras: [Int] = []
             desiredExtras.reserveCapacity(range.count - 1)
             for i in range.lowerBound..<(range.upperBound - 1) {
-                let d = sqrt(dot(pts[i+1] - pts[i], pts[i+1] - pts[i]))
+                let d = distance(pts[i], pts[i+1])
                 guard d.isFinite else { return [] }
                 // Allocate samples for this edge proportional to its length
                 // relative to the COMPONENT's total length (not a global total).

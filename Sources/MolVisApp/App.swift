@@ -79,7 +79,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var exportAnimationURL: URL?
         /// Frames per second for --export-anim (default 10).
         var animFPS: Int = 10
-        /// Frame count for --export-anim: 0 = all frames, >0 = first N frames.
+        /// Frame count for --export-anim (--frames K): 0 = every remaining frame,
+        /// >0 = at most K frames counted from the start frame (--frame N).
         var animFrameCount: Int = 0
         /// Explicit viewport size for --export-anim (--anim-size WxH).
         var animSize: CGSize?
@@ -165,6 +166,17 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
     }()
 
+    /// True when the command line asks for the usage text. Checked before full
+    /// parsing so `--help` short-circuits every other flag and all validation.
+    /// `--` still terminates option parsing, matching `parseArguments`.
+    static func requestsHelp(_ args: [String]) -> Bool {
+        for argument in args {
+            if argument == "--" { return false }
+            if argument == "--help" || argument == "-h" { return true }
+        }
+        return false
+    }
+
     static func parseArguments(_ args: [String]) throws -> LaunchOptions {
         var options = LaunchOptions()
         var positionals: [String] = []
@@ -174,13 +186,18 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var convertVerbSeen = false
         var convertRequiresXSF = false
         var fpsSeen = false
+        var framesSeen = false
         var animSizeSeen = false
         while index < args.count {
             let argument = args[index]
             if !optionsEnded && argument == "--" {
                 optionsEnded = true
             } else if !optionsEnded && (argument == "--help" || argument == "-h") {
+                // --help short-circuits: return immediately so no later flag and
+                // none of the post-loop consistency checks can turn a request for
+                // the usage text into an error exit.
                 options.help = true
+                return options
             } else if !optionsEnded && argument == "--convert" {
                 guard !convertVerbSeen, options.convertURL == nil,
                       index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
@@ -226,6 +243,15 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 fpsSeen = true
                 index += 1
                 options.animFPS = value
+            } else if !optionsEnded && argument == "--frames" {
+                // 0 = every remaining frame (the default); >0 = at most K frames.
+                guard !framesSeen, index + 1 < args.count,
+                      let value = Int(args[index + 1]), value >= 0, value <= Int(Int32.max) else {
+                    throw CLIError.invalid("--frames requires a non-negative 32-bit integer")
+                }
+                framesSeen = true
+                index += 1
+                options.animFrameCount = value
             } else if !optionsEnded && argument == "--anim-size" {
                 guard !animSizeSeen, index + 1 < args.count,
                       let size = parseAnimSize(args[index + 1]) else {
@@ -354,6 +380,26 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
         if let convertURL = options.convertURL {
             guard options.inputURL != nil else { throw CLIError.invalid("--convert requires an input file") }
+            // `--format` names an OUTPUT structure format (xsf|cif|poscar|xyz|qe),
+            // and single-file `--convert` already derives its output format from
+            // the output extension -- so the flag has nothing left to select and
+            // was previously dropped in silence. It is now accepted only when it
+            // agrees with the extension; a contradiction such as
+            // `--convert out.cif --format xsf` names two different targets and is
+            // rejected instead of quietly writing one of them. (The INPUT parser is
+            // chosen by the force-format flags --xsf/--pwi/..., which --convert
+            // already honors through `options.format`.)
+            if let requested = options.convertFormat {
+                guard let fromExtension = Converter.outputFormat(forExtension: convertURL.pathExtension) else {
+                    throw CLIError.invalid("unsupported --convert output extension: \(convertURL.pathExtension)")
+                }
+                guard fromExtension == requested else {
+                    throw CLIError.invalid("--format \(convertFormatName(requested)) conflicts with the --convert output "
+                                           + "extension .\(convertURL.pathExtension.lowercased()) "
+                                           + "(\(convertFormatName(fromExtension))); --format selects the output format "
+                                           + "for --convert-all only")
+                }
+            }
             if convertRequiresXSF {
                 guard convertURL.pathExtension.lowercased() == "xsf" else {
                     throw CLIError.invalid("--pwi2xsf/--pwo2xsf/--struct2xsf require an .xsf output path")
@@ -372,11 +418,24 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 throw CLIError.invalid("--convert-all output directory aliases the input: \(protected.path)")
             }
         }
-        if options.exportAnimationURL != nil {
+        if let animURL = options.exportAnimationURL {
             guard options.inputURL != nil else { throw CLIError.invalid("--export-anim requires an input file") }
-            guard ["gif", "apng", "mp4"].contains(options.exportAnimationURL!.pathExtension.lowercased()) else {
+            guard ["gif", "apng", "mp4"].contains(animURL.pathExtension.lowercased()) else {
                 throw CLIError.invalid("--export-anim requires a .gif, .apng, or .mp4 output path")
             }
+        } else {
+            // Animation qualifiers only bound the animation loop; anywhere else
+            // they would be accepted and silently ignored, the exact class of bug
+            // these checks exist to prevent.
+            if framesSeen { throw CLIError.invalid("--frames requires --export-anim") }
+            if fpsSeen { throw CLIError.invalid("--fps requires --export-anim") }
+            if animSizeSeen { throw CLIError.invalid("--anim-size requires --export-anim") }
+        }
+        // `--format` names an OUTPUT structure format and only selects one for
+        // `--convert`/`--convert-all`; with any other action it is meaningless
+        // and must not be silently dropped.
+        if options.convertFormat != nil, options.convertURL == nil, options.convertAllURL == nil {
+            throw CLIError.invalid("--format requires --convert or --convert-all")
         }
         return options
     }
@@ -394,6 +453,18 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
     private static let convertFormatFlags = ["xsf", "cif", "poscar", "xyz", "qe"]
 
+    /// Inverse of `parseConvertFormat`, so a diagnostic names the same spelling
+    /// the user typed on the command line.
+    private static func convertFormatName(_ format: StructureExportFormat) -> String {
+        switch format {
+        case .xsf: return "xsf"
+        case .cif: return "cif"
+        case .poscar: return "poscar"
+        case .xyz: return "xyz"
+        case .qeInput: return "qe"
+        }
+    }
+
     /// Parse a `--anim-size WxH` value into a CGSize. Returns nil on any malformed input.
     private static func parseAnimSize(_ raw: String) -> CGSize? {
         let parts = raw.lowercased().split(separator: "x").map(String.init)
@@ -401,6 +472,25 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             return nil
         }
         return CGSize(width: w, height: h)
+    }
+
+    /// The frame range exported by `--export-anim`.
+    ///
+    /// `--frame N` is the 0-based STARTING frame (default 0) and `--frames K`
+    /// bounds how many frames follow it (0 = every remaining frame). Both flags
+    /// were previously parsed and then dropped by the animation path, which
+    /// always exported the whole file from frame 0. An out-of-range start throws
+    /// rather than exporting something the user did not ask for.
+    static func animationFrameRange(total: Int, startFrame: Int, frameCount: Int,
+                                    name: String) throws -> Range<Int> {
+        guard total > 0 else { throw CLIError.invalid("\(name) contains no frames") }
+        let start = startFrame < 0 ? 0 : startFrame
+        guard start < total else {
+            throw CLIError.invalid("--frame \(start) is out of range for \(name) (\(total) frame(s))")
+        }
+        let remaining = total - start
+        let count = frameCount > 0 ? min(frameCount, remaining) : remaining
+        return start..<(start + count)
     }
 
     private static let supportedExportExtensions: Set<String> = ["png", "pdf", "svg", "eps", "ps"]
@@ -643,6 +733,14 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeKey(_:)),
                                                name: NSWindow.didBecomeKeyNotification, object: nil)
         let args = Array(CommandLine.arguments.dropFirst())
+        // --help short-circuits BEFORE parsing: asking for the usage text must
+        // never be turned into an error exit by an unrelated malformed flag on
+        // the same command line, and must never fall through to a headless
+        // action. Exit 0 directly so `mcrysden --help` is usable in scripts.
+        if Self.requestsHelp(args) {
+            Self.printHelp()
+            exit(EXIT_SUCCESS)
+        }
         let options: LaunchOptions
         do {
             options = try Self.parseArguments(args)
@@ -651,7 +749,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             exit(EXIT_FAILURE)
         }
         if options.help {
-            Self.printHelp(); NSApp.terminate(nil); return
+            Self.printHelp()
+            exit(EXIT_SUCCESS)
         }
         // headless export path
         if let outURL = options.exportURL, let inURL = options.inputURL {
@@ -719,10 +818,15 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             do {
                 let fc = Parser.frameCount(inURL, as: options.format)
                 let total = fc > 0 ? fc : 1
-                let limit = options.animFrameCount > 0 ? min(options.animFrameCount, total) : total
+                // --frame N is the starting frame and --frames K bounds the count;
+                // both were parsed but ignored here before.
+                let range = try Self.animationFrameRange(total: total,
+                                                         startFrame: options.frame,
+                                                         frameCount: options.animFrameCount,
+                                                         name: inURL.lastPathComponent)
                 var scenes: [Scene] = []
-                scenes.reserveCapacity(limit)
-                for i in 0..<limit {
+                scenes.reserveCapacity(range.count)
+                for i in range {
                     scenes.append(Scene(loaded: try Parser.load(inURL, as: options.format, frameIndex: i)))
                 }
                 let size = options.animSize ?? CGSize(width: 640, height: 480)
@@ -742,9 +846,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             do {
                 let content = try String(contentsOf: scriptURL, encoding: .utf8)
                 let workingDirectory = scriptURL.deletingLastPathComponent()
+                // Shared with ScriptRunner so `~`/`$HOME`, absolute, and
+                // script-relative paths resolve identically everywhere.
                 func resolve(_ arg: String) -> URL {
-                    if arg.hasPrefix("/") { return URL(fileURLWithPath: arg) }
-                    return workingDirectory.appendingPathComponent(arg)
+                    ScriptRunner.resolvePath(arg, workingDirectory: workingDirectory)
                 }
                 final class Holder<T> { var value: T?; init() {} }
                 let currentScene = Holder<Scene>()
@@ -848,6 +953,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
         // GUI path. Resolve which file to open: explicit CLI input always wins;
         // otherwise fall back to the stored lastOpenedURL (implicit reopen).
+        // An `odoc` open event is delivered BEFORE this method, so when Finder
+        // already handed us documents, do not additionally reopen the stored
+        // lastOpenedURL (or add an empty window) on top of them.
+        if didOpenFilesFromSystem, options.inputURL == nil { return }
         let (inputURL, isReopen) = Self.resolveLaunchURL(options: options)
         if let inURL = inputURL {
             do {
@@ -1129,6 +1238,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// File > Open...
+    @MainActor
     @objc private func openDocument(_ sender: Any?) {
         guard let wc = mainWC else { return }
         let panel = NSOpenPanel()
@@ -1143,17 +1253,140 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
     }
 
-    /// Shared Open path used by Open..., Open Recent, and drag-and-drop: parse
-    /// `url` and load it into `wc`. Mirrors the Open panel's error handling.
-    private func openFile(_ url: URL, into wc: MainWindowController? = nil) {
+    /// Shared Open path used by Open..., Open Recent, Finder open events, and
+    /// drag-and-drop: parse `url` and load it into `wc`. A parse failure is now
+    /// surfaced in an alert on the target window as well as logged: the Finder
+    /// path has no console for the user to read, and a window that silently did
+    /// not change is indistinguishable from a hang.
+    @MainActor
+    @discardableResult
+    private func openFile(_ url: URL, into wc: MainWindowController? = nil) -> Bool {
         let wc = wc ?? mainWC
-        guard let wc else { return }
+        guard let wc else { return false }
         do {
             let scene = Scene(loaded: try Parser.load(url))
             wc.loadFile(scene, from: url, format: nil, frameIndex: 0)
+            return true
         } catch {
             print("[mcrysden] open failed: \(error)")
+            presentFileOperationError(error, title: "Could not open \(url.lastPathComponent)", for: wc)
+            return false
         }
+    }
+
+    // MARK: - Finder / open-app events
+
+    /// True once an `odoc` open event has been serviced. `openFiles:` is
+    /// delivered BEFORE applicationDidFinishLaunching, so the launch path must
+    /// not additionally reopen the stored lastOpenedURL on top of the document
+    /// the user just double-clicked.
+    private var didOpenFilesFromSystem = false
+
+    /// Finder double-click, `open -a mcrysden file.xyz`, and drops on the app
+    /// icon all arrive as an `odoc` Apple event routed here. Without this method
+    /// the event is answered by AppKit's default no-op and the file is silently
+    /// never opened.
+    ///
+    /// Each file goes through the SAME `openFile` path the Open... menu item
+    /// uses, so format sniffing, recent-documents bookkeeping, file watching and
+    /// error reporting are identical. CLI-only options (`--frame`, the
+    /// force-format flags) deliberately do not apply here: an open event carries
+    /// nothing but a path.
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        // AppKit also turns plain command-line file arguments into an `odoc`
+        // event. Those paths are already owned by `parseArguments` (which may
+        // pair them with --frame/a force-format flag, or run a headless action
+        // and exit), so opening them again here would double-load the document
+        // -- and would pop a GUI window in the middle of a headless export.
+        // Anything present in our own argv is therefore CLI-owned and skipped.
+        // Compare by resolved file identity rather than raw string equality: a
+        // path passed on the command line (e.g. `./data.xyz`) and the same
+        // document re-delivered as an `odoc` event are absolutized and symlink-
+        // resolved by AppKit to `/abs/.../data.xyz` -- equal files but unequal
+        // strings, so a `Set<String>.contains` check lets the document open
+        // TWICE. `sameFile` collapses path, symlink-target and hardlink aliases;
+        // genuinely distinct files (several documents dropped at once) still
+        // open in separate windows. Dedupe the delivered filenames among
+        // themselves too, so a double-delivered path opens only once.
+        let cliURLs = CommandLine.arguments.dropFirst().map { URL(fileURLWithPath: $0) }
+        var seenSystem: [URL] = []
+        let systemFiles = filenames.filter { path in
+            let candidate = URL(fileURLWithPath: path)
+            if cliURLs.contains(where: { Self.sameFile(candidate, $0) }) { return false }
+            if seenSystem.contains(where: { Self.sameFile(candidate, $0) }) { return false }
+            seenSystem.append(candidate)
+            return true
+        }
+        guard !systemFiles.isEmpty else {
+            // Nothing left for us to open (empty event, or every path is CLI
+            // owned) -- still answer so the sender is not left waiting for a
+            // reply that never comes.
+            sender.reply(toOpenOrPrint: .success)
+            return
+        }
+        didOpenFilesFromSystem = true
+        var failed = false
+        for path in systemFiles {
+            if !openFileFromSystem(URL(fileURLWithPath: path)) { failed = true }
+        }
+        sender.reply(toOpenOrPrint: failed ? .failure : .success)
+    }
+
+    /// Clicking the Dock icon with no visible window must restore a usable
+    /// viewer: raise an existing window, reopen the last document through the
+    /// shared open path, or present an empty window. Returning false tells
+    /// AppKit the reopen was handled here.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if flag { return true }
+        if let existing = windowRegistry.active {
+            existing.window.makeKeyAndOrderFront(nil)
+            return false
+        }
+        if let path = UserDefaults.standard.string(forKey: Self.lastOpenedURLKey),
+           !path.isEmpty, FileManager.default.fileExists(atPath: path) {
+            openFileFromSystem(URL(fileURLWithPath: path))
+            return false
+        }
+        makeViewerWindow().window.makeKeyAndOrderFront(nil)
+        return false
+    }
+
+    /// Open `url` in a reusable empty viewer window when there is one, else in a
+    /// new window. Returns false when the file could not be parsed (the alert has
+    /// already been presented by `openFile`).
+    @MainActor
+    @discardableResult
+    private func openFileFromSystem(_ url: URL) -> Bool {
+        let target = reusableEmptyWindow() ?? makeViewerWindow()
+        let ok = openFile(url, into: target)
+        target.window.makeKeyAndOrderFront(nil)
+        return ok
+    }
+
+    /// An already-open window holding no document, reused instead of stacking a
+    /// second window on top of the empty one opened at launch.
+    @MainActor
+    private func reusableEmptyWindow() -> MainWindowController? {
+        windowRegistry.windows
+            .compactMap { $0.delegate as? MainWindowController }
+            .first { $0.currentSourceURL == nil && $0.scene.atoms.isEmpty }
+    }
+
+    /// Create and register a viewer window, cascaded off the key window so a
+    /// multi-file open event does not stack windows exactly on top of each other.
+    /// Mirrors `newDocument`'s placement.
+    @MainActor
+    @discardableResult
+    private func makeViewerWindow() -> MainWindowController {
+        let base = NSApp?.keyWindow ?? windowRegistry.windows.last
+        let wc = MainWindowController(scene: Scene())
+        windowRegistry.add(wc)
+        if let base {
+            let f = base.frame
+            wc.window.setFrame(NSRect(x: f.origin.x + 24, y: f.origin.y - 24,
+                                      width: f.width, height: f.height), display: false)
+        }
+        return wc
     }
 
     /// File > Revert To Saved: re-read the loaded source and reload it, exactly
@@ -1165,6 +1398,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// File > Open Recent > <file>: open a recently-viewed document.
+    @MainActor
     @objc private func openRecentFile(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         openFile(url)
@@ -1451,7 +1685,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     @MainActor
     @objc private func copyCurrentView(_ sender: Any?) {
         guard let wc = mainWC, let item = sender as? NSMenuItem else { return }
-        let size = Self.exportSizeForViewport(wc.viewport.bounds.size)
+        let size = copyExportSize(for: wc)
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("mcrysden-clip-\(UUID().uuidString).png")
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -1465,6 +1699,30 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             print("[mcrysden] copy current view failed: \(error)")
             flashCopyResult(item, success: false)
         }
+    }
+
+    /// The image size used by Edit > Copy Current View.
+    ///
+    /// Normally the live viewport's logical size, matching File > Export. But a
+    /// window that has not been laid out yet (copy invoked before the first
+    /// layout pass, or from an off-screen/zero-sized window) reports zero -- or
+    /// non-finite -- bounds, and `exportCurrentView` then throws with nothing but
+    /// a one-second "Copy Failed" flash to show for it. Fall back to the export
+    /// panel's configured dimensions so the copy still produces a usable image.
+    @MainActor
+    private func copyExportSize(for wc: MainWindowController) -> CGSize {
+        let bounds = wc.viewport.bounds.size
+        if bounds.width.isFinite, bounds.height.isFinite, bounds.width > 0, bounds.height > 0 {
+            return Self.exportSizeForViewport(bounds)
+        }
+        let fallback = CGSize(width: exportOptions.width, height: exportOptions.height)
+        // exportOptions is user-editable; if it is itself degenerate, fall back
+        // once more to the exporter's own default square.
+        guard (try? Self.validatedExportSize(fallback)) != nil else {
+            return CGSize(width: ExportOptions.defaultDimension,
+                          height: ExportOptions.defaultDimension)
+        }
+        return fallback
     }
 
     /// Briefly change the Copy Current View menu title to confirm (or report) the
@@ -1529,7 +1787,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.0"
+    static let appVersion = "1.2.1"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -1564,8 +1822,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         Apply rendering-quality settings with --preset default|journal|presentation|print.
         Structure conversion formats are chosen by the --convert output extension:
           .xsf .cif .poscar/.contcar/.vasp .xyz .pwi/.in/.inp/.qe
-        Batch --convert-all requires --format <xsf|cif|poscar|xyz|qe>.
-        Animation --export-anim takes optional --fps N (default 10) and --anim-size WxH (default 640x480).
+        Batch --convert-all requires --format <xsf|cif|poscar|xyz|qe>; with a single-file
+        --convert the output format comes from the output extension, so --format is
+        accepted only when it names that same format.
+        Animation --export-anim takes optional --fps N (default 10), --anim-size WxH
+        (default 640x480), --frame N (0-based STARTING frame, default 0) and
+        --frames K (export at most K frames from the start frame; default: all remaining).
         Only one of --export, --convert, --convert-all, --export-anim, --script may be used at once.
         """)
     }

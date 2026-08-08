@@ -39,8 +39,18 @@ final class SideBarState: ObservableObject {
     /// syncFromScene(); the controller mirrors changes back into the Scene.
     @Published var showScaleIndicator: Bool = false { didSet { onChange?() } }
     /// True when the loaded scene is a crystal (has a cell). Drives which
-    /// crystal-only controls (Brillouin zone, k-path) are shown.
-    @Published var isCrystal: Bool = false { didSet { onChange?() } }
+    /// crystal-only controls (Brillouin zone, k-path, supercell, slab) are shown.
+    ///
+    /// Dropping to `false` also clears the supercell/slab inputs: those sections
+    /// are hidden for a molecule, so a stale value carried over from a previous
+    /// crystal would be unreachable in the UI yet still mirrored into the scene
+    /// on the next sync.
+    @Published var isCrystal: Bool = false {
+        didSet {
+            enforceNonCrystalStructureControls()
+            onChange?()
+        }
+    }
     /// Runtime-only symmetry result for the current base crystal. It is read by
     /// the sidebar and never participates in view-state persistence.
     @Published var crystalSymmetry: CrystalSymmetryAnalysis?
@@ -561,6 +571,11 @@ final class SideBarState: ObservableObject {
         } else {
             slabEnabled = false
         }
+        // The Supercell/Slab sections are hidden for a molecule (no cell), so any
+        // value left over from a previously-loaded crystal would be invisible yet
+        // still mirrored back on the next syncFromState. Force them to the inert
+        // identity the scene itself already reports for a non-crystal.
+        enforceNonCrystalStructureControls()
         // Projection mode: the live render camera's perspective flag is the
         // source of truth, mirrored here so the toggle reflects the loaded view.
         orthographic = !scene.camera.perspective
@@ -650,6 +665,20 @@ final class SideBarState: ObservableObject {
         surfaceVacuumAdjustable = scene.periodicDim == 2
             && scene.cell?.isCZParallel == true && scene.surfaceSlabExtent != nil
         onChange = saved
+    }
+
+    /// Reset the crystal-only structural controls (supercell counts, slab) to
+    /// their inert identity when the scene is not a crystal. The Supercell/Slab
+    /// sidebar sections are hidden in that case, so a leftover value from a
+    /// previously-loaded crystal would be both invisible and un-editable while
+    /// still being mirrored into the scene by `syncFromState`. Assignments are
+    /// guarded on inequality so this never fires a spurious `onChange`.
+    func enforceNonCrystalStructureControls() {
+        guard !isCrystal else { return }
+        if n1 != 1 { n1 = 1 }
+        if n2 != 1 { n2 = 1 }
+        if n3 != 1 { n3 = 1 }
+        if slabEnabled { slabEnabled = false }
     }
 
     /// Mirror the controller's basis-transform availability computation into state.

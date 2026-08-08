@@ -27,13 +27,11 @@ enum ProjectStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(bundle)
-        let tmp = url.appendingPathExtension("tmp")
-        try data.write(to: tmp, options: .atomic)
-        let fm = FileManager.default
-        if fm.fileExists(atPath: url.path) {
-            try fm.removeItem(at: url)
-        }
-        try fm.moveItem(at: tmp, to: url)
+        // Atomic write via rename(2): written to a temporary sibling then renamed
+        // onto the target. No window where the file is missing (a crash between
+        // the old remove+move would lose the previous project), and concurrent
+        // CLI/GUI saves no longer race on a fixed `.tmp` name.
+        try data.write(to: url, options: .atomic)
     }
 
     static func load(from url: URL) throws -> Scene {

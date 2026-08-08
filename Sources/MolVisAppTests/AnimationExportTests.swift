@@ -51,9 +51,9 @@ final class AnimationExportTests: XCTestCase {
                       "GIF must start with a valid GIF signature, got \(gifHeader ?? "nil")")
         // ImageIO must preserve all 3 frames as animation (not collapse to a
         // single static frame).
-        if let src = CGImageSourceCreateWithData(gifData as CFData, nil) {
-            XCTAssertEqual(CGImageSourceGetCount(src), 3, "GIF must keep all 3 animation frames")
-        }
+        let src = try XCTUnwrap(CGImageSourceCreateWithData(gifData as CFData, nil),
+                                "GIF data must decode via ImageIO")
+        XCTAssertEqual(CGImageSourceGetCount(src), 3, "GIF must keep all 3 animation frames")
 
         // APNG: contains acTL chunk and frame count == 3
         let apngURL = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -87,17 +87,12 @@ final class AnimationExportTests: XCTestCase {
             .appendingPathComponent("mcrysden_test_\(UUID().uuidString).mp4")
         do {
             try AnimationExporter.export(frames: frames, camera: fixedCamera, size: size, fps: 10, format: .mp4, to: mp4URL)
-            if let mp4Data = try? Data(contentsOf: mp4URL), mp4Data.count >= 12 {
-                let ftyp = mp4Data[4..<8]
-                XCTAssertEqual(String(data: ftyp, encoding: .ascii), "ftyp")
-            } else {
-                // AVAssetWriter can be flaky in headless CI — lenient: file exists & non-empty
-                let exists = FileManager.default.fileExists(atPath: mp4URL.path)
-                XCTAssertTrue(exists || true, "MP4 export did not produce a file (lenient)")
-            }
+            let mp4Data = try Data(contentsOf: mp4URL)
+            XCTAssertGreaterThanOrEqual(mp4Data.count, 12, "MP4 export produced an empty/truncated file")
+            let ftyp = mp4Data[4..<8]
+            XCTAssertEqual(String(data: ftyp, encoding: .ascii), "ftyp")
         } catch {
-            // Lenient: never crash the test run on AVFoundation availability.
-            XCTAssertTrue(true, "MP4 export threw (lenient): \(error)")
+            XCTFail("MP4 export threw: \(error)")
         }
     }
 

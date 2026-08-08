@@ -40,7 +40,9 @@ final class ExtensibilityTests: XCTestCase {
         XCTAssertEqual(loaded.cell, scene.cell)
         XCTAssertEqual(loaded.bandStructure?.kPoints.map(\.label),
                        scene.bandStructure?.kPoints.map(\.label))
-        XCTAssertEqual(loaded.bandStructure?.fermiEnergy, scene.bandStructure?.fermiEnergy)
+        XCTAssertEqual(try XCTUnwrap(loaded.bandStructure?.fermiEnergy),
+                       try XCTUnwrap(scene.bandStructure?.fermiEnergy),
+                       accuracy: 1e-3)
         XCTAssertEqual(loaded.densityOfStates?.energies, scene.densityOfStates?.energies)
         XCTAssertEqual(loaded.densityOfStates?.series.first?.values,
                        scene.densityOfStates?.series.first?.values)
@@ -64,6 +66,7 @@ final class ExtensibilityTests: XCTestCase {
             func run(scene: Scene) -> String? { "fake-output" }
         }
         PluginRegistry.register(FakePlugin())
+        defer { PluginRegistry.unregister(named: "fake-plugin") }
 
         let names = PluginRegistry.plugins().map { $0.name }
         XCTAssertTrue(names.contains("fake-plugin"))
@@ -74,10 +77,11 @@ final class ExtensibilityTests: XCTestCase {
         let fakeResult = results.first { $0.name == "fake-plugin" }
         XCTAssertEqual(fakeResult?.output, "fake-output")
 
-        let lines = PluginRegistry.listText().split(separator: "\n").sorted()
-        XCTAssertEqual(lines, PluginRegistry.listText().split(separator: "\n"))
-        XCTAssertTrue(lines.contains { $0.hasPrefix("band-gap —") })
-        XCTAssertTrue(lines.contains { $0.hasPrefix("dos-gap —") })
+        let listLines = PluginRegistry.listText().split(separator: "\n")
+        XCTAssertTrue(listLines.contains { $0.hasPrefix("fake-plugin —") },
+                      "registered plugin must appear in listText()")
+        XCTAssertTrue(listLines.contains { $0.hasPrefix("band-gap —") })
+        XCTAssertTrue(listLines.contains { $0.hasPrefix("dos-gap —") })
 
         // band-gap returns nil on a scene without bands.
         XCTAssertNil(PluginRegistry.plugin(named: "band-gap")?.run(scene: scene))

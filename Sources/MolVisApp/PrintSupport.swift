@@ -23,6 +23,7 @@ enum PrintSupport {
         case pixelCapExceeded
         case noGPU
         case noRenderTarget
+        case labelViewportMismatch(viewport: SIMD2<Float>, pixels: (width: Int, height: Int))
         case noImage
         case noCommandQueue
         case noCommandBuffer
@@ -39,6 +40,9 @@ enum PrintSupport {
                 return "No Metal GPU available for printing"
             case .noRenderTarget:
                 return "Could not allocate a print-resolution render target"
+            case .labelViewportMismatch(let viewport, let pixels):
+                return "Print label viewport (\(viewport.x), \(viewport.y)) does not match "
+                    + "the print pixel dimensions (\(pixels.width), \(pixels.height))"
             case .noImage:
                 return "Could not create an image from the printed output"
             case .noCommandQueue:
@@ -124,9 +128,13 @@ enum PrintSupport {
         let (width, height) = try pixelDimensions(for: pageRect, scale: scale)
         // The label projection viewport must match the render target in pixels;
         // a mismatch is the scale bug this parameter name exists to prevent.
-        assert(pixelViewport.x == Float(width) && pixelViewport.y == Float(height),
-               "label viewport (\(pixelViewport.x), \(pixelViewport.y)) must equal "
-               + "pixel dimensions (\(width), \(height))")
+        // This is a THROWN check, not an assert: asserts are compiled out in
+        // Release, which would let a shipping build silently print every label
+        // at the wrong position instead of reporting a recoverable failure.
+        guard pixelViewport.x == Float(width), pixelViewport.y == Float(height) else {
+            throw PrintError.labelViewportMismatch(viewport: pixelViewport,
+                                                   pixels: (width, height))
+        }
         guard let device = MTLCreateSystemDefaultDevice() else { throw PrintError.noGPU }
         let renderer: Renderer
         do {

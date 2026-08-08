@@ -69,7 +69,7 @@ final class Renderer: NSObject {
     private var msaaPipelineCache: [Int: (atom: MTLRenderPipelineState, line: MTLRenderPipelineState,
                                           flat2D: MTLRenderPipelineState, poly: MTLRenderPipelineState,
                                           grad: MTLRenderPipelineState, thickLine: MTLRenderPipelineState,
-                                          texQuad: MTLRenderPipelineState)] = [:]
+                                          texQuad: MTLRenderPipelineState, bgImage: MTLRenderPipelineState)] = [:]
     private var msaaColorTexture: MTLTexture?
     private var msaaColorTextureKey: (w: Int, h: Int, samples: Int) = (0, 0, 0)
     private var msaaDepthTexture: MTLTexture?
@@ -300,6 +300,26 @@ final class Renderer: NSObject {
     /// `sameValueStorage`. A freed-and-reused buffer address cannot alias a stale
     /// value because the base-address check is exact, not probabilistic.
     private var scalarFieldGeneration: UInt64 = 1
+
+    /// Renderer-owned token for volume-slice textures. Bumped ONLY when the scalar
+    /// field's geometry or content change — NOT when the iso level or clip plane
+    /// change. The iso shell cache keys off `scalarFieldGeneration` (which does
+    /// include iso/clip), but slice textures are sampled directly from the field
+    /// (`FieldSlice.sample` ignores isoLevel and clip), so dragging the iso slider
+    /// or editing clip planes must NOT rebuild them. Keeping the tokens separate
+    /// lets iso edits refresh the shells while slice textures stay cached.
+    private var sliceFieldGeneration: UInt64 = 1
+
+    /// Field geometry + content equality for the scalar field, ignoring iso level
+    /// and clip. Used to detect when slice textures (which sample the raw field)
+    /// actually need rebuilding.
+    private func scalarFieldContentUnchanged(old: Scene) -> Bool {
+        let a = old.scalarField, b = scene.scalarField
+        guard let a, let b else { return a == nil && b == nil }
+        return a.nx == b.nx && a.ny == b.ny && a.nz == b.nz
+            && a.origin == b.origin && a.vec == b.vec
+            && sameValueStorage(a.values, b.values)
+    }
 
     /// Exact content equality for two immutable [Float] value arrays, with an O(1)
     /// copy-on-write fast path — no hashing, no dimension truncation.
@@ -1051,8 +1071,8 @@ final class Renderer: NSObject {
         // Swap the active pipelines to the MSAA variants for the duration of this
         // encode, then restore the originals. The shared drawScene() references
         // the ivars directly, so it transparently uses the MSAA pipelines.
-        let saved = (atomPipeline, linePipeline, flat2DPipeline, polyPipeline, gradPipeline, thickLinePipeline, texQuadPipeline)
-        defer { atomPipeline = saved.0; linePipeline = saved.1; flat2DPipeline = saved.2; polyPipeline = saved.3; gradPipeline = saved.4; thickLinePipeline = saved.5; texQuadPipeline = saved.6 }
+        let saved = (atomPipeline, linePipeline, flat2DPipeline, polyPipeline, gradPipeline, thickLinePipeline, texQuadPipeline, bgImagePipeline)
+        defer { atomPipeline = saved.0; linePipeline = saved.1; flat2DPipeline = saved.2; polyPipeline = saved.3; gradPipeline = saved.4; thickLinePipeline = saved.5; texQuadPipeline = saved.6; bgImagePipeline = saved.7 }
         atomPipeline = pipelines.atom
         linePipeline = pipelines.line
         flat2DPipeline = pipelines.flat2D
@@ -1060,6 +1080,7 @@ final class Renderer: NSObject {
         gradPipeline = pipelines.grad
         thickLinePipeline = pipelines.thickLine
         texQuadPipeline = pipelines.texQuad
+        bgImagePipeline = pipelines.bgImage
 
         let clearColor: MTLClearColor
         if let override = clearColorOverride {
@@ -1202,8 +1223,8 @@ final class Renderer: NSObject {
         let pipelines = msaaPipelineCache[sampleCount]!
         guard let msaaColor = ensureMSAAColorTexture(width: w, height: h, sampleCount: sampleCount) else { return false }
         guard let msaaDepth = ensureMSAADepthTexture(width: w, height: h, sampleCount: sampleCount) else { return false }
-        let saved = (atomPipeline, linePipeline, flat2DPipeline, polyPipeline, gradPipeline, thickLinePipeline, texQuadPipeline)
-        defer { atomPipeline = saved.0; linePipeline = saved.1; flat2DPipeline = saved.2; polyPipeline = saved.3; gradPipeline = saved.4; thickLinePipeline = saved.5; texQuadPipeline = saved.6 }
+        let saved = (atomPipeline, linePipeline, flat2DPipeline, polyPipeline, gradPipeline, thickLinePipeline, texQuadPipeline, bgImagePipeline)
+        defer { atomPipeline = saved.0; linePipeline = saved.1; flat2DPipeline = saved.2; polyPipeline = saved.3; gradPipeline = saved.4; thickLinePipeline = saved.5; texQuadPipeline = saved.6; bgImagePipeline = saved.7 }
         atomPipeline = pipelines.atom
         linePipeline = pipelines.line
         flat2DPipeline = pipelines.flat2D
@@ -1211,6 +1232,7 @@ final class Renderer: NSObject {
         gradPipeline = pipelines.grad
         thickLinePipeline = pipelines.thickLine
         texQuadPipeline = pipelines.texQuad
+        bgImagePipeline = pipelines.bgImage
 
         let desc = MTLRenderPassDescriptor()
         desc.colorAttachments[0].texture = msaaColor
@@ -1584,7 +1606,9 @@ final class Renderer: NSObject {
             let tlv = library.makeFunction(name: "thickLine_v"),
             let tlf = library.makeFunction(name: "thickLine_f"),
             let tqv = library.makeFunction(name: "texQuad_v"),
-            let tqf = library.makeFunction(name: "texQuad_f")
+            let tqf = library.makeFunction(name: "texQuad_f"),
+            let bgv = library.makeFunction(name: "bgImage_v"),
+            let bgf = library.makeFunction(name: "bgImage_f")
         else { return false }
 
         func pipeline(vertex: MTLFunction, fragment: MTLFunction, vd: MTLVertexDescriptor,
@@ -1606,10 +1630,13 @@ final class Renderer: NSObject {
               let poly = pipeline(vertex: pv, fragment: pf, vd: Renderer.makePolyVertexDescriptor(), blend: true),
               let grad = pipeline(vertex: gv, fragment: gf, vd: Renderer.makeGradVertexDescriptor()),
               let thickLine = pipeline(vertex: tlv, fragment: tlf, vd: Renderer.makeLineVertexDescriptor(), blend: true),
-              let texQuad = pipeline(vertex: tqv, fragment: tqf, vd: Renderer.makeTexQuadVertexDescriptor(), blend: true)
+              let texQuad = pipeline(vertex: tqv, fragment: tqf, vd: Renderer.makeTexQuadVertexDescriptor(), blend: true),
+              let bgImage = pipeline(vertex: bgv, fragment: bgf, vd: Renderer.makeBgQuadVertexDescriptor(), blend: true)
         else { return false }
 
-        msaaPipelineCache[sampleCount] = (atom: atom, line: line, flat2D: flat2D, poly: poly, grad: grad, thickLine: thickLine, texQuad: texQuad)
+        // Background-image pipeline is included so the MSAA + background-image path
+        // draws with a pipeline whose rasterSampleCount matches the resolve target.
+        msaaPipelineCache[sampleCount] = (atom: atom, line: line, flat2D: flat2D, poly: poly, grad: grad, thickLine: thickLine, texQuad: texQuad, bgImage: bgImage)
         return true
     }
 
@@ -2338,42 +2365,68 @@ final class Renderer: NSObject {
         guard atoms.count > 1 else { return true }
         let neigh = buildNeighborCoords()
         let selected = Set(scene.selectedAtoms)
-        let view = sceneView(frameBuffer)
+        let key = (atoms: atoms, bonds: scene.bonds, selected: scene.selectedAtoms,
+                   coordinationNumbers: coordinationNumbers,
+                   showCoordinationColors: showCoordinationColors)
+        // Rebuild the static triangle geometry only when the structural key changes.
+        // Per frame we only apply the structure cull and re-sort by view depth.
+        if !transparentPolyKeyMatches(key) {
+            var atomTris: [[TransparentTri]] = []
+            atomTris.reserveCapacity(atoms.count)
+            for (i, a) in atoms.enumerated() {
+                guard neigh[i].count >= 3 else { atomTris.append([]); continue }
+                guard let tris = Geometry.polyhedronFaces(center: a.coord, neighbors: neigh[i], maxNeighbors: 12) else {
+                    atomTris.append([]); continue
+                }
+                let col = atomColor(at: i, selected: selected.contains(i))
+                var out: [TransparentTri] = []
+                out.reserveCapacity(tris.count / 3)
+                var j = 0
+                while j < tris.count {
+                    let p0 = tris[j], p1 = tris[j + 1], p2 = tris[j + 2]
+                    let n = normalize(cross(p1 - p0, p2 - p0))
+                    let centroid = (p0 + p1 + p2) / 3.0
+                    out.append(TransparentTri(
+                        v0: PolyVert(x: p0.x, y: p0.y, z: p0.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z),
+                        v1: PolyVert(x: p1.x, y: p1.y, z: p1.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z),
+                        v2: PolyVert(x: p2.x, y: p2.y, z: p2.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z),
+                        centroid: centroid))
+                    j += 3
+                }
+                atomTris.append(out)
+            }
+            cachedTransparentPoly = TransparentPolyCache(
+                atoms: key.atoms, bonds: key.bonds, selected: key.selected,
+                coordinationNumbers: key.coordinationNumbers,
+                showCoordinationColors: key.showCoordinationColors, atomTris: atomTris)
+        }
+        guard let cache = cachedTransparentPoly else { return true }
 
-        struct V { var x: Float; var y: Float; var z: Float; var nx: Float; var ny: Float; var nz: Float; var r: Float; var g: Float; var b: Float }
-        // Collect all triangles with their centroid depths for sorting.
-        var triData: [(depth: Float, verts: [V])] = []
-        for (i, a) in atoms.enumerated() {
+        let view = sceneView(frameBuffer)
+        // Per-frame: collect the visible (non-culled) triangles with their view-space
+        // centroid depths for back-to-front sorting. Geometry is cached; only this
+        // depth sort + repack is recomputed each frame.
+        var triData: [(depth: Float, tri: TransparentTri)] = []
+        for (i, tris) in cache.atomTris.enumerated() {
             if i < frameStructureCull.count && frameStructureCull[i] { continue }
-            guard neigh[i].count >= 3 else { continue }
-            guard let tris = Geometry.polyhedronFaces(center: a.coord, neighbors: neigh[i], maxNeighbors: 12) else { continue }
-            let col = atomColor(at: i, selected: selected.contains(i))
-            var j = 0
-            while j < tris.count {
-                let p0 = tris[j], p1 = tris[j + 1], p2 = tris[j + 2]
-                let n = normalize(cross(p1 - p0, p2 - p0))
-                let centroid = (p0 + p1 + p2) / 3.0
-                let viewPos = view * SIMD4<Float>(centroid, 1.0)
-                let verts = [
-                    V(x: p0.x, y: p0.y, z: p0.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z),
-                    V(x: p1.x, y: p1.y, z: p1.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z),
-                    V(x: p2.x, y: p2.y, z: p2.z, nx: n.x, ny: n.y, nz: n.z, r: col.x, g: col.y, b: col.z)
-                ]
-                triData.append((depth: -viewPos.z, verts: verts))
-                j += 3
+            for tri in tris {
+                let viewPos = view * SIMD4<Float>(tri.centroid, 1.0)
+                triData.append((depth: -viewPos.z, tri: tri))
             }
         }
         if triData.isEmpty { return true }
         // Sort back-to-front (largest depth first).
         triData.sort { $0.depth > $1.depth }
         // Pack all sorted triangles into one contiguous vertex buffer.
-        var allVerts: [V] = []
+        var allVerts: [PolyVert] = []
         allVerts.reserveCapacity(triData.count * 3)
         for tri in triData {
-            allVerts.append(contentsOf: tri.verts)
+            allVerts.append(tri.tri.v0)
+            allVerts.append(tri.tri.v1)
+            allVerts.append(tri.tri.v2)
         }
         guard let buf = device.makeBuffer(bytes: allVerts,
-                                          length: allVerts.count * MemoryLayout<V>.stride,
+                                          length: allVerts.count * MemoryLayout<PolyVert>.stride,
                                           options: []) else { return false }
         enc.setRenderPipelineState(polyPipeline)
         enc.setVertexBuffer(buf, offset: 0, index: 0)
@@ -2381,6 +2434,19 @@ final class Renderer: NSObject {
         enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVerts.count)
         return true
+    }
+
+    /// Structural-key equality for the transparent polyhedral cache, mirroring the
+    /// opaque `drawPolyhedral` cache's comparison (Bond is not Equatable, so bonds
+    /// are compared field-wise).
+    private func transparentPolyKeyMatches(_ key: (atoms: [Atom], bonds: [Bond], selected: [Int],
+                                            coordinationNumbers: [Int], showCoordinationColors: Bool)) -> Bool {
+        guard let pk = cachedTransparentPoly else { return false }
+        return pk.selected == key.selected
+            && pk.coordinationNumbers == key.coordinationNumbers
+            && pk.showCoordinationColors == key.showCoordinationColors
+            && pk.atoms.count == key.atoms.count && zip(pk.atoms, key.atoms).allSatisfy { $0.coord == $1.coord && $0.atomicNumber == $1.atomicNumber }
+            && pk.bonds.count == key.bonds.count && zip(pk.bonds, key.bonds).allSatisfy { $0.i == $1.i && $0.j == $1.j }
     }
 
     // MARK: - Cell frame + axes
@@ -2996,12 +3062,20 @@ final class Renderer: NSObject {
                     return false
                 }
                 // Apply the clipping plane to the shell mesh when active.
-                let verts: [Float]
+                let clipped: FieldSlice.ClippedMesh
                 if let clip {
-                    verts = FieldSlice.clipTriangles(mesh.vertices, plane: clip, keepSide: 1)
+                    clipped = FieldSlice.clipTrianglesWithOverflow(mesh.vertices, plane: clip, keepSide: 1)
                 } else {
-                    verts = mesh.vertices
+                    clipped = FieldSlice.ClippedMesh(vertices: mesh.vertices, overflow: false)
                 }
+                // A clipped shell that overflowed the 5M-triangle cap is a truncated surface
+                // — never cache or render it as complete. Surface the failure so the frame
+                // drops rather than silently drawing a truncated shell, mirroring the
+                // IsoMesh.overflow check above.
+                if clipped.overflow {
+                    return false
+                }
+                let verts = clipped.vertices
                 if !verts.isEmpty {
                     // A non-empty mesh that fails to allocate is a real failure — do not
                     // cache nil as "empty", or the frame would silently drop the surface
@@ -3089,6 +3163,25 @@ final class Renderer: NSObject {
     private var cachedPolyKey: (atoms: [Atom], bonds: [Bond], selected: [Int],
                                 coordinationNumbers: [Int], showCoordinationColors: Bool)?
 
+    // Transparent polyhedral cache: the world-space triangle geometry is static
+    // (camera-independent), so per-atom triangle lists are cached keyed exactly like
+    // the opaque polyhedral cache. Per frame, only the structure clip cull is applied
+    // and the visible triangles are depth-sorted + repacked — the expensive
+    // polyhedronFaces/normal/color work is done once per cache key, not per frame.
+    private var cachedTransparentPoly: TransparentPolyCache?
+    private struct PolyVert { var x: Float; var y: Float; var z: Float; var nx: Float; var ny: Float; var nz: Float; var r: Float; var g: Float; var b: Float }
+    private struct TransparentTri { var v0: PolyVert; var v1: PolyVert; var v2: PolyVert; var centroid: SIMD3<Float> }
+    private struct TransparentPolyCache {
+        var atoms: [Atom]
+        var bonds: [Bond]
+        var selected: [Int]
+        var coordinationNumbers: [Int]
+        var showCoordinationColors: Bool
+        // atomTris[i] holds the static triangles built from atom i's neighbors; empty
+        // for atoms with too few neighbors. Per-frame culling skips whole atoms.
+        var atomTris: [[TransparentTri]]
+    }
+
     // One-entry distance cache. An optional vertex array distinguishes a cached
     // malformed-geometry failure from an uncached key, so failed periodic solves
     // are not retried on every camera redraw.
@@ -3139,17 +3232,21 @@ final class Renderer: NSObject {
         var colormapRaw: String
     }
 
-    /// Color-plane (2D grid) compositing texture cache. One slot, keyed by the
-    /// grid's value storage identity + colormap. Follows the CoW sameValueStorage
-    /// pattern used for scalar fields.
+    /// Color-plane (2D grid) compositing texture cache. One slot, keyed by the grid
+    /// geometry + colormap + the base address of the RETAINED flat copy (stable for the
+    /// renderer's lifetime — never the transient per-frame flat, whose reused malloc
+    /// address would alias a stale texture). A cache hit also requires the retained flat's
+    /// content to equal the incoming grid content, compared via CoW storage identity or
+    /// exact == against the retained copy.
     private var cachedColorPlaneTexture: MTLTexture?
     private var cachedColorPlaneKey: ColorPlaneTextureKey?
+    private var cachedColorPlaneFlat: [Float]?
 
     struct ColorPlaneTextureKey: Equatable {
         var cols: Int, rows: Int
         var origin: SIMD3<Float>
         var vec0: SIMD3<Float>, vec1: SIMD3<Float>
-        var valueBase: UnsafeRawPointer?
+        var valueBase: UnsafeRawPointer?   // base of RETAINED flat, never a scoped temporary
         var colormapRaw: String
     }
 
@@ -3191,12 +3288,21 @@ final class Renderer: NSObject {
                     break
                 }
                 // Apply the clipping plane to the band mesh when active.
-                let verts: [Float]
+                let clipped: FieldSlice.ClippedMesh
                 if let clip {
-                    verts = FieldSlice.clipTriangles(mesh.vertices, plane: clip, keepSide: 1)
+                    clipped = FieldSlice.clipTrianglesWithOverflow(mesh.vertices, plane: clip, keepSide: 1)
                 } else {
-                    verts = mesh.vertices
+                    clipped = FieldSlice.ClippedMesh(vertices: mesh.vertices, overflow: false)
                 }
+                // A clipped band that overflowed the 5M-triangle cap is a truncated surface
+                // — never cache or render it as complete. Surface the failure so the frame
+                // drops rather than silently drawing a truncated band, mirroring the
+                // IsoMesh.overflow check above.
+                if clipped.overflow {
+                    ok = false
+                    break
+                }
+                let verts = clipped.vertices
                 if !verts.isEmpty {
                     // A non-empty band that fails to allocate must not commit a partial
                     // array (its length would then match fs.bands.count and defeat the
@@ -3266,7 +3372,7 @@ final class Renderer: NSObject {
                                        colormap: Colormap) -> MTLTexture? {
         let key = SliceTextureKey(h: slice.h, k: slice.k, l: slice.l,
                                   distance: slice.distance,
-                                  generation: scalarFieldGeneration,
+                                  generation: sliceFieldGeneration,
                                   colormapRaw: colormap.rawValue)
         // Find the matching cached slot by key identity (the slice list order is
         // stable, but a slice may be toggled/disabled, so we rebuild per-frame).
@@ -3374,12 +3480,23 @@ final class Renderer: NSObject {
     private func textureForColorPlane(grid: Grid2D, colormap: Colormap) -> MTLTexture? {
         let flat = grid.values.flatMap { $0 }
         guard !flat.isEmpty else { return nil }
-        let valueBase = flat.withUnsafeBufferPointer { $0.baseAddress }
+        // Key on the RETAINED flat's base address (stable for the renderer's lifetime),
+        // never the transient per-frame flat, whose reused malloc address would alias a
+        // stale texture across frames.
+        let valueBase = cachedColorPlaneFlat?.withUnsafeBufferPointer { UnsafeRawPointer($0.baseAddress) }
         let key = ColorPlaneTextureKey(cols: grid.cols, rows: grid.rows,
                                        origin: grid.origin, vec0: grid.vec[0], vec1: grid.vec[1],
-                                       valueBase: valueBase, colormapRaw: colormap.rawValue)
-        if cachedColorPlaneKey == key, let tex = cachedColorPlaneTexture { return tex }
-        // Content changed or first build: compare via storage identity OR bytes.
+                                       valueBase: valueBase,
+                                       colormapRaw: colormap.rawValue)
+        // Hit only when the key matches AND the retained flat's content equals the incoming
+        // grid content. Content is compared via CoW storage identity (O(1)) or exact ==
+        // when storage differs — rebuilding the texture ONLY on a real content change.
+        if cachedColorPlaneKey == key, let tex = cachedColorPlaneTexture,
+           sameValueStorage(cachedColorPlaneFlat ?? [], flat) {
+            return tex
+        }
+        // Content changed or first build: encode a fresh texture and retain its flat.
+        cachedColorPlaneFlat = flat
         let bytes = Renderer.colorPlaneTextureBytes(grid: grid, colormap: colormap)
         let w = grid.cols, h = grid.rows
         guard w > 0, h > 0 else { return nil }
@@ -3549,6 +3666,16 @@ final class Renderer: NSObject {
             || zip(oldPolyKey.bonds, scene.bonds).contains(where: { $0.i != $1.i || $0.j != $1.j }) {
             cachedPolyBuffer = nil; cachedPolyVertexCount = 0; cachedPolyKey = nil
         }
+        // Transparent polyhedral cache shares the same structural key; clear it on the
+        // same atom/bond/selected changes. Guarded on the cache being populated so an
+        // unrelated appearance tweak doesn't spuriously rebuild the geometry.
+        if let oldTPoly = cachedTransparentPoly, oldTPoly.selected != scene.selectedAtoms
+            || oldTPoly.atoms.count != scene.atoms.count
+            || zip(oldTPoly.atoms, scene.atoms).contains(where: { $0.coord != $1.coord || $0.atomicNumber != $1.atomicNumber })
+            || oldTPoly.bonds.count != scene.bonds.count
+            || zip(oldTPoly.bonds, scene.bonds).contains(where: { $0.i != $1.i || $0.j != $1.j }) {
+            cachedTransparentPoly = nil
+        }
         if !isoInputsUnchanged(old: old) || old.isoSurfaces != scene.isoSurfaces || old.clipPlane != scene.clipPlane {
             // Content, geometry, iso level, spec list, or clip plane changed: any
             // existing mesh/vertex-data is stale. Bump the renderer-owned generation
@@ -3564,6 +3691,15 @@ final class Renderer: NSObject {
             cachedIsoTriangleCounts = []
             cachedIsoSpecSignature = []
             cachedIsoClip = nil
+        }
+        // Slice textures sample the raw field (FieldSlice.sample ignores isoLevel and
+        // clip), so they only rebuild when the field's geometry or content change —
+        // never on a pure iso-level or clip-plane edit. Bumping a SEPARATE token keeps
+        // iso/clip edits from throwing away cached slice textures. The slice plane is
+        // positioned against the unit cell, so a lattice change (leaving the field
+        // untouched) also shifts the sampled world-space plane and must rebuild them.
+        if !scalarFieldContentUnchanged(old: old) || old.cell != scene.cell {
+            sliceFieldGeneration += 1
         }
         if !fermiInputsUnchanged(old: old) || old.clipPlane != scene.clipPlane {
             // A Fermi band's content, geometry, band count, Fermi energy, or clip
@@ -3589,6 +3725,7 @@ final class Renderer: NSObject {
         if colorPlaneChanged {
             cachedColorPlaneTexture = nil
             cachedColorPlaneKey = nil
+            cachedColorPlaneFlat = nil
         }
         // Background image: invalidate when the path changes so the next frame
         // reloads (or clears) the texture AND the cached quad buffer.
@@ -3607,21 +3744,22 @@ final class Renderer: NSObject {
         guard a.cols == b.cols, a.rows == b.rows, a.origin == b.origin, a.vec == b.vec else {
             return false
         }
-        // Row-major comparison via storage identity (CoW) or element-wise fallback.
+        // Exact element-wise comparison. CoW storage-identity alone is unsound here: an
+        // in-place value mutation that preserves row storage would be judged unchanged.
+        // exact == catches every content drift (this runs only on scene reassignment, so
+        // the O(n) scan is acceptable; the per-frame cache key relies on the retained flat).
         guard a.values.count == b.values.count else { return false }
         for (ra, rb) in zip(a.values, b.values) {
-            if !sameValueStorage(ra, rb) { return false }
+            if ra != rb { return false }
         }
         return true
     }
 
     private func isoInputsUnchanged(old: Scene) -> Bool {
-        let a = old.scalarField, b = scene.scalarField
-        guard let a, let b else { return a == nil && b == nil }
-        return a.nx == b.nx && a.ny == b.ny && a.nz == b.nz
-            && a.origin == b.origin && a.vec == b.vec
-            && sameValueStorage(a.values, b.values)
-            && old.isoLevel == scene.isoLevel
+        // Field geometry + content unchanged (see scalarFieldContentUnchanged) AND
+        // the iso level unchanged — the iso shell is surfaced at this level, so a
+        // level change rebuilds the shells but leaves slice textures cached.
+        return scalarFieldContentUnchanged(old: old) && old.isoLevel == scene.isoLevel
     }
 
     private func fermiInputsUnchanged(old: Scene) -> Bool {
