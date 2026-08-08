@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-08 (v1.2.1: review-fix hardening — color-plane cache pointer safety, slab/supercell reframe ordering, Finder/CLI dedup and flag validation, Wannier90 import bounds; 36 focused tests)**.
+Last updated: **2026-08-08 (v1.2.2: XCrySDen Tier-1 parity complete — H-bonds with detector settings, molecular surface, color schemes, per-element overrides with periodic-table editor, unit-of-repetition toggle, crystal-cell rods, unicolor bonds, tessellation factor, up-to-6-light rig, force overlay; 36 focused tests; XCrySDen gap backlog tiered in 3 tiers: self-contained parity, format interop, external-job integration)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
@@ -173,6 +173,39 @@ All 10 original Tier A items complete: Gaussian Cube/G98, BXSF/Fermi surfaces, 3
 - [x] **Stereo / anaglyph** rendering (v1.1.40).
 - [ ] **Tcl scripting engine** — a Tcl interpreter is not bundled; embedded scripting is provided by the `--script` line interpreter and `PluginRegistry` (v1.1.45) instead.
 - [x] **External-code converters** (`pwi2xsf`, `pwo2xsf`, `struct2xsf`, …) as CLI verbs (v1.1.45).
+
+## XCrySDen 1.6.2 gap backlog (tiered)
+
+Audit of XCrySDen 1.6.2's function inventory against mcrysden (≈94 items: 68 done, 17 partial, 21 missing). The remaining gaps are sorted into tiers by dependency and priority. Legend as above; `[~]` = partially realized.
+
+### Tier 1 — self-contained parity (no external tools; recommended next)
+- [x] **H-bonds** — display toggle with settings (donor/acceptor detection, distance/angle criteria)
+- [x] **Force-vector overlay** — draw forces from PWscf `.pwo`/per-frame data as arrows with a length-factor setting (mcrysden currently only computes per-frame force metrics)
+- [x] **Molecular surface** (Connolly/solvent-accessible) with settings dialog — distinct from the existing Voronoi-like polyhedral mode
+- [x] **Color schemes** — coordination-proportional, slab-fraction, and distance-proportional coloring
+- [x] **Per-element customization** — per-Z color, covalent/van-der-Waals radii, and symbol font/size overrides (currently global sliders + fixed CPK table)
+- [x] **Unit-of-repetition toggle** — display full unit-cell content (atoms crossing borders) vs. translational asymmetric unit
+- [x] **Crystal cells as rods** — rod-style cell rendering with a `rod_factor` setting (currently lines-only)
+- [x] **Unicolor bonds** — display all bonds in one configurable color (bonds currently inherit atom colors)
+- [x] **Tessellation factor** — geometry-quality setting for spheres/cylinders/polyhedra (currently fixed)
+- [x] **Multi-light setup** — XCrySDen supports up to 6 adjustable lights; mcrysden has a single light + material sliders
+- [x] **Periodic-table dialog** — labelled element palette, matching XCrySDen's element selector
+
+### Tier 2 — format interop (no external binaries; moderate effort)
+- [ ] **CRYSTAL properties file (`fort.9`/band-DOS units)** — reader for band widths, DOS/projected DOS, and band-structure plots (feature set exists via QE band/DOS inputs; adds the CRYSTAL native path)
+- [ ] **WIEN2k `.struct` export** (currently read-only)
+- [ ] **Gaussian Z-matrix input** (`.gzmat`, via OpenBabel, per XCrySDen convention)
+- [ ] **XCrySDen scripting-file save/load compatibility** (`.tcl` dialect; mcrysden has its own line-script engine)
+- [ ] **`Save CRYSTAL-95/98/03 input`** and **`New CRYSTAL input`** file-out forms
+
+### Tier 3 — external-job integration (depends on third-party binaries/suite; low priority)
+- [ ] **WIEN2k "Calculate & Render Density"** — interactive region pick → generate `in5`/`lstart` input → run WIEN2k → render results
+- [ ] **WIEN2k "Render pre-computed density"** — read `output5` + `rho`/`case.ind` and render the fixed charge density
+- [ ] **WIEN2k Fermi-surface job** — task wizard driving the isosurface through WIEN2k steps
+- [ ] **Tcl scripting** — a Tcl interpreter is not bundled; the `--script` line interpreter + `PluginRegistry` remain the embedded-script plan (deferred by design)
+
+### Accepted as absent
+- 2D line/point display variants of element labels, legacy OpenGL-era conveniences, and per-theme fonts that have been given existing equivalent overrides (not tracked).
 
 ## Reference: what XCrySDen implements
 

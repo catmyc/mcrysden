@@ -114,16 +114,17 @@ final class Renderer: NSObject {
     /// silently leaving the route invisible.
     private let routeDepthState: MTLDepthStencilState
     private var lastW: Int = 0, lastH: Int = 0    // viewport size from last encode()
-    private let sphereMesh: Mesh
-    private let cylinderMesh: Mesh
+    private var sphereMesh: Mesh
+    private var cylinderMesh: Mesh
     private let coneMesh: Mesh
-    private let sphereVB: MTLBuffer
-    private let sphereIB: MTLBuffer
-    private let cylinderVB: MTLBuffer
-    private let cylinderIB: MTLBuffer
+    private var sphereVB: MTLBuffer
+    private var sphereIB: MTLBuffer
+    private var cylinderVB: MTLBuffer
+    private var cylinderIB: MTLBuffer
     private let coneVB: MTLBuffer
     private let coneIB: MTLBuffer
     private let quadVB: MTLBuffer                    // 2 triangles covering NDC
+    private var tessellationBuiltFactor = 0
 
     private var depthPixelFormat: MTLPixelFormat = .depth32Float
     private var depthTexture: MTLTexture?
@@ -170,6 +171,14 @@ final class Renderer: NSObject {
         return coordinationPalette[index]
     }
 
+    /// True when atom `index` is excluded by either the active structure clip or
+    /// the translational-asymmetric-unit filter for this frame.
+    private func isAtomCulled(_ index: Int) -> Bool {
+        if index < frameStructureCull.count && frameStructureCull[index] { return true }
+        if index < frameRepetitionCull.count && frameRepetitionCull[index] { return true }
+        return false
+    }
+
     /// Pure base-color seam shared by every atom rendering path. The caller passes
     /// nil when the coordination array is not a complete match for the scene.
     static func baseAtomColor(atomicNumber: Int, coordinationNumber: Int?,
@@ -189,14 +198,100 @@ final class Renderer: NSObject {
     }
 
     private func atomColor(at index: Int, selected: Bool) -> SIMD3<Float> {
-        let coordinationNumber = coordinationNumbers.count == scene.atoms.count
-            ? coordinationNumbers[index]
-            : nil
-        return Renderer.atomColor(atomicNumber: scene.atoms[index].atomicNumber,
-                                  coordinationNumber: coordinationNumber,
-                                  showCoordinationColors: showCoordinationColors,
-                                  selected: selected)
+        if selected { return SIMD3<Float>(1, 1, 0.2) }
+        if let scheme = colorSchemeColor(for: index) { return scheme }
+        let z = scene.atoms[index].atomicNumber
+        if showCoordinationColors, coordinationNumbers.count == scene.atoms.count {
+            return Renderer.coordinationColor(coordinationNumbers[index])
+        }
+        return elementColor(z)
     }
+
+    /// Runtime-only per-atom color for non-elemental schemes. Returns nil when the
+    /// active scheme can't be resolved (analysis stubbed / over cap) so callers keep
+    /// the elemental default. Bonds and the unlit line path ignore this.
+    ///
+    /// The coordination/slab arrays are computed once per distinct (atoms, cell,
+    /// slab, scheme, periodicDim) and cached; without this, each per-atom call
+    /// rebuilt the O(n) analysis, turning a frame into O(n²).
+    private func colorSchemeColor(for index: Int) -> SIMD3<Float>? {
+        switch scene.atomColorScheme {
+        case .elemental:
+            return nil
+        case .coordination:
+            ensureSchemeMetrics()
+            guard let cn = cachedSchemeMetrics?.coordination, cn.count > index else { return nil }
+            return AtomSchemeMetrics.ramp(Float(cn[index]) / 10.0)
+        case .slabFraction:
+            ensureSchemeMetrics()
+            guard let m = cachedSchemeMetrics?.slab, m.count > index else { return nil }
+            return AtomSchemeMetrics.ramp(m[index].fraction)
+        case .distanceProportional:
+            ensureSchemeMetrics()
+            guard let m = cachedSchemeMetrics?.slab, m.count > index else { return nil }
+            let maxDist = cachedSchemeMetrics?.slabMaxDist ?? 0
+            guard maxDist > 1e-6 else { return nil }
+            let t = 0.5 + 0.5 * (m[index].distance / maxDist)
+            return AtomSchemeMetrics.ramp(t)
+        }
+    }
+
+    /// Cached coordination/slab arrays for the active color scheme, plus the
+    /// max |distance| needed by `.distanceProportional` (precomputed once so the
+    /// per-atom loop doesn't re-scan). Rebuilt only when `schemeFingerprint()`
+    /// changes, so camera-only frames pay nothing.
+    private var cachedSchemeMetrics: SchemeMetrics?
+    private struct SchemeMetrics {
+        var coordination: [Int]?
+        var slab: [AtomSchemeMetrics.SlabPoint]?
+        var slabMaxDist: Float
+    }
+
+    /// FNV-1a digest of everything the scheme metrics depend on: the atom set
+    /// (reuses `atomFingerprint`), the active scheme, slab planes, cell, and the
+    /// periodic dimension. Cheap to recompute and deterministic.
+    private func schemeFingerprint() -> UInt64 {
+        var h = atomFingerprint()
+        h ^= UInt64(scene.atomColorScheme.rawValue.hashValue); h = h &* 0x100000001b3
+        if let slab = scene.slab {
+            for p in [slab.planeA, slab.planeB] {
+                h ^= UInt64(bitPattern: Int64(p.h)); h = h &* 0x100000001b3
+                h ^= UInt64(bitPattern: Int64(p.k)); h = h &* 0x100000001b3
+                h ^= UInt64(bitPattern: Int64(p.l)); h = h &* 0x100000001b3
+                h ^= UInt64(p.distance.bitPattern); h = h &* 0x100000001b3
+            }
+        }
+        if let cell = scene.cell {
+            for v in [cell.a, cell.b, cell.c] {
+                h ^= UInt64(v.x.bitPattern); h = h &* 0x100000001b3
+                h ^= UInt64(v.y.bitPattern); h = h &* 0x100000001b3
+                h ^= UInt64(v.z.bitPattern); h = h &* 0x100000001b3
+            }
+        }
+        h ^= UInt64(bitPattern: Int64(scene.periodicDim)); h = h &* 0x100000001b3
+        return h
+    }
+
+    /// Compute the scheme metrics if the fingerprint changed since the last build.
+    private func ensureSchemeMetrics() {
+        let fp = schemeFingerprint()
+        if cachedSchemeMetrics != nil, fp == cachedSchemeMetricsFP { return }
+        var cache = SchemeMetrics(coordination: nil, slab: nil, slabMaxDist: 0)
+        switch scene.atomColorScheme {
+        case .coordination:
+            cache.coordination = AtomSchemeMetrics.coordinationNumbers(scene: scene)
+        case .slabFraction, .distanceProportional:
+            let slab = AtomSchemeMetrics.slabMetrics(scene: scene)
+            cache.slab = slab
+            cache.slabMaxDist = slab?.map { abs($0.distance) }.max() ?? 0
+        case .elemental:
+            break
+        }
+        cachedSchemeMetrics = cache
+        cachedSchemeMetricsFP = fp
+    }
+    /// Fingerprint the scheme metrics were last built against.
+    private var cachedSchemeMetricsFP: UInt64 = 0
 
     // Brillouin-zone cache. The BZ depends only on the conventional cell + its base
     // atoms, which are static across render frames, so build it ONCE and reuse.
@@ -369,6 +464,24 @@ final class Renderer: NSObject {
                          depthCueingStrength: 0.0, fogNear: 0.0, fogFar: 0.0,
                          aoStrength: 0.0, shadowStrength: 0.0,
                          backgroundColor: backgroundColor)
+    }
+
+    /// Resolve the multi-light rig to a single world-space light direction: the
+    /// brightest enabled light wins. Returns nil when `scene.lights` is empty so
+    /// the caller keeps the legacy single-light path byte-identical. The per-light
+    /// color is parsed but applied only as an intensity scale here; full per-light
+    /// tinting requires the optional multi-light shader path.
+    private func multiLightDir(view: float4x4) -> (dir: SIMD3<Float>, intensity: Float)? {
+        let enabled = scene.lights.filter { $0.enabled }
+        guard !enabled.isEmpty else { return nil }
+        guard let brightest = enabled.max(by: { $0.intensity < $1.intensity }) else { return nil }
+        let az = brightest.azimuth * .pi / 180.0
+        let el = brightest.elevation * .pi / 180.0
+        let cel = cos(el)
+        let viewLight = SIMD3<Float>(cel * cos(az), cel * sin(az), sin(el))
+        let dir = normalize((view.transpose * SIMD4<Float>(viewLight, 0)).xyz)
+        let intensity = max(0.0, min(brightest.intensity, 4.0))
+        return (dir, intensity)
     }
 
     /// Parse a "#rrggbb" (or "rrggbb") hex string into an MTLClearColor. Named for
@@ -890,6 +1003,12 @@ final class Renderer: NSObject {
         frame.fogFar = fogFar
         frame.aoStrength = scene.aoStrength
         frame.shadowStrength = scene.shadowStrength
+        // Multi-light rig: when configured, override the single-light direction
+        // with the brightest enabled light (intensity scales the diffuse term).
+        if let light = multiLightDir(view: cam.viewMatrix()) {
+            frame.lightDir = light.dir
+            frame.diffuse = min(scene.lighting.diffuse * light.intensity, 1.0)
+        }
         // Sync the world-space light direction for the AO/shadow cache key.
         currentLightDir = frame.lightDir
         if !Renderer.forceNextBufferAllocationSuccess {
@@ -966,9 +1085,26 @@ final class Renderer: NSObject {
     @discardableResult
     private func drawScene(enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?,
                            w: Int, h: Int, cam: Camera) -> Bool {
+        // Rebuild shared sphere/cylinder geometry if the tessellation factor
+        // changed (no-op when unchanged, so this is cheap every frame).
+        rebuildGeometryIfNeeded()
+
         // Structure-cull flags for this frame (display-only; empty in 2D or when
         // no clip plane is active). Computed once and shared by the draw paths.
         frameStructureCull = scene.displayMode.is2D ? [] : structureCullFlags()
+        // Translational-asymmetric-unit filter: with no supercell, keep only atoms
+        // whose fractional coords lie inside the base cell.
+        if scene.repetitionMode == .asymmetricUnit,
+           scene.superCell.total <= 1, let cell = scene.cell {
+            let eps: Float = 1e-4
+            frameRepetitionCull = scene.atoms.map { a in
+                guard let f = scene.fractionalCoord(a.coord),
+                      f.x.isFinite, f.y.isFinite, f.z.isFinite else { return true }
+                return f.x < -eps || f.x > 1 - eps || f.y < -eps || f.y > 1 - eps || f.z < -eps || f.z > 1 - eps
+            }
+        } else {
+            frameRepetitionCull = []
+        }
 
         // Image backdrop: drawn FIRST, before all geometry, with no depth
         // write so it sits behind everything. Suppressed during exports with an
@@ -989,6 +1125,14 @@ final class Renderer: NSObject {
         // can focus on the cell frame, axes, or Brillouin-zone overlay. The
         // frame/axes/BZ branches below draw regardless.
         if scene.showStructure {
+            // Translucent ordering (finding 6): when the structure itself is
+            // transparent, draw the molecular surface FIRST so the unified
+            // back-to-front atom/bond pass alpha-overs it correctly. (The surface
+            // is a single bulk mesh, so it can't share the per-atom blend queue;
+            // drawing it first is the pragmatic approximation.)
+            if scene.opacity < 1.0, !scene.displayMode.is2D {
+                guard drawMolecularSurface(enc, frameBuffer: frameBuffer) else { return false }
+            }
             if scene.displayMode.is2D {
                 // Transparent 2D: disable depth writes so flat atoms/bonds blend.
                 if scene.opacity < 1.0, let tds = transparentDepthState {
@@ -1024,6 +1168,16 @@ final class Renderer: NSObject {
             // using the shared line pipeline; still gated by showStructure above.
             guard drawDisplacementArrows(enc, frameBuffer: frameBuffer) else { return false }
             guard drawTrajectoryTrails(enc, frameBuffer: frameBuffer) else { return false }
+            if !scene.displayMode.is2D {
+                guard drawHbonds(enc, frameBuffer: frameBuffer) else { return false }
+            }
+        }
+
+        // Opaque-case surface draw. The transparent case is handled at the top of
+        // the showStructure block (drawn before the structure) so it isn't drawn
+        // twice. Hide with `showStructure` off and skip in 2D modes.
+        if scene.showStructure && scene.opacity >= 1.0, !scene.displayMode.is2D {
+            guard drawMolecularSurface(enc, frameBuffer: frameBuffer) else { return false }
         }
 
         guard drawCell(enc, frameBuffer: frameBuffer) else { return false }
@@ -1176,6 +1330,10 @@ final class Renderer: NSObject {
         frame.fogFar = fogFar
         frame.aoStrength = scene.aoStrength
         frame.shadowStrength = scene.shadowStrength
+        if let light = multiLightDir(view: cam.viewMatrix()) {
+            frame.lightDir = light.dir
+            frame.diffuse = min(scene.lighting.diffuse * light.intensity, 1.0)
+        }
         guard let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
 
         if sampleCount > 1 {
@@ -1356,6 +1514,10 @@ final class Renderer: NSObject {
         frame.fogFar = fogFar
         frame.aoStrength = scene.aoStrength
         frame.shadowStrength = scene.shadowStrength
+        if let light = multiLightDir(view: cam.viewMatrix()) {
+            frame.lightDir = light.dir
+            frame.diffuse = min(scene.lighting.diffuse * light.intensity, 1.0)
+        }
         guard let frameBuffer = device.makeBuffer(bytes: &frame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
         if effectiveCount > 1 {
             return encodeMSAA(to: commandBuffer, target: target, viewport: viewport,
@@ -1840,8 +2002,8 @@ final class Renderer: NSObject {
         var inst: [(depth: Float, data: InstanceData)] = []
         inst.reserveCapacity(scene.atoms.count)
         for (i, a) in scene.atoms.enumerated() {
-            // Display-only clip: skip atoms culled behind the clip plane.
-            if i < frameStructureCull.count && frameStructureCull[i] { continue }
+            // Display-only clip + asymmetric-unit filter.
+            if isAtomCulled(i) { continue }
             let radius = atomRadius(z: a.atomicNumber)
             if radius <= 0 { continue }
             let c = atomColor(at: i, selected: selected.contains(i))
@@ -1879,13 +2041,13 @@ final class Renderer: NSObject {
     private func atomRadius(z: Int) -> Float {
         switch scene.displayMode {
         case .spaceFill:
-            return ElementTable.vdwRadius(z)
+            return elementVdwRadius(z)
         case .wireFrame:
             return 0.06
         case .polyhedral:
             return 0
         default: // ballStick and any 2D mode
-            return ElementTable.covalentRadius(z) * scene.atomScale
+            return elementCovalentRadius(z) * scene.atomScale
         }
     }
 
@@ -1906,6 +2068,9 @@ final class Renderer: NSObject {
             // Display-only clip: cull bonds where BOTH endpoints are culled.
             if b.i < frameStructureCull.count && b.j < frameStructureCull.count,
                frameStructureCull[b.i] && frameStructureCull[b.j] { continue }
+            // Asymmetric-unit filter: drop bonds touching a dropped atom.
+            if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
+               b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
             let a = atoms[b.i].coord, b2 = atoms[b.j].coord
             let dir = b2 - a
             let len = length(dir)
@@ -1914,8 +2079,14 @@ final class Renderer: NSObject {
             let model = float4x4(translation: mid)
                 * .rotation(fromYTo: dir / len)
                 * float4x4(scale: SIMD3<Float>(scene.bondRadius, len, scene.bondRadius))
-            // Coordination coloring is intentionally atom-only; bonds retain CPK colors.
-            let c = ElementTable.color(atoms[b.i].atomicNumber)
+            // Coordination coloring is intentionally atom-only; bonds retain element
+            // colors (with per-element overrides), or the unicolor bond color.
+            let c: SIMD3<Float>
+            if scene.unicolorBonds {
+                c = ColorUtil.hexColor(scene.unicolorBondHex) ?? SIMD3<Float>(0.5, 0.5, 0.5)
+            } else {
+                c = elementColor(atoms[b.i].atomicNumber)
+            }
             let aoI = b.i < aoShadow.ao.count ? aoShadow.ao[b.i] : 1.0
             let aoJ = b.j < aoShadow.ao.count ? aoShadow.ao[b.j] : 1.0
             let shI = b.i < aoShadow.shadow.count ? aoShadow.shadow[b.i] : 1.0
@@ -1960,7 +2131,7 @@ final class Renderer: NSObject {
         var atomInst: [(depth: Float, data: InstanceData)] = []
         atomInst.reserveCapacity(scene.atoms.count)
         for (i, a) in scene.atoms.enumerated() {
-            if i < frameStructureCull.count && frameStructureCull[i] { continue }
+            if isAtomCulled(i) { continue }
             let radius = atomRadius(z: a.atomicNumber)
             if radius <= 0 { continue }
             let c = atomColor(at: i, selected: selected.contains(i))
@@ -1979,8 +2150,12 @@ final class Renderer: NSObject {
         bondInst.reserveCapacity(scene.bonds.count)
         for b in scene.bonds {
             guard b.i >= 0, b.i < scene.atoms.count, b.j >= 0, b.j < scene.atoms.count else { continue }
+            // Display-only clip: cull bonds where BOTH endpoints are culled.
             if b.i < frameStructureCull.count && b.j < frameStructureCull.count,
                frameStructureCull[b.i] && frameStructureCull[b.j] { continue }
+            // Asymmetric-unit filter: drop bonds touching a dropped atom.
+            if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
+               b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
             let a = scene.atoms[b.i].coord, b2 = scene.atoms[b.j].coord
             let dir = b2 - a
             let len = length(dir)
@@ -1989,7 +2164,12 @@ final class Renderer: NSObject {
             let model = float4x4(translation: mid)
                 * .rotation(fromYTo: dir / len)
                 * float4x4(scale: SIMD3<Float>(scene.bondRadius, len, scene.bondRadius))
-            let c = ElementTable.color(scene.atoms[b.i].atomicNumber)
+            let c: SIMD3<Float>
+            if scene.unicolorBonds {
+                c = ColorUtil.hexColor(scene.unicolorBondHex) ?? SIMD3<Float>(0.5, 0.5, 0.5)
+            } else {
+                c = elementColor(scene.atoms[b.i].atomicNumber)
+            }
             let aoI = b.i < aoShadow.ao.count ? aoShadow.ao[b.i] : 1.0
             let aoJ = b.j < aoShadow.ao.count ? aoShadow.ao[b.j] : 1.0
             let shI = b.i < aoShadow.shadow.count ? aoShadow.shadow[b.i] : 1.0
@@ -2185,7 +2365,7 @@ final class Renderer: NSObject {
             let ndc = projectNDC(a.coord, view: view, proj: proj)
             let rPx: Float = scene.displayMode == .point2D
                 ? 2.5
-                : max(3.0, ElementTable.covalentRadius(a.atomicNumber) * scene.atomScale * 12.0)
+                : max(3.0, elementCovalentRadius(a.atomicNumber) * scene.atomScale * 12.0)
             let rx = rPx / (wF * 0.5)
             let ry = rPx / (hF * 0.5)
             let c = atomColor(at: i, selected: selected.contains(i))
@@ -2217,7 +2397,9 @@ final class Renderer: NSObject {
         let bondWidth: Float = 2.0  // pixels
         let halfW = bondWidth / (wF * 0.5)
         let halfH = bondWidth / (hF * 0.5)
-        let bondColor = SIMD3<Float>(0.35, 0.35, 0.35)
+        let bondColor: SIMD3<Float> = scene.unicolorBonds
+            ? (ColorUtil.hexColor(scene.unicolorBondHex) ?? SIMD3<Float>(0.5, 0.5, 0.5))
+            : SIMD3<Float>(0.35, 0.35, 0.35)
 
         struct V { var px: Float; var py: Float; var lx: Float; var ly: Float; var r: Float; var g: Float; var b: Float }
         var verts: [V] = []
@@ -2290,11 +2472,17 @@ final class Renderer: NSObject {
         guard atoms.count > 1 else { return true }
         let key = (atoms: atoms, bonds: scene.bonds, selected: scene.selectedAtoms,
                    coordinationNumbers: coordinationNumbers,
-                   showCoordinationColors: showCoordinationColors)
+                   showCoordinationColors: showCoordinationColors,
+                   atomColorScheme: scene.atomColorScheme,
+                   atomScale: scene.atomScale,
+                   elementOverridesFP: elementOverridesFingerprint())
         if let pk = cachedPolyKey,
            pk.selected == key.selected,
            pk.coordinationNumbers == key.coordinationNumbers,
            pk.showCoordinationColors == key.showCoordinationColors,
+           pk.atomColorScheme == key.atomColorScheme,
+           pk.atomScale == key.atomScale,
+           pk.elementOverridesFP == key.elementOverridesFP,
            pk.atoms.count == key.atoms.count, zip(pk.atoms, key.atoms).allSatisfy({ $0.coord == $1.coord && $0.atomicNumber == $1.atomicNumber }),
            pk.bonds.count == key.bonds.count, zip(pk.bonds, key.bonds).allSatisfy({ $0.i == $1.i && $0.j == $1.j }) {
             // cache hit (possibly an empty mesh). Draw only if geometry is present.
@@ -2313,8 +2501,8 @@ final class Renderer: NSObject {
         struct V { var x: Float; var y: Float; var z: Float; var nx: Float; var ny: Float; var nz: Float; var r: Float; var g: Float; var b: Float }
         var verts: [V] = []
         for (i, a) in atoms.enumerated() {
-            // Display-only clip: drop polyhedra of culled atoms.
-            if i < frameStructureCull.count && frameStructureCull[i] { continue }
+            // Display-only clip + asymmetric-unit filter.
+            if isAtomCulled(i) { continue }
             guard neigh[i].count >= 3 else { continue }
             guard let tris = Geometry.polyhedronFaces(center: a.coord, neighbors: neigh[i], maxNeighbors: 12) else { continue }
             let col = atomColor(at: i, selected: selected.contains(i))
@@ -2367,7 +2555,10 @@ final class Renderer: NSObject {
         let selected = Set(scene.selectedAtoms)
         let key = (atoms: atoms, bonds: scene.bonds, selected: scene.selectedAtoms,
                    coordinationNumbers: coordinationNumbers,
-                   showCoordinationColors: showCoordinationColors)
+                   showCoordinationColors: showCoordinationColors,
+                   atomColorScheme: scene.atomColorScheme,
+                   atomScale: scene.atomScale,
+                   elementOverridesFP: elementOverridesFingerprint())
         // Rebuild the static triangle geometry only when the structural key changes.
         // Per frame we only apply the structure cull and re-sort by view depth.
         if !transparentPolyKeyMatches(key) {
@@ -2398,7 +2589,10 @@ final class Renderer: NSObject {
             cachedTransparentPoly = TransparentPolyCache(
                 atoms: key.atoms, bonds: key.bonds, selected: key.selected,
                 coordinationNumbers: key.coordinationNumbers,
-                showCoordinationColors: key.showCoordinationColors, atomTris: atomTris)
+                showCoordinationColors: key.showCoordinationColors,
+                atomColorScheme: key.atomColorScheme,
+                atomScale: key.atomScale,
+                elementOverridesFP: key.elementOverridesFP, atomTris: atomTris)
         }
         guard let cache = cachedTransparentPoly else { return true }
 
@@ -2408,7 +2602,7 @@ final class Renderer: NSObject {
         // depth sort + repack is recomputed each frame.
         var triData: [(depth: Float, tri: TransparentTri)] = []
         for (i, tris) in cache.atomTris.enumerated() {
-            if i < frameStructureCull.count && frameStructureCull[i] { continue }
+            if isAtomCulled(i) { continue }
             for tri in tris {
                 let viewPos = view * SIMD4<Float>(tri.centroid, 1.0)
                 triData.append((depth: -viewPos.z, tri: tri))
@@ -2440,11 +2634,16 @@ final class Renderer: NSObject {
     /// opaque `drawPolyhedral` cache's comparison (Bond is not Equatable, so bonds
     /// are compared field-wise).
     private func transparentPolyKeyMatches(_ key: (atoms: [Atom], bonds: [Bond], selected: [Int],
-                                            coordinationNumbers: [Int], showCoordinationColors: Bool)) -> Bool {
+                                            coordinationNumbers: [Int], showCoordinationColors: Bool,
+                                            atomColorScheme: AtomColorScheme, atomScale: Float,
+                                            elementOverridesFP: UInt64)) -> Bool {
         guard let pk = cachedTransparentPoly else { return false }
         return pk.selected == key.selected
             && pk.coordinationNumbers == key.coordinationNumbers
             && pk.showCoordinationColors == key.showCoordinationColors
+            && pk.atomColorScheme == key.atomColorScheme
+            && pk.atomScale == key.atomScale
+            && pk.elementOverridesFP == key.elementOverridesFP
             && pk.atoms.count == key.atoms.count && zip(pk.atoms, key.atoms).allSatisfy { $0.coord == $1.coord && $0.atomicNumber == $1.atomicNumber }
             && pk.bonds.count == key.bonds.count && zip(pk.bonds, key.bonds).allSatisfy { $0.i == $1.i && $0.j == $1.j }
     }
@@ -2499,20 +2698,176 @@ final class Renderer: NSObject {
             // scene stays under that ceiling, so normal rendering is unaffected.
             guard let replicas = Renderer.cellBoxCount(sc),
                   replicas <= Scene.superCellAtomCap else { return false }
-            var frameVerts: [SIMD3<Float>] = []
-            frameVerts.reserveCapacity(replicas * 24)
+            var edgePairs: [(SIMD3<Float>, SIMD3<Float>)] = []
+            edgePairs.reserveCapacity(replicas * 12)
             for i in 0..<sc.n1 {
                 for j in 0..<sc.n2 {
                     for k in 0..<sc.n3 {
                         let t = a * Float(i) + b * Float(j) + c * Float(k)
                         let o = base + t
                         let corners = [o, a + o, a + b + o, b + o, c + o, a + c + o, b + c + o, a + b + c + o]
-                        for (ci, cj) in edges { frameVerts.append(corners[ci]); frameVerts.append(corners[cj]) }
+                        for (ci, cj) in edges { edgePairs.append((corners[ci], corners[cj])) }
                     }
                 }
             }
+            if scene.cellRodsEnabled {
+                return drawCellRods(enc, frameBuffer: frameBuffer, edgePairs: edgePairs)
+            }
+            var frameVerts: [SIMD3<Float>] = []
+            frameVerts.reserveCapacity(edgePairs.count * 2)
+            for (p, q) in edgePairs { frameVerts.append(p); frameVerts.append(q) }
             return drawLineBuffer(frameVerts, color: SIMD3<Float>(0.75, 0.75, 0.75), enc: enc, frameBuffer: frameBuffer)
         }
+        return true
+    }
+
+    /// Draw the cell frame edges as lit rods (XCrySDen "Crystal Cells As Rods")
+    /// using the shared cylinder mesh + atom pipeline. Radius derives from the
+    /// hydrogen covalent radius scaled by `scene.cellRodFactor`.
+    private func drawCellRods(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?,
+                              edgePairs: [(SIMD3<Float>, SIMD3<Float>)]) -> Bool {
+        let radius = scene.cellRodFactor * elementCovalentRadius(1)
+        if radius <= 0 { return true }
+        let color = SIMD3<Float>(0.75, 0.75, 0.75)
+        var inst: [InstanceData] = []
+        inst.reserveCapacity(edgePairs.count)
+        for (p, q) in edgePairs {
+            let dir = q - p
+            let len = length(dir)
+            guard len > 1e-5 else { continue }
+            let mid = (p + q) * 0.5
+            let model = float4x4(translation: mid)
+                * .rotation(fromYTo: dir / len)
+                * float4x4(scale: SIMD3<Float>(radius, len, radius))
+            inst.append(InstanceData(model: model, color: SIMD4(color, 1.0), radius: 1.0,
+                                     metalness: 0.0, aoFactor: 1.0, shadowFactor: 1.0))
+        }
+        if inst.isEmpty { return true }
+        guard let buf = device.makeBuffer(bytes: inst,
+                                          length: inst.count * MemoryLayout<InstanceData>.stride,
+                                          options: []) else { return false }
+        enc.setRenderPipelineState(atomPipeline)
+        enc.setVertexBuffer(cylinderVB, offset: 0, index: 0)
+        enc.setVertexBuffer(buf, offset: 0, index: 1)
+        enc.setVertexBuffer(frameBuffer, offset: 0, index: 2)
+        enc.setFragmentBuffer(frameBuffer, offset: 0, index: 2)
+        enc.drawIndexedPrimitives(type: .triangle,
+                                  indexCount: cylinderIB.length / MemoryLayout<UInt16>.stride,
+                                  indexType: .uint16,
+                                  indexBuffer: cylinderIB,
+                                  indexBufferOffset: 0,
+                                  instanceCount: inst.count)
+        return true
+    }
+
+    /// Draw detected H-bonds (`scene.hbondPairs`) as thin dashed line segments
+    /// between each hydrogen and its acceptor, tinted with
+    /// `hbondSettings.colorHex`. Reuses the existing line primitive with a
+    /// reduced width; deterministic (sorted) output.
+    @discardableResult
+    private func drawHbonds(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        guard scene.hbondSettings.enabled, !scene.hbondPairs.isEmpty else { return true }
+        let atoms = scene.atoms
+        let pairs = scene.hbondPairs.sorted {
+            ($0.donor, $0.hydrogen, $0.acceptor) < ($1.donor, $1.hydrogen, $1.acceptor)
+        }
+        let color = ColorUtil.hexColor(scene.hbondSettings.colorHex) ?? SIMD3<Float>(0.53, 0.8, 1.0)
+        // Dashed look: emit short sub-segments with gaps along each H-bond.
+        let dashes = 8
+        var verts: [SIMD3<Float>] = []
+        verts.reserveCapacity(pairs.count * dashes * 2)
+        for p in pairs {
+            guard p.donor >= 0, p.donor < atoms.count,
+                  p.hydrogen >= 0, p.hydrogen < atoms.count,
+                  p.acceptor >= 0, p.acceptor < atoms.count else { continue }
+            // Cull a dashed segment if any of its three atoms is culled (structure
+            // clip or asymmetric-unit filter), matching the bond/atom draw paths.
+            if isAtomCulled(p.donor) || isAtomCulled(p.hydrogen) || isAtomCulled(p.acceptor) { continue }
+            let h = atoms[p.hydrogen].coord
+            // For crystals the bond reaches the periodic image that satisfied the
+            // H…A criteria; for molecules the home copy is used.
+            let a = p.acceptorImage ?? atoms[p.acceptor].coord
+            for s in 0..<dashes where s % 2 == 0 {
+                let t0 = Float(s) / Float(dashes)
+                let t1 = Float(s + 1) / Float(dashes)
+                verts.append(h + (a - h) * t0)
+                verts.append(h + (a - h) * t1)
+            }
+        }
+        guard !verts.isEmpty else { return true }
+        return drawLineBuffer(verts, color: color, enc: enc, frameBuffer: frameBuffer)
+    }
+
+    /// Draw the molecular (solvent-accessible) surface as a translucent,
+    /// depth-tested triangle mesh tinted with `molecularSurfaceSettings.colorHex`
+    /// at the configured opacity. Uses the poly (flat-shaded, lit) pipeline with
+    /// transparent blending. Skipped when the surface generator returns nil.
+    @discardableResult
+    private func drawMolecularSurface(_ enc: MTLRenderCommandEncoder, frameBuffer: MTLBuffer?) -> Bool {
+        let settings = scene.molecularSurfaceSettings
+        guard settings.enabled else {
+            // Release the cached GPU buffers when the surface is toggled off so
+            // they don't linger until the next (optional) rebuild.
+            if cachedMolSurface != nil { cachedMolSurface = nil }
+            return true
+        }
+        let fp = atomFingerprint()
+        let overridesFP = elementOverridesFingerprint()
+        let color = ColorUtil.hexColor(settings.colorHex) ?? SIMD3<Float>(0.69, 0.74, 0.77)
+        if cachedMolSurface == nil ||
+            cachedMolSurface!.atomFP != fp ||
+            cachedMolSurface!.elementOverridesFP != overridesFP ||
+            cachedMolSurface!.probeRadius != settings.probeRadius ||
+            cachedMolSurface!.color != color ||
+            cachedMolSurface!.opacity != settings.opacity {
+            // Pass overrides through so the builder uses overridden vdW radii
+            // (falls back to CPK radii when the dictionary is empty).
+            guard let mesh = MolecularSurface.mesh(atoms: scene.atoms,
+                                                    probeRadius: settings.probeRadius,
+                                                    overrides: scene.elementOverrides) else {
+                cachedMolSurface = nil
+                return true
+            }
+            // Mesh vertices carry only position + normal; expand indices into a
+            // flat lit-vertex stream with per-vertex surface color.
+            let vertStride = MemoryLayout<Float>.stride * 9
+            guard let vb = device.makeBuffer(length: mesh.positions.count * vertStride, options: []),
+                  let ib = device.makeBuffer(bytes: mesh.indices,
+                                            length: mesh.indices.count * MemoryLayout<UInt16>.stride,
+                                            options: []) else {
+                cachedMolSurface = nil
+                return true
+            }
+            let p = vb.contents().assumingMemoryBound(to: Float.self)
+            for i in 0..<mesh.positions.count {
+                let pos = mesh.positions[i], nrm = mesh.normals[i]
+                let o = i * 9
+                p[o+0]=pos.x; p[o+1]=pos.y; p[o+2]=pos.z
+                p[o+3]=nrm.x; p[o+4]=nrm.y; p[o+5]=nrm.z
+                p[o+6]=color.x; p[o+7]=color.y; p[o+8]=color.z
+            }
+            cachedMolSurface = MolSurfaceCache(atomFP: fp, elementOverridesFP: overridesFP,
+                                               probeRadius: settings.probeRadius,
+                                               color: color, opacity: settings.opacity,
+                                               vertexBuffer: vb, indexBuffer: ib,
+                                               indexCount: mesh.indices.count)
+        }
+        guard let cache = cachedMolSurface, let frameBuffer else { return true }
+        // Override the shared frame's opacity for this translucent draw.
+        let ptr = frameBuffer.contents().assumingMemoryBound(to: FrameData.self)
+        let base = ptr.pointee
+        var tframe = base
+        tframe.opacity = settings.opacity
+        guard let tbuf = device.makeBuffer(bytes: &tframe, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
+        enc.setDepthStencilState(transparentDepthState)
+        enc.setRenderPipelineState(polyPipeline)
+        enc.setVertexBuffer(cache.vertexBuffer, offset: 0, index: 0)
+        enc.setVertexBuffer(tbuf, offset: 0, index: 2)
+        enc.setFragmentBuffer(tbuf, offset: 0, index: 2)
+        enc.drawIndexedPrimitives(type: .triangle, indexCount: cache.indexCount,
+                                  indexType: .uint16, indexBuffer: cache.indexBuffer,
+                                  indexBufferOffset: 0)
+        enc.setDepthStencilState(depthStencilState)
         return true
     }
 
@@ -2627,6 +2982,13 @@ final class Renderer: NSObject {
         var arrowFrame = Renderer.makeFrame(view: matrix_identity_float4x4, proj: proj,
                                             lighting: scene.lighting,
                                             eye: SIMD3<Float>(0, 0, 100))
+        // Apply the multi-light rig to the gizmo arrows exactly as the main scene
+        // does. The gizmo uses an identity view, so its light direction stays in
+        // camera space — keeping the light camera-relative (AGENTS invariant).
+        if let light = multiLightDir(view: matrix_identity_float4x4) {
+            arrowFrame.lightDir = light.dir
+            arrowFrame.diffuse = min(scene.lighting.diffuse * light.intensity, 1.0)
+        }
         guard let arrowFB = device.makeBuffer(bytes: &arrowFrame, length: MemoryLayout<FrameData>.stride, options: []) else { return false }
         var labelFrame = Renderer.makeFrame(view: worldToView, proj: proj,
                                             lighting: scene.lighting,
@@ -3161,7 +3523,9 @@ final class Renderer: NSObject {
     private var cachedPolyBuffer: MTLBuffer?
     private var cachedPolyVertexCount: Int = 0
     private var cachedPolyKey: (atoms: [Atom], bonds: [Bond], selected: [Int],
-                                coordinationNumbers: [Int], showCoordinationColors: Bool)?
+                                coordinationNumbers: [Int], showCoordinationColors: Bool,
+                                atomColorScheme: AtomColorScheme, atomScale: Float,
+                                elementOverridesFP: UInt64)?
 
     // Transparent polyhedral cache: the world-space triangle geometry is static
     // (camera-independent), so per-atom triangle lists are cached keyed exactly like
@@ -3177,6 +3541,9 @@ final class Renderer: NSObject {
         var selected: [Int]
         var coordinationNumbers: [Int]
         var showCoordinationColors: Bool
+        var atomColorScheme: AtomColorScheme
+        var atomScale: Float
+        var elementOverridesFP: UInt64
         // atomTris[i] holds the static triangles built from atom i's neighbors; empty
         // for atoms with too few neighbors. Per-frame culling skips whole atoms.
         var atomTris: [[TransparentTri]]
@@ -3214,6 +3581,26 @@ final class Renderer: NSObject {
     /// Per-atom structure-cull flags for the current drawScene pass. Empty when no
     /// structure clip is active (or in 2D modes). Recomputed at the top of drawScene.
     private var frameStructureCull: [Bool] = []
+    /// Translational-asymmetric-unit cull flags for this frame. True means the atom
+    /// lies outside the base cell and must be dropped. Empty (no culling) unless
+    /// `repetitionMode == .translationalAsymmetricUnit` with no supercell.
+    private var frameRepetitionCull: [Bool] = []
+
+    // MARK: - Molecular (solvent-accessible) surface cache
+
+    /// Cached GPU mesh for the molecular surface, keyed by (atom fingerprint,
+    /// probe radius, color, opacity). Rebuilt only when its inputs change.
+    private var cachedMolSurface: MolSurfaceCache?
+    private struct MolSurfaceCache {
+        var atomFP: UInt64
+        var elementOverridesFP: UInt64
+        var probeRadius: Float
+        var color: SIMD3<Float>
+        var opacity: Float
+        var vertexBuffer: MTLBuffer
+        var indexBuffer: MTLBuffer
+        var indexCount: Int
+    }
 
     // MARK: - Volume slice texture cache
 
@@ -4048,6 +4435,41 @@ final class Renderer: NSObject {
         return device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: [])
     }
 
+    // MARK: - Tessellation rebuild
+
+    /// Rebuild the shared sphere/cylinder geometry when `scene.tessellationFactor`
+    /// changes. Keyed by factor so it runs at most once per change, never per
+    /// frame. factor 0 keeps the legacy fixed counts (sphere 12/20, cylinder 12).
+    private func rebuildGeometryIfNeeded() {
+        let k = scene.tessellationFactor
+        if k == tessellationBuiltFactor { return }
+        tessellationBuiltFactor = k
+        let sphereLat: Int, sphereLon: Int, cylRad: Int
+        if k <= 0 {
+            sphereLat = 12; sphereLon = 20; cylRad = 12
+        } else {
+            // Clamp lat >= 4 and lon >= 6 so small k (e.g. k = 1) can't produce a
+            // degenerate sphere (a single lat band collapses to a point/line).
+            sphereLat = max(4, min(k, 72))
+            sphereLon = max(6, min(2 * k + 4, 72))
+            cylRad = max(3, min(k, 48))
+        }
+        let sMesh = Geometry.unitSphere(latSegments: sphereLat, lonSegments: sphereLon)
+        let cMesh = Geometry.unitCylinder(radialSegments: cylRad)
+        guard
+            let svb = Renderer.makeInterleavedBuffer(device, mesh: sMesh),
+            let sib = device.makeBuffer(bytes: sMesh.indices,
+                                       length: sMesh.indices.count * MemoryLayout<UInt16>.stride,
+                                       options: []),
+            let cvb = Renderer.makeInterleavedBuffer(device, mesh: cMesh),
+            let cib = device.makeBuffer(bytes: cMesh.indices,
+                                       length: cMesh.indices.count * MemoryLayout<UInt16>.stride,
+                                       options: [])
+        else { return }
+        sphereMesh = sMesh; sphereVB = svb; sphereIB = sib
+        cylinderMesh = cMesh; cylinderVB = cvb; cylinderIB = cib
+    }
+
     // MARK: - Buffers
 
     private static func makeInterleavedBuffer(_ device: MTLDevice, mesh: Mesh) -> MTLBuffer? {
@@ -4064,7 +4486,55 @@ final class Renderer: NSObject {
         return buf
     }
 
-    // MARK: - Periodic-table lookups (CPK-ish)
+    // MARK: - Per-element display resolution
+
+    /// Deterministic per-element display color: override colorHex wins over the
+    /// CPK table, falling back to `ElementTable.color`.
+    private func elementColor(_ z: Int) -> SIMD3<Float> {
+        AtomSchemeMetrics.elementColor(z: z, overrides: scene.elementOverrides)
+    }
+
+    /// Display covalent radius with per-element override support.
+    private func elementCovalentRadius(_ z: Int) -> Float {
+        AtomSchemeMetrics.elementCovalentRadius(z: z, overrides: scene.elementOverrides)
+    }
+
+    /// Display van-der-Waals radius with per-element override support.
+    private func elementVdwRadius(_ z: Int) -> Float {
+        AtomSchemeMetrics.elementVdwRadius(z: z, overrides: scene.elementOverrides)
+    }
+
+    /// FNV-1a fingerprint of the displayed atom set (coords + atomic numbers).
+    /// Cheap incremental-style hash; good enough to detect content changes for
+    /// the molecular-surface cache key.
+    private func atomFingerprint() -> UInt64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for a in scene.atoms {
+            h ^= UInt64(bitPattern: Int64(a.atomicNumber)); h = h &* 0x100000001b3
+            h ^= UInt64(a.coord.x.bitPattern); h = h &* 0x100000001b3
+            h ^= UInt64(a.coord.y.bitPattern); h = h &* 0x100000001b3
+            h ^= UInt64(a.coord.z.bitPattern); h = h &* 0x100000001b3
+        }
+        return h
+    }
+
+    /// Compact, deterministic digest of the per-element overrides that affect
+    /// geometry/color: a small FNV of sorted (z, colorHex, covalentRadius,
+    /// vdwRadius) tuples. Cheap to recompute; folded into cache keys so the
+    /// polyhedral and molecular-surface meshes rebuild when an override changes.
+    private func elementOverridesFingerprint() -> UInt64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for z in scene.elementOverrides.keys.sorted() {
+            h ^= UInt64(bitPattern: Int64(z)); h = h &* 0x100000001b3
+            let o = scene.elementOverrides[z]!
+            if let hex = o.colorHex {
+                for b in hex.utf8 { h ^= UInt64(b); h = h &* 0x100000001b3 }
+            }
+            h ^= UInt64(o.covalentRadius?.bitPattern ?? 0); h = h &* 0x100000001b3
+            h ^= UInt64(o.vdwRadius?.bitPattern ?? 0); h = h &* 0x100000001b3
+        }
+        return h
+    }
 
 }
 

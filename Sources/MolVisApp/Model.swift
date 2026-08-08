@@ -163,6 +163,86 @@ enum MSAASampleCount: Int, CaseIterable {
 
 struct ColorScheme: Codable { var mode: String = "atomic" }
 
+/// How atoms are colored when a non-element scheme is active. `.elemental`
+/// matches the current default exactly (CPK table + per-element overrides).
+enum AtomColorScheme: String, Codable, CaseIterable {
+    case elemental      // atom-colored: per-element overrides apply
+    case coordination   // color by coordination number (grouped buckets)
+    case slabFraction   // per-atom fractional position between slab planes
+    case distanceProportional // color by signed distance to the slab planeA
+    var label: String {
+        switch self {
+        case .elemental: return "Elemental"
+        case .coordination: return "Coordination"
+        case .slabFraction: return "Slab Fraction"
+        case .distanceProportional: return "Plane Distance"
+        }
+    }
+}
+
+/// How the base unit cell content is displayed without a supercell.
+enum RepetitionMode: String, Codable, CaseIterable {
+    case unitCell      // current default: atoms within the base cell, periodic images at borders
+    case asymmetricUnit // translational asymmetric unit only (base cell interior)
+    var label: String {
+        switch self {
+        case .unitCell: return "Unit Cell"
+        case .asymmetricUnit: return "Translational Asymmetric Unit"
+        }
+    }
+}
+
+/// One configurable light source. Empty `Scene.lights` = legacy single light
+/// (exactly today's output); when non-empty the renderer uses these instead.
+struct SceneLightSource: Codable, Equatable {
+    var enabled: Bool = true
+    var azimuth: Float = 225.0
+    var elevation: Float = 45.0
+    var intensity: Float = 1.0
+    var colorHex: String = "#FFFFFF"
+}
+
+/// Per-element display overrides. nil fields inherit the fixed CPK table.
+struct ElementOverride: Codable, Equatable {
+    var colorHex: String?
+    var covalentRadius: Float?
+    var vdwRadius: Float?
+    var labelOverride: String?
+    var fontScale: Float?
+}
+
+/// H-bond display + detection criteria (XCrySDen parity).
+struct HbondSettings: Codable, Equatable {
+    var enabled: Bool = false
+    /// Maximum H…A distance in Å. Aligned with XCrySDen's default 2.5 Å pair search.
+    var maxDistance: Float = 2.5
+    /// Minimum D−H…A angle in degrees (180 = perfectly linear).
+    var minAngleDegrees: Float = 120.0
+    var colorHex: String = "#88CCFF"
+}
+
+/// Molecular (solvent-accessible style) surface settings.
+struct MolecularSurfaceSettings: Codable, Equatable {
+    var enabled: Bool = false
+    /// Probe sphere radius in Å (default ≈ a water molecule).
+    var probeRadius: Float = 1.4
+    var opacity: Float = 0.6
+    var colorHex: String = "#B0BEC5"
+}
+
+/// One detected H bond: donor atom index, its bound hydrogen, acceptor atom.
+/// `acceptorImage` is the world coordinate of the periodic image of the acceptor
+/// that satisfied the H…A criteria (nil for non-crystal scenes where the home
+/// copy is the one matched). The renderer draws the dashed bond from the
+/// hydrogen to `acceptorImage ?? atoms[acceptor].coord` so crystalline lines
+/// connect to the right copy.
+struct HbondPair: Codable, Equatable {
+    var donor: Int
+    var hydrogen: Int
+    var acceptor: Int
+    var acceptorImage: SIMD3<Float>?
+}
+
 /// Publication-quality presets that set multiple rendering controls at once.
 /// Each preset configures line width, opacity, depth cueing, AO, and shadows for
 /// a common output target. `.default` preserves the original rendering exactly.
@@ -489,6 +569,18 @@ struct Scene: Codable {
         shadowStrength = try c.decodeIfPresent(Float.self, forKey: .shadowStrength) ?? 0.0
         aoQuality = try c.decodeIfPresent(Int.self, forKey: .aoQuality) ?? 2
         shadowQuality = try c.decodeIfPresent(Int.self, forKey: .shadowQuality) ?? 2
+        lights = try c.decodeIfPresent([SceneLightSource].self, forKey: .lights) ?? []
+        hbondSettings = try c.decodeIfPresent(HbondSettings.self, forKey: .hbondSettings) ?? HbondSettings()
+        hbondPairs = try c.decodeIfPresent([HbondPair].self, forKey: .hbondPairs) ?? []
+        molecularSurfaceSettings = try c.decodeIfPresent(MolecularSurfaceSettings.self, forKey: .molecularSurfaceSettings) ?? MolecularSurfaceSettings()
+        atomColorScheme = try c.decodeIfPresent(AtomColorScheme.self, forKey: .atomColorScheme) ?? .elemental
+        elementOverrides = try c.decodeIfPresent([Int: ElementOverride].self, forKey: .elementOverrides) ?? [:]
+        repetitionMode = try c.decodeIfPresent(RepetitionMode.self, forKey: .repetitionMode) ?? .unitCell
+        cellRodsEnabled = try c.decodeIfPresent(Bool.self, forKey: .cellRodsEnabled) ?? false
+        cellRodFactor = try c.decodeIfPresent(Float.self, forKey: .cellRodFactor) ?? 0.35
+        unicolorBonds = try c.decodeIfPresent(Bool.self, forKey: .unicolorBonds) ?? false
+        unicolorBondHex = try c.decodeIfPresent(String.self, forKey: .unicolorBondHex) ?? "#808080"
+        tessellationFactor = try c.decodeIfPresent(Int.self, forKey: .tessellationFactor) ?? 0
     }
 
     // MARK: - Rendering quality controls
@@ -516,6 +608,33 @@ struct Scene: Codable {
     var aoQuality: Int = 2
     /// Soft-shadow quality level (0 = off, 1 = low, 2 = medium, 3 = high).
     var shadowQuality: Int = 2
+    /// Multi-light rig. Empty (default) = legacy single light — byte-identical
+    /// output, upgraded scenes get up to 6 configurable sources.
+    var lights: [SceneLightSource] = []
+    /// H-bond detection/display settings. `hbondPairs` is populated by the
+    /// controller when settings.enabled is set; the renderer only draws.
+    var hbondSettings: HbondSettings = HbondSettings()
+    var hbondPairs: [HbondPair] = []
+    /// Molecular (solvent-accessible style) surface settings.
+    var molecularSurfaceSettings: MolecularSurfaceSettings = MolecularSurfaceSettings()
+    /// Active atom color scheme; `.elemental` reproduces today's output exactly.
+    var atomColorScheme: AtomColorScheme = .elemental
+    /// Per-element display overrides keyed by atomic number; defaults empty.
+    var elementOverrides: [Int: ElementOverride] = [:]
+    /// Unit-cell repetition display mode (unit cell vs asymmetric unit).
+    var repetitionMode: RepetitionMode = .unitCell
+    /// Crystal cell drawn as lit rods (XCrySDen "Crystal Cells As Rods") instead
+    /// of unlit lines. Rod thickness = rodFactor * hydrogen covalent radius.
+    var cellRodsEnabled: Bool = false
+    var cellRodFactor: Float = 0.35
+    /// Unicolor bonds: all bonds rendered in one color (O bonds currently inherit
+    /// each atom's color). When enabled, `unicolorBondHex` wins over atom colors.
+    var unicolorBonds: Bool = false
+    var unicolorBondHex: String = "#808080"
+    /// Geometry tessellation quality: 0 = legacy fixed counts (12/20 sphere,
+    /// 12 cylinder) — byte-identical output; >0 scales sphere lat/lon and
+    /// cylinder radial segments for smoother geometry.
+    var tessellationFactor: Int = 0
 }
 
 // simd_quatf is not Codable in the Swift stdlib (only SIMD vectors are),

@@ -2,6 +2,28 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] — 2026-08-08
+
+### Added
+
+- **H-bonds** — detection (N/O/F donors+H, optional periodic acceptor images) with configurable max H…A distance / min D-H-A angle, and dashed-line display bound to the matched image copy.
+- **Molecular surface** — probe-inflated (Connolly-style) isosurface via bounded marching cubes with opacity/color/probe settings; UInt16-index-safe vertex cap.
+- **Color schemes** — coordination-number, slab-fraction, and signed slab-distance proportional coloring alongside the elemental default; per-frame cached metrics.
+- **Per-element customization** — per-Z color, covalent/van-der-Waals radii, and label/font overrides via a periodic-table element editor sheet.
+- **Unit-of-repetition toggle** — display full unit-cell content vs. the translational asymmetric unit.
+- **Crystal cells as rods** — lit rod-cell rendering with thickness factor.
+- **Unicolor bonds** — all bonds in a single configurable color.
+- **Tessellation factor** — sphere/cylinder quality scale (0 = legacy fixed counts, byte-identical output).
+- **Multi-light rig** — up to 6 configurable lights (empty = legacy single light, byte-identical default output).
+- Force-arrow overlay now exposes its existing readout in the force dashboard; Y-snap tinting unchanged.
+
+### Fixed
+
+- Spurious double `shadowStrength` decode in `Scene` (redundant, harmless).
+- Polyhedral/transparent-poly caches now key on the active color scheme and element overrides (stale colors after switching scheme), and cached molecular-surface meshes are released when the surface is disabled.
+- Orientation gizmo and axis frames use the active light rig (multi-light) rather than the legacy single light.
+- Molecular surface is gated on `Scene.showStructure` and drawn transparent atoms in the correct blend order.
+
 ## [1.2.1] — 2026-08-08
 
 ### Fixed

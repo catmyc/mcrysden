@@ -111,6 +111,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Test-only seam: when true, renderer creation is forced to fail so the graceful
     /// Metal-unavailable path is exercisable without a real GPU-less machine.
     internal static var forceRendererFailure = false
+    /// Upper bound on mirrored light sources (XCrySDen parity: 6 lights). The
+    /// sidebar cannot exceed it, but the mirror clamps defensively so a restored
+    /// or scripted state can never overrun the renderer's fixed light block.
+    internal static let maxSceneLights = 6
     let state: SideBarState
     /// Derived coordination data for the currently displayed atom ordering. It
     /// is runtime-only and is discarded whenever the displayed geometry changes.
@@ -163,6 +167,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private var distributionGeneration = 0
     private var lastCoordinationEnabled = false
     private var lastCoordinationScale = CoordinationAnalyzer.defaultRadiusScale
+    /// Identity of the atom set + criteria the currently installed
+    /// `scene.hbondPairs` were detected for. H-bond detection is O(n²)-ish, so
+    /// it must not rerun on every unrelated sidebar change; it reruns only when
+    /// this fingerprint changes. Wholesale scene replacements (file open, frame
+    /// reload) reset it to nil so a fresh scene always recomputes.
+    private var lastHbondFingerprint: HbondFingerprint?
     /// Complete CN data installed for the currently displayed atom ordering.
     /// This is the only CN array consumed by renderers and avoids deriving it on
     /// camera-only renders.
@@ -323,6 +333,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // before installing onChange, because every @Published assignment is
         // synchronous and would otherwise feed default state back into it.
         state.syncFromScene(scene)
+        // Tier-1 appearance mirror for a directly-constructed controller. Static
+        // because `self` is not yet fully initialized here; `syncFromScene`
+        // above covers the pre-Tier-1 fields the same way.
+        MainWindowController.mirrorTier1Appearance(scene, into: state)
         state.syncCameraBookmarkSlots(cameraBookmarks)
         sidebar = NSHostingView(rootView: SideBar(state: state))
         canvas = MetalView(frame: .zero, device: device)
@@ -615,6 +629,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         self.scene = scene
         bzEpoch += 1   // new scene: cell/baseAtoms may differ, rebuild the editor BZ
         state.syncFromScene(scene)
+        mirrorTier1AppearanceToState(from: scene)
         refreshBasisTransformAvailability()
         // syncFromScene exits edit mode (editKPathOnBZ -> false); mirror that into the
         // renderer so a freshly-loaded scene can't leave stale landmark crosses drawn.
@@ -647,6 +662,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // Metal scene by the renderer (gated on scene.showColorPlane). No separate
         // canvas swap needed.
         updateContentVisibility()
+        // A freshly installed scene owns a new atom set: drop the cached H-bond
+        // fingerprint and re-derive the pairs for it (a no-op when disabled).
+        hbondGeometryDidChange()
         // Initialise the animation controls WITHOUT triggering onChange (which
         // would otherwise try to reload frame 0 on top of this fresh load).
         let saved = state.onChange
@@ -681,6 +699,38 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         } catch {
             print("[mcrysden] revert failed: \(error)")
         }
+    }
+
+    /// Scene -> sidebar mirror for the Tier-1 appearance fields, the exact
+    /// inverse of the `syncFromState` block that pushes them the other way.
+    /// `SideBarState.syncFromScene` owns the pre-Tier-1 fields; these live here
+    /// instead so the sidebar-state file stays untouched by this wiring.
+    ///
+    /// onChange is suspended for the duration (the same pattern the lattice and
+    /// animation prefills use): every assignment below is a @Published didSet
+    /// that would otherwise synchronously re-enter `syncFromState` and push the
+    /// half-mirrored sidebar back into the scene we are reading from.
+    private static func mirrorTier1Appearance(_ scene: Scene, into state: SideBarState) {
+        let saved = state.onChange
+        state.onChange = nil
+        defer { state.onChange = saved }
+        state.lights = Array(scene.lights.prefix(maxSceneLights))
+        state.hbondSettings = scene.hbondSettings
+        state.molecularSurfaceSettings = scene.molecularSurfaceSettings
+        state.atomColorScheme = scene.atomColorScheme
+        state.elementOverrides = scene.elementOverrides
+        state.repetitionMode = scene.repetitionMode
+        state.cellRodsEnabled = scene.cellRodsEnabled
+        state.cellRodFactor = scene.cellRodFactor
+        state.unicolorBonds = scene.unicolorBonds
+        state.unicolorBondHex = scene.unicolorBondHex
+        state.tessellationFactor = scene.tessellationFactor
+    }
+
+    /// Instance form of the Tier-1 scene -> sidebar mirror, used by the scene
+    /// installation paths (`installScene`, `reloadFrame`).
+    private func mirrorTier1AppearanceToState(from scene: Scene) {
+        MainWindowController.mirrorTier1Appearance(scene, into: state)
     }
 
     /// Refresh the runtime-only basis-transform availability + help text from the
@@ -3410,6 +3460,35 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         scene.backgroundBottom = state.backgroundBottomHex
         scene.backgroundImagePath = state.backgroundImagePath
         scene.anaglyphMode = state.anaglyphMode
+        // ---- Tier-1 appearance mirrors (state -> scene) ----
+        // All of these are plain value mirrors: the renderer reads them straight
+        // off the scene, and StateStore persists them through Scene's Codable
+        // conformance (whose custom decoder supplies the legacy defaults). They
+        // are written unconditionally — each field's default reproduces the
+        // pre-Tier-1 output exactly, so an untouched sidebar changes nothing.
+        // Multi-light rig: empty = legacy single light. Capped at 6 sources to
+        // match the renderer's fixed-size uniform block.
+        scene.lights = Array(state.lights.prefix(MainWindowController.maxSceneLights))
+        // H-bond criteria mirror here; the detected pair list is derived below
+        // (after supercell/slab settle) so it always matches the displayed atoms.
+        scene.hbondSettings = state.hbondSettings
+        // Molecular surface: settings only. There is no scene-side mesh field —
+        // the renderer builds and caches the mesh from these settings itself, so
+        // the controller must not compute geometry here.
+        scene.molecularSurfaceSettings = state.molecularSurfaceSettings
+        // Color scheme + per-element overrides: the renderer resolves per-atom
+        // colors/radii from these via ColorSchemes.
+        scene.atomColorScheme = state.atomColorScheme
+        scene.elementOverrides = state.elementOverrides
+        // Unit-of-repetition: `.asymmetricUnit` is a display-time filter applied
+        // by the renderer (no atom-set mutation here), so this is a pure mirror
+        // even when the supercell is (1,1,1).
+        scene.repetitionMode = state.repetitionMode
+        scene.cellRodsEnabled = state.cellRodsEnabled
+        scene.cellRodFactor = state.cellRodFactor
+        scene.unicolorBonds = state.unicolorBonds
+        scene.unicolorBondHex = state.unicolorBondHex
+        scene.tessellationFactor = state.tessellationFactor
         let reciprocalPresentationBefore = reciprocalPresentationSignature(for: scene)
         // supercell — compare the (n1,n2,n3) tuple, not just total, so changing
         // replication DIRECTION (e.g. 2×1×1 → 1×2×1, same total) re-widen happens.
@@ -3491,6 +3570,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 state.surfaceVacuum = currentVacuum
             }
         }
+        // H-bond pair list: derived from the FINAL displayed atom set, so it runs
+        // after supercell/slab/vacuum have settled and after scene.hbondSettings
+        // was mirrored above.
+        syncHbondPairs()
         // Reframe when crossing the 2D↔3D boundary — after supercell/slab
         // mutations so the camera fits the final geometry.
         if !exitingReciprocalEdit {
@@ -3568,6 +3651,80 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // recomputes on every sidebar/scene change without a debounce.
         updatePowderXRD()
         setNeedsRender()
+    }
+
+    // MARK: - H-bond lifecycle
+
+    /// Identity of the inputs an `HbondAnalysis.detect` result depends on: the
+    /// detection criteria plus the displayed atom set. Positions are folded into
+    /// an FNV-1a hash rather than compared element-wise so the check stays O(n)
+    /// with no per-sync allocation of a second atom array.
+    private struct HbondFingerprint: Equatable {
+        var settings: HbondSettings
+        var atomCount: Int
+        var atomHash: UInt64
+        var cellHash: UInt64
+    }
+
+    /// Fold the displayed geometry into a cheap 64-bit digest. Distinct atom
+    /// sets can theoretically collide, but only a collision *plus* an identical
+    /// count and criteria would skip a recomputation, and every wholesale scene
+    /// replacement clears the fingerprint outright.
+    private static func hbondFingerprint(for scene: Scene) -> HbondFingerprint {
+        var atomHash: UInt64 = 0xcbf29ce484222325
+        func mix(_ bits: UInt32) {
+            atomHash = (atomHash ^ UInt64(bits)) &* 0x100000001b3
+        }
+        for atom in scene.atoms {
+            mix(atom.coord.x.bitPattern)
+            mix(atom.coord.y.bitPattern)
+            mix(atom.coord.z.bitPattern)
+            mix(UInt32(truncatingIfNeeded: atom.atomicNumber))
+        }
+        var cellHash: UInt64 = 0xcbf29ce484222325
+        if let cell = scene.cell {
+            for v in [cell.a, cell.b, cell.c] {
+                for c in [v.x, v.y, v.z] {
+                    cellHash = (cellHash ^ UInt64(c.bitPattern)) &* 0x100000001b3
+                }
+            }
+        }
+        cellHash = (cellHash ^ UInt64(truncatingIfNeeded: scene.periodicDim)) &* 0x100000001b3
+        return HbondFingerprint(settings: scene.hbondSettings,
+                                atomCount: scene.atoms.count,
+                                atomHash: atomHash,
+                                cellHash: cellHash)
+    }
+
+    /// Keep `scene.hbondPairs` consistent with `scene.hbondSettings` and the
+    /// displayed atoms. Disabled ⇒ the list is emptied (so the renderer draws
+    /// nothing and no stale pairs persist into a saved state). Enabled ⇒ the
+    /// list is recomputed only when the criteria or the atom set actually
+    /// changed. `HbondAnalysis.detect` is non-trapping and enforces its own atom
+    /// cap, returning [] rather than failing, so no additional guard is needed.
+    ///
+    /// Call sites: the end of the `syncFromState` mirror (after supercell, slab,
+    /// and vacuum have produced the final atom set) and every path that installs
+    /// a replacement scene (file open, frame reload, in-scene transforms), which
+    /// clear the fingerprint via `hbondGeometryDidChange()` first.
+    private func syncHbondPairs() {
+        guard scene.hbondSettings.enabled else {
+            lastHbondFingerprint = nil
+            if !scene.hbondPairs.isEmpty { scene.hbondPairs = [] }
+            return
+        }
+        let fingerprint = MainWindowController.hbondFingerprint(for: scene)
+        guard fingerprint != lastHbondFingerprint else { return }
+        lastHbondFingerprint = fingerprint
+        scene.hbondPairs = HbondAnalysis.detect(scene: scene)
+    }
+
+    /// Invalidate the cached H-bond fingerprint after a wholesale scene
+    /// replacement, then recompute for the newly installed atoms. Mirrors
+    /// `coordinationGeometryDidChange()`'s role for the coordination lifecycle.
+    private func hbondGeometryDidChange() {
+        lastHbondFingerprint = nil
+        syncHbondPairs()
     }
 
     // MARK: - Coordination lifecycle
@@ -4408,6 +4565,22 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         next.showForces = scene.showForces
         next.forceScale = scene.forceScale
         next.lighting = state.lighting
+        // Tier-1 appearance carries across a frame reload exactly like the other
+        // display settings above: a freshly parsed frame starts from Scene's
+        // defaults, so without this the user's lights/colors/quality settings
+        // would silently reset on every scrub. hbondPairs are NOT carried — they
+        // index the previous frame's atoms — they are re-derived after install.
+        next.lights = scene.lights
+        next.hbondSettings = scene.hbondSettings
+        next.molecularSurfaceSettings = scene.molecularSurfaceSettings
+        next.atomColorScheme = scene.atomColorScheme
+        next.elementOverrides = scene.elementOverrides
+        next.repetitionMode = scene.repetitionMode
+        next.cellRodsEnabled = scene.cellRodsEnabled
+        next.cellRodFactor = scene.cellRodFactor
+        next.unicolorBonds = scene.unicolorBonds
+        next.unicolorBondHex = scene.unicolorBondHex
+        next.tessellationFactor = scene.tessellationFactor
         next.backgroundType = state.backgroundType
         next.background = state.backgroundHex
         next.backgroundBottom = state.backgroundBottomHex
@@ -4535,6 +4708,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // suppress the invalidation render.
         invalidateComparisonRequest(render: false)
         coordinationGeometryDidChange()
+        // The frame's atom set replaced the previous one: the carried settings are
+        // already in `scene`, so mirror them back to the sidebar (a no-op in the
+        // steady state) and re-derive the H-bond pairs for the new coordinates.
+        mirrorTier1AppearanceToState(from: scene)
+        hbondGeometryDidChange()
         refreshAtomTable()
         setNeedsRender()
     }

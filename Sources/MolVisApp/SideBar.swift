@@ -26,6 +26,196 @@ struct SideBar: View {
     // external route mutation from clobbering a draft in progress while focused.
     @FocusState private var editorFocused: Bool
 
+    // MARK: - Tier-1 rendering control helpers (instance members)
+
+    /// Binding driving the segmented light-count picker. Maps the picker's 1...6 value
+    /// onto `state.lights`: value 1 means the legacy single-light mode (empty array);
+    /// values 2...6 pad/trim the array to that many `SceneLightSource` entries.
+    private var lightCountBinding: Binding<Int> {
+        Binding(
+            get: { max(1, state.lights.count) },
+            set: { n in
+                let clamped = min(6, max(1, n))
+                if clamped == 1 {
+                    state.lights = []
+                    return
+                }
+                var arr = state.lights
+                if arr.count < clamped {
+                    arr.append(contentsOf: Array(repeating: SceneLightSource(), count: clamped - arr.count))
+                } else if arr.count > clamped {
+                    arr = Array(arr.prefix(clamped))
+                }
+                state.lights = arr
+            })
+    }
+
+    /// One editable row in the multi-light rig. Reads/writes `state.lights[index]`.
+    @ViewBuilder
+    private func lightSourceRow(_ index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Light \(index + 1)").font(.caption).bold()
+                Spacer()
+                Toggle("On", isOn: Binding(
+                    get: { state.lights[index].enabled },
+                    set: { var a = state.lights; a[index].enabled = $0; state.lights = a }))
+                    .labelsHidden()
+            }
+            Slider(value: Binding(
+                get: { state.lights[index].azimuth },
+                set: { var a = state.lights; a[index].azimuth = $0; state.lights = a }),
+                in: 0...360) {
+                Text("Azimuth: \(Int(state.lights[index].azimuth))°")
+            }
+            Slider(value: Binding(
+                get: { state.lights[index].elevation },
+                set: { var a = state.lights; a[index].elevation = $0; state.lights = a }),
+                in: -90...90) {
+                Text("Elevation: \(Int(state.lights[index].elevation))°")
+            }
+            Slider(value: Binding(
+                get: { state.lights[index].intensity },
+                set: { var a = state.lights; a[index].intensity = $0; state.lights = a }),
+                in: 0...3) {
+                Text("Intensity: \(state.lights[index].intensity, specifier: "%.2f")")
+            }
+            HStack {
+                Text("Color").font(.caption2).foregroundColor(.secondary)
+                TextField("hex", text: Binding(
+                    get: { state.lights[index].colorHex },
+                    set: { var a = state.lights; a[index].colorHex = $0; state.lights = a }))
+                    .frame(width: 90)
+                ColorPicker("", selection: Binding(
+                    get: { Color(hex: state.lights[index].colorHex) ?? .white },
+                    set: { var a = state.lights; a[index].colorHex = $0.hexString; state.lights = a }),
+                    supportsOpacity: false)
+                    .labelsHidden()
+                    .frame(width: 44, height: 20)
+            }
+        }
+    }
+
+    /// Compact list of currently-overridden elements (tappable to re-edit).
+    @ViewBuilder
+    private var elementOverrideList: some View {
+        let keys = state.elementOverrides.keys.sorted()
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(keys, id: \.self) { z in
+                    Button(action: { editingElement = z; showElementEditor = true }) {
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(Color(hex: state.elementOverrides[z]?.colorHex ?? "#808080") ?? .gray)
+                                .frame(width: 10, height: 10)
+                            Text(ElementTable.symbol(z)).font(.system(.caption, design: .monospaced))
+                        }
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    /// The element-override editor: a sheet with a LazyVGrid of all 118 elements to pick
+    /// from, plus an editor for the selected element bound into state.elementOverrides.
+    @ViewBuilder
+    private func elementEditorSheet() -> some View {
+        let z = editingElement ?? 1
+        NavigationStack {
+            VStack(spacing: 0) {
+                elementEditorForm(z)
+                Divider()
+                LazyVGrid(columns: Array(repeating: GridItem(.adaptive(minimum: 40)), count: 12), spacing: 4) {
+                    ForEach(1...118, id: \.self) { n in
+                        Button(action: { editingElement = n }) {
+                            Text(ElementTable.symbol(n))
+                                .font(.system(size: 11))
+                                .frame(width: 38, height: 26)
+                                .background(n == z ? Color.accentColor.opacity(0.3) : Color.gray.opacity(0.12))
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(8)
+            }
+            .navigationTitle("Override \(ElementTable.symbol(z))")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { showElementEditor = false; editingElement = nil }
+                }
+            }
+        }
+        .frame(minWidth: 520, minHeight: 420)
+    }
+
+    @ViewBuilder
+    private func elementEditorForm(_ z: Int) -> some View {
+        let ov = Binding(
+            get: { state.elementOverrides[z] ?? ElementOverride() },
+            set: { state.elementOverrides[z] = $0 })
+        Form {
+            Section {
+                HStack {
+                    Text("Color").font(.caption2).foregroundColor(.secondary)
+                    TextField("hex", text: Binding(
+                        get: { ov.wrappedValue.colorHex ?? "" },
+                        set: { ov.wrappedValue.colorHex = $0.isEmpty ? nil : $0 })).frame(width: 90)
+                    ColorPicker("", selection: Binding(
+                        get: { Color(hex: ov.wrappedValue.colorHex ?? "#808080") ?? .gray },
+                        set: { ov.wrappedValue.colorHex = $0.hexString }),
+                        supportsOpacity: false)
+                        .labelsHidden().frame(width: 44, height: 20)
+                }
+            }
+            Section {
+                HStack {
+                    Text("Covalent")
+                    Slider(value: Binding(
+                        get: { ov.wrappedValue.covalentRadius ?? ElementTable.covalentRadius(z) },
+                        set: { ov.wrappedValue.covalentRadius = $0 }),
+                        in: 0.2...3.0, step: 0.01) {
+                        Text("\(ov.wrappedValue.covalentRadius ?? ElementTable.covalentRadius(z), specifier: "%.2f") Å")
+                    }
+                }
+                HStack {
+                    Text("vdW")
+                    Slider(value: Binding(
+                        get: { ov.wrappedValue.vdwRadius ?? ElementTable.vdwRadius(z) },
+                        set: { ov.wrappedValue.vdwRadius = $0 }),
+                        in: 0.5...4.0, step: 0.01) {
+                        Text("\(ov.wrappedValue.vdwRadius ?? ElementTable.vdwRadius(z), specifier: "%.2f") Å")
+                    }
+                }
+            }
+            Section {
+                TextField("Label override", text: Binding(
+                    get: { ov.wrappedValue.labelOverride ?? "" },
+                    set: { ov.wrappedValue.labelOverride = $0.isEmpty ? nil : $0 }))
+                HStack {
+                    Text("Font scale")
+                    Slider(value: Binding(
+                        get: { ov.wrappedValue.fontScale ?? 1.0 },
+                        set: { ov.wrappedValue.fontScale = $0 }),
+                        in: 0.5...2.0, step: 0.05) {
+                        Text("\(ov.wrappedValue.fontScale ?? 1.0, specifier: "%.2f")×")
+                    }
+                }
+            }
+            Section {
+                Button("Clear Override", role: .destructive) {
+                    state.elementOverrides[z] = nil
+                }
+                .disabled(state.elementOverrides[z] == nil)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(.horizontal, 8)
+    }
+
     // Collapsed-state for each major sidebar section, persisted in UserDefaults
     // under CollapsibleSidebarSection.<case>.rawValue. A missing key defaults to
     // expanded (true); toggling writes the new value straight through.
@@ -49,6 +239,16 @@ struct SideBar: View {
     @AppStorage(CollapsibleSidebarSection.clipping.rawValue) private var clippingExpanded = true
     @AppStorage(CollapsibleSidebarSection.region.rawValue) private var regionExpanded = true
     @AppStorage(CollapsibleSidebarSection.xrd.rawValue) private var xrdExpanded = true
+    @AppStorage(CollapsibleSidebarSection.hBonds.rawValue) private var hBondsExpanded = true
+    @AppStorage(CollapsibleSidebarSection.molecularSurface.rawValue) private var molecularSurfaceExpanded = true
+    @AppStorage(CollapsibleSidebarSection.elementOverrides.rawValue) private var elementOverridesExpanded = true
+    @AppStorage(CollapsibleSidebarSection.repetition.rawValue) private var repetitionExpanded = true
+    @AppStorage(CollapsibleSidebarSection.rendering.rawValue) private var renderingExpanded = true
+    @AppStorage(CollapsibleSidebarSection.lighting.rawValue) private var lightingExpanded = true
+    // Local state for the element-override editor sheet. `editingElement` holds the
+    // atomic number currently being edited; nil when the sheet is dismissed.
+    @State private var editingElement: Int? = nil
+    @State private var showElementEditor = false
 
     var body: some View {
         Form {
@@ -89,6 +289,7 @@ struct SideBar: View {
         .onChange(of: editorFocused) { _, focused in
             if !focused { commitEdits() }
         }
+        .sheet(isPresented: $showElementEditor) { elementEditorSheet() }
     }
 
     // The full Form body is extracted to keep each builder below the type-checker's
@@ -202,6 +403,44 @@ struct SideBar: View {
                 Slider(value: $state.lighting.shininess, in: 1...128) { Text("Shininess: \(Int(state.lighting.shininess))") }
                 Slider(value: $state.lighting.azimuth, in: degRange) { Text("Light Azimuth: \(Int(state.lighting.azimuth))°") }
                 Slider(value: $state.lighting.elevation, in: -90...90) { Text("Light Elevation: \(Int(state.lighting.elevation))°") }
+                // --- Rendering --------------------------------------------------
+                // Geometry tessellation, crystal-cell rods, atom color scheme, and
+                // unicolor-bond controls. Each maps straight through to a Scene field.
+                CollapsibleSection(title: "Rendering", isExpanded: $renderingExpanded) {
+                    Picker("Tessellation", selection: $state.tessellationFactor) {
+                        Text("Off").tag(0)
+                        Text("16").tag(16)
+                        Text("24").tag(24)
+                        Text("32").tag(32)
+                        Text("48").tag(48)
+                    }
+                    .pickerStyle(.menu)
+                    Toggle("Crystal Cell Rods", isOn: $state.cellRodsEnabled)
+                    if state.cellRodsEnabled {
+                        Slider(value: $state.cellRodFactor, in: 0.1...1.0) {
+                            Text("Rod Factor: \(state.cellRodFactor, specifier: "%.2f")")
+                        }
+                    }
+                    Picker("Color Scheme", selection: $state.atomColorScheme) {
+                        ForEach(AtomColorScheme.allCases, id: \.self) {
+                            Text($0.label).tag($0)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Toggle("Unicolor Bonds", isOn: $state.unicolorBonds)
+                    if state.unicolorBonds {
+                        HStack {
+                            Text("Bond Color")
+                            TextField("hex", text: $state.unicolorBondHex).frame(width: 90)
+                            ColorPicker("", selection: Binding(
+                                get: { Color(hex: state.unicolorBondHex) ?? .gray },
+                                set: { state.unicolorBondHex = $0.hexString }),
+                                supportsOpacity: false)
+                                .labelsHidden()
+                                .frame(width: 44, height: 20)
+                        }
+                    }
+                }
                 // MSAA anti-aliasing. The picker sets the render-target sample
                 // count directly (Off=1, 2x=2, 4x=4, 8x=8 samples).
                 Picker("MSAA", selection: $state.msaaSampleCount) {
@@ -246,6 +485,102 @@ struct SideBar: View {
                 .pickerStyle(.menu)
                 .onChange(of: selectedPreset) { _, newValue in
                     state.applyPreset(newValue)
+                }
+            }
+            // --- Lighting: multi-light rig ----------------------------------
+            // The single-light azimuth/elevation sliders stay for the default
+            // (lights empty) mode; a segmented count selector swaps in N per-source
+            // rows when lights.count > 1. Empty lights = legacy single light.
+            CollapsibleSection(title: "Lighting", isExpanded: $lightingExpanded) {
+                Picker("Light Count", selection: lightCountBinding) {
+                    ForEach(1...6, id: \.self) { Text("\($0)").tag($0) }
+                }
+                .pickerStyle(.segmented)
+                if state.lights.isEmpty {
+                    Slider(value: $state.lighting.azimuth, in: degRange) { Text("Light Azimuth: \(Int(state.lighting.azimuth))°") }
+                    Slider(value: $state.lighting.elevation, in: -90...90) { Text("Light Elevation: \(Int(state.lighting.elevation))°") }
+                } else {
+                    ForEach(Array(state.lights.enumerated()), id: \.offset) { index, _ in
+                        lightSourceRow(index)
+                    }
+                }
+            }
+            // --- Repetition (crystal only) ----------------------------------
+            // Unit-cell vs translational-asymmetric-unit display of the base cell.
+            if state.isCrystal {
+                CollapsibleSection(title: "Repetition", isExpanded: $repetitionExpanded) {
+                    Picker("Mode", selection: $state.repetitionMode) {
+                        ForEach(RepetitionMode.allCases, id: \.self) {
+                            Text($0.label).tag($0)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+            }
+            // --- H-Bonds (crystal only) -------------------------------------
+            // D–H···A bond detection criteria + display. Requires a cell.
+            if state.isCrystal {
+                CollapsibleSection(title: "H-Bonds", isExpanded: $hBondsExpanded) {
+                    Toggle("Enforce", isOn: $state.hbondSettings.enabled)
+                    Slider(value: $state.hbondSettings.maxDistance, in: 1.5...4.0, step: 0.1) {
+                        Text("H…A max: \(state.hbondSettings.maxDistance, specifier: "%.1f") Å")
+                    }
+                    Slider(value: $state.hbondSettings.minAngleDegrees, in: 90...180) {
+                        Text("Min D−H…A angle: \(Int(state.hbondSettings.minAngleDegrees))°")
+                    }
+                    HStack {
+                        Text("Color")
+                        TextField("hex", text: $state.hbondSettings.colorHex).frame(width: 90)
+                        ColorPicker("", selection: Binding(
+                            get: { Color(hex: state.hbondSettings.colorHex) ?? .white },
+                            set: { state.hbondSettings.colorHex = $0.hexString }),
+                            supportsOpacity: false)
+                            .labelsHidden()
+                            .frame(width: 44, height: 20)
+                    }
+                }
+            }
+            // --- Molecular Surface ------------------------------------------
+            // Solvent-accessible style surface. Available whenever the scene has
+            // atoms (molecules always; crystals too).
+            if state.structureSummary?.atomCount ?? 0 > 0 {
+                CollapsibleSection(title: "Molecular Surface", isExpanded: $molecularSurfaceExpanded) {
+                    Toggle("Enable", isOn: $state.molecularSurfaceSettings.enabled)
+                    if state.molecularSurfaceSettings.enabled {
+                        Slider(value: $state.molecularSurfaceSettings.probeRadius, in: 0.5...3.0, step: 0.1) {
+                            Text("Probe Radius: \(state.molecularSurfaceSettings.probeRadius, specifier: "%.1f") Å")
+                        }
+                        Slider(value: $state.molecularSurfaceSettings.opacity, in: 0.1...1.0) {
+                            Text("Opacity: \(state.molecularSurfaceSettings.opacity, specifier: "%.2f")")
+                        }
+                        HStack {
+                            Text("Color")
+                            TextField("hex", text: $state.molecularSurfaceSettings.colorHex).frame(width: 90)
+                            ColorPicker("", selection: Binding(
+                                get: { Color(hex: state.molecularSurfaceSettings.colorHex) ?? .white },
+                                set: { state.molecularSurfaceSettings.colorHex = $0.hexString }),
+                                supportsOpacity: false)
+                                .labelsHidden()
+                                .frame(width: 44, height: 20)
+                        }
+                    }
+                }
+            }
+            // --- Element Overrides ------------------------------------------
+            // Per-element color/radius/label/font edits, keyed by atomic number.
+            // The "Periodic Table…" button opens a sheet to pick any element to edit.
+            if state.structureSummary?.atomCount ?? 0 > 0 {
+                CollapsibleSection(title: "Element Overrides", isExpanded: $elementOverridesExpanded) {
+                    if state.elementOverrides.isEmpty {
+                        Text("No overrides").font(.caption).foregroundColor(.secondary)
+                    } else {
+                        elementOverrideList
+                    }
+                    Button("Periodic Table…") {
+                        if editingElement == nil { editingElement = 1 }
+                        showElementEditor = true
+                    }
+                    .buttonStyle(.bordered)
                 }
             }
             // --- Stereo / anaglyph -------------------------------------------

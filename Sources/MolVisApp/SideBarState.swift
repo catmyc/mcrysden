@@ -380,6 +380,36 @@ final class SideBarState: ObservableObject {
     @Published var aoQuality: Int = 2 { didSet { onChange?() } }
     /// Soft-shadow quality level (0 = off, 1 = low, 2 = medium, 3 = high).
     @Published var shadowQuality: Int = 2 { didSet { onChange?() } }
+    // --- Tier-1 rendering appearance + display controls ------------------------
+    // Mirrors Scene fields; each change fires onChange so the controller's
+    // syncFromState pushes them into the scene for render + persistence.
+    /// Geometry tessellation quality: 0 = Off (legacy fixed counts, byte-identical
+    /// output); 16/24/32/48 scale sphere lat/lon and cylinder radial segments.
+    @Published var tessellationFactor: Int = 0 { didSet { onChange?() } }
+    /// Crystal cell drawn as lit rods (XCrySDen "Crystal Cells As Rods") instead
+    /// of unlit lines.
+    @Published var cellRodsEnabled: Bool = false { didSet { onChange?() } }
+    /// Cell-rod thickness multiplier (× hydrogen covalent radius).
+    @Published var cellRodFactor: Float = 0.35 { didSet { onChange?() } }
+    /// Active atom color scheme.
+    @Published var atomColorScheme: AtomColorScheme = .elemental { didSet { onChange?() } }
+    /// Unicolor bonds: all bonds rendered in one color instead of per-atom.
+    @Published var unicolorBonds: Bool = false { didSet { onChange?() } }
+    /// Hex color used when unicolorBonds is on.
+    @Published var unicolorBondHex: String = "#808080" { didSet { onChange?() } }
+    /// H-bond detection/display settings.
+    @Published var hbondSettings: HbondSettings = HbondSettings() { didSet { onChange?() } }
+    /// Molecular (solvent-accessible style) surface settings.
+    @Published var molecularSurfaceSettings: MolecularSurfaceSettings = MolecularSurfaceSettings() {
+        didSet { onChange?() }
+    }
+    /// Unit-cell repetition display mode.
+    @Published var repetitionMode: RepetitionMode = .unitCell { didSet { onChange?() } }
+    /// Per-element display overrides keyed by atomic number; empty = inherit CPK.
+    @Published var elementOverrides: [Int: ElementOverride] = [:] { didSet { onChange?() } }
+    /// Multi-light rig. Empty = legacy single light (byte-identical output);
+    /// non-empty uses these sources in the renderer.
+    @Published var lights: [SceneLightSource] = [] { didSet { onChange?() } }
     /// Human-readable force/energy/stress readout for the Forces sidebar section,
     /// set by the controller from scene.forceSet on every render. Not @Published:
     /// it changes only when the scene reloads, so a plain assignment suffices.
@@ -664,6 +694,17 @@ final class SideBarState: ObservableObject {
         }
         surfaceVacuumAdjustable = scene.periodicDim == 2
             && scene.cell?.isCZParallel == true && scene.surfaceSlabExtent != nil
+        tessellationFactor = scene.tessellationFactor
+        cellRodsEnabled = scene.cellRodsEnabled
+        cellRodFactor = scene.cellRodFactor
+        atomColorScheme = scene.atomColorScheme
+        unicolorBonds = scene.unicolorBonds
+        unicolorBondHex = scene.unicolorBondHex
+        hbondSettings = scene.hbondSettings
+        molecularSurfaceSettings = scene.molecularSurfaceSettings
+        repetitionMode = scene.repetitionMode
+        elementOverrides = scene.elementOverrides
+        lights = scene.lights
         onChange = saved
     }
 
@@ -1138,6 +1179,12 @@ enum CollapsibleSidebarSection: String, CaseIterable {
     case volumeSlices = "SideBarCollapsed.volumeSlices"
     case stereo = "SideBarCollapsed.stereo"
     case xrd = "SideBarCollapsed.xrd"
+    case hBonds = "SideBarCollapsed.hBonds"
+    case molecularSurface = "SideBarCollapsed.molecularSurface"
+    case elementOverrides = "SideBarCollapsed.elementOverrides"
+    case repetition = "SideBarCollapsed.repetition"
+    case rendering = "SideBarCollapsed.rendering"
+    case lighting = "SideBarCollapsed.lighting"
 
     var defaultsKey: String { rawValue }
 }
