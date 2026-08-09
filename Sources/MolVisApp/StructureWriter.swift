@@ -3,10 +3,15 @@ import Foundation
 import simd
 
 /// A structure-export format. `label`/`fileExtension` feed the export UI's
-/// picker and the on-disk filename; the writer matches each format exactly to
-/// what its parser accepts so files round-trip.
+/// picker and the on-disk filename; the writer matches each format to what
+/// makes it usable in the target program. Only XSF/CIF/POSCAR/XYZ/QE and
+/// WIEN2k struct have in-app readers and therefore round-trip; the CRYSTAL
+/// d12 variants are output-only (their reader side is the CRYSTAL band/dos
+/// analysis parsers, not a structure loader).
 enum StructureExportFormat: String, CaseIterable, Equatable {
     case xsf, cif, poscar, xyz, qeInput
+    case wienStruct
+    case crystal95, crystal98, crystal03, crystalNew
     var label: String {
         switch self {
         case .xsf: return "XSF"
@@ -14,6 +19,11 @@ enum StructureExportFormat: String, CaseIterable, Equatable {
         case .poscar: return "POSCAR"
         case .xyz: return "XYZ"
         case .qeInput: return "QE PWscf input"
+        case .wienStruct: return "WIEN2k struct"
+        case .crystal95: return "CRYSTAL-95 input"
+        case .crystal98: return "CRYSTAL-98 input"
+        case .crystal03: return "CRYSTAL-03 input"
+        case .crystalNew: return "New CRYSTAL input"
         }
     }
     var fileExtension: String {
@@ -23,6 +33,8 @@ enum StructureExportFormat: String, CaseIterable, Equatable {
         case .poscar: return "poscar"
         case .xyz: return "xyz"
         case .qeInput: return "in"
+        case .wienStruct: return "struct"
+        case .crystal95, .crystal98, .crystal03, .crystalNew: return "d12"
         }
     }
 }
@@ -34,14 +46,12 @@ enum StructureWriteError: Error, Equatable, CustomStringConvertible {
     case requiresCrystal(String)
     case nonFiniteGeometry
     case singularCell
-    case invalidElement(Int)
     var description: String {
         switch self {
         case .emptyAtoms: return "no atoms to export"
         case .requiresCrystal(let name): return "\(name) export requires a unit cell"
         case .nonFiniteGeometry: return "structure contains a non-finite value"
         case .singularCell: return "unit cell is singular"
-        case .invalidElement(let i): return "atom \(i) has an invalid atomic number"
         }
     }
 }
@@ -58,6 +68,12 @@ enum StructureWriter {
     /// Lower-level variant for callers without a Scene.
     static func write(atoms: [Atom], cell: Cell?, title: String, isCrystal: Bool,
                       periodicDim: Int, as format: StructureExportFormat) throws -> String {
+        // "New CRYSTAL input" is an empty template: no atoms, no cell, no geometry
+        // checks. Emit it before the empty-atoms guard so the scene need not carry a
+        // real structure.
+        if format == .crystalNew {
+            return writeCRYSTALNew(title: title)
+        }
         guard !atoms.isEmpty else { throw StructureWriteError.emptyAtoms }
         // Skip atoms with an invalid atomic number (Z outside 1...118 — e.g. a
         // dummy "X" atom with Z=0 or an unrecognized symbol) rather than fail the
@@ -93,6 +109,19 @@ enum StructureWriter {
             let cell = try requireCell(cell, format)
             try validateCell(cell)
             return writeQE(exportAtoms, cell: cell)
+        case .wienStruct:
+            let cell = try requireCell(cell, format)
+            try validateCell(cell)
+            return writeWIEN2kStruct(exportAtoms, cell: cell, title: title)
+        case .crystal95, .crystal98, .crystal03:
+            let cell = try requireCell(cell, format)
+            try validateCell(cell)
+            let version: String = format == .crystal95 ? "95" : format == .crystal98 ? "98" : "03"
+            return writeCRYSTAL(exportAtoms, cell: cell, title: title, version: version)
+        case .crystalNew:
+            // Unreachable: handled above the empty-atoms guard, but kept for
+            // exhaustiveness so the switch stays valid if the early path moves.
+            return writeCRYSTALNew(title: title)
         }
     }
 
@@ -233,6 +262,77 @@ enum StructureWriter {
         return out
     }
 
+    // MARK: - WIEN2k .struct
+
+    /// WIEN2k `.struct` crystal structure. Emits the dialect `loadWIEN2kStruct`
+    /// reads back: title, primitive lattice line, RELA mode line, cell params
+    /// (Bohr for lengths, degrees for angles), then per-atom ATOM/MULT/element
+    /// records in fractional coordinates. Lengths are divided by the Bohr->Angstrom
+    /// factor so the reader's multiplication round-trips exactly.
+    private static func writeWIEN2kStruct(_ atoms: [Atom], cell: Cell, title: String) -> String {
+        let b2a = 0.52917721067
+        let (a, b, c) = cellLengths(cell)
+        let (alpha, beta, gamma) = cellAngles(cell)
+        var out = "\(sanitizeTitle(title))\n"
+        out += "P        LATTICE,NONEQUIV. ATOMS  \(atoms.count)\n"
+        out += "MODE OF CALC=RELA\n"
+        out += "\(fmt(a / b2a)) \(fmt(b / b2a)) \(fmt(c / b2a)) \(fmt(alpha)) \(fmt(beta)) \(fmt(gamma))\n"
+        let inv = cellInverse(cell)
+        for (i, atom) in atoms.enumerated() {
+            let f = inv * SIMD3(Double(atom.coord.x), Double(atom.coord.y), Double(atom.coord.z))
+            let fx = String(format: "%.8f", f.x)
+            let fy = String(format: "%.8f", f.y)
+            let fz = String(format: "%.8f", f.z)
+            out += "ATOM= \(i + 1): X=\(fx) Y=\(fy) Z=\(fz)\n"
+            out += "       MULT= 1  ISPLIT= 8\n"
+            let sym = atom.label.isEmpty ? ElementTable.symbol(atom.atomicNumber) : atom.label
+            out += "\(sym)    NPT=  781  R0=0.0000500000 RMT= 0.00005     Z: \(atom.atomicNumber)\n"
+        }
+        return out
+    }
+
+    // MARK: - CRYSTAL input
+
+    /// CRYSTAL-95/98/03 input skeleton. This is a geometry-transfer form, not a
+    /// runnable quantum input: it carries the lattice (Angstrom + degrees) and the
+    /// fractional atomic layout so a CRYSTAL user can graft in keywords. Layout:
+    ///   <title>
+    ///   CRYSTAL <version>
+    ///   LATTICE
+    ///   <a> <b> <c> <alpha> <beta> <gamma>
+    ///   FRACCOORD
+    ///   <symbol> <fx> <fy> <fz>
+    ///   END
+    private static func writeCRYSTAL(_ atoms: [Atom], cell: Cell, title: String, version: String) -> String {
+        let (a, b, c) = cellLengths(cell)
+        let (alpha, beta, gamma) = cellAngles(cell)
+        var out = "\(sanitizeTitle(title))\n"
+        out += "CRYSTAL \(version)\n"
+        out += "LATTICE\n"
+        out += "\(fmt(a)) \(fmt(b)) \(fmt(c)) \(fmt(alpha)) \(fmt(beta)) \(fmt(gamma))\n"
+        out += "FRACCOORD\n"
+        let inv = cellInverse(cell)
+        for atom in atoms {
+            let f = inv * SIMD3(Double(atom.coord.x), Double(atom.coord.y), Double(atom.coord.z))
+            let sym = atom.label.isEmpty ? ElementTable.symbol(atom.atomicNumber) : atom.label
+            out += "\(sym) \(frac(f.x)) \(frac(f.y)) \(frac(f.z))\n"
+        }
+        out += "END\n"
+        return out
+    }
+
+    /// "New CRYSTAL input" empty template — mirrors XCrySDen's fresh-file form.
+    /// Carries only the title and an empty lattice block; no atoms and no
+    /// FRACCOORD block.
+    private static func writeCRYSTALNew(title: String) -> String {
+        var out = "\(sanitizeTitle(title))\n"
+        out += "CRYSTAL NEW\n"
+        out += "LATTICE\n"
+        out += "\(fmt(0)) \(fmt(0)) \(fmt(0)) \(fmt(90)) \(fmt(90)) \(fmt(90))\n"
+        out += "END\n"
+        return out
+    }
+
     // MARK: - Geometry helpers
 
     private static func cellLengths(_ cell: Cell) -> (Double, Double, Double) {
@@ -269,3 +369,7 @@ private func angle(_ u: SIMD3<Float>, _ v: SIMD3<Float>) -> Double {
 private func row(_ v: SIMD3<Float>) -> String { "\(fmt(Double(v.x))) \(fmt(Double(v.y))) \(fmt(Double(v.z)))" }
 
 private func fmt(_ v: Double) -> String { String(format: "%.6f", v) }
+
+/// 8-decimal fractional coordinate — enough precision to round-trip Å positions
+/// through the cell inverse within ~1e-8.
+private func frac(_ v: Double) -> String { String(format: "%.8f", v) }

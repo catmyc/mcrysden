@@ -2,6 +2,22 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] — 2026-08-09
+
+### Added
+
+- **CRYSTAL band/DOS import** — readers for CRYSTAL properties files (`fort.9`/`band` units and `fort.8`/`doss` units), gated on their canonical headers, feeding the band-structure and DOS analysis graphs; `--crystal-band`/`--crystal-dos` force-format flags.
+- **WIEN2k `.struct` export** — full-lattice WIEN2k struct writer (Bohr units, P LATTICE header, non-equivalent atoms); `--format struct` / `--convert out.struct` in the CLI, plus the File menu path.
+- **CRYSTAL input export** — `Save CRYSTAL-95/98/03 input` (LATTICE + FRACCOORD text) and `New CRYSTAL input` (empty template, exportable without a loaded structure).
+- **Gaussian Z-matrix import** — `.gzmat`/`zmat` files (including generic and Cartesian indicators) via a native small-parser; `--gzmat` force flag; malformed coordinate rows fail loudly instead of truncating.
+- **XCrySDen view-script save/load** — File menu `Save XCrySDen Script…` writes a `.tcl` view file (rotation/zoom/background/bonds/cell); opening a `.tcl` applies it to the current view, skipping unknown commands with a report.
+
+### Fixed
+
+- CRYSTAL DOS gate now accepts canonical `DENSITY OF STATES` headers (incl. `…PER ATOM`/`…PERCELL`) while still rejecting `BAND STRUCTURE` content; integrated-DOS (`DOSS(INTEGRATED)`) columns are dropped; band files tolerate leading `E(F)=` lines.
+- Filename sniffing for extension-less CRYSTAL files (`band`, `doss`, `fort.8/9`) runs only when the extension is unrecognized, so `band.xyz`/`doss.pdb` keep their real formats.
+- `--convert`/`--convert-all` accept `struct` and `d12` output targets (were dead cases).
+
 ## [1.2.2] — 2026-08-08
 
 ### Added

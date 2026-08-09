@@ -1369,7 +1369,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     /// Present a save panel and write the structure in the chosen format.
     func exportStructure(_ format: StructureExportFormat) {
-        guard !scene.atoms.isEmpty else {
+        guard !scene.atoms.isEmpty || format == .crystalNew else {
             state.setStructureEditStatus("No atoms to export.")
             return
         }
@@ -1393,6 +1393,95 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             let alert = NSAlert()
             alert.alertStyle = .warning
             alert.messageText = "Structure Export Failed"
+            alert.informativeText = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.beginSheetModal(for: window)
+        }
+    }
+
+    // MARK: - XCrySDen script (.tcl) save / load
+
+    /// Mirror the live scene into the XCrySDen dialect's view-state projection.
+    /// The mapping is a documented simplification (see XcryViewState): azimuth
+    /// and elevation come from the camera-relative light direction, zoom from
+    /// the camera distance (20 Å at zoom 1), background colors from whichever
+    /// of the solid/gradient channels are active, cell/bonds from the display
+    /// toggles, and atomScale from the atom scale.
+    private func currentXcrysdenViewState() -> XcrysdenViewState {
+        XcrysdenViewState(
+            azimuth: state.lighting.azimuth,
+            elevation: state.lighting.elevation,
+            zoom: camera.distance > 0 ? 20 / camera.distance : 1,
+            backgroundTopHex: state.backgroundHex,
+            backgroundBottomHex: state.backgroundBottomHex,
+            showCell: state.showCellFrame,
+            showBonds: state.showStructure,
+            atomScale: state.atomScale)
+    }
+
+    /// Apply an XCrySDen-dialect view state to the side bar + camera. Exact
+    /// inverse of `currentXcrysdenViewState()`. Assignments go through @Published
+    /// state (whose onChange mirrors into the scene), so the camera distance is
+    /// the only field set directly.
+    private func apply(_ view: XcrysdenViewState) {
+        state.lighting.azimuth = view.azimuth
+        state.lighting.elevation = view.elevation
+        state.backgroundHex = view.backgroundTopHex
+        state.backgroundBottomHex = view.backgroundBottomHex
+        state.showCellFrame = view.showCell
+        state.showStructure = view.showBonds
+        state.atomScale = view.atomScale
+        camera.distance = view.zoom > 0 ? 20 / view.zoom : 20
+        scene.camera = camera
+        setNeedsRender()
+    }
+
+    /// File > Save XCrySDen Script…: present a save panel and write the current
+    /// view state as an XCrySDen-dialect .tcl script.
+    @objc func saveXcrysdenScript(_ sender: Any?) {
+        let panel = NSSavePanel()
+        let base = scene.title.isEmpty ? "view" : scene.title
+        panel.nameFieldStringValue = "\(base).tcl"
+        panel.allowedContentTypes = [UTType(filenameExtension: "tcl") ?? .plainText]
+        panel.canCreateDirectories = true
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            do {
+                try XcrysdenScript.save(self.currentXcrysdenViewState())
+                    .write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Script Save Failed"
+                alert.informativeText = error.localizedDescription
+                alert.addButton(withTitle: "OK")
+                alert.beginSheetModal(for: self.window)
+            }
+        }
+    }
+
+    /// Open an XCrySDK-dialect .tcl view script and apply it. Skipped lines are
+    /// reported to the console but never fail the open.
+    func loadXcrydenScript(_ url: URL) {
+        do {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            guard let (state, skipped) = XcrysdenScript.load(text, base: currentXcrysdenViewState()) else {
+                throw ParseError.parse(path: url.path, line: 0, reason: "no mapped XCrySDen script commands")
+            }
+            apply(state)
+            if !skipped.isEmpty {
+                let max = 5
+                let summary = skipped.prefix(max)
+                    .map { "line \($0.line): \($0.text)" }
+                    .joined(separator: "; ")
+                let tail = skipped.count > max ? "; +\(skipped.count - max) more" : ""
+                print("[mcrysden] xcrysden script: skipped \(skipped.count) unmapped line(s): \(summary)\(tail)")
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Script Load Failed"
             alert.informativeText = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             alert.addButton(withTitle: "OK")

@@ -192,11 +192,11 @@ Audit of XCrySDen 1.6.2's function inventory against mcrysden (≈94 items: 68 d
 - [x] **Periodic-table dialog** — labelled element palette, matching XCrySDen's element selector
 
 ### Tier 2 — format interop (no external binaries; moderate effort)
-- [ ] **CRYSTAL properties file (`fort.9`/band-DOS units)** — reader for band widths, DOS/projected DOS, and band-structure plots (feature set exists via QE band/DOS inputs; adds the CRYSTAL native path)
-- [ ] **WIEN2k `.struct` export** (currently read-only)
-- [ ] **Gaussian Z-matrix input** (`.gzmat`, via OpenBabel, per XCrySDen convention)
-- [ ] **XCrySDen scripting-file save/load compatibility** (`.tcl` dialect; mcrysden has its own line-script engine)
-- [ ] **`Save CRYSTAL-95/98/03 input`** and **`New CRYSTAL input`** file-out forms
+- [x] **CRYSTAL properties file (`fort.9`/band-DOS units)** — reader for band widths, DOS/projected DOS, and band-structure plots (feature set exists via QE band/DOS inputs; adds the CRYSTAL native path)
+- [x] **WIEN2k `.struct` export** (was read-only)
+- [x] **Gaussian Z-matrix input** (`.gzmat`, per XCrySDen convention)
+- [x] **XCrySDen scripting-file save/load compatibility** (`.tcl` dialect subset; mcrysden's line-script engine handles the rest)
+- [x] **`Save CRYSTAL-95/98/03 input`** and **`New CRYSTAL input`** file-out forms
 
 ### Tier 3 — external-job integration (depends on third-party binaries/suite; low priority)
 - [ ] **WIEN2k "Calculate & Render Density"** — interactive region pick → generate `in5`/`lstart` input → run WIEN2k → render results

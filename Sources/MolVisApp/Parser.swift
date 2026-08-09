@@ -149,7 +149,7 @@ private struct CRYSCALDedupKey: Hashable {
 /// A parser format that can be forced via a CLI flag (`--xsf`, `--pdb`, ...).
 /// When omitted, `Parser.load` falls back to the file extension.
 enum ParseFormat: Equatable {
-    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi, bands, dos
+    case xsf, axsf, xyz, pdb, pwi, pwo, cif, poscar, cube, bxsf, struct_, crystal, orca, fhi, bands, dos, gzmat, crystalBand, crystalDOS
     /// Map a lowercased path extension to a format. Returns nil if unknown.
     init?(ext: String) {
         switch ext.lowercased() {
@@ -174,6 +174,9 @@ enum ParseFormat: Equatable {
         case "fhi", "coord": self = .fhi
         case "bands": self = .bands
         case "dos", "pdos", "pdos_tot": self = .dos
+        case "gzmat", "zmat": self = .gzmat
+        case "band", "fort9": self = .crystalBand
+        case "doss", "fort8": self = .crystalDOS
         default: return nil
         }
     }
@@ -197,6 +200,21 @@ enum ParseFormat: Equatable {
         if ext == "gz", let f = ParseFormat(ext: url.deletingPathExtension().pathExtension.lowercased()) {
             return f
         }
+        // CRYSTAL band/DOS properties files historically carry no recognized
+        // extension (Fortran units 9 and 8, e.g. "fort.9"/"fortran.9", and
+        // "band"/"doss" stems). Route by full filename only as a fallback AFTER
+        // the extension table, so a file like `band.xyz` or `doss.pdb` keeps its
+        // well-known format instead of being hijacked.
+        let name = url.lastPathComponent.lowercased()
+        let fortranUnit = name.hasPrefix("fort") || name.contains("fort.")
+                          || name.hasPrefix("fortran")
+        if fortranUnit, let digits = name.split(whereSeparator: { !$0.isNumber }).last,
+           digits == "9" || digits == "8" || digits == "09" || digits == "08" {
+            if digits == "8" || digits == "08" { return .crystalDOS }
+            return .crystalBand
+        }
+        if name.hasPrefix("band") || name == "band" { return .crystalBand }
+        if name.hasPrefix("doss") || name == "doss" { return .crystalDOS }
         return nil
     }
 
@@ -325,6 +343,46 @@ enum Parser {
             out.densityOfStates = densityOfStates
             return out
         }
+        // Gaussian Z-matrix (.gzmat): internal coordinates (bonds/angles/
+        // dihedrals) converted to Cartesian by GZMatrixParser. Molecule only —
+        // no cell, no periodicity.
+        if effective == .gzmat {
+            let text = try readCappedText(url)
+            guard let atoms = GZMatrixParser.parse(text), !atoms.isEmpty else {
+                let detail = GZMatrixError.get() ?? "invalid Gaussian Z-matrix"
+                throw ParseError.parse(path: url.path, line: 0, reason: detail)
+            }
+            var out = LoadedScene()
+            out.title = url.lastPathComponent
+            out.atoms = atoms
+            out.isCrystal = false
+            out.periodicDim = 0
+            return out
+        }
+        // CRYSTAL band-structure properties file (BAND, historically fort.9):
+        // parsed in Swift into a BandStructure for the 2D grapher.
+        if effective == .crystalBand {
+            let text = try readCappedText(url)
+            guard let bands = CrystalBandParser.parse(text) else {
+                throw ParseError.parse(path: url.path, line: 0, reason: "invalid CRYSTAL band file")
+            }
+            var out = LoadedScene()
+            out.title = url.lastPathComponent
+            out.bandStructure = bands
+            return out
+        }
+        // CRYSTAL DOS properties file (DOSS, historically fort.8): energy grid +
+        // total/projected DOS tables, rendered by the DOS grapher.
+        if effective == .crystalDOS {
+            let text = try readCappedText(url)
+            guard let dos = CrystalDOSParser.parse(text) else {
+                throw ParseError.parse(path: url.path, line: 0, reason: "invalid CRYSTAL DOS file")
+            }
+            var out = LoadedScene()
+            out.title = url.lastPathComponent
+            out.densityOfStates = dos
+            return out
+        }
         // QE PWscf output (.pwo): structure (atoms/cell) via the C parser, plus
         // forces/energy/stress parsed in Swift from the raw text and attached to
         // the scene. Forces correspond to the final SCF iteration (the one the
@@ -351,6 +409,9 @@ enum Parser {
         case .fhi: scene = nil   // FHI-aims coord.out is parsed in Swift (see loadFHIaims)
         case .bands: scene = nil   // QE bands are parsed in Swift (see loadBands)
         case .dos: scene = nil     // DOS is parsed in Swift above
+        case .gzmat: scene = nil   // Z-matrix is parsed in Swift (see GZMatrixParser)
+        case .crystalBand: scene = nil   // CRYSTAL band is parsed in Swift
+        case .crystalDOS: scene = nil    // CRYSTAL DOS is parsed in Swift
         }
         guard let scene else {
             let msg = String(cString: molenv_last_error())

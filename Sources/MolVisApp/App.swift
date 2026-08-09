@@ -71,7 +71,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var convertURL: URL?
         /// Headless batch conversion output directory (--convert-all).
         var convertAllURL: URL?
-        /// Target structure format for --convert-all (--format <xsf|cif|poscar|xyz|qe>).
+        /// Target structure format for --convert-all (--format <xsf|cif|poscar|xyz|qe|struct|d12>).
         var convertFormat: StructureExportFormat?
         /// Headless script file (--script).
         var scriptURL: URL?
@@ -150,6 +150,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         FormatInfo(flag: "--fhi",     extensions: ["fhi", "coord"],              format: .fhi),
         FormatInfo(flag: "--bands",   extensions: ["bands"],                     format: .bands),
         FormatInfo(flag: "--dos",     extensions: ["dos", "pdos", "pdos_tot"], format: .dos),
+        FormatInfo(flag: "--gzmat",   extensions: ["gzmat", "zmat"],             format: .gzmat),
+        FormatInfo(flag: "--crystal-band", extensions: ["band", "fort9"],        format: .crystalBand),
+        FormatInfo(flag: "--crystal-dos", extensions: ["doss", "fort8"],         format: .crystalDOS),
     ]
     /// Force-format flags (take no value).
     private static let formatFlags: Set<String> = Set(formatTable.map { $0.flag })
@@ -380,7 +383,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
         if let convertURL = options.convertURL {
             guard options.inputURL != nil else { throw CLIError.invalid("--convert requires an input file") }
-            // `--format` names an OUTPUT structure format (xsf|cif|poscar|xyz|qe),
+            // `--format` names an OUTPUT structure format
+            // (xsf|cif|poscar|xyz|qe|struct|d12),
             // and single-file `--convert` already derives its output format from
             // the output extension -- so the flag has nothing left to select and
             // was previously dropped in silence. It is now accepted only when it
@@ -448,10 +452,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         case "poscar": return .poscar
         case "xyz": return .xyz
         case "qe": return .qeInput
+        case "struct": return .wienStruct
+        case "d12", "crystal": return .crystal03
         default: return nil
         }
     }
-    private static let convertFormatFlags = ["xsf", "cif", "poscar", "xyz", "qe"]
+    private static let convertFormatFlags = ["xsf", "cif", "poscar", "xyz", "qe", "struct", "d12"]
 
     /// Inverse of `parseConvertFormat`, so a diagnostic names the same spelling
     /// the user typed on the command line.
@@ -462,6 +468,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         case .poscar: return "poscar"
         case .xyz: return "xyz"
         case .qeInput: return "qe"
+        case .wienStruct: return "struct"
+        case .crystal95, .crystal98, .crystal03, .crystalNew: return "d12"
         }
     }
 
@@ -1073,6 +1081,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         exportItem.target = self
         let exportStructureItem = file.addItem(withTitle: "Export Structure\u{2026}", action: #selector(exportStructureDocument), keyEquivalent: "")
         exportStructureItem.target = self
+        let saveScriptItem = file.addItem(withTitle: "Save XCrySDen Script\u{2026}", action: #selector(MainWindowController.saveXcrysdenScript(_:)), keyEquivalent: "")
+        saveScriptItem.target = nil
         let exportOptionsItem = file.addItem(withTitle: "Export Options\u{2026}", action: #selector(showExportOptions), keyEquivalent: "")
         exportOptionsItem.target = self
         let newWindowItem = file.addItem(withTitle: "New Window", action: #selector(newDocument), keyEquivalent: "N")
@@ -1263,6 +1273,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     private func openFile(_ url: URL, into wc: MainWindowController? = nil) -> Bool {
         let wc = wc ?? mainWC
         guard let wc else { return false }
+        // XCrySDen view scripts (.tcl) apply to the LIVE window instead of
+        // replacing its document: the script carries only view state.
+        if url.pathExtension.lowercased() == "tcl" {
+            wc.loadXcrydenScript(url)
+            return true
+        }
         do {
             let scene = Scene(loaded: try Parser.load(url))
             wc.loadFile(scene, from: url, format: nil, frameIndex: 0)
@@ -1787,7 +1803,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.2"
+    static let appVersion = "1.2.3"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -1822,7 +1838,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         Apply rendering-quality settings with --preset default|journal|presentation|print.
         Structure conversion formats are chosen by the --convert output extension:
           .xsf .cif .poscar/.contcar/.vasp .xyz .pwi/.in/.inp/.qe
-        Batch --convert-all requires --format <xsf|cif|poscar|xyz|qe>; with a single-file
+        Batch --convert-all requires --format <xsf|cif|poscar|xyz|qe|struct|d12>; with a single-file
         --convert the output format comes from the output extension, so --format is
         accepted only when it names that same format.
         Animation --export-anim takes optional --fps N (default 10), --anim-size WxH

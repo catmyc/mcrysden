@@ -32,6 +32,8 @@ enum Converter {
         case "poscar", "contcar", "vasp": return .poscar
         case "xyz": return .xyz
         case "pwi", "in", "inp", "qe": return .qeInput
+        case "struct": return .wienStruct
+        case "d12", "crystal": return .crystal03
         default: return nil
         }
     }
@@ -44,6 +46,8 @@ enum Converter {
         case .poscar: return "poscar"
         case .xyz: return "xyz"
         case .qeInput: return "pwi"
+        case .wienStruct: return "struct"
+        case .crystal95, .crystal98, .crystal03, .crystalNew: return "d12"
         }
     }
 
