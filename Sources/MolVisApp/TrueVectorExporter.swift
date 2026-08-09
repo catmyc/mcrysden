@@ -153,13 +153,15 @@ enum TrueVectorExporter {
     /// using the same view/proj/viewport convention as `Renderer.encode`.
     private static func project(_ world: SIMD3<Float>, view: float4x4, proj: float4x4,
                                 w: Float, h: Float) -> SIMD2<Float>? {
-        let clip = proj * view * SIMD4<Float>(world, 1)
+        let mvp  = proj * view
+        let clip = mvp * SIMD4<Float>(world, 1)
         guard clip.w > 1e-6 else { return nil }
         let ndc = clip.xyz / clip.w
         guard ndc.x.isFinite, ndc.y.isFinite, ndc.z.isFinite else { return nil }
         let sx = (ndc.x * 0.5 + 0.5) * w
         // Metal's viewport y is flipped: NDC +y (up) maps to the top of the target.
-        let sy = (1 - (ndc.y * 0.5 + 0.5)) * h
+        let ndcY05 = ndc.y * 0.5 + 0.5
+        let sy = (1 - ndcY05) * h
         return SIMD2<Float>(sx, sy)
     }
 

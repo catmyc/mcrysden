@@ -250,7 +250,9 @@ extension Scene {
             // origin plus the summed negative extents, so accumulate per-axis.
             var mn = o, mx = o
             for corner in [(0,0,0),(1,0,0),(0,1,0),(0,0,1),(1,1,0),(1,0,1),(0,1,1),(1,1,1)] {
-                let p = o + v[0]*Float(corner.0) + v[1]*Float(corner.1) + v[2]*Float(corner.2)
+                let p0 = o + v[0] * Float(corner.0)
+                let p1 = p0 + v[1] * Float(corner.1)
+                let p  = p1 + v[2] * Float(corner.2)
                 mn = min(mn, p); mx = max(mx, p)
             }
             minCorner = min(minCorner, mn); maxCorner = max(maxCorner, mx); hasAny = true
