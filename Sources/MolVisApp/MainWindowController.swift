@@ -144,6 +144,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private var xrdWorkItem: DispatchWorkItem?
     private var xrdDebounceCancellation: (() -> Void)?
     private var xrdGeneration = 0
+    private var xrdCancellationToken: CoordinationCancellationToken?
     /// Derived first-shell polyhedron metrics (aligned to `scene.atoms`), computed
     /// on a background work item after the coordination result is installed.
     private(set) var polyhedronMetrics: [PolyhedronMetrics]? = nil
@@ -172,6 +173,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// O(n·k²) bond-angle sweep.
     private var distributionWorkItem: DispatchWorkItem?
     private var distributionGeneration = 0
+    private var distributionCancellationToken: CoordinationCancellationToken?
     private var lastCoordinationEnabled = false
     private var lastCoordinationScale = CoordinationAnalyzer.defaultRadiusScale
     /// Identity of the atom set + criteria the currently installed
@@ -201,6 +203,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// completion (after a scene/frame reload) can never publish into the
     /// freshly-installed state.
     private var animationDataGeneration = 0
+    private var animationDataCancellationToken: CoordinationCancellationToken?
     /// Cache key (sourceURL + frameCount) for the last thumbnail/metric build,
     /// so re-entrant installScene calls for the same document don't re-decode.
     private var lastAnimationDataKey: (url: URL, count: Int)?
@@ -284,6 +287,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         cancelCoordinationRequest()
         cancelPolyhedronRequest()
         cancelXRDRequest()
+        cancelAnimationDataRequest()
         // Cancellation-only teardown: do not mutate published UI state or the
         // installed result from deinit (no alive view/window to render into).
         cancelComparisonRequestOnly()
@@ -1474,7 +1478,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// reported to the console but never fail the open.
     func loadXcrydenScript(_ url: URL) {
         do {
-            let text = try String(contentsOf: url, encoding: .utf8)
+            let text = try readCappedText(url, cap: 16 * 1024 * 1024)
             guard let (state, skipped) = XcrysdenScript.load(text, base: currentXcrysdenViewState()) else {
                 throw ParseError.parse(path: url.path, line: 0, reason: "no mapped XCrySDen script commands")
             }
@@ -3891,8 +3895,20 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationWorkItem = nil
         coordinationDebounceCancellation?()
         coordinationDebounceCancellation = nil
+        cancelDistributionRequest()
+    }
+
+    private func cancelDistributionRequest() {
+        distributionCancellationToken?.cancel()
+        distributionCancellationToken = nil
         distributionWorkItem?.cancel()
         distributionWorkItem = nil
+    }
+
+    private func cancelAnimationDataRequest() {
+        animationDataCancellationToken?.cancel()
+        animationDataCancellationToken = nil
+        animationDataGeneration += 1
     }
 
     /// Cancel any in-flight comparison, clear the installed result + arrows,
@@ -4081,9 +4097,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // thread is not blocked by the O(27·n²) RDF enumeration or the
         // O(n·k²) bond-angle sweep. Each request gets a generation token so
         // stale results from a superseded request are discarded.
-        distributionWorkItem?.cancel()
+        cancelDistributionRequest()
         distributionGeneration += 1
         let distGeneration = distributionGeneration
+        let distToken = CoordinationCancellationToken()
+        distributionCancellationToken = distToken
         let distAtoms = scene.atoms
         // Use the effective (widened) coordination cell so that volume,
         // density, and minimum-image periodicity are consistent with the
@@ -4091,19 +4109,18 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let distCell = effectiveCoordinationCell(for: scene)
         let distPeriodicDim = scene.periodicDim
         let distResult = result
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            guard self.distributionGeneration == distGeneration else { return }
+        let work = DispatchWorkItem {
+            guard !distToken.isCancelled() else { return }
             let dist = DistributionAnalyzer.analyze(distResult, atoms: distAtoms,
                                                      cell: distCell,
                                                      periodicDim: distPeriodicDim,
-                                                     isCancelled: { [weak self] in
-                                                         guard let self else { return true }
-                                                         return self.distributionGeneration != distGeneration
-                                                     })
+                                                     isCancelled: distToken.isCancelled)
+            guard !distToken.isCancelled() else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                guard self.distributionGeneration == distGeneration else { return }
+                guard !distToken.isCancelled(),
+                      self.distributionGeneration == distGeneration,
+                      self.distributionCancellationToken === distToken else { return }
                 if let dist {
                     self.distributionAnalysis = dist
                     self.state.distributionAnalysis = dist
@@ -4114,6 +4131,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                     self.state.distributionAnalysisAvailable = false
                 }
                 self.distributionWorkItem = nil
+                self.distributionCancellationToken = nil
                 self.setNeedsRender()
             }
         }
@@ -4175,6 +4193,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         coordinationCancellationToken?.cancel()
         coordinationCancellationToken = nil
         coordinationWorkItem = nil
+        cancelDistributionRequest()
         distributionGeneration += 1
         cancelPolyhedronRequest()
         coordinationAnalysis = nil
@@ -4859,6 +4878,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private func loadAllFrames() -> [Scene]? {
         guard let url = sourceURL, state.frameCount > 1 else { return nil }
         let count = state.frameCount
+        guard count <= AnimationExporter.maxFrameCount else { return nil }
         var frames: [Scene] = []
         frames.reserveCapacity(count)
         for i in 0..<count {
@@ -4875,7 +4895,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// snapshot them on the main thread before dispatching — never reads
     /// instance state (sourceURL / state.frameCount / forcedFormat) directly.
     private static func loadAllFrames(from url: URL, count: Int, format: ParseFormat?) -> [Scene]? {
-        guard count > 1 else { return nil }
+        guard count > 1, count <= AnimationExporter.maxFrameCount else { return nil }
         var frames: [Scene] = []
         frames.reserveCapacity(count)
         for i in 0..<count {
@@ -4909,9 +4929,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// sourceURL + frameCount; stale generations are discarded by token.
     private func refreshAnimationData() {
         guard let url = sourceURL, state.frameCount > 1 else {
+            cancelAnimationDataRequest()
+            let generation = animationDataGeneration
             DispatchQueue.main.async { [weak self] in
-                guard let self, !self.state.timelineThumbnails.isEmpty
-                    || !self.state.frameMetrics.isEmpty else { return }
+                guard let self, self.animationDataGeneration == generation,
+                      (!self.state.timelineThumbnails.isEmpty || !self.state.frameMetrics.isEmpty) else { return }
                 self.state.setTimelineThumbnails([])
                 self.state.frameMetrics = []
                 self.state.trajectoryTrailsAvailable = false
@@ -4922,8 +4944,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if let existing = lastAnimationDataKey, existing == key { return }
         lastAnimationDataKey = key
 
-        animationDataGeneration += 1
+        cancelAnimationDataRequest()
         let token = animationDataGeneration
+        let cancellationToken = CoordinationCancellationToken()
+        animationDataCancellationToken = cancellationToken
         let thumbSize = CGSize(width: 128, height: 96)
         // Snapshot ALL main-thread inputs before dispatch so the background
         // closure never touches self.state / self.camera off the main thread.
@@ -4931,9 +4955,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let showTrails = state.showTrajectoryTrails
         let count = state.frameCount
         let format = forcedFormat
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            guard self.animationDataGeneration == token else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard !cancellationToken.isCancelled() else { return }
             guard let frames = Self.loadAllFrames(from: url, count: count, format: format) else {
                 return
             }
@@ -4948,20 +4971,24 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             }
             if ok {
                 metrics = FrameMetrics.compute(frames: frames)
-                if showTrails {
+                if showTrails && !cancellationToken.isCancelled() {
                     trails = Self.trajectoryTrailVertices(frames: frames)
                 }
             }
+            guard !cancellationToken.isCancelled() else { return }
             DispatchQueue.main.async { [weak self] in
                 // Re-check the token ON THE MAIN THREAD: a generation bump between
                 // the background read and this block must discard stale data.
-                guard let self, self.animationDataGeneration == token else { return }
+                guard let self, !cancellationToken.isCancelled(),
+                      self.animationDataGeneration == token,
+                      self.animationDataCancellationToken === cancellationToken else { return }
                 self.state.setTimelineThumbnails(images)
                 self.state.frameMetrics = metrics
                 if self.state.showTrajectoryTrails {
                     self.state.trajectoryTrailsAvailable = true
                     self.renderer?.trajectoryTrails = trails
                 }
+                self.animationDataCancellationToken = nil
             }
         }
     }
@@ -4997,28 +5024,37 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             renderer?.showTrajectoryTrails = true
             return
         }
-        animationDataGeneration += 1
+        cancelAnimationDataRequest()
         let token = animationDataGeneration
+        let cancellationToken = CoordinationCancellationToken()
+        animationDataCancellationToken = cancellationToken
         // Snapshot ALL main-thread inputs before dispatch. alignedFrames is
         // main-thread-owned; reading it off-main is a race, so capture it (or
         // nil) here. When nil, the background path decodes from the snapshots.
         let prealigned = state.alignTrajectory ? alignedFrames : nil
         let count = state.frameCount
         let format = forcedFormat
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            guard self.animationDataGeneration == token else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard !cancellationToken.isCancelled() else { return }
             guard let frames = prealigned ?? Self.loadAllFrames(from: url, count: count, format: format) else {
                 return
             }
             let trails = Self.trajectoryTrailVertices(frames: frames)
+            guard !cancellationToken.isCancelled() else { return }
             DispatchQueue.main.async { [weak self] in
                 // Re-check the token ON THE MAIN THREAD: a generation bump between
                 // the background read and this block must discard stale data.
-                guard let self, self.animationDataGeneration == token else { return }
+                guard let self, !cancellationToken.isCancelled(),
+                      self.animationDataGeneration == token,
+                      self.animationDataCancellationToken === cancellationToken else { return }
+                guard self.state.showTrajectoryTrails else {
+                    self.animationDataCancellationToken = nil
+                    return
+                }
                 self.state.trajectoryTrailsAvailable = true
                 self.renderer?.trajectoryTrails = trails
                 self.renderer?.showTrajectoryTrails = true
+                self.animationDataCancellationToken = nil
             }
         }
     }
@@ -5050,25 +5086,30 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             presentExportError(error, title: "Animation export failed")
             return
         }
-        animationDataGeneration += 1
+        cancelAnimationDataRequest()
         let token = animationDataGeneration
+        let cancellationToken = CoordinationCancellationToken()
+        animationDataCancellationToken = cancellationToken
         // Snapshot main-thread inputs for the background closure.
         let cam = camera
         let count = state.frameCount
         let forced = forcedFormat
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            guard self.animationDataGeneration == token else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard !cancellationToken.isCancelled() else { return }
             do {
                 guard let frames = Self.loadAllFrames(from: url, count: count, format: forced) else {
                     throw ParseError.io(path: url.path, reason: "failed to load animation frames")
                 }
+                guard !cancellationToken.isCancelled() else { return }
                 try AnimationExporter.export(frames: frames, camera: cam,
                                              size: CGSize(width: 640, height: 480),
                                              fps: 10, format: format, to: url)
             } catch {
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, self.animationDataGeneration == token else { return }
+                    guard let self, !cancellationToken.isCancelled(),
+                          self.animationDataGeneration == token,
+                          self.animationDataCancellationToken === cancellationToken else { return }
+                    self.animationDataCancellationToken = nil
                     self.presentExportError(error, title: "Animation export failed")
                 }
             }
@@ -5459,10 +5500,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let symmetryOps = state.crystalSymmetry?.symmetry?.symmetryOperations
         let electronDensity = state.xrdUseElectronDensity ? scene.scalarField : nil
         let showLabels = state.xrdShowLabels
+        let token = CoordinationCancellationToken()
+        xrdCancellationToken = token
 
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            guard self.xrdGeneration == generation else { return }
+        let work = DispatchWorkItem {
+            guard !token.isCancelled() else { return }
             let result = PowderXRD.analyze(
                 cell: cell,
                 atoms: atoms,
@@ -5475,9 +5517,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                 symmetryOps: symmetryOps,
                 electronDensity: electronDensity
             )
+            guard !token.isCancelled() else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.xrdGeneration == generation else { return }
+                guard let self, !token.isCancelled(), self.xrdGeneration == generation,
+                      self.xrdCancellationToken === token else { return }
                 self.installPowderXRD(result: result, showLabels: showLabels)
+                self.xrdWorkItem = nil
+                self.xrdCancellationToken = nil
             }
         }
         xrdWorkItem = work
@@ -5488,6 +5534,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     /// Cancel any pending XRD debounce + background work.
     private func cancelXRDRequest() {
+        xrdCancellationToken?.cancel()
+        xrdCancellationToken = nil
         xrdWorkItem?.cancel()
         xrdWorkItem = nil
         xrdDebounceCancellation?()

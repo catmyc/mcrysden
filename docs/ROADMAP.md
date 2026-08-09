@@ -4,6 +4,8 @@ Last updated: **2026-08-09 (v1.2.4: adversarial-review hardening batch — parse
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
+Current v1.2.5 verification: rank-aware exact periodic bonding, animation pixel/frame limits, cancellable background analysis, and the added parser hardening are covered by a passing 60-test suite.
+
 ## Implemented foundation (through v1.1.32)
 
 ### File formats

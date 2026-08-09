@@ -122,4 +122,45 @@ final class CParserHardeningTests: XCTestCase {
                           "reason should mention the non-finite celldm, got: \(reason)")
         }
     }
+
+    /// Periodic bonding must honor the active dimensionality. Slab and polymer
+    /// cells intentionally have rank-two/rank-one embeddings, so requiring a
+    /// full 3D determinant would silently drop boundary-crossing bonds.
+    func testPeriodicBondingForSlabAndPolymerCells() throws {
+        func parse(_ contents: String, suffix: String) throws -> LoadedScene {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mcrysden-test-\(UUID().uuidString).\(suffix)")
+            defer { try? FileManager.default.removeItem(at: url) }
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            return try Parser.load(url, as: .xsf)
+        }
+
+        let slab = try parse("""
+        SLAB
+        PRIMVEC
+        10 0 0
+        0 10 0
+        0 0 0
+        PRIMCOORD
+        2 1
+        C 0 0 0
+        C 9 0 0
+        """, suffix: "xsf")
+        XCTAssertEqual(slab.periodicDim, 2)
+        XCTAssertTrue(slab.bonds.contains { Set([$0.i, $0.j]) == Set([0, 1]) })
+
+        let polymer = try parse("""
+        POLYMER
+        PRIMVEC
+        10 0 0
+        0 0 0
+        0 0 0
+        PRIMCOORD
+        2 1
+        C 0 0 0
+        C 9 0 0
+        """, suffix: "xsf")
+        XCTAssertEqual(polymer.periodicDim, 1)
+        XCTAssertTrue(polymer.bonds.contains { Set([$0.i, $0.j]) == Set([0, 1]) })
+    }
 }

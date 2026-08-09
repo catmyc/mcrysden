@@ -67,6 +67,9 @@ enum ProjectStore {
     }
 
     static func isValidProjectFile(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let fileSize = attributes[.size] as? Int,
+              fileSize <= 200 * 1024 * 1024 else { return false }
         guard let data = try? Data(contentsOf: url) else { return false }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
         return obj["scene"] != nil

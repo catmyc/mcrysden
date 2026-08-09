@@ -58,7 +58,7 @@ internal func gunzipData(_ url: URL) throws -> Data {
 /// Read a text file with a size cap, mirroring gunzipData's 200 MB bound.
 /// Pre-checks the on-disk size, then reads through FileHandle so a malformed
 /// file cannot allocate unbounded memory before the cap is detected.
-fileprivate func readCappedText(_ url: URL, cap: Int = 200 * 1024 * 1024) throws -> String {
+internal func readCappedText(_ url: URL, cap: Int = 200 * 1024 * 1024) throws -> String {
     let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
     if let fileSize = attributes[.size] as? Int, fileSize > cap {
         throw ParseError.io(path: url.path, reason: "file size \(fileSize) exceeds \(cap) byte limit")

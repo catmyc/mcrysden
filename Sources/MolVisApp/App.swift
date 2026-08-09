@@ -479,6 +479,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         guard parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w > 0, h > 0 else {
             return nil
         }
+        guard w <= AnimationExporter.maxDimension, h <= AnimationExporter.maxDimension else {
+            return nil
+        }
+        let pixels = w.multipliedReportingOverflow(by: h)
+        guard !pixels.overflow, pixels.partialValue <= AnimationExporter.maxTotalPixels else {
+            return nil
+        }
         return CGSize(width: w, height: h)
     }
 
@@ -498,6 +505,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
         let remaining = total - start
         let count = frameCount > 0 ? min(frameCount, remaining) : remaining
+        guard count <= AnimationExporter.maxFrameCount else {
+            throw CLIError.invalid("animation frame count exceeds the cap of \(AnimationExporter.maxFrameCount)")
+        }
         return start..<(start + count)
     }
 
@@ -862,7 +872,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         // headless script (--script).
         if let scriptURL = options.scriptURL {
             do {
-                let content = try String(contentsOf: scriptURL, encoding: .utf8)
+                let content = try readCappedText(scriptURL, cap: 16 * 1024 * 1024)
                 let workingDirectory = scriptURL.deletingLastPathComponent()
                 // Shared with ScriptRunner so `~`/`$HOME`, absolute, and
                 // script-relative paths resolve identically everywhere.
@@ -893,12 +903,18 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     }
                     let inURL = resolve(args[0])
                     let outURL = resolve(args[1])
-                    let fps = args.count == 3 ? (Int(args[2]) ?? 10) : 10
+                    let fps = args.count == 3 ? (Int(args[2]) ?? -1) : 10
+                    guard (1...600).contains(fps) else {
+                        throw CLIError.invalid("export-anim fps must be in 1...600")
+                    }
                     let fc = Parser.frameCount(inURL, as: nil)
                     let total = fc > 0 ? fc : 1
+                    let range = try App.animationFrameRange(total: total, startFrame: 0,
+                                                            frameCount: 0,
+                                                            name: inURL.lastPathComponent)
                     var scenes: [Scene] = []
-                    scenes.reserveCapacity(total)
-                    for i in 0..<total {
+                    scenes.reserveCapacity(range.count)
+                    for i in range {
                         scenes.append(Scene(loaded: try Parser.load(inURL, as: nil, frameIndex: i)))
                     }
                     let ext = outURL.pathExtension.lowercased()
@@ -1813,7 +1829,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.4"
+    static let appVersion = "1.2.5"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

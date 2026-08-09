@@ -2,6 +2,15 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] — 2026-08-09
+
+### Fixed
+
+- **Lower-dimensional periodic bonding** — the C covalent-radii heuristic now uses a bounded exact minimum-image search over the active rank-1/2/3 periodic lattice, including skewed cells and bonds requiring translations beyond one cell.
+- **Parser edge validation** — XSF grids, conversion-coordinate records, AXSF frame counts, POSCAR coordinate modes, and QE/CIF/POSCAR periodic cells reject malformed, singular, or pathological input before allocation or conversion.
+- **Animation resource bounds** — animated export validates per-axis dimensions and total pixels in addition to its fps/frame caps; CLI scripts use the same frame and size limits.
+- **Background cancellation** — animation, coordination-distribution, and powder-XRD workers use lock-backed cancellation tokens in addition to main-thread generation checks, so superseded expensive calculations stop promptly and cannot publish stale results.
+
 ## [1.2.4] — 2026-08-09
 
 ### Fixed

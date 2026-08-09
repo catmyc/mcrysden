@@ -13,11 +13,26 @@ enum AnimationExportError: Error {
 }
 
 enum AnimationExporter {
+    static let maxFrameCount = 1000
+    static let maxDimension = 16_384
+    static let maxTotalPixels = 16_000_000
+
     static func export(frames: [Scene], camera: Camera?, size: CGSize, fps: Int,
                        format: AnimationExportFormat, to url: URL) throws {
         guard !frames.isEmpty else { throw AnimationExportError.noFrames }
         guard fps >= 1, fps <= 600 else { throw AnimationExportError.invalidSize }
-        guard frames.count <= 1000 else { throw AnimationExportError.invalidSize }
+        guard frames.count <= maxFrameCount else { throw AnimationExportError.invalidSize }
+        let rw = size.width.rounded(), rh = size.height.rounded()
+        guard rw.isFinite, rh.isFinite, rw >= 1, rh >= 1,
+              rw <= CGFloat(maxDimension), rh <= CGFloat(maxDimension),
+              rw <= CGFloat(Int.max), rh <= CGFloat(Int.max) else {
+            throw AnimationExportError.invalidSize
+        }
+        let width = Int(rw), height = Int(rh)
+        let pixels = width.multipliedReportingOverflow(by: height)
+        guard !pixels.overflow, pixels.partialValue <= maxTotalPixels else {
+            throw AnimationExportError.invalidSize
+        }
         switch format {
         case .gif: try exportGIF(frames: frames, camera: camera, size: size, fps: fps, to: url)
         case .apng: try exportAPNG(frames: frames, camera: camera, size: size, fps: fps, to: url)
@@ -171,7 +186,16 @@ enum ApngWriter {
 
     static func write(frameCount: Int, width: Int, height: Int, fps: Int,
                       to url: URL, render: (Int) throws -> CGImage) throws {
-        guard width > 0, height > 0, frameCount > 0 else { throw AnimationExportError.invalidSize }
+        guard width > 0, height > 0, frameCount > 0,
+              fps >= 1, fps <= 600,
+              frameCount <= AnimationExporter.maxFrameCount,
+              width <= AnimationExporter.maxDimension, height <= AnimationExporter.maxDimension else {
+            throw AnimationExportError.invalidSize
+        }
+        let pixels = width.multipliedReportingOverflow(by: height)
+        guard !pixels.overflow, pixels.partialValue <= AnimationExporter.maxTotalPixels else {
+            throw AnimationExportError.invalidSize
+        }
         let data = NSMutableData()
         data.append(ApngWriter.signature, length: 8)
         // IHDR: 13-byte payload, serialized as big-endian bytes to avoid struct

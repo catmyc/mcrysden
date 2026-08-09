@@ -1,5 +1,6 @@
 #include "molenv_parse.h"
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -121,18 +122,183 @@ static double det3d(const double m[3][3]) {
          + m[0][2]*(m[1][0]*m[2][1] - m[2][0]*m[1][1]);
 }
 
-static int cell_usable_for_bonds(const float cell[3][3]) {
-    double m[3][3];
-    for (int i=0;i<3;i++) for (int j=0;j<3;j++) m[i][j] = (double)cell[i][j];
-    if (fabs(det3d(m)) < 1e-6) return 0;
-    for (int i=0;i<3;i++)
-        if (fabs(m[i][0]) < 1e-8 && fabs(m[i][1]) < 1e-8 && fabs(m[i][2]) < 1e-8) return 0;
+/* Validate only the active periodic subspace. A slab/polymer may embed a
+   rank-two/rank-one lattice in 3D, while a crystal/QE/POSCAR cell must be full
+   rank. The tolerance is relative to the vector lengths so tiny valid cells
+   and near-singular malformed cells are not confused. */
+static int cell_rank_usable(const double cell[3][3], int periodic_dim) {
+    if (periodic_dim <= 0) return 1;
+    if (periodic_dim == 1) {
+        double n = 0.0;
+        for (int j = 0; j < 3; j++) n += cell[0][j] * cell[0][j];
+        return isfinite(n) && n > 1e-30;
+    }
+    if (periodic_dim == 2) {
+        double a2 = 0.0, b2 = 0.0, dot = 0.0;
+        for (int j = 0; j < 3; j++) {
+            a2 += cell[0][j] * cell[0][j];
+            b2 += cell[1][j] * cell[1][j];
+            dot += cell[0][j] * cell[1][j];
+        }
+        double gram_det = a2 * b2 - dot * dot;
+        double scale = a2 * b2;
+        return isfinite(gram_det) && isfinite(scale) && scale > 0.0 && gram_det > 1e-12 * scale;
+    }
+    double det = det3d(cell);
+    double scale = 1.0;
+    for (int i = 0; i < 3; i++) {
+        double n = 0.0;
+        for (int j = 0; j < 3; j++) n += cell[i][j] * cell[i][j];
+        if (!isfinite(n) || n <= 0.0) return 0;
+        scale *= sqrt(n);
+    }
+    return isfinite(det) && isfinite(scale) && scale > 0.0 && fabs(det) > 1e-12 * scale;
+}
+
+static int parse_bounded_long(const char *token, long minimum, long maximum, long *out) {
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(token, &end, 10);
+    if (errno == ERANGE || end == token || *end != '\0' || value < minimum || value > maximum) return 0;
+    *out = value;
     return 1;
 }
 
 #define MOLENV_BOND_MAX_ATOMS 8000
 #define MOLENV_BOND_MAX_CAP 2000000     /* ~32 MB bond buffer ceiling */
 #define MOLENV_BOND_MAX_DEGREE 128     /* per-atom degree cap */
+#define MOLENV_BOND_SEARCH_LIMIT 100000
+
+/* Pseudoinverse rows for the active periodic lattice vectors. A full 3D
+   determinant is not required: polymer and slab cells intentionally have only
+   one or two periodic vectors. */
+typedef struct {
+    int dim;
+    double basis[3][3];
+    double pinv[3][3];
+    double row_norm[3];
+} PeriodicBondBasis;
+
+static int periodic_bond_basis_init(const MolEnvScene *s, PeriodicBondBasis *out) {
+    memset(out, 0, sizeof(*out));
+    int dim = s->periodic_dim;
+    if (dim < 1 || dim > 3) return 0;
+    out->dim = dim;
+    for (int i = 0; i < dim; i++) {
+        for (int j = 0; j < 3; j++) {
+            double value = (double)s->cell[i][j];
+            if (!isfinite(value)) return -1;
+            out->basis[i][j] = value;
+        }
+    }
+
+    if (dim == 1) {
+        double g = 0.0;
+        for (int j = 0; j < 3; j++) g += out->basis[0][j] * out->basis[0][j];
+        if (!isfinite(g) || g <= 1e-30) return -1;
+        for (int j = 0; j < 3; j++) out->pinv[0][j] = out->basis[0][j] / g;
+    } else if (dim == 2) {
+        double g00 = 0.0, g01 = 0.0, g11 = 0.0;
+        for (int j = 0; j < 3; j++) {
+            g00 += out->basis[0][j] * out->basis[0][j];
+            g01 += out->basis[0][j] * out->basis[1][j];
+            g11 += out->basis[1][j] * out->basis[1][j];
+        }
+        double det = g00 * g11 - g01 * g01;
+        double scale = g00 * g11;
+        if (!isfinite(det) || !isfinite(scale) || scale <= 0.0 || det <= 1e-12 * scale) return -1;
+        double i00 = g11 / det, i01 = -g01 / det, i11 = g00 / det;
+        for (int j = 0; j < 3; j++) {
+            out->pinv[0][j] = i00 * out->basis[0][j] + i01 * out->basis[1][j];
+            out->pinv[1][j] = i01 * out->basis[0][j] + i11 * out->basis[1][j];
+        }
+    } else {
+        double m[3][3];
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) m[i][j] = out->basis[i][j];
+        double det = det3d(m);
+        double scale = 1.0;
+        for (int i = 0; i < 3; i++) {
+            double length_sq = 0.0;
+            for (int j = 0; j < 3; j++) length_sq += m[i][j] * m[i][j];
+            if (!isfinite(length_sq) || length_sq <= 0.0) return -1;
+            scale *= sqrt(length_sq);
+        }
+        if (!isfinite(det) || !isfinite(scale) || scale <= 0.0 || fabs(det) <= 1e-12 * scale) return -1;
+        double inv[3][3];
+        inv[0][0]=(m[1][1]*m[2][2]-m[2][1]*m[1][2])/det;
+        inv[0][1]=(m[0][2]*m[2][1]-m[0][1]*m[2][2])/det;
+        inv[0][2]=(m[0][1]*m[1][2]-m[0][2]*m[1][1])/det;
+        inv[1][0]=(m[1][2]*m[2][0]-m[1][0]*m[2][2])/det;
+        inv[1][1]=(m[0][0]*m[2][2]-m[0][2]*m[2][0])/det;
+        inv[1][2]=(m[0][2]*m[1][0]-m[0][0]*m[1][2])/det;
+        inv[2][0]=(m[1][0]*m[2][1]-m[1][1]*m[2][0])/det;
+        inv[2][1]=(m[0][1]*m[2][0]-m[0][0]*m[2][1])/det;
+        inv[2][2]=(m[0][0]*m[1][1]-m[0][1]*m[1][0])/det;
+        /* B has lattice vectors as rows, so coefficient i is d dot inv[*][i]. */
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) out->pinv[i][j] = inv[j][i];
+    }
+
+    for (int i = 0; i < dim; i++) {
+        double norm_sq = 0.0;
+        for (int j = 0; j < 3; j++) norm_sq += out->pinv[i][j] * out->pinv[i][j];
+        if (!isfinite(norm_sq) || norm_sq <= 0.0) return -1;
+        out->row_norm[i] = sqrt(norm_sq);
+    }
+    return 1;
+}
+
+/* Return whether a periodic image is within `tol` of d. The coefficient box
+   is derived from the lattice pseudoinverse, so every possible image inside
+   the threshold is enumerated exactly. A pathological box returns -1 rather
+   than falling back to an approximate nearest-image calculation. */
+static int periodic_bond_within(const PeriodicBondBasis *basis,
+                                double dx, double dy, double dz, double tol) {
+    double d[3] = {dx, dy, dz};
+    if (!isfinite(dx) || !isfinite(dy) || !isfinite(dz) || !isfinite(tol) || tol < 0.0) return -1;
+    double lo_d[3], hi_d[3];
+    int64_t lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
+    int64_t total = 1;
+    for (int i = 0; i < basis->dim; i++) {
+        double center = d[0] * basis->pinv[i][0] +
+                        d[1] * basis->pinv[i][1] +
+                        d[2] * basis->pinv[i][2];
+        double bound = tol * basis->row_norm[i];
+        if (!isfinite(center) || !isfinite(bound) || center < -1e15 || center > 1e15) return -1;
+        lo_d[i] = ceil(center - bound - 1e-12);
+        hi_d[i] = floor(center + bound + 1e-12);
+        if (!isfinite(lo_d[i]) || !isfinite(hi_d[i]) ||
+            lo_d[i] < -1e15 || hi_d[i] > 1e15 || hi_d[i] < lo_d[i]) return 0;
+        lo[i] = (int64_t)lo_d[i];
+        hi[i] = (int64_t)hi_d[i];
+        int64_t span = hi[i] - lo[i] + 1;
+        if (span <= 0 || total > MOLENV_BOND_SEARCH_LIMIT / span) return -1;
+        total *= span;
+    }
+
+    double tol_sq = tol * tol;
+    if (!isfinite(tol_sq)) return -1;
+    int64_t n[3] = {lo[0], lo[1], lo[2]};
+    for (int64_t attempt = 0; attempt < total; attempt++) {
+        double cx = d[0], cy = d[1], cz = d[2];
+        for (int i = 0; i < basis->dim; i++) {
+            double coefficient = (double)n[i];
+            cx -= coefficient * basis->basis[i][0];
+            cy -= coefficient * basis->basis[i][1];
+            cz -= coefficient * basis->basis[i][2];
+        }
+        double distance_sq = cx * cx + cy * cy + cz * cz;
+        if (isfinite(distance_sq) && distance_sq <= tol_sq) return 1;
+
+        for (int i = 0; i < basis->dim; i++) {
+            if (n[i] < hi[i]) {
+                n[i]++;
+                break;
+            }
+            n[i] = lo[i];
+        }
+    }
+    return 0;
+}
 
 static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float factor, int *out_nbonds) {
     /* Documented workload guard: the O(n^2) bond pass is skipped above this count
@@ -141,7 +307,21 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
        Scene+Init if a smaller structure legitimately needs them. The guard reads
        natoms (an int) before dereferencing the atom buffer, so any size is refused
        promptly and never allocates. */
-    if (s->natoms > MOLENV_BOND_MAX_ATOMS) { set_error(path,0,"too many atoms for bond heuristic"); *out_nbonds=0; return NULL; }
+    if (!s || !out_nbonds || !isfinite(factor) || factor < 0.0f) {
+        if (out_nbonds) *out_nbonds = 0;
+        return NULL;
+    }
+    if (s->natoms < 0 || s->natoms > MOLENV_BOND_MAX_ATOMS) { set_error(path,0,"too many atoms for bond heuristic"); *out_nbonds=0; return NULL; }
+    PeriodicBondBasis periodic_basis;
+    int periodic_status = 0;
+    if (s->is_crystal && s->periodic_dim >= 1) {
+        periodic_status = periodic_bond_basis_init(s, &periodic_basis);
+        if (periodic_status < 0) {
+            set_error(path, 0, "invalid periodic cell for bond heuristic");
+            *out_nbonds = 0;
+            return NULL;
+        }
+    }
     int cap = s->natoms * 4, nb = 0;
     if (cap < 4) cap = 4;
     MolEnvBond *b = calloc((size_t)cap, sizeof(MolEnvBond));
@@ -149,81 +329,31 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
     int *degree = calloc((size_t)s->natoms, sizeof(int));
     if (!degree) { free(b); set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
 
-    const int do_periodic = (s->is_crystal && s->periodic_dim >= 1 && cell_usable_for_bonds(s->cell));
+    const int do_periodic = periodic_status > 0;
 
     for (int i=0;i<s->natoms;i++) for (int j=i+1;j<s->natoms;j++) {
         int zi=s->atoms[i].atomic_number, zj=s->atoms[j].atomic_number;
         if (zi<=0 || zi>118 || zj<=0 || zj>118) continue;
-        float r=bond_rcov(zi)+bond_rcov(zj);
-        float rcut2=(r*factor)*(r*factor);
-        float dx=s->atoms[i].coord[0]-s->atoms[j].coord[0],
-              dy=s->atoms[i].coord[1]-s->atoms[j].coord[1],
-              dz=s->atoms[i].coord[2]-s->atoms[j].coord[2];
+        double r=(double)bond_rcov(zi)+(double)bond_rcov(zj);
+        double tol = r * (double)factor;
+        double rcut2=tol*tol;
+        double dx=(double)s->atoms[i].coord[0]-(double)s->atoms[j].coord[0],
+               dy=(double)s->atoms[i].coord[1]-(double)s->atoms[j].coord[1],
+               dz=(double)s->atoms[i].coord[2]-(double)s->atoms[j].coord[2];
+        if (!isfinite(dx) || !isfinite(dy) || !isfinite(dz) || !isfinite(rcut2)) {
+            free(degree); free(b); set_error(path,0,"non-finite atom coordinate in bond heuristic"); *out_nbonds=0; return NULL;
+        }
 
         int bonded = 0;
         if (!do_periodic) {
-            float d2=dx*dx+dy*dy+dz*dz;
+            double d2=dx*dx+dy*dy+dz*dz;
             bonded = (d2 <= rcut2);
-        } else if (s->natoms > 3000) {
-            /* Fast path: fractional-rounding nearest-image. Convert displacement to
-               fractional coordinates, round to nearest integer to find the minimum
-               image. Exact when the minimum image lies within one lattice translation
-               per axis (the practical case for covalent radii). For very skewed cells
-               this may miss the true minimum image — acceptable tradeoff for large
-               structures where full 27-candidate enumeration would be prohibitive. */
-            double c[3][3];
-            for (int p=0;p<3;p++) for (int q=0;q<3;q++) c[p][q] = (double)s->cell[p][q];
-            double det = det3d(c);
-            if (fabs(det) > 1e-6) {
-                double inv[3][3];
-                inv[0][0]=(c[1][1]*c[2][2]-c[2][1]*c[1][2])/det;
-                inv[0][1]=(c[0][2]*c[2][1]-c[0][1]*c[2][2])/det;
-                inv[0][2]=(c[0][1]*c[1][2]-c[0][2]*c[1][1])/det;
-                inv[1][0]=(c[1][2]*c[2][0]-c[1][0]*c[2][2])/det;
-                inv[1][1]=(c[0][0]*c[2][2]-c[0][2]*c[2][0])/det;
-                inv[1][2]=(c[0][2]*c[1][0]-c[0][0]*c[1][2])/det;
-                inv[2][0]=(c[1][0]*c[2][1]-c[1][1]*c[2][0])/det;
-                inv[2][1]=(c[0][1]*c[2][0]-c[0][0]*c[2][1])/det;
-                inv[2][2]=(c[0][0]*c[1][1]-c[0][1]*c[1][0])/det;
-                double fx=dx*inv[0][0]+dy*inv[1][0]+dz*inv[2][0];
-                double fy=dx*inv[0][1]+dy*inv[1][1]+dz*inv[2][1];
-                double fz=dx*inv[0][2]+dy*inv[1][2]+dz*inv[2][2];
-                int ka = s->periodic_dim>=1 ? (int)round(fx) : 0;
-                int kb = s->periodic_dim>=2 ? (int)round(fy) : 0;
-                int kc = s->periodic_dim>=3 ? (int)round(fz) : 0;
-                if (ka<-1)ka=-1; if (ka>1)ka=1;
-                if (kb<-1)kb=-1; if (kb>1)kb=1;
-                if (kc<-1)kc=-1; if (kc>1)kc=1;
-                float cdx=dx+ka*s->cell[0][0]+kb*s->cell[1][0]+kc*s->cell[2][0];
-                float cdy=dy+ka*s->cell[0][1]+kb*s->cell[1][1]+kc*s->cell[2][1];
-                float cdz=dz+ka*s->cell[0][2]+kb*s->cell[1][2]+kc*s->cell[2][2];
-                float d2=cdx*cdx+cdy*cdy+cdz*cdz;
-                bonded = (d2 <= rcut2);
-            } else {
-                float d2=dx*dx+dy*dy+dz*dz;
-                bonded = (d2 <= rcut2);
-            }
         } else {
-            /* Slow path: enumerate candidate images within one lattice translation
-               per periodic axis. 3 candidates for dim 1, 9 for dim 2, 27 for dim 3. */
-            float min_d2 = dx*dx+dy*dy+dz*dz;
-            int ka_lo = s->periodic_dim>=1 ? -1 : 0;
-            int ka_hi = s->periodic_dim>=1 ?  1 : 0;
-            int kb_lo = s->periodic_dim>=2 ? -1 : 0;
-            int kb_hi = s->periodic_dim>=2 ?  1 : 0;
-            int kc_lo = s->periodic_dim>=3 ? -1 : 0;
-            int kc_hi = s->periodic_dim>=3 ?  1 : 0;
-            for (int ka=ka_lo; ka<=ka_hi; ka++)
-                for (int kb=kb_lo; kb<=kb_hi; kb++)
-                    for (int kc=kc_lo; kc<=kc_hi; kc++) {
-                        if (ka==0&&kb==0&&kc==0) continue;
-                        float cdx=dx+ka*s->cell[0][0]+kb*s->cell[1][0]+kc*s->cell[2][0];
-                        float cdy=dy+ka*s->cell[0][1]+kb*s->cell[1][1]+kc*s->cell[2][1];
-                        float cdz=dz+ka*s->cell[0][2]+kb*s->cell[1][2]+kc*s->cell[2][2];
-                        float d2=cdx*cdx+cdy*cdy+cdz*cdz;
-                        if (d2 < min_d2) min_d2 = d2;
-                    }
-            bonded = (min_d2 <= rcut2);
+            int within = periodic_bond_within(&periodic_basis, dx, dy, dz, tol);
+            if (within < 0) {
+                free(degree); free(b); set_error(path,0,"periodic bond search exceeded safety limit"); *out_nbonds=0; return NULL;
+            }
+            bonded = within > 0;
         }
 
         if (bonded) {
@@ -401,12 +531,16 @@ static int read_datagrid_block_ex(FILE *fp, MolEnvGrid *g, const char *path, int
     if (!fgets(line, sizeof(line), fp)) { set_error(path,*ln,"unexpected end in DATAGRID"); return -1; }
     (*ln)++;
     {
-        int nx=0, ny=0, nz=0;
-        int parsed = sscanf(line,"%d %d %d",&nx,&ny,&nz);
-        if ((g->dim == 2 && parsed != 2) || (g->dim == 3 && parsed != 3) ||
-            nx <= 0 || ny <= 0 || (g->dim == 3 && nz <= 0)) {
+        char sx[64] = {0}, sy[64] = {0}, sz[64] = {0}, extra[64] = {0};
+        int parsed = sscanf(line, "%63s %63s %63s %63s", sx, sy, sz, extra);
+        int expected = g->dim == 2 ? 2 : 3;
+        long lx = 0, ly = 0, lz = 0;
+        if (parsed != expected || !parse_bounded_long(sx, 1, 25000000, &lx) ||
+            !parse_bounded_long(sy, 1, 25000000, &ly) ||
+            (g->dim == 3 && !parse_bounded_long(sz, 1, 25000000, &lz))) {
             set_error(path,*ln,"malformed DATAGRID dims"); return -1;
         }
+        int nx = (int)lx, ny = (int)ly, nz = (int)lz;
         if (g->dim==2) { g->n[0]=nx; g->n[1]=ny; g->n[2]=1; }
         else           { g->n[0]=nx; g->n[1]=ny; g->n[2]=nz; }
     }
@@ -525,12 +659,21 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             continue;
         }
         if (strcmp(tok,"CONVCOORD")==0) {
-            int na=0, nc=0;
+            char na_tok[64] = {0}, nc_tok[64] = {0}, extra[64] = {0};
             if (!fgets(line,sizeof(line),fp)) return -1; (*ln)++;
-            if (sscanf(line,"%d %d",&na,&nc)<1) { set_error(path,*ln,"malformed CONVCOORD header"); return -1; }
-            if (na<1) { set_error(path,*ln,"no atoms in CONVCOORD"); return -1; }
-            if (na>500000 || nc>500000) { set_error(path,*ln,"unreasonable atom count in CONVCOORD"); return -1; }
-            for (int i=0;i<na*nc;i++) { if(!fgets(line,sizeof(line),fp)) return -1; (*ln)++; }
+            if (sscanf(line, "%63s %63s %63s", na_tok, nc_tok, extra) != 2) {
+                set_error(path,*ln,"malformed CONVCOORD header"); return -1;
+            }
+            long na = 0, nc = 0;
+            if (!parse_bounded_long(na_tok, 1, 500000, &na) ||
+                !parse_bounded_long(nc_tok, 0, 500000, &nc)) {
+                set_error(path,*ln,"unreasonable atom count in CONVCOORD"); return -1;
+            }
+            if (nc > 0 && na > 500000 / nc) {
+                set_error(path,*ln,"CONVCOORD record count exceeds cap"); return -1;
+            }
+            long records = na * nc;
+            for (long i=0; i<records; i++) { if(!fgets(line,sizeof(line),fp)) return -1; (*ln)++; }
             continue;
         }
         if (strcmp(tok,"PRIMCOORD")==0) {
@@ -557,7 +700,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                 char *endp = NULL;
                 long Znum = strtol(Zstr, &endp, 10);
                 if (endp && *endp == '\0') {
-                    at[i].atomic_number = (int)Znum;
+                    at[i].atomic_number = (Znum >= 1 && Znum <= 118) ? (int)Znum : 0;
                     snprintf(at[i].label,sizeof(at[i].label),"%ld",Znum);
                 } else {
                     at[i].atomic_number = molenv_symbol_to_z(Zstr);
@@ -591,7 +734,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                     char *endp = NULL;
                     long Znum = strtol(Zstr, &endp, 10);
                     if (endp && *endp == '\0') {
-                        zi = (int)Znum;
+                        zi = (Znum >= 1 && Znum <= 118) ? (int)Znum : 0;
                         snprintf(lbl,sizeof(lbl),"%ld",Znum);
                     } else {
                         zi = molenv_symbol_to_z(Zstr);
@@ -603,7 +746,6 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                     acap = acap?acap*2:16; if (acap>500000) acap=500000;
                     MolEnvAtom *t=realloc(at,(size_t)acap*sizeof(MolEnvAtom)); if(!t){free(at);set_error(path,*ln,"out of memory");return -1;} at=t;
                 }
-                if (zi<0) zi=0; if (zi>118) zi=118;
                 float fx=(float)x, fy=(float)y, fz=(float)z;
                 if (frac) {
                     /* Compute in double: individually finite x/y/z and cell
@@ -780,6 +922,13 @@ MolEnvScene* parse_xsf(const char *path) {
             }
         }
     }
+    if (have_cell) {
+        double matrix[3][3];
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) matrix[i][j] = cell[i][j];
+        if (!cell_rank_usable(matrix, pd)) {
+            molenv_scene_free(s); set_error(path, 0, "singular periodic cell"); return NULL;
+        }
+    }
     fclose(fp);
 
     s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
@@ -836,12 +985,15 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
     while (fgets(line,sizeof(line),fp)) {
         ln++;
         if (first_tok(line,tok,sizeof(tok))>0 && strcmp(tok,"ANIMSTEPS")==0) {
-            int n = 0;
-            /* token already consumed; re-scan the raw line for the integer */
-            if (sscanf(line, "%*s %d", &n) >= 1 && n > 0) {
-                if (n > 500000) { fclose(fp); set_error(path,0,"unreasonable ANIMSTEPS count"); return NULL; }
-                nframes = n;
+            char n_tok[64] = {0};
+            if (sscanf(line, "%*63s %63s", n_tok) != 1) {
+                fclose(fp); set_error(path,0,"malformed ANIMSTEPS count"); return NULL;
             }
+            long n = 0;
+            if (!parse_bounded_long(n_tok, 1, 500000, &n)) {
+                fclose(fp); set_error(path,0,"unreasonable ANIMSTEPS count"); return NULL;
+            }
+            nframes = (int)n;
         }
     }
     if (nframes == 0) { fclose(fp); set_error(path,0,"ANIMSTEPS header not found"); return NULL; }
@@ -868,6 +1020,13 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
     memcpy(s->cell, cell, sizeof(s->cell));
     s->periodic_dim = pd;
     s->is_crystal = have_cell ? 1 : 0;
+    if (have_cell) {
+        double matrix[3][3];
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) matrix[i][j] = cell[i][j];
+        if (!cell_rank_usable(matrix, pd)) {
+            molenv_scene_free(s); set_error(path, 0, "singular periodic cell"); return NULL;
+        }
+    }
     s->bonds = make_bonds(s, path, 1.0f, &s->nbonds);
     return s;
 }
@@ -883,8 +1042,10 @@ int molenv_axsf_frame_count(const char *path) {
     int nframes = 0;
     while (fgets(line, sizeof(line), fp)) {
         if (first_tok(line, tok, sizeof(tok)) > 0 && strcmp(tok, "ANIMSTEPS") == 0) {
-            int n = 0;
-            if (sscanf(line, "%*s %d", &n) >= 1 && n > 0 && n <= 500000) nframes = n;
+            char n_tok[64] = {0};
+            long n = 0;
+            if (sscanf(line, "%*63s %63s", n_tok) == 1 &&
+                parse_bounded_long(n_tok, 1, 500000, &n)) nframes = (int)n;
         }
     }
     fclose(fp);
@@ -1438,6 +1599,11 @@ MolEnvScene* parse_pwi(const char *path) {
             if (!in_float_range(cell[i][j])) { free(ax); free(ay); free(az); free(asym); set_error(path, 0, "non-finite cell from latgen"); return NULL; }
     }
 
+    if (!cell_rank_usable(cell, 3)) {
+        free(ax); free(ay); free(az); free(asym);
+        set_error(path, 0, "singular cell in pwi"); return NULL;
+    }
+
     /* Convert atom positions to Cartesian Angstroms. */
     float pos_scale = 1.0f;
     int frac = 0;
@@ -1547,7 +1713,10 @@ static int read_3x3(FILE *fp, double m[3][3], int *ln, const char *path) {
 static int unit_scales(const char *unit, double alat_ang, double *scale, int *frac) {
     *scale = 1.0; *frac = 0;
     if (strcasecmp(unit, "bohr") == 0) *scale = BOHR_TO_ANG;
-    else if (strcasecmp(unit, "alat") == 0) *scale = alat_ang;
+    else if (strcasecmp(unit, "alat") == 0) {
+        if (!isfinite(alat_ang) || alat_ang <= 0.0) return -1;
+        *scale = alat_ang;
+    }
     else if (strcasecmp(unit, "crystal") == 0) { *scale = 1.0; *frac = 1; }
     else if (strcasecmp(unit, "angstrom") == 0) { /* scale already 1 */ }
     else return -1;
@@ -1659,6 +1828,7 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
                     } else {
                         snprintf(unit, sizeof(unit), "%s", u);
                     }
+                    trim_in_place(unit);
                 }
             } else {
                 char *u = p + 15;
@@ -1667,6 +1837,7 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
                 while (*e && *e != ' ' && *e != '\t') e++;
                 *e = '\0';
                 if (*u) snprintf(unit, sizeof(unit), "%s", u);
+                trim_in_place(unit);
             }
             double raw[3][3];
             if (read_3x3(fp, raw, &ln, path) == 0) {
@@ -1696,7 +1867,7 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
             char *op = strchr(p, '(');
             if (op) {
                 char *cp = strchr(op, ')');
-                if (cp) { *cp = '\0'; snprintf(unit, sizeof(unit), "%s", op + 1); }
+                if (cp) { *cp = '\0'; snprintf(unit, sizeof(unit), "%s", op + 1); trim_in_place(unit); }
             }
             double scale = 1.0; int frac = 0;
             double alat_ang = have_alat ? alat_bohr * (double)BOHR_TO_ANG : 0.0;
@@ -1715,6 +1886,14 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
                 char sym[16]; double px, py, pz;
                 if (sscanf(q, "%15s %lf %lf %lf", sym, &px, &py, &pz) < 4) break;
                 if (!is_target) { got++; continue; }   /* skip non-target frames */
+                if (!isfinite(px) || !isfinite(py) || !isfinite(pz)) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "non-finite atom coordinate in target pwo frame"); return NULL;
+                }
+                if (frac && !have_cell) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "fractional target frame requires a cell in pwo"); return NULL;
+                }
                 if (got >= cap) {
                     if (cap > 1 << 29) {
                         if (ax) { free(ax); } if (ay) { free(ay); }
@@ -1737,6 +1916,10 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
                     ax[got] = cx; ay[got] = cy; az[got] = cz;
                 } else {
                     ax[got] = px * scale; ay[got] = py * scale; az[got] = pz * scale;
+                }
+                if (!in_float_range(ax[got]) || !in_float_range(ay[got]) || !in_float_range(az[got])) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "non-finite atom coordinate in target pwo frame"); return NULL;
                 }
                 got++;
             }
@@ -1782,6 +1965,9 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
     if (have_cell) {
         for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++)
             s->cell[i][j] = (float)cell[i][j];
+        if (!cell_rank_usable(cell, 3)) {
+            molenv_scene_free(s); set_error(path, 0, "singular cell in pwo"); return NULL;
+        }
     }
     s->is_crystal = have_cell;
     s->periodic_dim = 3;
@@ -3369,6 +3555,14 @@ process_row:
             for (int k = 0; k < natoms; k++) free(at[k].label);
             free(at); set_error(path, 0, "non-finite cell components"); return NULL;
         }
+        {
+            double matrix[3][3];
+            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) matrix[i][j] = cell[i][j];
+            if (!cell_rank_usable(matrix, 3)) {
+                for (int k = 0; k < natoms; k++) free(at[k].label);
+                free(at); set_error(path, 0, "singular CIF cell"); return NULL;
+            }
+        }
         for (int i = 0; i < natoms; i++) {
             if (!at[i].frac) continue;
             double fx = at[i].coord[0], fy = at[i].coord[1], fz = at[i].coord[2];
@@ -3501,7 +3695,10 @@ MolEnvScene* parse_poscar(const char *path) {
                    - cellv[0][1] * (cellv[1][0] * cellv[2][2] - cellv[2][0] * cellv[1][2])
                    + cellv[0][2] * (cellv[1][0] * cellv[2][1] - cellv[2][0] * cellv[1][1]);
         double v0 = fabs(det);
-        latScale = (v0 > 0.0) ? cbrt(fabs(scale) / v0) : 1.0;
+        if (!isfinite(v0) || v0 <= 0.0) {
+            fclose(fp); set_error(path, ln, "negative POSCAR scale requires a non-singular lattice"); return NULL;
+        }
+        latScale = cbrt(fabs(scale) / v0);
     }
     /* Validate latScale: cbrt of a non-finite or negative value can produce NaN/inf
        which silently corrupts the cell. */
@@ -3515,6 +3712,9 @@ MolEnvScene* parse_poscar(const char *path) {
                 fclose(fp); set_error(path, ln, "non-finite cell vector in POSCAR"); return NULL;
             }
         }
+    if (!cell_rank_usable(cellv, 3)) {
+        fclose(fp); set_error(path, ln, "singular cell in POSCAR"); return NULL;
+    }
 
     /* line 6: element symbols (VASP 5+) or counts (VASP 4). Strict 32-token
        cap: the species/counts arrays are fixed at 32, so a surplus-token line is
@@ -3600,6 +3800,12 @@ MolEnvScene* parse_poscar(const char *path) {
                 fclose(fp); set_error(path, ln, "unexpected end at coord mode"); return NULL;
             }
             ln++;
+        }
+        q = line;
+        while (*q == ' ' || *q == '\t') q++;
+        if (!((*q == 'D' || *q == 'd' || *q == 'F' || *q == 'f') ||
+              *q == 'C' || *q == 'c' || *q == 'K' || *q == 'k')) {
+            fclose(fp); set_error(path, ln, "malformed POSCAR coordinate mode"); return NULL;
         }
     }
     int is_frac = 1;
