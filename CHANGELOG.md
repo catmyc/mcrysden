@@ -2,6 +2,31 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] — 2026-08-09
+
+### Fixed
+
+- **Parser hardening** — all declared atom counts (XYZ, PDB, XSF PRIMCOORD/ATOMS/CONVCOORD, AXSF ANIMSTEPS, QE input/output nat, POSCAR, FHI-aims, ORCA, WIEN2k) are now strictly parsed and capped at 500,000 with fail-closed errors instead of unbounded allocations; Swift loaders reject non-finite (NaN/inf/out-of-float-range) lattice and atom coordinates before they can poison framing/cameras.
+- **QE unit tokens are case-insensitive** — `(BOHR)`, `{Alat}`, `(CRYSTAL)` etc. resolve correctly in `.pwi`/`.pwo` instead of silently defaulting to Ångström; unknown unit tokens are now hard parse errors; derived cells/scales/coordinates are validated finite and Float-representable (pwi/pwo/POSCAR).
+- **Periodic bonding** — the C covalent-radii heuristic now applies minimum-image wrapping for crystal scenes (per `periodicDim`, exact 3ᵈ-image enumeration up to 3000 atoms, fractional-rounding fast path beyond), so bonds across cell boundaries and 1D/2D periodicities are detected; the bond buffer ceiling is lowered to 2M with a per-atom degree cap (128) so pathological dense structures fail closed instead of allocating gigabytes; the covalent-radii cache is now thread-safe for concurrent parsing.
+- **APNG export** — fcTL/fdAT sequence numbers follow the spec (0, 1, 2, … strictly increasing), per-frame delay is now 1/fps seconds (was 100/fps), frames stream one at a time instead of pre-rendering all CGImages, and fps is bounded to 1…600 with a 1000-frame cap (MP4 timescale and `UInt16` conversions can no longer trap).
+- **Animation export** — `--export-anim` now applies a companion `.mvis-state` (appearance, supercell/slab, saved camera and frame), honors `--preset`/`--msaa`, validates the destination against input/state aliasing, and starts from the saved frame when `--frame` is absent.
+- **Saved-frame appearance** — re-parsing a saved animation frame (CLI/GUI open and in-window scrubbing) now carries every appearance/display/quality setting via a shared `Scene.adoptAppearance(from:)`, instead of a stale per-field list that dropped clip planes, iso-surface lists, volume slices, AO/shadow/quality, MSAA, opacity, anaglyph, color-plane styling, H-bond/molecular-surface/scheme/override settings, and more.
+- **Animation background work** — thumbnail/trail/export workers snapshot all inputs on the main thread before dispatch and re-check their generation token on the main thread before publishing, eliminating data races and stale-result publication.
+- **H-bond analysis** — periodic acceptor/H images use the exact minimum-image displacement (`PeriodicGeometry`, per `periodicDim`) instead of independent fractional rounding (wrong for skew cells, silent zero-mapping for singular cells); detection is accelerated with a uniform spatial grid (fallback to brute force above 4M buckets).
+- **Powder XRD** — engine fails closed above 2000 atoms; the GUI recomputes debounced on a background queue with a generation token and skips work while the panel is hidden.
+- **CRYSTAL band/DOS parsing** — leading count pairs use checked integer conversion (no `Int(Float)` trap on huge values) and unit-scaled energies are rejected when they overflow to non-finite.
+- **QE band parsing** — a numeric token that is NaN/inf now fails the whole parse instead of silently shortening the row and misaligning every later band.
+- **Z-matrix import** — `0`/`-` placeholder references are only accepted in the first three rows before any real reference (malformed later placeholders are rejected), and Cartesian positions are validated finite after the Double→Float conversion.
+- **Heavy elements** — cube/CRYSCAL/WIEN2k symbol resolution now uses the full 118-element table instead of the 36/42-entry subset.
+- **Export destinations** — GUI structure export, GUI animation export, and headless animation export refuse to overwrite the loaded source/state file (same-file alias check).
+- **State/project/BXSF reads** — file-size caps (50 MB state, 200 MB project/BXSF) before unbounded `Data`/`String` allocation; `.mvis-state` now round-trips H-bond, molecular-surface, color-scheme, element-override, repetition-mode, rod, unicolor-bond and tessellation settings.
+- **Supercell of 1D/2D structures** — expanding a non-periodic axis is refused with a warning instead of creating physically invalid replicas; rebonding uses the scene's own `periodicDim`.
+- **2D display culling** — asymmetric-unit and clip-plane culling now applies to 2D line/point/ball-stick atom and bond drawing, matching the 3D paths.
+- **Basis tools** — primitive/conventional transforms and deformation preserve user-edited k-paths (remapped through the new reciprocal basis) instead of replacing them with the generated route.
+- **convert-all** — inputs whose output names collide (same stem, e.g. `a.xyz` and `a.pdb` → `a.xsf`) are skipped with a warning instead of silently overwriting each other.
+- **Renderer fingerprint** — the atom-color-scheme hash no longer traps when `hashValue` is negative.
+
 ## [1.2.3] — 2026-08-09
 
 ### Added

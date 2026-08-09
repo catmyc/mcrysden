@@ -128,4 +128,143 @@ final class AnimationExportTests: XCTestCase {
         let pngSig: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
         XCTAssertEqual(Array(pngData.prefix(8)), pngSig, "export must write a valid PNG signature")
     }
+
+    /// Parse the APNG chunk stream and return the (type, sequenceNumber?) for
+    /// each fcTL/fdAT chunk in order. Sequence numbers are extracted from the
+    /// chunk payload (fcTL: first 4 bytes; fdAT: first 4 bytes after the type).
+    private static func apngSequence(_ data: Data) -> [(type: String, seq: UInt32)] {
+        var result: [(String, UInt32)] = []
+        var offset = 8 // skip signature
+        while offset + 8 <= data.count {
+            let chunkLen = UInt32(data[offset]) << 24 | UInt32(data[offset + 1]) << 16
+                | UInt32(data[offset + 2]) << 8 | UInt32(data[offset + 3])
+            let typeStart = offset + 4
+            let typeBytes = data[typeStart..<typeStart + 4]
+            guard let type = String(data: typeBytes, encoding: .ascii) else { break }
+            let payloadStart = typeStart + 4
+            if type == "fcTL" || type == "fdAT" {
+                let seq = UInt32(data[payloadStart]) << 24 | UInt32(data[payloadStart + 1]) << 16
+                    | UInt32(data[payloadStart + 2]) << 8 | UInt32(data[payloadStart + 3])
+                result.append((type, seq))
+            }
+            // length(4) + type(4) + data(len) + crc(4)
+            offset = payloadStart + Int(chunkLen) + 4
+        }
+        return result
+    }
+
+    func testApngSequenceNumbersAndDelay() throws {
+        let frames = [
+            Self.makeSyntheticScene(seed: 0),
+            Self.makeSyntheticScene(seed: 1),
+            Self.makeSyntheticScene(seed: 2),
+        ]
+        let size = CGSize(width: 64, height: 64)
+        var fixedCamera = Camera()
+        fixedCamera.distance = 12
+        fixedCamera.perspective = false
+
+        let apngURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mcrysden_test_\(UUID().uuidString).apng")
+        try AnimationExporter.export(frames: frames, camera: fixedCamera, size: size, fps: 10,
+                                     format: .apng, to: apngURL)
+        let data = try Data(contentsOf: apngURL)
+        let seq = Self.apngSequence(data)
+
+        // 3 frames → fcTL/fdAT sequence: fcTL=0, fcTL=1, fdAT=2, fcTL=3, fdAT=4
+        // (first frame's pixels go in IDAT, not fdAT).
+        XCTAssertEqual(seq.count, 5, "3 frames → 5 sequenced chunks (fcTL×3 + fdAT×2)")
+        XCTAssertEqual(seq[0].type, "fcTL"); XCTAssertEqual(seq[0].seq, 0)
+        XCTAssertEqual(seq[1].type, "fcTL"); XCTAssertEqual(seq[1].seq, 1)
+        XCTAssertEqual(seq[2].type, "fdAT"); XCTAssertEqual(seq[2].seq, 2)
+        XCTAssertEqual(seq[3].type, "fcTL"); XCTAssertEqual(seq[3].seq, 3)
+        XCTAssertEqual(seq[4].type, "fdAT"); XCTAssertEqual(seq[4].seq, 4)
+
+        // Sequence numbers must be strictly increasing.
+        for i in 1..<seq.count {
+            XCTAssertGreaterThan(seq[i].seq, seq[i - 1].seq,
+                                  "APNG sequence numbers must be strictly increasing")
+        }
+
+        // Delay must be 1/fps (delayNum=1, delayDen=10), not the old 100/fps.
+        // fcTL payload: seq(4) + w(4) + h(4) + x(4) + y(4) + delayNum(2) + delayDen(2) + dispose(1) + blend(1)
+        // Find the first fcTL and read its delay.
+        var offset = 8
+        var foundDelay = false
+        while offset + 8 <= data.count {
+            let chunkLen = UInt32(data[offset]) << 24 | UInt32(data[offset + 1]) << 16
+                | UInt32(data[offset + 2]) << 8 | UInt32(data[offset + 3])
+            let typeStart = offset + 4
+            let typeBytes = data[typeStart..<typeStart + 4]
+            if String(data: typeBytes, encoding: .ascii) == "fcTL" {
+                let p = typeStart + 4 + 20 // skip seq+w+h+x+y = 20 bytes
+                let delayNum = UInt16(data[p]) << 8 | UInt16(data[p + 1])
+                let delayDen = UInt16(data[p + 2]) << 8 | UInt16(data[p + 3])
+                XCTAssertEqual(delayNum, 1, "APNG delay numerator must be 1 (1/fps seconds)")
+                XCTAssertEqual(delayDen, 10, "APNG delay denominator must equal fps")
+                foundDelay = true
+                break
+            }
+            offset = typeStart + 4 + Int(chunkLen) + 4
+        }
+        XCTAssertTrue(foundDelay, "must find at least one fcTL chunk to verify delay")
+    }
+
+    func testFpsBoundsEnforced() throws {
+        let frames = [Self.makeSyntheticScene(seed: 0)]
+        let size = CGSize(width: 64, height: 64)
+
+        // fps > 600 must be rejected (would overflow UInt16 in APNG, overflow
+        // Int32 in MP4 CMTimeMultiply).
+        do {
+            try AnimationExporter.export(frames: frames, camera: nil, size: size, fps: 601,
+                                         format: .apng, to: URL(fileURLWithPath: "/dev/null"))
+            XCTFail("fps=601 should have thrown")
+        } catch AnimationExportError.invalidSize {
+            // expected
+        }
+
+        // fps = 0 must be rejected.
+        do {
+            try AnimationExporter.export(frames: frames, camera: nil, size: size, fps: 0,
+                                         format: .apng, to: URL(fileURLWithPath: "/dev/null"))
+            XCTFail("fps=0 should have thrown")
+        } catch AnimationExportError.invalidSize {
+            // expected
+        }
+
+        // fps = 600 is the upper bound and must be accepted (no throw).
+        let apngURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mcrysden_test_\(UUID().uuidString).apng")
+        try AnimationExporter.export(frames: frames, camera: nil, size: size, fps: 600,
+                                     format: .apng, to: apngURL)
+        XCTAssertGreaterThan(try Data(contentsOf: apngURL).count, 8)
+    }
+
+    func testFrameCountCap() throws {
+        // Build 1001 single-atom scenes. The exporter must refuse before
+        // materializing them all into CGImages.
+        var scenes: [Scene] = []
+        for i in 0..<1001 {
+            var s = Scene()
+            s.atoms = [Atom(coord: SIMD3<Float>(Float(i), 0, 0), atomicNumber: 1, label: "H")]
+            scenes.append(s)
+        }
+        let size = CGSize(width: 32, height: 32)
+        do {
+            try AnimationExporter.export(frames: scenes, camera: nil, size: size, fps: 10,
+                                         format: .apng, to: URL(fileURLWithPath: "/dev/null"))
+            XCTFail("1001 frames should have thrown")
+        } catch AnimationExportError.invalidSize {
+            // expected
+        }
+
+        // Exactly 1000 frames must be accepted.
+        scenes.removeLast()
+        let apngURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mcrysden_test_\(UUID().uuidString).apng")
+        try AnimationExporter.export(frames: scenes, camera: nil, size: size, fps: 10,
+                                     format: .apng, to: apngURL)
+        XCTAssertGreaterThan(try Data(contentsOf: apngURL).count, 8)
+    }
 }

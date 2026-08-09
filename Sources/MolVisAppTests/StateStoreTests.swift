@@ -32,6 +32,16 @@ final class StateStoreTests: XCTestCase {
         scene.shadowStrength = 0.55
         scene.aoQuality = 3
         scene.shadowQuality = 1
+        scene.hbondSettings.maxDistance = 3.75
+        scene.molecularSurfaceSettings.probeRadius = 2.0
+        scene.atomColorScheme = .coordination
+        scene.elementOverrides = [1: ElementOverride(colorHex: "#FF0000", covalentRadius: 0.5, vdwRadius: 1.5, labelOverride: "H", fontScale: 1.2)]
+        scene.repetitionMode = .asymmetricUnit
+        scene.cellRodsEnabled = true
+        scene.cellRodFactor = 0.8
+        scene.unicolorBonds = true
+        scene.unicolorBondHex = "#00FF00"
+        scene.tessellationFactor = 3
 
         let fields = [
             ScalarField(nx: 2, ny: 2, nz: 2, origin: .zero,
@@ -112,6 +122,16 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(loaded.shadowStrength, 0.55, accuracy: 1e-5)
         XCTAssertEqual(loaded.aoQuality, 3)
         XCTAssertEqual(loaded.shadowQuality, 1)
+        XCTAssertEqual(loaded.hbondSettings.maxDistance, 3.75, accuracy: 1e-5)
+        XCTAssertEqual(loaded.molecularSurfaceSettings.probeRadius, 2.0, accuracy: 1e-5)
+        XCTAssertEqual(loaded.atomColorScheme, .coordination)
+        XCTAssertEqual(loaded.elementOverrides[1]?.colorHex, "#FF0000")
+        XCTAssertEqual(loaded.repetitionMode, .asymmetricUnit)
+        XCTAssertEqual(loaded.cellRodsEnabled, true)
+        XCTAssertEqual(loaded.cellRodFactor, 0.8, accuracy: 1e-5)
+        XCTAssertEqual(loaded.unicolorBonds, true)
+        XCTAssertEqual(loaded.unicolorBondHex, "#00FF00")
+        XCTAssertEqual(loaded.tessellationFactor, 3)
         XCTAssertEqual(loaded.currentOrbital, 1)
         XCTAssertEqual(loaded.isoLevel, 5, accuracy: 1e-5)
         XCTAssertEqual(loaded.colorPlaneColormap, .turbo)

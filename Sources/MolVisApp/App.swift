@@ -240,8 +240,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 options.exportAnimationURL = URL(fileURLWithPath: args[index])
             } else if !optionsEnded && argument == "--fps" {
                 guard !fpsSeen, index + 1 < args.count,
-                      let value = Int(args[index + 1]), value >= 1 else {
-                    throw CLIError.invalid("--fps requires a positive integer")
+                      let value = Int(args[index + 1]), value >= 1, value <= 600 else {
+                    throw CLIError.invalid("--fps requires an integer in 1...600")
                 }
                 fpsSeen = true
                 index += 1
@@ -623,19 +623,16 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             scene = Scene(loaded: try Parser.load(url, as: format, frameIndex: scene.currentFrame))
             if restored.superCell.total > 1 { scene = scene.widenSuperCell(restored.superCell) }
             if let sl = restored.slab { scene = scene.applySlab(sl) }
-            // carry over appearance/structural settings (kept while only geometry changes)
-            scene.displayMode = restored.displayMode
-            scene.background = restored.background
-            scene.backgroundBottom = restored.backgroundBottom
-            scene.backgroundType = restored.backgroundType
-            scene.lighting = restored.lighting
-            scene.showCellFrame = restored.showCellFrame
-            scene.showAxes = restored.showAxes
-            scene.showLabels = restored.showLabels
-            scene.showStructure = restored.showStructure
-            scene.showBrillouinZone = restored.showBrillouinZone
-            scene.showIsoSurface = restored.showIsoSurface
-            scene.isoLevel = restored.isoLevel
+            // Carry over every appearance/display/quality setting the user can
+            // control in the sidebar (kept while only geometry changes). This
+            // replaces the per-field list that previously dropped showBondDistances,
+            // isoSurfaces, clipPlane, colorPlane*, volumeSlices, msaa, opacity,
+            // lineWidth, depth/shadow/AO strength and quality, hbond/molecular-
+            // surface settings, color scheme, element overrides, repetition mode,
+            // cell rods, unicolor bonds, tessellation and anaglyph mode.
+            scene.adoptAppearance(from: restored)
+            // measurementMode is not an appearance field; carry it explicitly.
+            scene.measurementMode = restored.measurementMode
             // The freshly parsed frame may carry a scalar field whose value range differs
             // from the frame we carried the level over (e.g. animated XSF). Clamp the
             // carried level into the new field's range so it stays meaningful; when the
@@ -645,15 +642,6 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             if let field = scene.scalarField {
                 scene.isoLevel = min(field.maxValue, max(field.minValue, scene.isoLevel))
             }
-            // Force-arrow settings: carry across the frame rebuild so restoring a saved
-            // animation frame (headless --frame or GUI saved currentFrame) keeps the
-            // visibility/scale the user set, matching the other appearance fields.
-            scene.showForces = restored.showForces
-            scene.forceScale = restored.forceScale
-            scene.atomScale = restored.atomScale
-            scene.bondRadius = restored.bondRadius
-            scene.measurementMode = restored.measurementMode
-            scene.showColorPlane = restored.showColorPlane
             // A rebuilt frame may have a different input reciprocal basis even
             // when its standardized symmetry signature is unchanged (for example
             // a physically rotated cell). Generated paths stay with the freshly
@@ -824,23 +812,45 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         // headless animation export (--export-anim).
         if let animURL = options.exportAnimationURL, let inURL = options.inputURL {
             do {
+                try Self.validateExportDestination(animURL, input: inURL, state: options.stateURL)
+                // Load the reference frame ONCE with the companion state applied:
+                // this restores appearance, supercell, slab, the saved camera and
+                // the saved animation frame. Each exported frame is then re-parsed
+                // and re-dressed with these structural/appearance settings so the
+                // animation reflects what the user saved, not raw parser defaults.
+                var kPathSampling = 20
+                let (refScene, refCamera, _) = try Self.loadScene(
+                    from: inURL,
+                    format: options.format,
+                    cliFrame: options.frame,
+                    stateURL: options.stateURL,
+                    kPathImportURL: options.kPathImportURL,
+                    kPathSampling: &kPathSampling
+                )
                 let fc = Parser.frameCount(inURL, as: options.format)
                 let total = fc > 0 ? fc : 1
                 // --frame N is the starting frame and --frames K bounds the count;
-                // both were parsed but ignored here before.
+                // a state-restored currentFrame overrides --frame when none was given.
+                let start = options.frame >= 0 ? options.frame : refScene.currentFrame
                 let range = try Self.animationFrameRange(total: total,
-                                                         startFrame: options.frame,
+                                                         startFrame: start,
                                                          frameCount: options.animFrameCount,
                                                          name: inURL.lastPathComponent)
                 var scenes: [Scene] = []
                 scenes.reserveCapacity(range.count)
                 for i in range {
-                    scenes.append(Scene(loaded: try Parser.load(inURL, as: options.format, frameIndex: i)))
+                    var scene = Scene(loaded: try Parser.load(inURL, as: options.format, frameIndex: i))
+                    if refScene.superCell.total > 1 { scene = scene.widenSuperCell(refScene.superCell) }
+                    if let slab = refScene.slab { scene = scene.applySlab(slab) }
+                    scene.adoptAppearance(from: refScene)
+                    if let preset = options.preset { preset.apply(to: &scene) }
+                    if let msaa = options.msaaSampleCount { scene.msaaSampleCount = msaa }
+                    scenes.append(scene)
                 }
                 let size = options.animSize ?? CGSize(width: 640, height: 480)
                 let ext = animURL.pathExtension.lowercased()
                 let aformat: AnimationExportFormat = ext == "gif" ? .gif : (ext == "mp4" ? .mp4 : .apng)
-                try AnimationExporter.export(frames: scenes, camera: nil, size: size, fps: options.animFPS,
+                try AnimationExporter.export(frames: scenes, camera: refCamera, size: size, fps: options.animFPS,
                                              format: aformat, to: animURL)
             } catch {
                 print("[mcrysden] export-anim failed: \(error)")
@@ -1803,7 +1813,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.3"
+    static let appVersion = "1.2.4"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

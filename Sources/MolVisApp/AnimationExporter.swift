@@ -16,7 +16,8 @@ enum AnimationExporter {
     static func export(frames: [Scene], camera: Camera?, size: CGSize, fps: Int,
                        format: AnimationExportFormat, to url: URL) throws {
         guard !frames.isEmpty else { throw AnimationExportError.noFrames }
-        guard fps >= 1 else { throw AnimationExportError.invalidSize }
+        guard fps >= 1, fps <= 600 else { throw AnimationExportError.invalidSize }
+        guard frames.count <= 1000 else { throw AnimationExportError.invalidSize }
         switch format {
         case .gif: try exportGIF(frames: frames, camera: camera, size: size, fps: fps, to: url)
         case .apng: try exportAPNG(frames: frames, camera: camera, size: size, fps: fps, to: url)
@@ -55,8 +56,11 @@ enum AnimationExporter {
             throw AnimationExportError.invalidSize
         }
         let w = Int(rw), h = Int(rh)
-        let rendered: [CGImage] = try frames.map { try PngExporter.render(scene: $0, camera: camera, size: size) }
-        try ApngWriter.write(frames: rendered, width: w, height: h, fps: fps, to: url)
+        // Stream frames one at a time: render + deflate + append per frame so a
+        // long trajectory never materializes every CGImage in memory at once.
+        try ApngWriter.write(frameCount: frames.count, width: w, height: h, fps: fps, to: url) { index in
+            try PngExporter.render(scene: frames[index], camera: camera, size: size)
+        }
     }
 
     // MARK: - MP4 (AVFoundation)
@@ -165,33 +169,41 @@ enum MP4PixelBuffer {
 enum ApngWriter {
     static let signature: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
 
-    static func write(frames: [CGImage], width: Int, height: Int, fps: Int, to url: URL) throws {
-        guard width > 0, height > 0, !frames.isEmpty else { throw AnimationExportError.invalidSize }
+    static func write(frameCount: Int, width: Int, height: Int, fps: Int,
+                      to url: URL, render: (Int) throws -> CGImage) throws {
+        guard width > 0, height > 0, frameCount > 0 else { throw AnimationExportError.invalidSize }
         let data = NSMutableData()
         data.append(ApngWriter.signature, length: 8)
         // IHDR: 13-byte payload, serialized as big-endian bytes to avoid struct
         // alignment padding corrupting the wire format.
         writeChunk(data: data, type: "IHDR", bytes: ihdrBytes(width: width, height: height))
         // acTL: num_frames, num_plays
-        writeChunk(data: data, type: "acTL", bytes: actlBytes(numFrames: UInt32(frames.count), numPlays: 0))
-        let delayNum = fps > 0 ? 100 : 1000
+        writeChunk(data: data, type: "acTL", bytes: actlBytes(numFrames: UInt32(frameCount), numPlays: 0))
+        // APNG spec: fcTL and fdAT chunks share one sequence-number space.
+        // Frame 0: fcTL seq=0, then for frame i>=1: fcTL seq=2i-1, fdAT seq=2i.
+        // IDAT (first frame) carries no sequence number. Delay = 1/fps seconds.
+        let delayNum: UInt16 = 1
         let delayDen = fps > 0 ? UInt16(fps) : 1
-        for (i, frame) in frames.enumerated() {
+        var seq = 0
+        for i in 0..<frameCount {
             let isFirst = i == 0
-            let frameData = try frameRowData(cg: frame, width: width, height: height)
+            let cg = try render(i)
+            let frameData = try frameRowData(cg: cg, width: width, height: height)
             let deflated = deflate(frameData)
             writeChunk(data: data, type: "fcTL", bytes: fcTLBytes(
-                sequenceNumber: UInt32(i),
+                sequenceNumber: UInt32(seq),
                 width: UInt32(width), height: UInt32(height),
                 xOffset: 0, yOffset: 0,
-                delayNum: UInt16(delayNum), delayDen: delayDen,
+                delayNum: delayNum, delayDen: delayDen,
                 disposeOp: 0, blendOp: 0))
-            // IDAT for first frame, fdAT for rest
+            seq += 1
+            // IDAT for first frame (carries no sequence number), fdAT for rest.
             if isFirst {
                 deflated.withUnsafeBytes { writeChunk(data: data, type: "IDAT", ptr: $0) }
             } else {
-                var fdat = fdATData(sequenceNumber: UInt32(i), frameData: deflated)
+                let fdat = fdATData(sequenceNumber: UInt32(seq), frameData: deflated)
                 fdat.withUnsafeBytes { writeChunk(data: data, type: "fdAT", ptr: $0) }
+                seq += 1
             }
         }
         let empty = UnsafeRawBufferPointer(start: nil, count: 0)

@@ -375,4 +375,115 @@ final class AnimationControllerTests: XCTestCase {
                        "single-field clamp bounds the iso level")
     }
 
+    // MARK: - Export destination overwrite guard
+
+    /// Writing an exported structure back onto the loaded source URL must be
+    /// blocked by the destination-validation guard, not silently allowed to
+    /// destroy the source. The guard lives in `App.validateGUIWriteDestination`
+    /// and is invoked before any bytes are written.
+    @MainActor
+    func testExportStructureRefusesToOverwriteSource() throws {
+        // A real multi-frame source the parser accepts.
+        let src = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Assets/si_relax.out")
+        let initial = Scene(loaded: try Parser.load(src, as: nil, frameIndex: 0))
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(initial, from: src, format: nil, frameIndex: 0)
+
+        // Snapshot the source content, then attempt to export onto it.
+        let original = try String(contentsOf: src, encoding: .utf8)
+        controller.exportStructure(.xyz, to: src)
+
+        // The guard must block the write: the file is unchanged. (If the guard
+        // were missing, the .xyz text — a different format — would overwrite it.)
+        let after = try String(contentsOf: src, encoding: .utf8)
+        XCTAssertEqual(after, original, "export must not overwrite the loaded source")
+    }
+
+    // MARK: - Frame-reload appearance parity
+
+    /// reloadFrame now adopts every appearance field from the previous frame
+    /// via `Scene.adoptAppearance(from:)`. Before the fix, fields added to
+    /// Scene after the original carry block (anaglyphMode, opacity, lineWidth,
+    /// aoQuality, …) silently reset on every scrub. This test sets a
+    /// distinctive value on each of those previously-missed fields, scrubs to
+    /// the next frame, and asserts every one survives the reload.
+    @MainActor
+    func testReloadFrameAdoptsAllAppearanceFields() throws {
+        let src = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Assets/si_relax.out")
+        let initial = Scene(loaded: try Parser.load(src, as: nil, frameIndex: 0))
+        let controller = MainWindowController(scene: Scene(), showWindow: false)
+        controller.loadFile(initial, from: src, format: nil, frameIndex: 0)
+        XCTAssertEqual(controller.state.frameCount, 2)
+
+        // Stamp the live scene with distinctive values for every field
+        // adoptAppearance copies (including the ones the old manual block
+        // missed). Use values far from Scene's defaults.
+        var staged = controller.scene
+        staged.anaglyphMode = .redCyan
+        staged.opacity = 0.42
+        staged.lineWidth = 3.7
+        staged.depthCueingStrength = 0.31
+        staged.aoStrength = 0.58
+        staged.shadowStrength = 0.69
+        staged.aoQuality = 5
+        staged.shadowQuality = 4
+        staged.msaaSampleCount = 8
+        staged.clipPlane = ClipPlane(enabled: true, h: 1, k: 2, l: 3, distance: 1.5)
+        staged.isoSurfaces = [IsoSurfaceSpec(level: 0.25, colorHex: "#AABBCC", sign: -1, enabled: true)]
+        staged.colorPlaneColormap = .turbo
+        staged.colorPlaneContourEnabled = true
+        staged.colorPlaneContourCount = 12
+        staged.volumeSlices = [VolumeSlice(), VolumeSlice()]
+        staged.atomColorScheme = .coordination
+        staged.cellRodsEnabled = true
+        staged.cellRodFactor = 0.33
+        staged.unicolorBonds = !staged.unicolorBonds
+        controller.scene = staged
+
+        // Scrub to frame 1 → reloadFrame builds the next scene from the parsed
+        // frame and adopts appearance from the previous (staged) scene.
+        controller.state.frameIndex = 1
+        let next = controller.scene
+
+        // Selection + measurement are per-frame and must NOT carry.
+        XCTAssertTrue(next.selectedAtoms.isEmpty)
+        XCTAssertNil(next.measurementResult)
+
+        // Every adopted field must match the staged scene.
+        XCTAssertEqual(next.anaglyphMode, .redCyan)
+        XCTAssertEqual(next.opacity, 0.42, accuracy: 1e-6)
+        XCTAssertEqual(next.lineWidth, 3.7, accuracy: 1e-6)
+        XCTAssertEqual(next.depthCueingStrength, 0.31, accuracy: 1e-6)
+        XCTAssertEqual(next.aoStrength, 0.58, accuracy: 1e-6)
+        XCTAssertEqual(next.shadowStrength, 0.69, accuracy: 1e-6)
+        XCTAssertEqual(next.aoQuality, 5)
+        XCTAssertEqual(next.shadowQuality, 4)
+        XCTAssertEqual(next.msaaSampleCount, 8)
+        XCTAssertNotNil(next.clipPlane)
+        XCTAssertEqual(next.clipPlane?.enabled, true)
+        XCTAssertEqual(next.clipPlane?.h, 1)
+        XCTAssertEqual(next.clipPlane?.distance ?? -1, Float(1.5), accuracy: 1e-4)
+        XCTAssertEqual(next.isoSurfaces.count, 1)
+        XCTAssertEqual(next.isoSurfaces.first?.level ?? -1, Float(0.25), accuracy: 1e-4)
+        XCTAssertEqual(next.colorPlaneColormap, .turbo)
+        XCTAssertEqual(next.colorPlaneContourEnabled, true)
+        XCTAssertEqual(next.colorPlaneContourCount, 12)
+        XCTAssertEqual(next.volumeSlices.count, 2)
+        XCTAssertEqual(next.atomColorScheme, .coordination)
+        XCTAssertEqual(next.cellRodsEnabled, true)
+        XCTAssertEqual(next.cellRodFactor, 0.33, accuracy: 1e-6)
+        XCTAssertEqual(next.unicolorBonds, staged.unicolorBonds)
+
+        // Geometry must come from the freshly parsed frame, NOT the staged scene.
+        XCTAssertEqual(next.currentFrame, 1)
+    }
+
 }

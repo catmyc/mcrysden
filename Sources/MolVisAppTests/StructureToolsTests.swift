@@ -191,4 +191,30 @@ final class StructureToolsTests: XCTestCase {
         case .success: XCTFail("tiny radius should yield an empty cluster")
         }
     }
+
+    func testUserKPathPreservedThroughTransform() {
+        let scene = makeDiamondSiScene()
+
+        // A scene with a user-edited k-path keeps its provenance and point count.
+        var userScene = scene
+        userScene.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ"),
+                                 KPoint(SIMD3(0.5, 0, 0), "X"),
+                                 KPoint(SIMD3(0.5, 0.5, 0), "M")]
+        userScene.kPathProvenance = .userEdited
+        userScene.kPathBreaks = [1]
+        let userPointCount = userScene.kPathPoints.count
+
+        let userResult = try! userScene.transformed(to: .primitive).get()
+        XCTAssertEqual(userResult.kPathProvenance, .userEdited,
+                       "user-edited provenance must survive a basis transform")
+        XCTAssertEqual(userResult.kPathPoints.count, userPointCount,
+                       "user route point count must be preserved")
+        XCTAssertEqual(userResult.kPathBreaks, [1])
+
+        // A generated route is regenerated (provenance stays .generated, and the
+        // point count reflects the new primitive-cell canonical path).
+        let genResult = try! scene.transformed(to: .primitive).get()
+        XCTAssertEqual(genResult.kPathProvenance, .generated)
+        XCTAssertGreaterThan(genResult.kPathPoints.count, 0)
+    }
 }

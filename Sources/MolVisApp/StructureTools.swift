@@ -107,7 +107,14 @@ extension Scene {
         out.crystalSymmetry = CrystalSymmetryAnalyzer.analyze(
             cell: newCell, atoms: newAtoms, isCrystal: true, periodicDim: 3,
             inputCompleteness: crystalSymmetry?.inputCompleteness ?? .complete)
-        out.installCanonicalPath(cell: newCell)
+        // A user-edited route is data, not a request to regenerate. Remap it
+        // through the new reciprocal basis instead of replacing it with the
+        // canonical path (which would destroy the user's edits).
+        if out.kPathProvenance == .generated {
+            out.installCanonicalPath(cell: newCell)
+        } else {
+            out.transferKPathAcrossGeometryChange(from: self)
+        }
         out.title = (out.title.isEmpty ? "" : out.title + " ")
             + (representation == .primitive ? "(primitive)" : "(conventional)")
         return .success(out)
@@ -166,7 +173,13 @@ extension Scene {
             cell: newCell, atoms: newAtoms, isCrystal: isCrystal, periodicDim: periodicDim,
             inputCompleteness: crystalSymmetry?.inputCompleteness ?? .complete)
         if isCrystal, let c = out.cell {
-            out.installCanonicalPath(cell: c)
+            // A user-edited route is data, not a request to regenerate. Remap it
+            // through the new reciprocal basis instead of replacing it.
+            if out.kPathProvenance == .generated {
+                out.installCanonicalPath(cell: c)
+            } else {
+                out.transferKPathAcrossGeometryChange(from: self)
+            }
         }
         out.title = (out.title.isEmpty ? "" : out.title + " ") + "(deformed)"
         return .success(out)

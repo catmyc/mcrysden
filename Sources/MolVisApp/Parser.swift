@@ -657,7 +657,9 @@ enum Parser {
         // lattice line: "<F|P|C>   LATTICE,NONEQUIV. ATOMS  <nat>"
         guard let latLine = nextLine() else { throw E.malformed("empty") }
         let latToks = tok(latLine)
-        guard let natoms = latToks.last.flatMap(Int.init), natoms > 0 else {
+        // Cap declared atoms: the reading loop honors this count, so an
+        // absurd value must be rejected before it can drive unbounded work.
+        guard let natoms = latToks.last.flatMap(Int.init), natoms > 0, natoms <= 500_000 else {
             throw E.malformed("bad atom count: \(latLine)")
         }
         _ = nextLine()   // MODE OF CALC=...
@@ -680,7 +682,11 @@ enum Parser {
         }
         var params = scanFloats(pLine)
         while params.count < 6, let more = nextLine() { params += scanFloats(more) }
-        guard params.count >= 6 else { throw E.malformed("bad cell params") }
+        // Reject non-finite params before Cell.fromLattice can turn them into
+        // its zero-cell sentinel (Float("nan") parses as non-nil but isNaN).
+        guard params.count >= 6, params.allSatisfy(\.isFinite) else {
+            throw E.malformed("bad cell params")
+        }
         let (a, b, c) = (params[0], params[1], params[2])
         let (alpha, beta, gamma) = (params[3], params[4], params[5])
         let cell = Cell.fromLattice(a: a * b2a, b: b * b2a, c: c * b2a,
@@ -713,8 +719,11 @@ enum Parser {
             let t = tok(line)
             // site start: "ATOM= <i>:" / "Atom <i>:" (first position line)
             let firstIsAtom = (!t.isEmpty && (t[0] == "ATOM=" || t[0] == "Atom" || t[0] == "ATOM"))
-            guard firstIsAtom, let x = parseVal("X=", t), let y = parseVal("Y=", t),
-                  let z = parseVal("Z=", t) else {
+            // Reject non-finite coordinates: Float("nan")/Float("inf") parse as
+            // non-nil, so isFinite is required on every component.
+            guard firstIsAtom, let x = parseVal("X=", t), x.isFinite,
+                  let y = parseVal("Y=", t), y.isFinite,
+                  let z = parseVal("Z=", t), z.isFinite else {
                 // not a site-start line (symmetry ops, stray text) -> skip
                 continue
             }
@@ -724,7 +733,10 @@ enum Parser {
             // read the remaining (m-1) position lines, each "<i>: X=.. Y=.. Z=.."
             while positions.count < mult, let pline = nextLine() {
                 let pt = tok(pline)
-                if let px = parseVal("X=", pt), let py = parseVal("Y=", pt), let pz = parseVal("Z=", pt) {
+                // MULT position lines must also be finite (same NaN/inf risk).
+                if let px = parseVal("X=", pt), px.isFinite,
+                   let py = parseVal("Y=", pt), py.isFinite,
+                   let pz = parseVal("Z=", pt), pz.isFinite {
                     positions.append(SIMD3<Float>(px, py, pz))
                 }
             }
@@ -753,7 +765,16 @@ enum Parser {
             if Z == 0 { Z = Table.z(symbol) }
             let sym = symbol.isEmpty ? Table.id(Z) : symbol
             for frac in positions {
-                atoms.append(Atom(coord: cell.cartesian(frac), atomicNumber: Z, label: sym))
+                // Cap total atoms across all sites: an absurd MULT or a runaway
+                // loop must not allocate unboundedly.
+                if atoms.count >= 500_000 { throw E.malformed("too many atoms") }
+                let cart = cell.cartesian(frac)
+                // The Cartesian result must be finite: a non-finite fractional
+                // coordinate or a degenerate cell can produce inf/NaN here.
+                guard cart.x.isFinite, cart.y.isFinite, cart.z.isFinite else {
+                    throw E.malformed("non-finite atom position")
+                }
+                atoms.append(Atom(coord: cart, atomicNumber: Z, label: sym))
             }
         }
 
@@ -1524,23 +1545,18 @@ enum CRYSCALSlabBuilder {
     }
 }
 
-// Minimal element-symbol helper used by the cube + WIEN2k readers (avoids
-// ElementTable's full API which needs the renderer).
+// Element-symbol helper used by the cube + WIEN2k readers. Delegates to the
+// full ElementTable (Z=0..118, pure data — no renderer dependency) so heavy
+// elements resolve correctly. Fallbacks match prior behavior: unknown symbol
+// -> 0 (Table.z), out-of-range Z -> "\(z)" (Table.id).
 enum Table {
     static func id(_ z: Int) -> String {
-        let sym = ["H","He","Li","Be","B","C","N","O","F","Ne","Na","Mg","Al","Si","P","S","Cl","Ar",
-                   "K","Ca","Sc","Ti","V","Cr","Mn","Fe","Co","Ni","Cu","Zn","Ga","Ge","As","Se","Br","Kr"]
-        return (z >= 1 && z <= sym.count) ? sym[z-1] : "\(z)"
+        guard z >= 1, z <= 118 else { return "\(z)" }
+        return ElementTable.symbol(z)
     }
     /// Parse an element symbol to atomic number; returns 0 if unknown.
     static func z(_ s: String) -> Int {
-        let table: [String: Int] = [
-            "H":1,"HE":2,"LI":3,"BE":4,"B":5,"C":6,"N":7,"O":8,"F":9,"NE":10,"NA":11,"MG":12,
-            "AL":13,"SI":14,"P":15,"S":16,"CL":17,"AR":18,"K":19,"CA":20,"SC":21,"TI":22,
-            "V":23,"CR":24,"MN":25,"FE":26,"CO":27,"NI":28,"CU":29,"ZN":30,"GA":31,"GE":32,
-            "AS":33,"SE":34,"BR":35,"KR":36,"RB":37,"SR":38,"Y":39,"ZR":40,"NB":41,"MO":42
-        ]
-        return table[s.uppercased()] ?? 0
+        return ElementTable.atomicNumber(s)
     }
 }
 
@@ -1568,7 +1584,12 @@ enum OrcaParser {
         let lines = raw.components(separatedBy: "\n")
         // Collect the start line of every coordinate block.
         var blockStarts: [Int] = []
-        for (i, line) in lines.enumerated() where line.contains(coordHeader) { blockStarts.append(i) }
+        for (i, line) in lines.enumerated() where line.contains(coordHeader) {
+            // Cap the number of tracked blocks: a file with an absurd number of
+            // coordinate blocks is malformed and must not allocate unboundedly.
+            if blockStarts.count >= 100_000 { break }
+            blockStarts.append(i)
+        }
         guard !blockStarts.isEmpty else { enum E: Error { case noCoords }; throw E.noCoords }
         guard frameIndex < 0 || frameIndex < blockStarts.count else {
             enum E: Error { case noCoords }; throw E.noCoords
@@ -1587,8 +1608,15 @@ enum OrcaParser {
             let line = lines[idx].trimmingCharacters(in: .whitespaces)
             if line.isEmpty { break }
             let toks = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            guard toks.count >= 4, let x = Float(toks[1]), let y = Float(toks[2]),
-                  let z = Float(toks[3]) else { break }   // next section reached
+            // Reject non-finite coordinates: Float("nan")/Float("inf") return
+            // non-nil, so the plain `Float(tok) != nil` check is not enough — a
+            // NaN coordinate poisons framingSphere/defaultCamera downstream.
+            guard toks.count >= 4, let x = Float(toks[1]), x.isFinite,
+                  let y = Float(toks[2]), y.isFinite,
+                  let z = Float(toks[3]), z.isFinite else { break }   // next section reached
+            // Cap total atoms: a file with an absurd number of atoms must not
+            // allocate unboundedly.
+            if atoms.count >= 500_000 { break }
             let Z = ElementTable.atomicNumber(toks[0])
             let sym = Z == 0 ? toks[0] : ElementTable.symbol(Z)
             atoms.append(Atom(coord: SIMD3<Float>(x, y, z), atomicNumber: Z, label: sym))
@@ -1670,17 +1698,25 @@ internal func loadFHIaimsGeometryIn(lines: [String], url: URL) throws -> LoadedS
         guard let kw = t.first?.lowercased() else { continue }
         switch kw {
         case "lattice_vector":
-            guard t.count >= 4, let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else {
+            // Reject non-finite components: Float("nan")/Float("inf") parse as
+            // non-nil, so isFinite is required on every component.
+            guard t.count >= 4, let x = Float(t[1]), x.isFinite,
+                  let y = Float(t[2]), y.isFinite,
+                  let z = Float(t[3]), z.isFinite else {
                 throw E.malformed("bad lattice_vector: \(line)")
             }
             latticeVecs.append(SIMD3<Float>(x, y, z))
         case "atom_frac":
-            guard t.count >= 5, let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else {
+            guard t.count >= 5, let x = Float(t[1]), x.isFinite,
+                  let y = Float(t[2]), y.isFinite,
+                  let z = Float(t[3]), z.isFinite else {
                 throw E.malformed("bad atom_frac: \(line)")
             }
             fracAtoms.append((SIMD3<Float>(x, y, z), t[4]))
         case "atom":
-            guard t.count >= 5, let x = Float(t[1]), let y = Float(t[2]), let z = Float(t[3]) else {
+            guard t.count >= 5, let x = Float(t[1]), x.isFinite,
+                  let y = Float(t[2]), y.isFinite,
+                  let z = Float(t[3]), z.isFinite else {
                 throw E.malformed("bad atom: \(line)")
             }
             cartAtoms.append((SIMD3<Float>(x, y, z), t[4]))
@@ -1706,12 +1742,23 @@ internal func loadFHIaimsGeometryIn(lines: [String], url: URL) throws -> LoadedS
     for (coord, sym) in fracAtoms {
         let Z = ElementTable.atomicNumber(sym)
         if hasCell {
-            atoms.append(Atom(coord: fracToCart(coord), atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
+            let cart = fracToCart(coord)
+            // fracToCart can overflow to inf with extreme fractional coords or
+            // a degenerate cell; reject non-finite results.
+            guard cart.x.isFinite, cart.y.isFinite, cart.z.isFinite else {
+                throw E.malformed("non-finite fractional-to-Cartesian coordinate")
+            }
+            atoms.append(Atom(coord: cart, atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
         }
     }
     for (coord, sym) in cartAtoms {
         let Z = ElementTable.atomicNumber(sym)
         atoms.append(Atom(coord: coord, atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
+    }
+    // Cap total atoms: an absurd number of atom_frac/atom lines must not
+    // allocate unboundedly.
+    if atoms.count > 500_000 {
+        throw E.malformed("too many atoms")
     }
 
     var out = LoadedScene()
@@ -1741,21 +1788,43 @@ internal func loadFHIaimsCoordOut(lines: [String]) throws -> LoadedScene {
     for _ in 0..<3 {
         guard let line = next() else { throw E.malformed("short lattice") }
         let t = tok(line)
-        guard t.count >= 3, let x = Float(t[0]), let y = Float(t[1]), let z = Float(t[2]) else {
+        // Reject non-finite components: Float("nan")/Float("inf") parse as
+        // non-nil, so isFinite is required on every component.
+        guard t.count >= 3, let x = Float(t[0]), x.isFinite,
+              let y = Float(t[1]), y.isFinite,
+              let z = Float(t[2]), z.isFinite else {
             throw E.malformed("bad lattice vector")
         }
-        cols.append(SIMD3<Float>(x, y, z) * bohr2ang)
+        let col = SIMD3<Float>(x, y, z) * bohr2ang
+        // The Bohr->Angstrom scaled column must also be finite.
+        guard col.x.isFinite, col.y.isFinite, col.z.isFinite else {
+            throw E.malformed("non-finite lattice vector")
+        }
+        cols.append(col)
     }
     let cell = Cell(a: cols[0], b: cols[1], c: cols[2])
+    // The derived cell vectors must all be finite: a degenerate or
+    // extreme lattice can produce inf/NaN cell edges.
+    let cellVals = [cell.a.x, cell.a.y, cell.a.z, cell.b.x, cell.b.y, cell.b.z,
+                    cell.c.x, cell.c.y, cell.c.z]
+    guard cellVals.allSatisfy(\.isFinite) else {
+        throw E.malformed("non-finite cell")
+    }
 
     // number of species
-    guard let nsLine = next(), let nSpecies = Int(tok(nsLine).first ?? ""), nSpecies > 0 else {
+    // Cap nSpecies: an absurd species count must not drive unbounded work.
+    guard let nsLine = next(), let nSpecies = Int(tok(nsLine).first ?? ""), nSpecies > 0, nSpecies <= 500_000 else {
         throw E.malformed("bad n_all_species")
     }
     var atoms: [Atom] = []
     for _ in 0..<nSpecies {
-        guard let cLine = next(), let count = Int(tok(cLine).first ?? ""), count > 0 else {
+        guard let cLine = next(), let count = Int(tok(cLine).first ?? ""), count > 0, count <= 500_000 else {
             throw E.malformed("bad species count")
+        }
+        // Running total cap: the per-species count feeds the atom loop below,
+        // so the cumulative total must stay bounded.
+        if atoms.count + count > 500_000 {
+            throw E.malformed("too many atoms")
         }
         guard let nameLine = next() else { throw E.malformed("bad species name") }
         let speciesName = nameLine.trimmingCharacters(in: .whitespaces)
@@ -1764,10 +1833,19 @@ internal func loadFHIaimsCoordOut(lines: [String]) throws -> LoadedScene {
         for _ in 0..<count {
             guard let line = next() else { throw E.malformed("short atom") }
             let t = tok(line)
-            guard t.count >= 4, let x = Float(t[0]), let y = Float(t[1]), let z = Float(t[2]) else {
+            // Reject non-finite coordinates: Float("nan")/Float("inf") parse as
+            // non-nil, so isFinite is required on every component.
+            guard t.count >= 4, let x = Float(t[0]), x.isFinite,
+                  let y = Float(t[1]), y.isFinite,
+                  let z = Float(t[2]), z.isFinite else {
                 throw E.malformed("bad atom coord")
             }
-            atoms.append(Atom(coord: SIMD3<Float>(x, y, z) * bohr2ang, atomicNumber: Z, label: sym))
+            let coord = SIMD3<Float>(x, y, z) * bohr2ang
+            // The Bohr->Angstrom scaled coordinate must also be finite.
+            guard coord.x.isFinite, coord.y.isFinite, coord.z.isFinite else {
+                throw E.malformed("non-finite atom coord")
+            }
+            atoms.append(Atom(coord: coord, atomicNumber: Z, label: sym))
         }
     }
 

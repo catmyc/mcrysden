@@ -177,6 +177,31 @@ final class PowderXRDTests: XCTestCase {
         }
     }
 
+    func testXRDAtomCapReturnsUnavailable() {
+        // The atomic-form-factor path is O(reflections × atoms); a 100k-atom
+        // cell would hang. The cap must fail closed with .unavailable.
+        let a: Float = 5.0
+        let cell = Cell(a: SIMD3(a, 0, 0), b: SIMD3(0, a, 0), c: SIMD3(0, 0, a))
+        var atoms: [Atom] = []
+        atoms.reserveCapacity(2001)
+        for i in 0..<2001 {
+            atoms.append(Atom(coord: SIMD3(Float(i % 10) * 0.5, Float((i / 10) % 10) * 0.5, Float(i / 100) * 0.5),
+                              atomicNumber: 6, label: "C"))
+        }
+        let pattern = PowderXRD.analyze(cell: cell, atoms: atoms, periodicDim: 3,
+                                        wavelength: Self.cuAlpha, maxTwoTheta: 90, hklLimit: 6)
+        XCTAssertFalse(pattern.isAvailable)
+        XCTAssertNotNil(pattern.unavailableReason)
+        XCTAssertTrue((pattern.unavailableReason ?? "").contains("too many atoms"),
+                      "reason should name the atom cap, got: \(pattern.unavailableReason ?? "")")
+
+        // Just under the cap: should proceed (and produce a valid pattern).
+        let okAtoms = Array(atoms.prefix(2000))
+        let okPattern = PowderXRD.analyze(cell: cell, atoms: okAtoms, periodicDim: 3,
+                                          wavelength: Self.cuAlpha, maxTwoTheta: 90, hklLimit: 6)
+        XCTAssertTrue(okPattern.isAvailable, "2000 atoms should be within the cap")
+    }
+
     func testXRDElectronDensityProjectionAndFiniteParams() {
         // MARK: - Electron-density projection
         //

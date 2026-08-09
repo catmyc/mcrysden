@@ -160,6 +160,154 @@ final class SceneTests: XCTestCase {
         try "atom 0 0 0 H\n".write(to: emptyURL, atomically: true, encoding: .utf8)
         XCTAssertNoThrow(try Parser.load(emptyURL, as: .fhi))
         }   // end merged block
+    }
 
+    func testAdoptAppearanceCopiesAppearanceButNotGeometry() {
+        var source = Scene()
+        source.displayMode = .spaceFill
+        source.atomScale = 0.7
+        source.bondRadius = 0.2
+        source.showCellFrame = false
+        source.showAxes = false
+        source.showLabels = true
+        source.showBondDistances = true
+        source.showScaleIndicator = true
+        source.showBrillouinZone = true
+        source.showStructure = false
+        source.showIsoSurface = false
+        source.isoLevel = 0.5
+        source.isoSurfaces = [IsoSurfaceSpec(level: 0.1, colorHex: "#FF0000", sign: 1, enabled: true)]
+        source.clipPlane = ClipPlane(enabled: true, h: 1, k: 0, l: 0, distance: 0.5)
+        source.colorPlaneColormap = .inferno
+        source.colorPlaneContourEnabled = false
+        source.colorPlaneContourCount = 10
+        source.volumeSlices = [VolumeSlice()]
+        source.showFermiSurface = false
+        source.showForces = true
+        source.forceScale = 100
+        source.showColorPlane = false
+        source.msaaSampleCount = 4
+        source.opacity = 0.8
+        source.lineWidth = 2.5
+        source.depthCueingStrength = 0.3
+        source.aoStrength = 0.4
+        source.shadowStrength = 0.5
+        source.aoQuality = 3
+        source.shadowQuality = 3
+        source.lighting = Lighting(ambient: 0.1, diffuse: 0.9, specular: 0.5, shininess: 32, azimuth: 180, elevation: 30)
+        source.lights = [SceneLightSource(azimuth: 90, elevation: 60, intensity: 2.0, colorHex: "#FF0000")]
+        source.hbondSettings = HbondSettings(enabled: true, maxDistance: 3.0, minAngleDegrees: 150, colorHex: "#00FF00")
+        source.molecularSurfaceSettings = MolecularSurfaceSettings(enabled: true, probeRadius: 2.0, opacity: 0.5, colorHex: "#0000FF")
+        source.atomColorScheme = .coordination
+        source.elementOverrides = [1: ElementOverride(colorHex: "#123456")]
+        source.repetitionMode = .asymmetricUnit
+        source.cellRodsEnabled = true
+        source.cellRodFactor = 0.5
+        source.unicolorBonds = true
+        source.unicolorBondHex = "#ABCDEF"
+        source.tessellationFactor = 3
+        source.background = "#FFFFFF"
+        source.backgroundBottom = "#808080"
+        source.backgroundType = .gradient_top
+        source.backgroundImagePath = "/tmp/img.png"
+        source.anaglyphMode = .redCyan
+
+        var target = Scene()
+        target.atoms = [Atom(coord: .zero, atomicNumber: 6, label: "C"),
+                        Atom(coord: SIMD3(1, 0, 0), atomicNumber: 1, label: "H")]
+        target.cell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(0, 5, 0), c: SIMD3(0, 0, 5))
+        target.selectedAtoms = [0]
+        target.currentFrame = 7
+        target.kPathPoints = [KPoint(SIMD3(0, 0, 0), "Γ"), KPoint(SIMD3(0.5, 0, 0), "X")]
+        target.kPathProvenance = .userEdited
+        let originalAtoms = target.atoms
+        let originalCell = target.cell
+        let originalSelected = target.selectedAtoms
+        let originalFrame = target.currentFrame
+        let originalKPath = target.kPathPoints
+        let originalProvenance = target.kPathProvenance
+
+        target.adoptAppearance(from: source)
+
+        XCTAssertEqual(target.displayMode, .spaceFill)
+        XCTAssertEqual(target.atomScale, 0.7)
+        XCTAssertEqual(target.bondRadius, 0.2)
+        XCTAssertEqual(target.showCellFrame, false)
+        XCTAssertEqual(target.showAxes, false)
+        XCTAssertEqual(target.showLabels, true)
+        XCTAssertEqual(target.showBondDistances, true)
+        XCTAssertEqual(target.showScaleIndicator, true)
+        XCTAssertEqual(target.showBrillouinZone, true)
+        XCTAssertEqual(target.showStructure, false)
+        XCTAssertEqual(target.showIsoSurface, false)
+        XCTAssertEqual(target.isoLevel, 0.5)
+        XCTAssertEqual(target.isoSurfaces.count, 1)
+        XCTAssertNotNil(target.clipPlane)
+        XCTAssertEqual(target.colorPlaneColormap, .inferno)
+        XCTAssertEqual(target.colorPlaneContourEnabled, false)
+        XCTAssertEqual(target.colorPlaneContourCount, 10)
+        XCTAssertEqual(target.volumeSlices.count, 1)
+        XCTAssertEqual(target.showFermiSurface, false)
+        XCTAssertEqual(target.showForces, true)
+        XCTAssertEqual(target.forceScale, 100)
+        XCTAssertEqual(target.showColorPlane, false)
+        XCTAssertEqual(target.msaaSampleCount, 4)
+        XCTAssertEqual(target.opacity, 0.8)
+        XCTAssertEqual(target.lineWidth, 2.5)
+        XCTAssertEqual(target.depthCueingStrength, 0.3)
+        XCTAssertEqual(target.aoStrength, 0.4)
+        XCTAssertEqual(target.shadowStrength, 0.5)
+        XCTAssertEqual(target.aoQuality, 3)
+        XCTAssertEqual(target.shadowQuality, 3)
+        XCTAssertEqual(target.lighting.ambient, 0.1)
+        XCTAssertEqual(target.lights.count, 1)
+        XCTAssertEqual(target.hbondSettings.enabled, true)
+        XCTAssertEqual(target.molecularSurfaceSettings.enabled, true)
+        XCTAssertEqual(target.atomColorScheme, .coordination)
+        XCTAssertEqual(target.elementOverrides.count, 1)
+        XCTAssertEqual(target.repetitionMode, .asymmetricUnit)
+        XCTAssertEqual(target.cellRodsEnabled, true)
+        XCTAssertEqual(target.cellRodFactor, 0.5)
+        XCTAssertEqual(target.unicolorBonds, true)
+        XCTAssertEqual(target.unicolorBondHex, "#ABCDEF")
+        XCTAssertEqual(target.tessellationFactor, 3)
+        XCTAssertEqual(target.background, "#FFFFFF")
+        XCTAssertEqual(target.backgroundBottom, "#808080")
+        XCTAssertEqual(target.backgroundType, .gradient_top)
+        XCTAssertEqual(target.backgroundImagePath, "/tmp/img.png")
+        XCTAssertEqual(target.anaglyphMode, .redCyan)
+
+        XCTAssertEqual(target.atoms, originalAtoms)
+        XCTAssertEqual(target.cell, originalCell)
+        XCTAssertEqual(target.selectedAtoms, originalSelected)
+        XCTAssertEqual(target.currentFrame, originalFrame)
+        XCTAssertEqual(target.kPathPoints, originalKPath)
+        XCTAssertEqual(target.kPathProvenance, originalProvenance)
+    }
+
+    func testWidenSuperCellRespectsPeriodicDim() {
+        // 2D scene (periodicDim 2): a small orthorhombic cell with a couple of atoms.
+        let a: Float = 3.0, b: Float = 4.0, c: Float = 15.0
+        let cell = Cell(a: SIMD3(a, 0, 0), b: SIMD3(0, b, 0), c: SIMD3(0, 0, c))
+        let atoms = [Atom(coord: SIMD3(0, 0, 0), atomicNumber: 6, label: "C"),
+                     Atom(coord: SIMD3(a * 0.5, b * 0.5, 0), atomicNumber: 1, label: "H")]
+        var scene = Scene()
+        scene.cell = cell
+        scene.atoms = atoms
+        scene.isCrystal = true
+        scene.periodicDim = 2
+        scene.baseAtoms = atoms
+        scene.baseBonds = []
+        scene.preslabAtoms = atoms
+
+        // n3 > 1 on a 2D structure must be refused (vacuum axis).
+        let refused = scene.widenSuperCell(SuperCell(n1: 2, n2: 2, n3: 2))
+        XCTAssertEqual(refused.atoms.count, scene.atoms.count,
+                       "2D supercell with n3>1 must be refused, leaving atoms unchanged")
+
+        // n1,n2 > 1 with n3 == 1 on a 2D structure must still expand.
+        let expanded = scene.widenSuperCell(SuperCell(n1: 2, n2: 2, n3: 1))
+        XCTAssertEqual(expanded.atoms.count, scene.atoms.count * 4,
+                       "2D supercell along periodic axes must expand")
     }
 }

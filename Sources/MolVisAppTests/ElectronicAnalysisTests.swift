@@ -69,6 +69,33 @@ final class ElectronicAnalysisTests: XCTestCase {
                                fermiEnergy: 0)
     }
 
+    // MARK: - CRYSTAL band parser robustness
+
+    func testCrystalBandParserRejectsNonFiniteToken() {
+        // A line with a NaN token must abort the parse (return nil) rather
+        // than silently shortening the row and misaligning every band after it.
+        let text = """
+            2 2
+            0.0 0.0 0.0
+            1.0 NaN 3.0
+            0.5 0.5 0.5
+            1.0 2.0 3.0
+        """
+        XCTAssertNil(CrystalBandParser.parse(text),
+                       "NaN token should cause the band parser to return nil")
+
+        // Sanity: a clean file still parses.
+        let clean = """
+            2 2
+            0.0 0.0 0.0
+            1.0 2.0 3.0
+            0.5 0.5 0.5
+            4.0 5.0 6.0
+        """
+        XCTAssertNotNil(CrystalBandParser.parse(clean),
+                        "clean band file should parse successfully")
+    }
+
     // MARK: - Linked band+DOS report and QE projwfc DOS label enrichment
 
     func testLinkedReportAndDOSLabelEnrichment() {

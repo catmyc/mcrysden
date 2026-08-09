@@ -115,10 +115,20 @@ enum Converter {
 
         let ext = outputNameExtension(for: targetFormat)
         var count = 0
+        var seenOutputs: [URL: String] = [:]   // output URL -> input name (for diagnostics)
         for file in files {
             let outURL = outputDirectory
                 .appendingPathComponent(file.deletingPathExtension().lastPathComponent)
                 .appendingPathExtension(ext)
+            // Two inputs with the same stem ("a.xyz", "a.pdb") map to the same
+            // output ("a.xsf"). The later conversion would silently overwrite
+            // the earlier while the success count still reports both. Skip the
+            // duplicate deterministically (the list is sorted) and warn.
+            if let existingName = seenOutputs[outURL] {
+                print("[mcrysden] convert-all: skipping \(file.lastPathComponent): output collides with \(existingName)")
+                continue
+            }
+            seenOutputs[outURL] = file.lastPathComponent
             do {
                 try convert(url: file, to: outURL, forcedFormat: forcedFormat)
                 count += 1

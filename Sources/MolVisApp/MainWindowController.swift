@@ -137,6 +137,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     private var coordinationCancellationToken: CoordinationCancellationToken?
     private var coordinationDebounceCancellation: (() -> Void)?
     private var coordinationGeneration = 0
+    /// Powder XRD debounce + background compute. PowderXRD.analyze is
+    /// O(hklLimit³ · atoms · symmetryOps) and can block the main thread for
+    /// seconds on large cells, so it is debounced (~0.2 s) and computed on a
+    /// global queue; a generation token discards stale completions.
+    private var xrdWorkItem: DispatchWorkItem?
+    private var xrdDebounceCancellation: (() -> Void)?
+    private var xrdGeneration = 0
     /// Derived first-shell polyhedron metrics (aligned to `scene.atoms`), computed
     /// on a background work item after the coordination result is installed.
     private(set) var polyhedronMetrics: [PolyhedronMetrics]? = nil
@@ -276,6 +283,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     deinit {
         cancelCoordinationRequest()
         cancelPolyhedronRequest()
+        cancelXRDRequest()
         // Cancellation-only teardown: do not mutate published UI state or the
         // installed result from deinit (no alive view/window to render into).
         cancelComparisonRequestOnly()
@@ -1387,6 +1395,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// Write the structure in `format` directly to `url` (used by the File menu).
     func exportStructure(_ format: StructureExportFormat, to url: URL) {
         do {
+            try App.validateGUIWriteDestination(url, source: sourceURL)
             let text = try structureExportText(format)
             try text.write(to: url, atomically: true, encoding: .utf8)
         } catch {
@@ -4619,27 +4628,28 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let restoredOrthographic = wasReciprocalEditing
             ? (reciprocalStructureOrthographic ?? state.orthographic)
             : state.orthographic
+        // Carry every appearance/display/quality setting from the previous
+        // frame so scrubbing never silently resets the view. This replaces a
+        // hand-maintained field list that silently drifted out of sync with
+        // Scene. hbondPairs are NOT carried — they index the previous frame's
+        // atoms — they are re-derived after install via hbondGeometryDidChange.
+        next.adoptAppearance(from: scene)
+        // adoptAppearance copies displayMode/showBrillouinZone from the old
+        // frame; restore the reciprocal-editing overrides on top when active.
         next.displayMode = restoredDisplayMode
-        next.atomScale = scene.atomScale
-        next.bondRadius = scene.bondRadius
-        next.showCellFrame = scene.showCellFrame
-        next.showAxes = scene.showAxes
-        next.showLabels = scene.showLabels
-        next.showBondDistances = scene.showBondDistances
-        next.showScaleIndicator = scene.showScaleIndicator
-        next.showStructure = scene.showStructure
         next.showBrillouinZone = restoredShowBZ
+        // Lighting + background are read from the live sidebar (the source of
+        // truth), not the old frame the adopt call just copied.
+        next.lighting = state.lighting
+        next.backgroundType = state.backgroundType
+        next.background = state.backgroundHex
+        next.backgroundBottom = state.backgroundBottomHex
         // The freshly parsed scene already owns the right generated route for
         // its current structure/input reciprocal basis.  Transfer only a user
         // route, remapping fractional coordinates through Cartesian reciprocal
         // space when this frame changed that basis.  (Supercell/slab are applied
         // later and intentionally do not affect this base-cell decision.)
         next.transferKPathAcrossGeometryChange(from: scene)
-        // Volumetric-surface settings: without these, scrubbing an animated scalar
-        // field or Fermi surface resets the iso level / visibility to defaults.
-        next.showIsoSurface = scene.showIsoSurface
-        next.isoLevel = scene.isoLevel
-        next.showFermiSurface = scene.showFermiSurface
         // The freshly parsed frame may carry a scalar field whose value range differs
         // from the frame we carried the level over (e.g. animated XSF). Clamp the
         // carried level into the new field's range so it stays meaningful; when the
@@ -4649,30 +4659,6 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if let field = next.scalarField {
             next.isoLevel = min(field.maxValue, max(field.minValue, next.isoLevel))
         }
-        // Force-arrow settings: carry them across the frame reload so scrubbing an
-        // animated .pwo doesn't silently drop the visibility / scale the user set.
-        next.showForces = scene.showForces
-        next.forceScale = scene.forceScale
-        next.lighting = state.lighting
-        // Tier-1 appearance carries across a frame reload exactly like the other
-        // display settings above: a freshly parsed frame starts from Scene's
-        // defaults, so without this the user's lights/colors/quality settings
-        // would silently reset on every scrub. hbondPairs are NOT carried — they
-        // index the previous frame's atoms — they are re-derived after install.
-        next.lights = scene.lights
-        next.hbondSettings = scene.hbondSettings
-        next.molecularSurfaceSettings = scene.molecularSurfaceSettings
-        next.atomColorScheme = scene.atomColorScheme
-        next.elementOverrides = scene.elementOverrides
-        next.repetitionMode = scene.repetitionMode
-        next.cellRodsEnabled = scene.cellRodsEnabled
-        next.cellRodFactor = scene.cellRodFactor
-        next.unicolorBonds = scene.unicolorBonds
-        next.unicolorBondHex = scene.unicolorBondHex
-        next.tessellationFactor = scene.tessellationFactor
-        next.backgroundType = state.backgroundType
-        next.background = state.backgroundHex
-        next.backgroundBottom = state.backgroundBottomHex
         next.selectedAtoms = []                 // selection is per-frame
         next.measurementResult = nil
         next.measurementMode = state.measurementMode  // mode survives frame changes
@@ -4884,10 +4870,28 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         return frames
     }
 
+    /// Pure snapshot-based frame decode for background use. Takes the source
+    /// URL, frame count, and format as explicit parameters so the caller can
+    /// snapshot them on the main thread before dispatching — never reads
+    /// instance state (sourceURL / state.frameCount / forcedFormat) directly.
+    private static func loadAllFrames(from url: URL, count: Int, format: ParseFormat?) -> [Scene]? {
+        guard count > 1 else { return nil }
+        var frames: [Scene] = []
+        frames.reserveCapacity(count)
+        for i in 0..<count {
+            guard let loaded = try? Parser.load(url, frameIndex: i, as: format) else {
+                return nil
+            }
+            frames.append(Scene(loaded: loaded))
+        }
+        return frames
+    }
+
     /// Flatten each atom's per-frame coordinates into a line-strip vertex array:
     /// for atom k the strip is [frame0.coord, frame1.coord, ...], concatenated
     /// for every atom index. Empty when frames have differing atom counts.
-    private func trajectoryTrailVertices(frames: [Scene]) -> [SIMD3<Float>] {
+    /// Pure function of `frames` — safe to call from any thread.
+    private static func trajectoryTrailVertices(frames: [Scene]) -> [SIMD3<Float>] {
         guard let atomCount = frames.first?.atoms.count, atomCount > 0,
               frames.allSatisfy({ $0.atoms.count == atomCount }) else { return [] }
         var verts: [SIMD3<Float>] = []
@@ -4921,10 +4925,18 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         animationDataGeneration += 1
         let token = animationDataGeneration
         let thumbSize = CGSize(width: 128, height: 96)
+        // Snapshot ALL main-thread inputs before dispatch so the background
+        // closure never touches self.state / self.camera off the main thread.
         let cam = camera
+        let showTrails = state.showTrajectoryTrails
+        let count = state.frameCount
+        let format = forcedFormat
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, self.animationDataGeneration == token else { return }
-            guard let frames = self.loadAllFrames() else { return }
+            guard let self else { return }
+            guard self.animationDataGeneration == token else { return }
+            guard let frames = Self.loadAllFrames(from: url, count: count, format: format) else {
+                return
+            }
             var images: [CGImage] = []
             var metrics: [FrameMetric] = []
             var trails: [SIMD3<Float>] = []
@@ -4936,19 +4948,19 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             }
             if ok {
                 metrics = FrameMetrics.compute(frames: frames)
-                if self.state.showTrajectoryTrails {
-                    trails = self.trajectoryTrailVertices(frames: frames)
+                if showTrails {
+                    trails = Self.trajectoryTrailVertices(frames: frames)
                 }
             }
-            let stillValid = self.animationDataGeneration == token
-            let publishTrails = trails
-            DispatchQueue.main.async {
-                guard stillValid else { return }
+            DispatchQueue.main.async { [weak self] in
+                // Re-check the token ON THE MAIN THREAD: a generation bump between
+                // the background read and this block must discard stale data.
+                guard let self, self.animationDataGeneration == token else { return }
                 self.state.setTimelineThumbnails(images)
                 self.state.frameMetrics = metrics
                 if self.state.showTrajectoryTrails {
                     self.state.trajectoryTrailsAvailable = true
-                    self.renderer?.trajectoryTrails = publishTrails
+                    self.renderer?.trajectoryTrails = trails
                 }
             }
         }
@@ -4987,18 +4999,23 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         animationDataGeneration += 1
         let token = animationDataGeneration
-        // Prefer the centroid-aligned frames when alignment is on so trails follow
-        // the aligned trajectory; fall back to the raw frames otherwise. The
-        // cached aligned frames are picked synchronously (no disk I/O); the raw
-        // path reads frames off the main thread below.
+        // Snapshot ALL main-thread inputs before dispatch. alignedFrames is
+        // main-thread-owned; reading it off-main is a race, so capture it (or
+        // nil) here. When nil, the background path decodes from the snapshots.
         let prealigned = state.alignTrajectory ? alignedFrames : nil
+        let count = state.frameCount
+        let format = forcedFormat
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, self.animationDataGeneration == token else { return }
-            guard let frames = prealigned ?? self.loadAllFrames() else { return }
-            let trails = self.trajectoryTrailVertices(frames: frames)
-            let stillValid = self.animationDataGeneration == token
-            DispatchQueue.main.async {
-                guard stillValid else { return }
+            guard let self else { return }
+            guard self.animationDataGeneration == token else { return }
+            guard let frames = prealigned ?? Self.loadAllFrames(from: url, count: count, format: format) else {
+                return
+            }
+            let trails = Self.trajectoryTrailVertices(frames: frames)
+            DispatchQueue.main.async { [weak self] in
+                // Re-check the token ON THE MAIN THREAD: a generation bump between
+                // the background read and this block must discard stale data.
+                guard let self, self.animationDataGeneration == token else { return }
                 self.state.trajectoryTrailsAvailable = true
                 self.renderer?.trajectoryTrails = trails
                 self.renderer?.showTrajectoryTrails = true
@@ -5025,15 +5042,28 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         case "mp4": format = .mp4
         default: format = .gif
         }
+        // Guard against overwriting the loaded source BEFORE dispatching: a
+        // successful background export would otherwise destroy the scene source.
+        do {
+            try App.validateGUIWriteDestination(url, source: sourceURL)
+        } catch {
+            presentExportError(error, title: "Animation export failed")
+            return
+        }
         animationDataGeneration += 1
         let token = animationDataGeneration
+        // Snapshot main-thread inputs for the background closure.
+        let cam = camera
+        let count = state.frameCount
+        let forced = forcedFormat
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, self.animationDataGeneration == token else { return }
+            guard let self else { return }
+            guard self.animationDataGeneration == token else { return }
             do {
-                guard let frames = self.loadAllFrames() else {
+                guard let frames = Self.loadAllFrames(from: url, count: count, format: forced) else {
                     throw ParseError.io(path: url.path, reason: "failed to load animation frames")
                 }
-                try AnimationExporter.export(frames: frames, camera: self.camera,
+                try AnimationExporter.export(frames: frames, camera: cam,
                                              size: CGSize(width: 640, height: 480),
                                              fps: 10, format: format, to: url)
             } catch {
@@ -5396,26 +5426,77 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     }
 
     /// Recompute the powder XRD pattern for the current scene and settings.
-    /// Cheap and gated on isCrystal, so it is called on every sidebar/scene change.
+    /// PowderXRD.analyze is O(hklLimit³ · atoms · symmetryOps) and can block
+    /// the main thread for seconds on large cells, so it is debounced (~0.2 s)
+    /// and computed on a global queue; a generation token discards stale
+    /// completions. The non-crystal clear path stays synchronous.
     private func updatePowderXRD() {
         guard scene.isCrystal else {
             state.xrdPattern = nil
             state.xrdStatusText = ""
+            cancelXRDRequest()
             return
         }
+        // When the XRD panel is not visible, skip the expensive compute
+        // entirely — the grapher only reads when visible and the CSV export
+        // is triggered from the panel. The previous pattern is left in place.
+        guard xrdWindow?.isVisible == true else { return }
+
+        // Cancel any pending debounce + work from a prior call.
+        cancelXRDRequest()
+        xrdGeneration += 1
+        let generation = xrdGeneration
+
+        // Snapshot ALL inputs on the main thread before the debounce fires so
+        // the background closure never touches mutable controller state.
+        let cell = scene.cell
+        let atoms = scene.baseAtoms.isEmpty ? scene.atoms : scene.baseAtoms
+        let periodicDim = scene.periodicDim
         let wavelengthIndex = max(0, min(state.xrdWavelengthIndex, PowderXRD.wavelengthOptions.count - 1))
-        let result = PowderXRD.analyze(
-            cell: scene.cell,
-            atoms: scene.baseAtoms.isEmpty ? scene.atoms : scene.baseAtoms,
-            periodicDim: scene.periodicDim,
-            wavelength: PowderXRD.wavelengthOptions[wavelengthIndex].wavelength,
-            maxTwoTheta: state.xrdMaxTwoTheta,
-            hklLimit: 8,
-            fwhm: state.xrdFWHM,
-            curveStep: 0.05,
-            symmetryOps: state.crystalSymmetry?.symmetry?.symmetryOperations,
-            electronDensity: state.xrdUseElectronDensity ? scene.scalarField : nil
-        )
+        let wavelength = PowderXRD.wavelengthOptions[wavelengthIndex].wavelength
+        let maxTwoTheta = state.xrdMaxTwoTheta
+        let fwhm = state.xrdFWHM
+        let symmetryOps = state.crystalSymmetry?.symmetry?.symmetryOperations
+        let electronDensity = state.xrdUseElectronDensity ? scene.scalarField : nil
+        let showLabels = state.xrdShowLabels
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.xrdGeneration == generation else { return }
+            let result = PowderXRD.analyze(
+                cell: cell,
+                atoms: atoms,
+                periodicDim: periodicDim,
+                wavelength: wavelength,
+                maxTwoTheta: maxTwoTheta,
+                hklLimit: 8,
+                fwhm: fwhm,
+                curveStep: 0.05,
+                symmetryOps: symmetryOps,
+                electronDensity: electronDensity
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.xrdGeneration == generation else { return }
+                self.installPowderXRD(result: result, showLabels: showLabels)
+            }
+        }
+        xrdWorkItem = work
+        xrdDebounceCancellation = coordinationDebounceScheduler(0.20) {
+            DispatchQueue.global(qos: .userInitiated).async(execute: work)
+        }
+    }
+
+    /// Cancel any pending XRD debounce + background work.
+    private func cancelXRDRequest() {
+        xrdWorkItem?.cancel()
+        xrdWorkItem = nil
+        xrdDebounceCancellation?()
+        xrdDebounceCancellation = nil
+    }
+
+    /// Publish a computed XRD pattern to state + the live grapher. Always
+    /// called on the main thread after the generation token confirms currency.
+    private func installPowderXRD(result: XRDPattern, showLabels: Bool) {
         state.xrdPattern = result
         if result.isAvailable {
             var text = "\(result.peaks.count) peaks · source: \(result.sourceDescription)"
@@ -5429,7 +5510,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         if let window = xrdWindow, window.isVisible {
             xrdGrapher.pattern = result
-            xrdGrapher.showLabels = state.xrdShowLabels
+            xrdGrapher.showLabels = showLabels
         }
     }
 

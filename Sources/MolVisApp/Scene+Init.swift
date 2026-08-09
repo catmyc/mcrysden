@@ -319,6 +319,24 @@ extension Scene {
             print("[mcrysden] warning: supercell \(sc.n1)×\(sc.n2)×\(sc.n3) would exceed \(Scene.superCellAtomCap) atom cap (\(total)×\(src.count)); refused")
             return self
         }
+        // 1D/2D structures replicate only along their periodic axes. Expanding a
+        // non-periodic axis (e.g. n3 > 1 for a 2D slab whose c is a vacuum gap)
+        // produces physically invalid replicas. Refuse any factor > 1 along a
+        // non-periodic dimension. Periodic axes: a = n1 for dim 1; a,b = n1,n2
+        // for dim 2. The (1,1,1) shrink path and cap checks above are untouched.
+        if periodicDim < 3 {
+            if periodicDim == 1 {
+                if sc.n2 > 1 || sc.n3 > 1 {
+                    print("[mcrysden] warning: supercell \(sc.n1)×\(sc.n2)×\(sc.n3) refused for a 1D structure: only n1 may exceed 1")
+                    return self
+                }
+            } else if periodicDim == 2 {
+                if sc.n3 > 1 {
+                    print("[mcrysden] warning: supercell \(sc.n1)×\(sc.n2)×\(sc.n3) refused for a 2D structure: only n1 and n2 may exceed 1")
+                    return self
+                }
+            }
+        }
         var newAtoms: [Atom] = []
         newAtoms.reserveCapacity(projected.partialValue)
         for i in 0..<sc.n1 { for j in 0..<sc.n2 { for k in 0..<sc.n3 {
@@ -332,7 +350,7 @@ extension Scene {
         }}}
         var out = self
         out.atoms = newAtoms
-        out.bonds = Self.rebond(newAtoms, cell: cell, isCrystal: true, periodicDim: 3)
+        out.bonds = Self.rebond(newAtoms, cell: cell, isCrystal: true, periodicDim: periodicDim)
         out.preslabAtoms = newAtoms    // snapshot for `applySlab`
         out.superCell = sc
         // For a hand-built scene (no pristine base yet), snapshot the pre-expansion
@@ -516,5 +534,59 @@ extension Scene {
         guard !ab.overflow else { return nil }
         let abc = ab.partialValue.multipliedReportingOverflow(by: c)
         return abc.overflow ? nil : abc.partialValue
+    }
+
+    /// Copy every appearance/display/quality setting from `other` onto `self`
+    /// (all sidebar-controllable fields that are independent of parsed geometry).
+    /// Geometry (atoms/bonds/cell), selection, measurement, currentFrame, camera,
+    /// k-path and hbondPairs are NOT touched.
+    mutating func adoptAppearance(from other: Scene) {
+        displayMode = other.displayMode
+        atomScale = other.atomScale
+        bondRadius = other.bondRadius
+        showCellFrame = other.showCellFrame
+        showAxes = other.showAxes
+        showLabels = other.showLabels
+        showBondDistances = other.showBondDistances
+        showScaleIndicator = other.showScaleIndicator
+        showBrillouinZone = other.showBrillouinZone
+        showStructure = other.showStructure
+        showIsoSurface = other.showIsoSurface
+        isoLevel = other.isoLevel
+        isoSurfaces = other.isoSurfaces
+        clipPlane = other.clipPlane
+        colorPlaneColormap = other.colorPlaneColormap
+        colorPlaneContourEnabled = other.colorPlaneContourEnabled
+        colorPlaneContourCount = other.colorPlaneContourCount
+        volumeSlices = other.volumeSlices
+        showFermiSurface = other.showFermiSurface
+        showForces = other.showForces
+        forceScale = other.forceScale
+        showColorPlane = other.showColorPlane
+        msaaSampleCount = other.msaaSampleCount
+        opacity = other.opacity
+        lineWidth = other.lineWidth
+        depthCueingStrength = other.depthCueingStrength
+        aoStrength = other.aoStrength
+        shadowStrength = other.shadowStrength
+        aoQuality = other.aoQuality
+        shadowQuality = other.shadowQuality
+        lighting = other.lighting
+        lights = other.lights
+        hbondSettings = other.hbondSettings
+        molecularSurfaceSettings = other.molecularSurfaceSettings
+        atomColorScheme = other.atomColorScheme
+        elementOverrides = other.elementOverrides
+        repetitionMode = other.repetitionMode
+        cellRodsEnabled = other.cellRodsEnabled
+        cellRodFactor = other.cellRodFactor
+        unicolorBonds = other.unicolorBonds
+        unicolorBondHex = other.unicolorBondHex
+        tessellationFactor = other.tessellationFactor
+        background = other.background
+        backgroundBottom = other.backgroundBottom
+        backgroundType = other.backgroundType
+        backgroundImagePath = other.backgroundImagePath
+        anaglyphMode = other.anaglyphMode
     }
 }

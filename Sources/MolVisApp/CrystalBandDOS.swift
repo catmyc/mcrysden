@@ -165,8 +165,13 @@ enum CrystalBandParser {
         var nbands = header.nbands
         if nbands <= 0, numberLines.count >= 1, numberLines[0].count == 2,
            numberLines[0].allSatisfy({ $0.isFinite && $0 == $0.rounded() }) {
-            nk = max(0, Int(numberLines[0][0].rounded()))
-            nbands = max(0, Int(numberLines[0][1].rounded()))
+            // Checked conversion: a value like 1e20 would trap Int() and is
+            // not a valid k-point/band count anyway.
+            let rawNk = numberLines[0][0].rounded()
+            let rawNb = numberLines[0][1].rounded()
+            guard let nk64 = Int64(exactly: rawNk), let nb64 = Int64(exactly: rawNb) else { return nil }
+            nk = max(0, min(2_000_000, Int(nk64)))
+            nbands = max(0, min(2_000_000, Int(nb64)))
             numberLines.removeFirst()
         }
 
@@ -194,6 +199,13 @@ enum CrystalBandParser {
                         energies: kp.energies.map { $0 * scale })
         }
         let fermi = header.fermi.map { $0 * scale }
+
+        // Guard against Float overflow from the unit scaling (near-FLT_MAX
+        // values in Hartree become inf); such a file is not representable.
+        for kp in scaled {
+            if !kp.energies.allSatisfy({ $0.isFinite }) { return nil }
+        }
+        if let f = fermi, !f.isFinite { return nil }
 
         return BandStructure(kPoints: scaled, fermiEnergy: fermi, nSpin: nSpin,
                               reciprocal: nil, kPointsAreCrystal: true,
@@ -449,13 +461,16 @@ enum CrystalDOSParser {
         guard rows.count * kept <= 1_000_000 else { return nil }
 
         let energies = rows.map { $0[0] * scale }
+        if !energies.allSatisfy({ $0.isFinite }) { return nil }
         var series: [DOSSeries] = []
         for (outIdx, c) in keepCols.enumerated() {
             let label = outIdx < labels.count ? labels[outIdx] : "dos-\(outIdx + 1)"
             let values = rows.map { $0[c] * invScale }
+            if !values.allSatisfy({ $0.isFinite }) { return nil }
             series.append(DOSSeries(label: label, values: values))
         }
         let fermi = header.fermi.map { $0 * scale }
+        if let f = fermi, !f.isFinite { return nil }
         return DensityOfStates(energies: energies, series: series, fermiEnergy: fermi)
     }
 

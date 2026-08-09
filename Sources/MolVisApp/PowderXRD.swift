@@ -343,6 +343,12 @@ enum PowderXRD {
             let z = atom.atomicNumber
             if z < 1 || z > 118 { return .unavailable(wavelength: wavelength, reason: "invalid atomic number at index \(i)") }
         }
+        // The atomic-form-factor path is O(reflections × atoms); cap the atom
+        // count so a 100k-atom cell cannot hang the main thread. The
+        // electron-density path keeps its own (grid-based) bounds below.
+        if atoms.count > 2000 {
+            return .unavailable(wavelength: wavelength, reason: "too many atoms for powder XRD (limit 2000)")
+        }
 
         // Fractional coordinates (wrapped to [0,1)).
         let inv = cell.inverseMatrix!

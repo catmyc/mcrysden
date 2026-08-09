@@ -169,4 +169,127 @@ final class ParserRobustnessTests: XCTestCase {
         XCTAssertEqual(result.state.elevation, base.elevation, "Inf must be skipped")
         XCTAssertEqual(result.skipped.count, 2)
     }
+
+    /// Finding 1: NaN/Inf coordinates must be rejected at parse time — not
+    /// silently accepted (Float("nan") parses as non-nil but isNaN, poisoning
+    /// framingSphere/defaultCamera downstream). Covers Orca, FHI-aims
+    /// geometry.in, FHI-aims coord.out, and WIEN2k .struct.
+    func testNonFiniteCoordinatesRejected() throws {
+        // --- Orca: a NaN x-coordinate must abort the block (no atoms produced) ---
+        let orcaURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-test-\(UUID().uuidString).out")
+        defer { try? FileManager.default.removeItem(at: orcaURL) }
+        try """
+            some header
+            CARTESIAN COORDINATES (ANGSTROEM)
+            -------------------------------------------
+            C   nan  0.0  0.0
+            H   1.0  0.0  0.0
+            """.write(to: orcaURL, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(orcaURL, as: .orca),
+                            "NaN coord must abort the block")
+
+        // --- FHI-aims geometry.in: NaN in lattice_vector must throw ---
+        let geomURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: geomURL) }
+        try """
+            lattice_vector  nan  0.0  0.0
+            lattice_vector  0.0  5.431  0.0
+            lattice_vector  0.0  0.0  5.431
+            atom_frac  0.0  0.0  0.0  Si
+            """.write(to: geomURL, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(geomURL, as: .fhi),
+                            "NaN lattice_vector must be rejected")
+
+        // --- FHI-aims coord.out: NaN in a lattice column must throw ---
+        let coordURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-test-\(UUID().uuidString).out")
+        defer { try? FileManager.default.removeItem(at: coordURL) }
+        try """
+            nan  0.0  0.0
+            0.0  5.431  0.0
+            0.0  0.0  5.431
+            1
+            1
+            Si
+            0.0  0.0  0.0 T
+            """.write(to: coordURL, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(coordURL, as: .fhi),
+                            "NaN lattice column must be rejected")
+
+        // --- WIEN2k .struct: non-finite in the lattice params must throw.
+        // Use "1e39" (not "nan") — the scanFloats regex only matches numeric
+        // forms, and 1e39 overflows Float to inf, which the isFinite guard
+        // catches. A bare "nan" would be silently skipped by the regex.
+        let wienURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-test-\(UUID().uuidString).struct")
+        defer { try? FileManager.default.removeItem(at: wienURL) }
+        try """
+            Si
+            F   LATTICE,NONEQUIV. ATOMS  1
+            MODE OF CALC=RELA
+            1e39  5.431  5.431  90.0  90.0  90.0
+            ATOM= 1: X=0.0 Y=0.0 Z=0.0
+            MULT= 1  ISPLIT= 0
+            Si   NPT= 79  R0= 0.0005  RMT= 2.0  Z: 28
+            """.write(to: wienURL, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(wienURL, as: .struct_),
+                            "non-finite lattice params must be rejected")
+    }
+
+    /// Finding 3: Table must resolve heavy-element symbols (Z > 42) that were
+    /// previously unknown, returning numeric placeholders like "92" instead
+    /// of "U". Delegates to ElementTable (full 118-element table).
+    func testHeavyElementSymbolResolution() {
+        // Forward: Z -> symbol
+        XCTAssertEqual(Table.id(79), "Au")
+        XCTAssertEqual(Table.id(92), "U")
+        XCTAssertEqual(Table.id(118), "Og")
+        XCTAssertEqual(Table.id(1), "H")
+        XCTAssertEqual(Table.id(36), "Kr")
+        // Fallback: out-of-range Z -> "\(z)"
+        XCTAssertEqual(Table.id(0), "0")
+        XCTAssertEqual(Table.id(-1), "-1")
+        XCTAssertEqual(Table.id(119), "119")
+        // Reverse: symbol -> Z (case-insensitive via .capitalized)
+        XCTAssertEqual(Table.z("Au"), 79)
+        XCTAssertEqual(Table.z("U"), 92)
+        XCTAssertEqual(Table.z("au"), 79)
+        XCTAssertEqual(Table.z("AU"), 79)
+        XCTAssertEqual(Table.z("og"), 118)
+        // Unknown symbol -> 0
+        XCTAssertEqual(Table.z("Xx"), 0)
+    }
+
+    /// Finding 2/4: atom-count sanity caps must reject absurd values before
+    /// they drive unbounded allocation. Covers WIEN2k natoms and FHI-aims
+    /// coord.out nSpecies.
+    func testAtomCountSanityCaps() throws {
+        // --- WIEN2k: absurd natoms must throw ---
+        let wienURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-test-\(UUID().uuidString).struct")
+        defer { try? FileManager.default.removeItem(at: wienURL) }
+        try """
+            Si
+            F   LATTICE,NONEQUIV. ATOMS  99999999
+            MODE OF CALC=RELA
+            5.431  5.431  5.431  90.0  90.0  90.0
+            """.write(to: wienURL, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(wienURL, as: .struct_),
+                            "absurd WIEN2k natoms must be rejected")
+
+        // --- FHI-aims coord.out: absurd nSpecies must throw ---
+        let fhiURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-test-\(UUID().uuidString).out")
+        defer { try? FileManager.default.removeItem(at: fhiURL) }
+        try """
+            5.431  0.0  0.0
+            0.0  5.431  0.0
+            0.0  0.0  5.431
+            99999999
+            """.write(to: fhiURL, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try Parser.load(fhiURL, as: .fhi),
+                            "absurd FHI-aims nSpecies must be rejected")
+    }
 }

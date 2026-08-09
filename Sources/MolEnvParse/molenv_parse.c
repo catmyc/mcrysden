@@ -85,10 +85,10 @@ static int molenv_symbol_to_z(const char *s) {
 }
 
 /* Covalent-radius bond heuristic, operating purely on a MolEnvScene. */
-static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float factor, int *out_nbonds) {
-    /* Covalent radii, ported verbatim from XCrySDen's rcovdef[] (atoms.h).
-       Index = atomic number (0..MAXNAT=100). Scaled by DEF_RCOVF (1.05), the
-       same way XCrySDen computes rcov[i] = DEF_RCOVF * rcovdef[i]. */
+/* Scaled covalent radius for element z (thread-safe: no shared mutable state).
+   Returns 1.05 * rcovdef[z] with a 0-fallback for z out of range, matching the
+   old static cov[119] cache semantics without the data race. */
+static float bond_rcov(int z) {
     static const float rcovdef[] = {
         0.38f, 0.38f, 0.38f, 1.23f, 0.89f, 0.91f,
         0.77f, 0.75f, 0.73f, 0.71f, 0.71f,
@@ -111,48 +111,138 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
         1.55f, 1.55f, 1.55f, 1.55f, 1.55f,
         1.55f, 1.55f, 1.55f, 1.55f, 1.55f
     };
-    static float cov[119];
-    static int ready = 0;
-    if (!ready) {
-        int n = (int)(sizeof(rcovdef)/sizeof(rcovdef[0]));
-        for (int i = 0; i < 119; i++) cov[i] = (i < n) ? 1.05f * rcovdef[i] : 0.0f;
-        ready = 1;
-    }
+    int n = (int)(sizeof(rcovdef)/sizeof(rcovdef[0]));
+    return (z >= 0 && z < n) ? 1.05f * rcovdef[z] : 0.0f;
+}
+
+static double det3d(const double m[3][3]) {
+    return m[0][0]*(m[1][1]*m[2][2] - m[2][1]*m[1][2])
+         - m[0][1]*(m[1][0]*m[2][2] - m[2][0]*m[1][2])
+         + m[0][2]*(m[1][0]*m[2][1] - m[2][0]*m[1][1]);
+}
+
+static int cell_usable_for_bonds(const float cell[3][3]) {
+    double m[3][3];
+    for (int i=0;i<3;i++) for (int j=0;j<3;j++) m[i][j] = (double)cell[i][j];
+    if (fabs(det3d(m)) < 1e-6) return 0;
+    for (int i=0;i<3;i++)
+        if (fabs(m[i][0]) < 1e-8 && fabs(m[i][1]) < 1e-8 && fabs(m[i][2]) < 1e-8) return 0;
+    return 1;
+}
+
+#define MOLENV_BOND_MAX_ATOMS 8000
+#define MOLENV_BOND_MAX_CAP 2000000     /* ~32 MB bond buffer ceiling */
+#define MOLENV_BOND_MAX_DEGREE 128     /* per-atom degree cap */
+
+static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float factor, int *out_nbonds) {
     /* Documented workload guard: the O(n^2) bond pass is skipped above this count
        (n^2/2 pair comparisons: 8000 atoms => ~32M, well under a second in C). A
        scene can still render (bonds == 0); bonds are recomputed on demand in
        Scene+Init if a smaller structure legitimately needs them. The guard reads
        natoms (an int) before dereferencing the atom buffer, so any size is refused
        promptly and never allocates. */
-    #define MOLENV_BOND_MAX_ATOMS 8000
-    #define MOLENV_BOND_MAX_CAP 100000000  /* ~160 MB bond buffer ceiling */
     if (s->natoms > MOLENV_BOND_MAX_ATOMS) { set_error(path,0,"too many atoms for bond heuristic"); *out_nbonds=0; return NULL; }
     int cap = s->natoms * 4, nb = 0;
     if (cap < 4) cap = 4;
     MolEnvBond *b = calloc((size_t)cap, sizeof(MolEnvBond));
     if (!b) { set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
+    int *degree = calloc((size_t)s->natoms, sizeof(int));
+    if (!degree) { free(b); set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
+
+    const int do_periodic = (s->is_crystal && s->periodic_dim >= 1 && cell_usable_for_bonds(s->cell));
+
     for (int i=0;i<s->natoms;i++) for (int j=i+1;j<s->natoms;j++) {
         int zi=s->atoms[i].atomic_number, zj=s->atoms[j].atomic_number;
         if (zi<=0 || zi>118 || zj<=0 || zj>118) continue;
+        float r=bond_rcov(zi)+bond_rcov(zj);
+        float rcut2=(r*factor)*(r*factor);
         float dx=s->atoms[i].coord[0]-s->atoms[j].coord[0],
               dy=s->atoms[i].coord[1]-s->atoms[j].coord[1],
               dz=s->atoms[i].coord[2]-s->atoms[j].coord[2];
-        float d2=dx*dx+dy*dy+dz*dz;
-        float r=cov[zi]+cov[zj];
-        if (d2 <= (r*factor)*(r*factor)) {
+
+        int bonded = 0;
+        if (!do_periodic) {
+            float d2=dx*dx+dy*dy+dz*dz;
+            bonded = (d2 <= rcut2);
+        } else if (s->natoms > 3000) {
+            /* Fast path: fractional-rounding nearest-image. Convert displacement to
+               fractional coordinates, round to nearest integer to find the minimum
+               image. Exact when the minimum image lies within one lattice translation
+               per axis (the practical case for covalent radii). For very skewed cells
+               this may miss the true minimum image — acceptable tradeoff for large
+               structures where full 27-candidate enumeration would be prohibitive. */
+            double c[3][3];
+            for (int p=0;p<3;p++) for (int q=0;q<3;q++) c[p][q] = (double)s->cell[p][q];
+            double det = det3d(c);
+            if (fabs(det) > 1e-6) {
+                double inv[3][3];
+                inv[0][0]=(c[1][1]*c[2][2]-c[2][1]*c[1][2])/det;
+                inv[0][1]=(c[0][2]*c[2][1]-c[0][1]*c[2][2])/det;
+                inv[0][2]=(c[0][1]*c[1][2]-c[0][2]*c[1][1])/det;
+                inv[1][0]=(c[1][2]*c[2][0]-c[1][0]*c[2][2])/det;
+                inv[1][1]=(c[0][0]*c[2][2]-c[0][2]*c[2][0])/det;
+                inv[1][2]=(c[0][2]*c[1][0]-c[0][0]*c[1][2])/det;
+                inv[2][0]=(c[1][0]*c[2][1]-c[1][1]*c[2][0])/det;
+                inv[2][1]=(c[0][1]*c[2][0]-c[0][0]*c[2][1])/det;
+                inv[2][2]=(c[0][0]*c[1][1]-c[0][1]*c[1][0])/det;
+                double fx=dx*inv[0][0]+dy*inv[1][0]+dz*inv[2][0];
+                double fy=dx*inv[0][1]+dy*inv[1][1]+dz*inv[2][1];
+                double fz=dx*inv[0][2]+dy*inv[1][2]+dz*inv[2][2];
+                int ka = s->periodic_dim>=1 ? (int)round(fx) : 0;
+                int kb = s->periodic_dim>=2 ? (int)round(fy) : 0;
+                int kc = s->periodic_dim>=3 ? (int)round(fz) : 0;
+                if (ka<-1)ka=-1; if (ka>1)ka=1;
+                if (kb<-1)kb=-1; if (kb>1)kb=1;
+                if (kc<-1)kc=-1; if (kc>1)kc=1;
+                float cdx=dx+ka*s->cell[0][0]+kb*s->cell[1][0]+kc*s->cell[2][0];
+                float cdy=dy+ka*s->cell[0][1]+kb*s->cell[1][1]+kc*s->cell[2][1];
+                float cdz=dz+ka*s->cell[0][2]+kb*s->cell[1][2]+kc*s->cell[2][2];
+                float d2=cdx*cdx+cdy*cdy+cdz*cdz;
+                bonded = (d2 <= rcut2);
+            } else {
+                float d2=dx*dx+dy*dy+dz*dz;
+                bonded = (d2 <= rcut2);
+            }
+        } else {
+            /* Slow path: enumerate candidate images within one lattice translation
+               per periodic axis. 3 candidates for dim 1, 9 for dim 2, 27 for dim 3. */
+            float min_d2 = dx*dx+dy*dy+dz*dz;
+            int ka_lo = s->periodic_dim>=1 ? -1 : 0;
+            int ka_hi = s->periodic_dim>=1 ?  1 : 0;
+            int kb_lo = s->periodic_dim>=2 ? -1 : 0;
+            int kb_hi = s->periodic_dim>=2 ?  1 : 0;
+            int kc_lo = s->periodic_dim>=3 ? -1 : 0;
+            int kc_hi = s->periodic_dim>=3 ?  1 : 0;
+            for (int ka=ka_lo; ka<=ka_hi; ka++)
+                for (int kb=kb_lo; kb<=kb_hi; kb++)
+                    for (int kc=kc_lo; kc<=kc_hi; kc++) {
+                        if (ka==0&&kb==0&&kc==0) continue;
+                        float cdx=dx+ka*s->cell[0][0]+kb*s->cell[1][0]+kc*s->cell[2][0];
+                        float cdy=dy+ka*s->cell[0][1]+kb*s->cell[1][1]+kc*s->cell[2][1];
+                        float cdz=dz+ka*s->cell[0][2]+kb*s->cell[1][2]+kc*s->cell[2][2];
+                        float d2=cdx*cdx+cdy*cdy+cdz*cdz;
+                        if (d2 < min_d2) min_d2 = d2;
+                    }
+            bonded = (min_d2 <= rcut2);
+        }
+
+        if (bonded) {
+            if (degree[i] >= MOLENV_BOND_MAX_DEGREE || degree[j] >= MOLENV_BOND_MAX_DEGREE) {
+                free(degree); free(b); set_error(path,0,"per-atom bond degree exceeded"); *out_nbonds=0; return NULL;
+            }
             if (nb>=cap) {
-                /* Checked growth: double the cap but never past MOLENV_BOND_MAX_CAP,
-                   and bail rather than wrap cap (which would corrupt the heap). */
-                if (cap > MOLENV_BOND_MAX_CAP / 2) { free(b); set_error(path,0,"bond capacity exceeded"); *out_nbonds=0; return NULL; }
+                if (cap > MOLENV_BOND_MAX_CAP / 2) { free(degree); free(b); set_error(path,0,"bond capacity exceeded"); *out_nbonds=0; return NULL; }
                 int ncap = cap * 2;
                 if (ncap < cap || ncap > MOLENV_BOND_MAX_CAP) ncap = MOLENV_BOND_MAX_CAP;
                 MolEnvBond *t=realloc(b, (size_t)ncap * sizeof(MolEnvBond));
-                if (!t) { free(b); set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
+                if (!t) { free(degree); free(b); set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
                 b=t; cap = ncap;
             }
             b[nb].i=i; b[nb].j=j; nb++;
+            degree[i]++; degree[j]++;
         }
     }
+    free(degree);
     *out_nbonds = nb;
     return b;
 }
@@ -439,6 +529,7 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             if (!fgets(line,sizeof(line),fp)) return -1; (*ln)++;
             if (sscanf(line,"%d %d",&na,&nc)<1) { set_error(path,*ln,"malformed CONVCOORD header"); return -1; }
             if (na<1) { set_error(path,*ln,"no atoms in CONVCOORD"); return -1; }
+            if (na>500000 || nc>500000) { set_error(path,*ln,"unreasonable atom count in CONVCOORD"); return -1; }
             for (int i=0;i<na*nc;i++) { if(!fgets(line,sizeof(line),fp)) return -1; (*ln)++; }
             continue;
         }
@@ -446,8 +537,15 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
             int na=0;
             if (!fgets(line,sizeof(line),fp)) { set_error(path,*ln,"unexpected end after PRIMCOORD"); return -1; }
             (*ln)++;
-            if (sscanf(line,"%d",&na)<1 || na<1) { set_error(path,*ln,"malformed PRIMCOORD header"); return -1; }
-            MolEnvAtom *at = calloc(na, sizeof(MolEnvAtom));
+            /* Strict parse of the first integer only: PRIMCOORD headers carry
+               `na nc` (atoms, repeats). sscanf("%d") on overflowed integers is
+               implementation-defined; strtol + endp rejects partial parses.
+               We only require na to be valid; nc is consumed separately. */
+            char *endp2 = NULL;
+            long na_long = strtol(line, &endp2, 10);
+            if (endp2 == line || na_long < 1 || na_long > 500000) { set_error(path,*ln,"malformed PRIMCOORD header"); return -1; }
+            na = (int)na_long;
+            MolEnvAtom *at = calloc((size_t)na, sizeof(MolEnvAtom));
             if (!at) { set_error(path,*ln,"out of memory"); return -1; }
             for (int i=0;i<na;i++) {
                 if (!fgets(line,sizeof(line),fp)) { free(at); set_error(path,*ln,"unexpected end in PRIMCOORD"); return -1; }
@@ -500,7 +598,11 @@ static int read_chunk(FILE *fp, float cell[3][3], int *pd, int *have_cell,
                         snprintf(lbl,sizeof(lbl),"%s",Zstr);
                     }
                 }
-                if (na>=acap) { acap = acap?acap*2:16; MolEnvAtom *t=realloc(at,acap*sizeof(MolEnvAtom)); if(!t){free(at);set_error(path,*ln,"out of memory");return -1;} at=t; }
+                if (na>=acap) {
+                    if (acap >= 500000) { free(at); set_error(path,*ln,"too many atoms in ATOMS block"); return -1; }
+                    acap = acap?acap*2:16; if (acap>500000) acap=500000;
+                    MolEnvAtom *t=realloc(at,(size_t)acap*sizeof(MolEnvAtom)); if(!t){free(at);set_error(path,*ln,"out of memory");return -1;} at=t;
+                }
                 if (zi<0) zi=0; if (zi>118) zi=118;
                 float fx=(float)x, fy=(float)y, fz=(float)z;
                 if (frac) {
@@ -736,7 +838,10 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
         if (first_tok(line,tok,sizeof(tok))>0 && strcmp(tok,"ANIMSTEPS")==0) {
             int n = 0;
             /* token already consumed; re-scan the raw line for the integer */
-            if (sscanf(line, "%*s %d", &n) >= 1 && n > 0) nframes = n;
+            if (sscanf(line, "%*s %d", &n) >= 1 && n > 0) {
+                if (n > 500000) { fclose(fp); set_error(path,0,"unreasonable ANIMSTEPS count"); return NULL; }
+                nframes = n;
+            }
         }
     }
     if (nframes == 0) { fclose(fp); set_error(path,0,"ANIMSTEPS header not found"); return NULL; }
@@ -779,7 +884,7 @@ int molenv_axsf_frame_count(const char *path) {
     while (fgets(line, sizeof(line), fp)) {
         if (first_tok(line, tok, sizeof(tok)) > 0 && strcmp(tok, "ANIMSTEPS") == 0) {
             int n = 0;
-            if (sscanf(line, "%*s %d", &n) >= 1 && n > 0) nframes = n;
+            if (sscanf(line, "%*s %d", &n) >= 1 && n > 0 && n <= 500000) nframes = n;
         }
     }
     fclose(fp);
@@ -793,10 +898,12 @@ MolEnvScene* parse_pdb(const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
     char line[1024];
-    int count = 0, ln = 0, got_title = 0;
+    long long count = 0;
+    int ln = 0, got_title = 0;
     char title[256] = {0};
 
-    /* First pass: count atoms + capture an optional title. */
+    /* First pass: count atoms + capture an optional title. count is long long so
+       a huge file cannot overflow the counter; we cap at 500000 below. */
     while (fgets(line,sizeof(line),fp)) {
         ln++;
         if (strncmp(line,"ATOM",4)==0 || strncmp(line,"HETATM",6)==0) count++;
@@ -813,13 +920,14 @@ MolEnvScene* parse_pdb(const char *path) {
         }
         if (strncmp(line,"END",3)==0 || strncmp(line,"ENDMDL",6)==0) break;
     }
+    if (count > 500000LL) { fclose(fp); set_error(path, ln, "unreasonable atom count in PDB"); return NULL; }
     rewind(fp);
 
     MolEnvScene *s = new_scene(path);
     if (!s) { fclose(fp); return NULL; }
     if (!got_title) snprintf(title,sizeof(title),"%s","PDB structure");
 
-    s->atoms = calloc(count, sizeof(MolEnvAtom));
+    s->atoms = calloc((size_t)count, sizeof(MolEnvAtom));
     if (!s->atoms || count==0) {
         if (count==0) set_error(path,ln,"no atoms found"); else set_error(path,0,"out of memory");
         fclose(fp); molenv_scene_free(s); return NULL;
@@ -1137,7 +1245,15 @@ MolEnvScene* parse_pwi(const char *path) {
 
                 int ci = celldm_index(key);
                 if (ci >= 1 && ci <= 6) {
-                    celldm[ci] = atof(vp);
+                    /* Validate finite: atof on overflowed values produces +/-inf
+                       which silently corrupts the generated cell. */
+                    char *celldm_end = NULL;
+                    double cv = strtod(vp, &celldm_end);
+                    if (!isfinite(cv)) {
+                        free(ax); free(ay); free(az); free(asym);
+                        fclose(fp); set_error(path, ln, "non-finite celldm value"); return NULL;
+                    }
+                    celldm[ci] = cv;
                 } else if (strcasecmp(key, "ibrav") == 0) {
                     ibrav = atoi(vp);
                 } else if (strcasecmp(key, "nat") == 0) {
@@ -1293,12 +1409,22 @@ MolEnvScene* parse_pwi(const char *path) {
             free(ax); free(ay); free(az); free(asym);
             set_error(path, 0, "ibrav=0 requires CELL_PARAMETERS"); return NULL;
         }
-        /* cellpar is in cell_unit; convert to Ang. */
+        /* cellpar is in cell_unit; convert to Ang. strcasecmp: valid uppercase
+           tokens like (BOHR) must not silently fall through to angstrom. An
+           unknown unit is a hard error, not a silent default. */
         float scale = 1.0f;
-        if (strcmp(cell_unit, "bohr") == 0) scale = BOHR_TO_ANG;
-        else if (strcmp(cell_unit, "alat") == 0) scale = (float)(celldm[1] * BOHR_TO_ANG);
-        /* angstrom: scale=1 */
+        if (strcasecmp(cell_unit, "bohr") == 0) scale = BOHR_TO_ANG;
+        else if (strcasecmp(cell_unit, "alat") == 0) scale = (float)(celldm[1] * BOHR_TO_ANG);
+        else if (strcasecmp(cell_unit, "angstrom") == 0) scale = 1.0f;
+        else if (strcasecmp(cell_unit, "crystal") == 0) { /* fractional atoms need a cell below */ scale = 1.0f; }
+        else {
+            free(ax); free(ay); free(az); free(asym);
+            set_error(path, 0, "unknown CELL_PARAMETERS unit in pwi"); return NULL;
+        }
         for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) cell[i][j] = cellpar[i][j] * scale;
+        /* Validate the derived cell is finite and in float range. */
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++)
+            if (!in_float_range(cell[i][j])) { free(ax); free(ay); free(az); free(asym); set_error(path, 0, "non-finite cell in pwi"); return NULL; }
     } else {
         if (latgen(ibrav, celldm, cell) != 0) {
             char buf[128]; snprintf(buf, sizeof(buf), "unsupported ibrav=%d", ibrav);
@@ -1307,15 +1433,22 @@ MolEnvScene* parse_pwi(const char *path) {
         }
         /* latgen returns Bohr -> convert to Ang. */
         for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) cell[i][j] *= BOHR_TO_ANG;
+        /* Validate the generated cell is finite and in float range. */
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++)
+            if (!in_float_range(cell[i][j])) { free(ax); free(ay); free(az); free(asym); set_error(path, 0, "non-finite cell from latgen"); return NULL; }
     }
 
     /* Convert atom positions to Cartesian Angstroms. */
     float pos_scale = 1.0f;
     int frac = 0;
-    if (strcmp(pos_unit, "bohr") == 0) pos_scale = BOHR_TO_ANG;
-    else if (strcmp(pos_unit, "alat") == 0) pos_scale = (float)(celldm[1] * BOHR_TO_ANG);
-    else if (strcmp(pos_unit, "crystal") == 0) frac = 1;
-    /* angstrom: scale=1 */
+    if (strcasecmp(pos_unit, "bohr") == 0) pos_scale = BOHR_TO_ANG;
+    else if (strcasecmp(pos_unit, "alat") == 0) { pos_scale = (float)(celldm[1] * BOHR_TO_ANG); if (!isfinite(pos_scale) || !in_float_range((double)celldm[1] * BOHR_TO_ANG)) { free(ax); free(ay); free(az); free(asym); set_error(path, 0, "non-finite alat scale in pwi"); return NULL; } }
+    else if (strcasecmp(pos_unit, "crystal") == 0) frac = 1;
+    else if (strcasecmp(pos_unit, "angstrom") == 0) { /* scale=1 */ }
+    else {
+        free(ax); free(ay); free(az); free(asym);
+        set_error(path, 0, "unknown ATOMIC_POSITIONS unit in pwi"); return NULL;
+    }
 
     MolEnvScene *s = new_scene(path);
     if (!s) { free(ax); free(ay); free(az); free(asym); return NULL; }
@@ -1334,6 +1467,10 @@ MolEnvScene* parse_pwi(const char *path) {
             cz = px*cell[0][2] + py*cell[1][2] + pz*cell[2][2];
         } else {
             cx = px * pos_scale; cy = py * pos_scale; cz = pz * pos_scale;
+        }
+        if (!in_float_range(cx) || !in_float_range(cy) || !in_float_range(cz)) {
+            free(ax); free(ay); free(az); free(asym);
+            molenv_scene_free(s); set_error(path, 0, "non-finite atom coordinate in pwi"); return NULL;
         }
         MolEnvAtom *a = &s->atoms[i];
         a->coord[0] = (float)cx; a->coord[1] = (float)cy; a->coord[2] = (float)cz;
@@ -1385,14 +1522,18 @@ int molenv_pwo_frame_count(const char *path) {
 }
 
 /* Read the next 3 lines as a 3x3 matrix (row-major) into m[3][3]. Returns 0 on
-   success, -1 if fewer than 3 valid rows were found. */
-static int read_3x3(FILE *fp, double m[3][3], int *ln) {
+   success, -1 if fewer than 3 valid rows were found or any value is non-finite. */
+static int read_3x3(FILE *fp, double m[3][3], int *ln, const char *path) {
     int r = 0;
     char line[1024];
     while (r < 3 && fgets(line, sizeof(line), fp)) {
         (*ln)++;
         double a, b, c;
         if (sscanf(line, "%lf %lf %lf", &a, &b, &c) < 3) continue;
+        if (!isfinite(a) || !isfinite(b) || !isfinite(c)) {
+            set_error(path, *ln, "non-finite matrix value");
+            return -1;
+        }
         m[r][0] = a; m[r][1] = b; m[r][2] = c;
         r++;
     }
@@ -1400,13 +1541,17 @@ static int read_3x3(FILE *fp, double m[3][3], int *ln) {
 }
 
 /* Dispatch a unit token (alat|angstrom|bohr|crystal). Sets *scale (multiplier to
-   Angstroms) and, for crystal, *frac=1. alat scales by alat_ang (Bohr->Å). */
-static void unit_scales(const char *unit, double alat_ang, double *scale, int *frac) {
+   Angstroms) and, for crystal, *frac=1. alat scales by alat_ang (Bohr->Å).
+   Returns 0 on success, -1 if the unit is unknown (not bohr/angstrom/alat/crystal).
+   Uses strcasecmp so valid uppercase tokens like (BOHR) are not silently ignored. */
+static int unit_scales(const char *unit, double alat_ang, double *scale, int *frac) {
     *scale = 1.0; *frac = 0;
-    if (strcmp(unit, "bohr") == 0) *scale = BOHR_TO_ANG;
-    else if (strcmp(unit, "alat") == 0) *scale = alat_ang;
-    else if (strcmp(unit, "crystal") == 0) { *scale = 1.0; *frac = 1; }
-    /* angstrom: scale already 1 */
+    if (strcasecmp(unit, "bohr") == 0) *scale = BOHR_TO_ANG;
+    else if (strcasecmp(unit, "alat") == 0) *scale = alat_ang;
+    else if (strcasecmp(unit, "crystal") == 0) { *scale = 1.0; *frac = 1; }
+    else if (strcasecmp(unit, "angstrom") == 0) { /* scale already 1 */ }
+    else return -1;
+    return 0;
 }
 
 /* Parse frame `frame_index` (0-based) of a .pwo file. Mirrors parse_pwi's memory
@@ -1448,22 +1593,46 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
         /* alat (celldm(1) in Bohr). */
         if (strncmp(p, "lattice parameter (alat)", 24) == 0) {
             char *eq = strchr(p, '=');
-            if (eq) alat_bohr = atof(eq + 1);
+            if (eq) {
+                alat_bohr = atof(eq + 1);
+                if (!isfinite(alat_bohr) || alat_bohr <= 0.0) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "non-finite or non-positive alat in pwo"); return NULL;
+                }
+            }
             have_alat = 1;
             continue;
         }
         if (strncmp(p, "number of atoms/cell", 20) == 0) {
-            nat = atoi(strrchr(p, '=') ? strrchr(p, '=') + 1 : "0");
+            /* Strict parse: atoi on overflowed values is undefined; strtol + endp
+               rejects partial parses and caps at 500000. */
+            char *eq = strrchr(p, '=');
+            char *nat_str = eq ? eq + 1 : "0";
+            char *nat_end = NULL;
+            long nat_val = strtol(nat_str, &nat_end, 10);
+            while (nat_end && (*nat_end == ' ' || *nat_end == '\t' || *nat_end == '\r' || *nat_end == '\n')) nat_end++;
+            if (nat_end == nat_str || (nat_end && *nat_end != '\0') || nat_val < 1 || nat_val > 500000) {
+                nat = 0;
+            } else {
+                nat = (int)nat_val;
+            }
             continue;
         }
 
         /* Initial lattice from crystal axes (alat units). */
         if (strncmp(p, "crystal axes", 12) == 0) {
-            if (read_3x3(fp, cell, &ln) == 0 && have_alat) {
+            if (read_3x3(fp, cell, &ln, path) == 0 && have_alat) {
                 double alat_ang = alat_bohr * (double)BOHR_TO_ANG;
+                int cell_ok = 1;
                 for (int i = 0; i < 3; i++)
-                    for (int j = 0; j < 3; j++)
+                    for (int j = 0; j < 3; j++) {
                         cell[i][j] *= alat_ang;
+                        if (!in_float_range(cell[i][j])) cell_ok = 0;
+                    }
+                if (!cell_ok) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "non-finite cell in pwo crystal axes"); return NULL;
+                }
                 have_cell = 1;
             }
             continue;
@@ -1481,7 +1650,7 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
                     char *u = op + 1;
                     while (*u == ' ') u++;
                     char *eq = strchr(u, '=');
-                    if (eq && strncmp(u, "alat", 4) == 0) {
+                    if (eq && strncasecmp(u, "alat", 4) == 0) {
                         snprintf(unit, sizeof(unit), "alat");
                         char *val = eq + 1;
                         while (*val == ' ') val++;
@@ -1500,14 +1669,22 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
                 if (*u) snprintf(unit, sizeof(unit), "%s", u);
             }
             double raw[3][3];
-            if (read_3x3(fp, raw, &ln) == 0) {
+            if (read_3x3(fp, raw, &ln, path) == 0) {
                 double scale = 1.0; int frac_dummy = 0;
                 double base_alat_ang = have_alat ? alat_bohr * (double)BOHR_TO_ANG : 0.0;
                 double alat_ang = (local_alat > 0) ? local_alat : base_alat_ang;
-                unit_scales(unit, alat_ang, &scale, &frac_dummy);
+                if (unit_scales(unit, alat_ang, &scale, &frac_dummy) != 0) {
+                    free(ax); free(ay); free(az); free(asym);
+                    fclose(fp); set_error(path, ln, "unknown CELL_PARAMETERS unit in pwo"); return NULL;
+                }
                 for (int i = 0; i < 3; i++)
-                    for (int j = 0; j < 3; j++)
+                    for (int j = 0; j < 3; j++) {
                         cell[i][j] = raw[i][j] * scale;
+                        if (!in_float_range(cell[i][j])) {
+                            free(ax); free(ay); free(az); free(asym);
+                            fclose(fp); set_error(path, ln, "non-finite cell in pwo CELL_PARAMETERS"); return NULL;
+                        }
+                    }
                 have_cell = 1;
             }
             continue;
@@ -1523,7 +1700,10 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
             }
             double scale = 1.0; int frac = 0;
             double alat_ang = have_alat ? alat_bohr * (double)BOHR_TO_ANG : 0.0;
-            unit_scales(unit, alat_ang, &scale, &frac);
+            if (unit_scales(unit, alat_ang, &scale, &frac) != 0) {
+                free(ax); free(ay); free(az); free(asym);
+                fclose(fp); set_error(path, ln, "unknown ATOMIC_POSITIONS unit in pwo"); return NULL;
+            }
 
             const int is_target = (step == frame_index);
             int got = 0;
@@ -3323,9 +3503,18 @@ MolEnvScene* parse_poscar(const char *path) {
         double v0 = fabs(det);
         latScale = (v0 > 0.0) ? cbrt(fabs(scale) / v0) : 1.0;
     }
+    /* Validate latScale: cbrt of a non-finite or negative value can produce NaN/inf
+       which silently corrupts the cell. */
+    if (!isfinite(latScale) || latScale <= 0.0) {
+        fclose(fp); set_error(path, ln, "non-finite lattice scale in POSCAR"); return NULL;
+    }
     for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++)
+        for (int c = 0; c < 3; c++) {
             cellv[r][c] *= latScale;
+            if (!in_float_range(cellv[r][c])) {
+                fclose(fp); set_error(path, ln, "non-finite cell vector in POSCAR"); return NULL;
+            }
+        }
 
     /* line 6: element symbols (VASP 5+) or counts (VASP 4). Strict 32-token
        cap: the species/counts arrays are fixed at 32, so a surplus-token line is
@@ -3462,6 +3651,10 @@ MolEnvScene* parse_poscar(const char *path) {
                 // latScale, which is always the effective positive multiplier).
                 cx = px * latScale; cy = py * latScale; cz = pz * latScale;
             }
+            if (!in_float_range(cx) || !in_float_range(cy) || !in_float_range(cz)) {
+                fclose(fp); set_error(path, ln, "non-finite atom coordinate in POSCAR");
+                molenv_scene_free(s); return NULL;
+            }
             MolEnvAtom *a = &s->atoms[ai];
             a->coord[0] = (float)cx; a->coord[1] = (float)cy; a->coord[2] = (float)cz;
             if (vasp5 && sp < nspecies) {
@@ -3489,13 +3682,19 @@ static MolEnvScene* parse_xyz_impl(const char *path) {
     char line[256];
     int na = 0;
 
-    /* line 1: number of atoms */
+    /* line 1: number of atoms. Strict parse: strtol + full-consumption + range
+       cap. sscanf("%d") on an overflowed integer is implementation-defined and
+       can silently produce a wrong atom count; strtol with endp rejects that. */
     if (fgets(line, sizeof(line), fp) == NULL) {
         fclose(fp); set_error(path, 1, "unexpected end of file"); return NULL;
     }
-    if (sscanf(line, "%d", &na) != 1 || na < 1) {
-        fclose(fp); set_error(path, 1, "number of atoms lower than one"); return NULL;
+    char *endp = NULL;
+    long na_long = strtol(line, &endp, 10);
+    while (endp && (*endp == ' ' || *endp == '\t' || *endp == '\r' || *endp == '\n')) endp++;
+    if (endp == line || (endp && *endp != '\0') || na_long < 1 || na_long > 500000) {
+        fclose(fp); set_error(path, 1, "unreasonable atom count in XYZ"); return NULL;
     }
+    na = (int)na_long;
 
     /* line 2: comment/title */
     if (fgets(line, sizeof(line), fp) == NULL) {

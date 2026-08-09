@@ -1,6 +1,6 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-08 (v1.2.2: XCrySDen Tier-1 parity complete — H-bonds with detector settings, molecular surface, color schemes, per-element overrides with periodic-table editor, unit-of-repetition toggle, crystal-cell rods, unicolor bonds, tessellation factor, up-to-6-light rig, force overlay; 36 focused tests; XCrySDen gap backlog tiered in 3 tiers: self-contained parity, format interop, external-job integration)**.
+Last updated: **2026-08-09 (v1.2.4: adversarial-review hardening batch — parser resource caps and non-finite rejection across all formats, case-insensitive QE unit tokens, periodic minimum-image bonding, spec-correct APNG sequence/delay with streaming and fps/frame bounds, state-aware headless animation export, full appearance carry on saved-frame reload via `Scene.adoptAppearance`, race-free background animation/XRD work, exact minimum-image H-bond detection with spatial acceleration, checked CRYSTAL band/DOS conversions, fail-closed Z-matrix placeholders, 118-element symbol table, export destination alias guards, state/project/BXSF size caps, .mvis-state appearance round-trip, periodic-dimension-aware supercells, 2D culling parity, user k-path preservation through basis tools, convert-all collision skipping; 59 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 

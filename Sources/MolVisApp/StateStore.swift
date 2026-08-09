@@ -115,6 +115,17 @@ enum StateStore {
         if let camera {
             payload["camera"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(camera))
         }
+        // Scene display/appearance settings that silently reset to defaults without persistence.
+        payload["hbondSettings"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(scene.hbondSettings))
+        payload["molecularSurfaceSettings"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(scene.molecularSurfaceSettings))
+        payload["atomColorScheme"] = scene.atomColorScheme.rawValue
+        payload["elementOverrides"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(scene.elementOverrides))
+        payload["repetitionMode"] = scene.repetitionMode.rawValue
+        payload["cellRodsEnabled"] = scene.cellRodsEnabled
+        payload["cellRodFactor"] = scene.cellRodFactor
+        payload["unicolorBonds"] = scene.unicolorBonds
+        payload["unicolorBondHex"] = scene.unicolorBondHex
+        payload["tessellationFactor"] = scene.tessellationFactor
         // New saves normalize even an empty input to the fixed three-slot
         // representation. The key remains optional when reading legacy files.
         payload["cameraBookmarks"] = try encodeCameraBookmarks(cameraBookmarks, url: url)
@@ -145,6 +156,20 @@ enum StateStore {
 
     private static func loadState(into scene: inout Scene, camera: inout Camera?,
                                   cameraBookmarks: inout [CameraBookmark?], from url: URL) throws -> Int {
+        // Pre-check the on-disk size so a malformed/giant state file cannot allocate
+        // unbounded memory before any parsing. A 50 MB cap is generous for a flat
+        // view-state file (typical size is a few KB).
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            if let fileSize = attributes[.size] as? Int, fileSize > 50 * 1024 * 1024 {
+                throw ParseError.io(path: url.path, reason: "state file too large (\(fileSize) bytes)")
+            }
+        } catch let error as ParseError {
+            throw error
+        } catch {
+            // File attribute errors fall through to Data(contentsOf:) which will
+            // produce its own path-bearing error below.
+        }
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -411,6 +436,43 @@ enum StateStore {
             l.elevation = try finiteFloat(light["elevation"], field: "lighting.elevation") ?? l.elevation
             candidate.lighting = l
         }
+        // Display/appearance settings. Optional for backward compatibility; missing
+        // keys keep the Scene defaults. A malformed value rejects the whole load
+        // transactionally (candidate is discarded, caller state preserved).
+        if let value = obj["hbondSettings"] {
+            do {
+                candidate.hbondSettings = try dec.decode(HbondSettings.self, from: try JSONSerialization.data(withJSONObject: value))
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0, reason: "malformed state field: hbondSettings")
+            }
+        }
+        if let value = obj["molecularSurfaceSettings"] {
+            do {
+                candidate.molecularSurfaceSettings = try dec.decode(MolecularSurfaceSettings.self, from: try JSONSerialization.data(withJSONObject: value))
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0, reason: "malformed state field: molecularSurfaceSettings")
+            }
+        }
+        if let raw = obj["atomColorScheme"] as? String {
+            candidate.atomColorScheme = AtomColorScheme(rawValue: raw) ?? .elemental
+        }
+        if let value = obj["elementOverrides"] {
+            do {
+                candidate.elementOverrides = try dec.decode([Int: ElementOverride].self, from: try JSONSerialization.data(withJSONObject: value))
+            } catch {
+                throw ParseError.parse(path: url.path, line: 0, reason: "malformed state field: elementOverrides")
+            }
+        }
+        if let raw = obj["repetitionMode"] as? String {
+            candidate.repetitionMode = RepetitionMode(rawValue: raw) ?? .unitCell
+        }
+        if let v = obj["cellRodsEnabled"] as? Bool { candidate.cellRodsEnabled = v }
+        if let v = try finiteFloat(obj["cellRodFactor"], field: "cellRodFactor") {
+            candidate.cellRodFactor = v
+        }
+        if let v = obj["unicolorBonds"] as? Bool { candidate.unicolorBonds = v }
+        if let v = obj["unicolorBondHex"] as? String { candidate.unicolorBondHex = v }
+        if let v = obj["tessellationFactor"] as? Int { candidate.tessellationFactor = v }
         if let v = obj["currentFrame"] as? Int { candidate.currentFrame = v }
         // k-path lifecycle. Keep the freshly parsed route as a snapshot before
         // applying persisted data: it is the authoritative canonical route for

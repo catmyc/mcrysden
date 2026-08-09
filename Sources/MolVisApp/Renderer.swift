@@ -252,7 +252,7 @@ final class Renderer: NSObject {
     /// periodic dimension. Cheap to recompute and deterministic.
     private func schemeFingerprint() -> UInt64 {
         var h = atomFingerprint()
-        h ^= UInt64(scene.atomColorScheme.rawValue.hashValue); h = h &* 0x100000001b3
+        h ^= UInt64(bitPattern: Int64(scene.atomColorScheme.rawValue.hashValue)); h = h &* 0x100000001b3
         if let slab = scene.slab {
             for p in [slab.planeA, slab.planeB] {
                 h ^= UInt64(bitPattern: Int64(p.h)); h = h &* 0x100000001b3
@@ -2362,6 +2362,8 @@ final class Renderer: NSObject {
         verts.reserveCapacity(atoms.count * 6)
         let wF = Float(w), hF = Float(h)
         for (i, a) in atoms.enumerated() {
+            // Display-only clip + asymmetric-unit filter (mirrors drawAtoms).
+            if isAtomCulled(i) { continue }
             let ndc = projectNDC(a.coord, view: view, proj: proj)
             let rPx: Float = scene.displayMode == .point2D
                 ? 2.5
@@ -2406,6 +2408,12 @@ final class Renderer: NSObject {
         verts.reserveCapacity(scene.bonds.count * 6)
         for b in scene.bonds {
             guard b.i >= 0, b.i < atoms.count, b.j >= 0, b.j < atoms.count else { continue }
+            // Display-only clip: cull bonds where BOTH endpoints are culled.
+            if b.i < frameStructureCull.count && b.j < frameStructureCull.count,
+               frameStructureCull[b.i] && frameStructureCull[b.j] { continue }
+            // Asymmetric-unit filter: drop bonds touching a dropped atom.
+            if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
+               b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
             guard let ndc0 = projectNDC2D(atoms[b.i].coord, view: view, proj: proj),
                   let ndc1 = projectNDC2D(atoms[b.j].coord, view: view, proj: proj) else { continue }
             let dir = SIMD2<Float>(ndc1.x - ndc0.x, ndc1.y - ndc0.y)

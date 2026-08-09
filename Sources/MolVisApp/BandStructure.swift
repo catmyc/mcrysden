@@ -237,9 +237,19 @@ enum BandParser {
                 if isIterationBoundary(t) { break }
                 if parseKHeader(t) != nil { break }
                 var row: [Float] = []
+                var rowMalformed = false
                 for s in t.split(whereSeparator: { $0 == " " || $0 == "\t" }) {
-                    if let v = Float(s), v.isFinite { row.append(v) }
+                    if let v = Float(s) {
+                        // A token that parses as a number but is non-finite
+                        // (NaN/Inf) is malformed data — abort the whole parse
+                        // rather than silently shortening the row (which would
+                        // misalign every band after it).
+                        if !v.isFinite { rowMalformed = true; break }
+                        row.append(v)
+                    }
+                    // Tokens that do not parse as numbers are silently skipped.
                 }
+                if rowMalformed { return nil }
                 if row.isEmpty { break }
                 energies.append(contentsOf: row)
                 i += 1

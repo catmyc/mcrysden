@@ -416,6 +416,42 @@ final class PeriodicMeasurementTests: XCTestCase {
         }
 }
 
+    func testHBondPeriodicImageUsesMinimumImageDisplacement() {
+        // A skew cell where the acceptor's nearest periodic image — not its base
+        // position — satisfies the H-bond criteria. The acceptor O1 sits near the
+        // -a boundary; its image at (10.4, 2.4) is only ~1.28 Å from the H while
+        // the base position is ~9.3 Å away. The donor O0 is near the H, so the
+        // D-H-A angle via the wrapped image is obtuse (>= 90°) while the reverse
+        // donor assignment fails the angle gate, leaving exactly one pair.
+        let skewCell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(2, 8, 0), c: SIMD3(0, 0, 12))
+        let atoms = [
+            Atom(coord: SIMD3(9.2, 4.2, 0), atomicNumber: 8, label: "O"),  // donor (index 0)
+            Atom(coord: SIMD3(0.4, 2.4, 0), atomicNumber: 8, label: "O"),  // acceptor (index 1)
+            Atom(coord: SIMD3(9.6, 3.4, 0), atomicNumber: 1, label: "H"),  // H near donor (index 2)
+        ]
+        var scene = Scene()
+        scene.atoms = atoms
+        scene.cell = skewCell
+        scene.periodicDim = 3
+        scene.hbondSettings = HbondSettings(enabled: true, maxDistance: 3.0, minAngleDegrees: 90)
+
+        let pairs = HbondAnalysis.detect(scene: scene)
+        // Exactly one pair: donor O0 -- H -- acceptor O1 via the wrapped image.
+        XCTAssertEqual(pairs.count, 1, "expected exactly one H-bond pair")
+        if let pair = pairs.first {
+            XCTAssertEqual(pair.donor, 0)
+            XCTAssertEqual(pair.acceptor, 1)
+            XCTAssertEqual(pair.hydrogen, 2)
+            // The acceptor image must be the wrapped nearest image (10.4, 2.4, 0),
+            // not the base position (0.4, 2.4, 0) which is ~9.3 Å from the H.
+            XCTAssertNotNil(pair.acceptorImage)
+            let base = atoms[1].coord
+            XCTAssertNotEqual(pair.acceptorImage, base, "acceptor image should be the wrapped nearest image")
+            XCTAssertEqual(pair.acceptorImage?.x ?? -1, Float(10.4), accuracy: 0.01)
+            XCTAssertEqual(pair.acceptorImage?.y ?? -1, Float(2.4), accuracy: 0.01)
+        }
+    }
+
     /// Brute-force i<j minimum-image RDF oracle.
     private func bruteForceRDF(atoms: [Atom], cell: Cell, periodicDim: Int,
                                 maxRadius: Float, bins: Int = 50) -> [(center: Float, count: Int)] {

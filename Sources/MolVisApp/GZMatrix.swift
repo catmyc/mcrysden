@@ -71,9 +71,9 @@ enum GZMatrixParser {
         guard lines.count <= maxLines else { GZMatrixError.set("input exceeds \(maxLines) lines"); return nil }
 
         let variables = collectVariables(lines)
-        let candidates = lines.map { line -> Row? in
+        let candidates = lines.enumerated().map { (i, line) -> Row? in
             let tokens = tokenize(line)
-            return tokens.isEmpty ? nil : parseRow(tokens)
+            return tokens.isEmpty ? nil : parseRow(tokens, rowIndex: i)
         }
 
         // Locate the single coordinate block. Everything before it (route line,
@@ -245,7 +245,7 @@ enum GZMatrixParser {
         return tokens[1] == "-" || Int(tokens[1]) != nil
     }
 
-    private static func parseRow(_ tokens: [String]) -> Row? {
+    private static func parseRow(_ tokens: [String], rowIndex: Int) -> Row? {
         guard let symbol = elementSymbol(tokens[0]) else { return nil }
         let upper = symbol.uppercased()
         let isDummy = (upper == "X" || upper == "BQ")
@@ -258,7 +258,17 @@ enum GZMatrixParser {
         while index + 1 < tokens.count, refs.count < 3 {
             guard let maybeRef = reference(tokens[index]) else { return nil }
             guard let ref = maybeRef else {
-                // "0"/"-" placeholder: consume the (ignored) paired value.
+                // "0"/"-" placeholder: only meaningful for the first rows of
+                // the coordinate block (before any real reference is
+                // accumulated, and only in the first three rows). A placeholder
+                // after a real reference, or deep in the block, lets a malformed
+                // file re-associate later placeholders into plausible-but-wrong
+                // geometry — reject it.
+                if refs.count > 0 || rowIndex > 2 {
+                    GZMatrixError.set("placeholder reference in row \(rowIndex + 1)")
+                    return nil
+                }
+                // Consume the (ignored) paired value.
                 guard value(tokens[index + 1]) != nil else { return nil }
                 index += 2
                 continue
@@ -321,7 +331,11 @@ enum GZMatrixParser {
 
             if !row.isDummy {
                 guard atoms.count < maxAtoms else { return nil }
-                atoms.append(Atom(coord: SIMD3<Float>(Float(position.x), Float(position.y), Float(position.z)),
+                let fx = Float(position.x)
+                let fy = Float(position.y)
+                let fz = Float(position.z)
+                guard fx.isFinite, fy.isFinite, fz.isFinite else { return nil }
+                atoms.append(Atom(coord: SIMD3<Float>(fx, fy, fz),
                                   atomicNumber: row.atomicNumber, label: row.label))
             }
         }
