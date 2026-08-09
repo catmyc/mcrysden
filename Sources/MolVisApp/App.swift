@@ -893,6 +893,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     }
                     let inURL = resolve(args[0])
                     let outURL = resolve(args[1])
+                    guard !App.sameFile(inURL, outURL) else {
+                        throw CLIError.invalid("output aliases input")
+                    }
                     try Converter.convert(url: inURL, to: outURL, forcedFormat: nil)
                     return "converted \(inURL.path) -> \(outURL.path)"
                 }
@@ -906,6 +909,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     let fps = args.count == 3 ? (Int(args[2]) ?? -1) : 10
                     guard (1...600).contains(fps) else {
                         throw CLIError.invalid("export-anim fps must be in 1...600")
+                    }
+                    guard !App.sameFile(inURL, outURL) else {
+                        throw CLIError.invalid("output aliases input")
                     }
                     let fc = Parser.frameCount(inURL, as: nil)
                     let total = fc > 0 ? fc : 1
@@ -944,6 +950,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                         throw CLIError.invalid("project-save requires a loaded scene (run load first)")
                     }
                     let outURL = resolve(args[0])
+                    // TODO: alias guard needs source URL
                     try ProjectStore.save(scene, to: outURL)
                     return "saved project -> \(outURL.path)"
                 }
@@ -1527,7 +1534,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         throw CLIError.invalid("destination aliases loaded source: \(source.path)")
     }
 
-    private static func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
+    static func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
         let left = lhs.standardizedFileURL.resolvingSymlinksInPath()
         let right = rhs.standardizedFileURL.resolvingSymlinksInPath()
         if left.path == right.path { return true }
@@ -1829,7 +1836,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.5"
+    static let appVersion = "1.2.6"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

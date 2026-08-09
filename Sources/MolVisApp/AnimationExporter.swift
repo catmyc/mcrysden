@@ -44,7 +44,12 @@ enum AnimationExporter {
 
     private static func exportGIF(frames: [Scene], camera: Camera?, size: CGSize, fps: Int,
                                   to url: URL) throws {
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, kUTTypeGIF, frames.count, nil) else {
+        // Write to a temp file first; only on successful finalize do we atomically
+        // move temp→final so a failed encode leaves any pre-existing file intact.
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("mcrysden-\(UUID().uuidString).\(url.pathExtension)")
+        var moved = false
+        defer { if !moved { try? FileManager.default.removeItem(at: tempURL) } }
+        guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, kUTTypeGIF, frames.count, nil) else {
             throw AnimationExportError.encodeFailed
         }
         // GIF-specific properties MUST be nested under kCGImagePropertyGIFDictionary
@@ -59,6 +64,9 @@ enum AnimationExporter {
             CGImageDestinationAddImage(dest, cg, frameProps as CFDictionary)
         }
         guard CGImageDestinationFinalize(dest) else { throw AnimationExportError.encodeFailed }
+        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+        try FileManager.default.moveItem(at: tempURL, to: url)
+        moved = true
     }
 
     // MARK: - APNG (manual chunk writer)
@@ -88,8 +96,14 @@ enum AnimationExporter {
             throw AnimationExportError.invalidSize
         }
         let w = Int(rw), h = Int(rh)
-        try? FileManager.default.removeItem(at: url)
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        // Write to a temp file first; only on successful finishWriting do we
+        // atomically move temp→final so a failed encode leaves any pre-existing
+        // file intact. (Previously the final URL was deleted BEFORE encoding,
+        // which destroyed the original on mid-stream failure.)
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("mcrysden-\(UUID().uuidString).\(url.pathExtension)")
+        var moved = false
+        defer { if !moved { try? FileManager.default.removeItem(at: tempURL) } }
+        let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mp4)
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: w,
@@ -147,6 +161,9 @@ enum AnimationExporter {
         done.wait()
         if let finishError { throw AnimationExportError.avFoundationFailed(finishError) }
         guard writer.status == .completed else { throw AnimationExportError.encodeFailed }
+        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+        try FileManager.default.moveItem(at: tempURL, to: url)
+        moved = true
     }
 }
 

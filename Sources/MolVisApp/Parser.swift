@@ -280,6 +280,14 @@ enum Parser {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
+        // Uniform 200 MB size cap at the load entry: the C-backed formats are
+        // dispatched to C parsers with no size cap, so reject oversized files
+        // here before any parser runs. Mirrors readCappedText's bound (the gzip
+        // XSF path also caps via gunzipData; redundant-but-harmless there).
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        if let size = attributes[.size] as? Int, size > 200 * 1024 * 1024 {
+            throw ParseError.io(path: url.path, reason: "file size \(size) exceeds 200 MB limit")
+        }
         let effective = format ?? ParseFormat.from(url: url)
         guard let effective else {
             throw ParseError.io(path: url.path, reason: "unknown extension \(url.pathExtension)")
@@ -1603,6 +1611,7 @@ enum OrcaParser {
         // advance past header + separator
         while idx < lines.count, !(lines[idx].contains(coordSeparator)) { idx += 1 }
         idx += 1   // first atom line (or beyond if file is malformed)
+        enum E: Error { case noAtoms; case tooManyAtoms }
         var atoms: [Atom] = []
         while idx < lines.count {
             let line = lines[idx].trimmingCharacters(in: .whitespaces)
@@ -1614,15 +1623,15 @@ enum OrcaParser {
             guard toks.count >= 4, let x = Float(toks[1]), x.isFinite,
                   let y = Float(toks[2]), y.isFinite,
                   let z = Float(toks[3]), z.isFinite else { break }   // next section reached
-            // Cap total atoms: a file with an absurd number of atoms must not
-            // allocate unboundedly.
-            if atoms.count >= 500_000 { break }
+            // Cap total atoms: a file with an absurd number of atoms must fail
+            // closed rather than allocate unboundedly (matches FHI-aims).
+            if atoms.count >= 500_000 { throw E.tooManyAtoms }
             let Z = ElementTable.atomicNumber(toks[0])
             let sym = Z == 0 ? toks[0] : ElementTable.symbol(Z)
             atoms.append(Atom(coord: SIMD3<Float>(x, y, z), atomicNumber: Z, label: sym))
             idx += 1
         }
-        guard !atoms.isEmpty else { enum E: Error { case noAtoms }; throw E.noAtoms }
+        guard !atoms.isEmpty else { throw E.noAtoms }
         var out = LoadedScene()
         out.atoms = atoms
         out.isCrystal = false
@@ -1749,14 +1758,23 @@ internal func loadFHIaimsGeometryIn(lines: [String], url: URL) throws -> LoadedS
                 throw E.malformed("non-finite fractional-to-Cartesian coordinate")
             }
             atoms.append(Atom(coord: cart, atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
+            // Incremental cap: fail before unbounded growth (matches coord.out).
+            if atoms.count > 500_000 {
+                throw E.malformed("too many atoms")
+            }
         }
     }
     for (coord, sym) in cartAtoms {
         let Z = ElementTable.atomicNumber(sym)
         atoms.append(Atom(coord: coord, atomicNumber: Z, label: Z == 0 ? sym : ElementTable.symbol(Z)))
+        // Incremental cap: fail before unbounded growth (matches coord.out).
+        if atoms.count > 500_000 {
+            throw E.malformed("too many atoms")
+        }
     }
     // Cap total atoms: an absurd number of atom_frac/atom lines must not
-    // allocate unboundedly.
+    // allocate unboundedly. Belt-and-suspenders alongside the incremental
+    // checks above.
     if atoms.count > 500_000 {
         throw E.malformed("too many atoms")
     }

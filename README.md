@@ -21,7 +21,7 @@ Local install: `swift build -c release && cp .build/release/mcrysden /usr/local/
 
 ## Highlights
 
-- 16 parser families with force-format CLI flags (`--xsf --xyz --pwi --pwo --cif --cube --bxsf --struct --crystal --orca --fhi --bands --dos`, …) and a 200 MB input cap
+- 18 parser families with force-format CLI flags (`--xsf --xyz --pwi --pwo --cif --cube --bxsf --struct --crystal --orca --fhi --bands --dos --crystal-band --crystal-dos`, …) and a 200 MB input cap
 - Metal rendering: ball-stick/space-fill/wireframe/polyhedral/2D modes, Blinn-Phong lighting, MSAA, depth cueing, AO and soft shadows, image/gradient/solid backgrounds, stereo and anaglyph
 - Supercell expansion, slab generation, cluster cutting, defect workflows, lattice editing
 - Crystal symmetry (space group, Wyckoff), canonical HPKOT k-paths, BZ overlay, structure summary, powder XRD

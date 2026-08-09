@@ -249,11 +249,16 @@ enum ForceParser {
             guard let eq = line.range(of: "force =") else { i += 1; continue }
             let nums = floats(in: String(line[eq.upperBound...]))
             guard nums.count >= 3 else { i += 1; continue }
+            // Skip the whole atom when any force component is non-finite, so a
+            // NaN/inf value doesn't poison the force-arrow rendering. Skipping the
+            // entire triple (not individual components) keeps per-atom alignment.
+            let fx = nums[0], fy = nums[1], fz = nums[2]
+            guard fx.isFinite, fy.isFinite, fz.isFinite else { i += 1; continue }
             // A repeated index (atom 1; atom 2; atom 2) would silently overwrite
             // the earlier vector — reject the block so an earlier clean iteration
             // is used instead of one with an arbitrary duplicate value.
             if byIndex[idx] != nil { return nil }
-            byIndex[idx] = SIMD3<Float>(nums[0], nums[1], nums[2]) * ryPerAu_to_eVPerAng
+            byIndex[idx] = SIMD3<Float>(fx, fy, fz) * ryPerAu_to_eVPerAng
             i += 1
         }
         guard !byIndex.isEmpty else { return nil }

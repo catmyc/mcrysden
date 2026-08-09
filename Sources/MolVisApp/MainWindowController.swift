@@ -5118,6 +5118,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     private func saveProject(to url: URL) {
         do {
+            try App.validateGUIWriteDestination(url, source: sourceURL)
             try ProjectStore.save(scene, to: url)
         } catch {
             presentExportError(error, title: "Save project failed")

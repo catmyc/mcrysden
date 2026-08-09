@@ -28,6 +28,14 @@ static int in_float_range(double x) {
     return isfinite(x) && x >= -FLT_MAX && x <= FLT_MAX;
 }
 
+/* Consume a leading UTF-8 BOM (EF BB BF) if present. For non-BOM files the first
+   3 bytes are put back by rewinding, so callers see the file unchanged. */
+static void molenv_skip_bom(FILE *fp) {
+    int a = fgetc(fp), b = fgetc(fp), c = fgetc(fp);
+    if (a == 0xEF && b == 0xBB && c == 0xBF) return;
+    rewind(fp);
+}
+
 void molenv_grid_free(MolEnvGrid *g) {
     if (!g) return;
     free(g->values);
@@ -110,7 +118,11 @@ static float bond_rcov(int z) {
         1.90f, 1.80f, 1.60f, 1.55f, 1.55f,
         1.55f, 2.80f, 1.44f, 1.95f, 1.55f,
         1.55f, 1.55f, 1.55f, 1.55f, 1.55f,
-        1.55f, 1.55f, 1.55f, 1.55f, 1.55f
+        1.55f, 1.55f, 1.55f, 1.55f, 1.55f,
+        1.73f, 1.70f, 1.70f, 1.60f, 1.53f,
+        1.43f, 1.38f, 1.32f, 1.29f, 1.28f,
+        1.21f, 1.22f, 1.36f, 1.43f, 1.62f,
+        1.75f, 1.65f, 1.57f
     };
     int n = (int)(sizeof(rcovdef)/sizeof(rcovdef[0]));
     return (z >= 0 && z < n) ? 1.05f * rcovdef[z] : 0.0f;
@@ -871,6 +883,7 @@ MolEnvScene* parse_xsf(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    molenv_skip_bom(fp);
     MolEnvScene *s = new_scene(path);
     if (!s) { fclose(fp); return NULL; }
     float cell[3][3]={{0}}; int pd=3, have_cell=0, ln=0;
@@ -979,6 +992,7 @@ MolEnvScene* parse_axsf(const char *path, int frame_index) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    molenv_skip_bom(fp);
     char line[256], tok[64];
     int nframes = 0, ln = 0;
     /* First pass: find ANIMSTEPS count. */
@@ -1058,6 +1072,7 @@ MolEnvScene* parse_pdb(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    molenv_skip_bom(fp);
     char line[1024];
     long long count = 0;
     int ln = 0, got_title = 0;
@@ -1336,6 +1351,7 @@ MolEnvScene* parse_pwi(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    molenv_skip_bom(fp);
 
     char line[1024];
     int ln = 0;
@@ -1729,6 +1745,7 @@ MolEnvScene* parse_pwo(const char *path, int frame_index) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    molenv_skip_bom(fp);
 
     char line[1024];
     int ln = 0;
@@ -2788,6 +2805,7 @@ MolEnvScene* parse_cif(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    molenv_skip_bom(fp);
 
     /* Cell parameters with presence tracking. */
     double len_a = 0, len_b = 0, len_c = 0;
@@ -2831,6 +2849,7 @@ MolEnvScene* parse_cif(const char *path) {
     while (1) {
         if (!cif_read_token(&ctx, fp, tok_buf, sizeof(tok_buf))) {
             if (ctx.error) {
+                for (int k = 0; k < row_used; k++) free(row_toks[k]);
                 for (int k = 0; k < natoms; k++) free(at[k].label);
                 free(at); fclose(fp); set_error(path, ctx.line, "unterminated CIF token"); return NULL;
             }
@@ -3643,6 +3662,7 @@ MolEnvScene* parse_poscar(const char *path) {
     last_error[0] = '\0';
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    molenv_skip_bom(fp);
 
     char line[1024], title[256] = {0};
     int ln = 0;
@@ -3884,6 +3904,7 @@ MolEnvScene* parse_poscar(const char *path) {
 static MolEnvScene* parse_xyz_impl(const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) { set_error(path, 0, "cannot open file"); return NULL; }
+    molenv_skip_bom(fp);
 
     char line[256];
     int na = 0;

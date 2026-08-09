@@ -63,6 +63,7 @@ final class DOSGrapherView: NSView {
         guard plotRect.width >= 24, plotRect.height >= 24 else { return nil }
         guard point.y >= plotRect.minY, point.y <= plotRect.maxY else { return nil }
         func dE(_ e: Float) -> Float { e - fermiShift }
+        guard !dos.energies.isEmpty else { return nil }
         var energyMin = dos.energies.first!
         var energyMax = dos.energies.last!
         // Energy window overrides the auto range (must mirror draw()).

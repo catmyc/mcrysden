@@ -25,6 +25,7 @@ enum DOSParser {
         var columnCounts: [Int: Int] = [:]
         var headers: [String] = []
         var fermiEnergy: Float?
+        var totalValues = 0
 
         for rawLine in text.split(omittingEmptySubsequences: false, whereSeparator: \Character.isNewline) {
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
@@ -51,6 +52,8 @@ enum DOSParser {
             }
             guard row.count >= 2 else { return nil }
             rows.append(row)
+            totalValues += row.count
+            if rows.count > 100_000 || totalValues > 1_000_000 { return nil }
             columnCounts[row.count, default: 0] += 1
         }
 

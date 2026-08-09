@@ -56,9 +56,9 @@ enum Converter {
     /// input parser. Writes through a temp file then atomically replaces the
     /// destination so an interrupted conversion can never leave a truncated file.
     static func convert(url: URL, to outputURL: URL, forcedFormat: ParseFormat?, frameIndex: Int = 0) throws {
-        let inputPath = url.standardizedFileURL.path
-        let outputPath = outputURL.standardizedFileURL.path
-        guard inputPath != outputPath else { throw ConverterError.outputAliasesInput }
+        // Resolve symlinks/hardlinks via inode comparison (mirrors App.sameFile);
+        // a plain path-string check would miss aliases that point at the input.
+        guard !App.sameFile(url, outputURL) else { throw ConverterError.outputAliasesInput }
 
         let loaded = try Parser.load(url, as: forcedFormat, frameIndex: frameIndex)
         let scene = Scene(loaded: loaded)
@@ -81,7 +81,7 @@ enum Converter {
         do {
             try text.write(to: tmp, atomically: true, encoding: .utf8)
             let fm = FileManager.default
-            if fm.fileExists(atPath: outputPath) {
+            if fm.fileExists(atPath: outputURL.path) {
                 try fm.replaceItemAt(outputURL, withItemAt: tmp)
             } else {
                 try fm.moveItem(at: tmp, to: outputURL)

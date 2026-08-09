@@ -3848,16 +3848,15 @@ final class Renderer: NSObject {
             let c11 = o + sampled.vec[0] * Float(sampled.cols - 1)
                        + sampled.vec[1] * Float(sampled.rows - 1)
             // Two triangles: (o, c01, c10) and (c01, c11, c10).
-            struct V { var pos: SIMD4<Float>; var uv: SIMD2<Float> }
-            let verts: [V] = [
-                V(pos: SIMD4(o.x, o.y, o.z, 1),   uv: SIMD2(0, 0)),
-                V(pos: SIMD4(c01.x, c01.y, c01.z, 1), uv: SIMD2(1, 0)),
-                V(pos: SIMD4(c10.x, c10.y, c10.z, 1), uv: SIMD2(0, 1)),
-                V(pos: SIMD4(c01.x, c01.y, c01.z, 1), uv: SIMD2(1, 0)),
-                V(pos: SIMD4(c11.x, c11.y, c11.z, 1), uv: SIMD2(1, 1)),
-                V(pos: SIMD4(c10.x, c10.y, c10.z, 1), uv: SIMD2(0, 1)),
+            let verts: [TexQuadVertex] = [
+                TexQuadVertex(pos: SIMD4(o.x, o.y, o.z, 1),   uv: SIMD2(0, 0)),
+                TexQuadVertex(pos: SIMD4(c01.x, c01.y, c01.z, 1), uv: SIMD2(1, 0)),
+                TexQuadVertex(pos: SIMD4(c10.x, c10.y, c10.z, 1), uv: SIMD2(0, 1)),
+                TexQuadVertex(pos: SIMD4(c01.x, c01.y, c01.z, 1), uv: SIMD2(1, 0)),
+                TexQuadVertex(pos: SIMD4(c11.x, c11.y, c11.z, 1), uv: SIMD2(1, 1)),
+                TexQuadVertex(pos: SIMD4(c10.x, c10.y, c10.z, 1), uv: SIMD2(0, 1)),
             ]
-            guard let vb = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: []) else {
+            guard let vb = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<TexQuadVertex>.stride, options: []) else {
                 return false
             }
             enc.setVertexBuffer(vb, offset: 0, index: 0)
@@ -3949,16 +3948,15 @@ final class Renderer: NSObject {
         let c01 = o + grid.vec[0] * Float(grid.cols - 1)
         let c10 = o + grid.vec[1] * Float(grid.rows - 1)
         let c11 = o + grid.vec[0] * Float(grid.cols - 1) + grid.vec[1] * Float(grid.rows - 1)
-        struct V { var pos: SIMD4<Float>; var uv: SIMD2<Float> }
-        let verts: [V] = [
-            V(pos: SIMD4(o.x, o.y, o.z, 1),   uv: SIMD2(0, 0)),
-            V(pos: SIMD4(c01.x, c01.y, c01.z, 1), uv: SIMD2(1, 0)),
-            V(pos: SIMD4(c10.x, c10.y, c10.z, 1), uv: SIMD2(0, 1)),
-            V(pos: SIMD4(c01.x, c01.y, c01.z, 1), uv: SIMD2(1, 0)),
-            V(pos: SIMD4(c11.x, c11.y, c11.z, 1), uv: SIMD2(1, 1)),
-            V(pos: SIMD4(c10.x, c10.y, c10.z, 1), uv: SIMD2(0, 1)),
+        let verts: [TexQuadVertex] = [
+            TexQuadVertex(pos: SIMD4(o.x, o.y, o.z, 1),   uv: SIMD2(0, 0)),
+            TexQuadVertex(pos: SIMD4(c01.x, c01.y, c01.z, 1), uv: SIMD2(1, 0)),
+            TexQuadVertex(pos: SIMD4(c10.x, c10.y, c10.z, 1), uv: SIMD2(0, 1)),
+            TexQuadVertex(pos: SIMD4(c01.x, c01.y, c01.z, 1), uv: SIMD2(1, 0)),
+            TexQuadVertex(pos: SIMD4(c11.x, c11.y, c11.z, 1), uv: SIMD2(1, 1)),
+            TexQuadVertex(pos: SIMD4(c10.x, c10.y, c10.z, 1), uv: SIMD2(0, 1)),
         ]
-        guard let vb = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<V>.stride, options: []) else {
+        guard let vb = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<TexQuadVertex>.stride, options: []) else {
             return false
         }
         enc.setRenderPipelineState(texQuadPipeline)
@@ -4387,7 +4385,10 @@ final class Renderer: NSObject {
     }
 
     /// TexQuadIn: float4 position @0 (world-space xyz + w=1), float2 uv @1.
-    /// float4 is 16 bytes, float2 is 8 bytes; stride = 24.
+    /// float4 is 16 bytes, float2 is 8 bytes; SIMD4 forces 16-byte alignment,
+    /// so the struct stride is 32 (8 bytes tail padding), not 24.
+    private struct TexQuadVertex { var pos: SIMD4<Float>; var uv: SIMD2<Float> }
+
     private static func makeTexQuadVertexDescriptor() -> MTLVertexDescriptor {
         let vd = MTLVertexDescriptor()
         vd.attributes[0].format = .float4
@@ -4396,7 +4397,7 @@ final class Renderer: NSObject {
         vd.attributes[1].format = .float2
         vd.attributes[1].offset = MemoryLayout<SIMD4<Float>>.stride  // 16
         vd.attributes[1].bufferIndex = 0
-        vd.layouts[0].stride = MemoryLayout<SIMD4<Float>>.stride + MemoryLayout<SIMD2<Float>>.stride  // 24
+        vd.layouts[0].stride = MemoryLayout<TexQuadVertex>.stride  // 32
         return vd
     }
 

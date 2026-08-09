@@ -70,6 +70,7 @@ final class BandGrapherView: NSView {
         // what is actually drawn.
         func dE(_ e: Float) -> Float { e - fermiShift }
         let allE = bs.kPoints.flatMap { $0.energies.map(dE) }
+        guard !allE.isEmpty else { return nil }
         var yMin = allE.min()!, yMax = allE.max()!
         let yPad = max(0.5, (yMax - yMin) * 0.08)
         yMin -= yPad; yMax += yPad
@@ -177,6 +178,7 @@ final class BandGrapherView: NSView {
         let distances = bs.kDistances
         let xMin = distances.first!, xMax = distances.last!
         let allE = bs.kPoints.flatMap { $0.energies.map(dE) }
+        guard !allE.isEmpty else { drawEmpty(dirtyRect); return }
         var yMin = allE.min()!, yMax = allE.max()!
         // pad range; include the (shifted) Fermi level in the window ONLY when present
         // (metallic). Insulating outputs have no Fermi energy and we must not

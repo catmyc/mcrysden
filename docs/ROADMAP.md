@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-09 (v1.2.4: adversarial-review hardening batch — parser resource caps and non-finite rejection across all formats, case-insensitive QE unit tokens, periodic minimum-image bonding, spec-correct APNG sequence/delay with streaming and fps/frame bounds, state-aware headless animation export, full appearance carry on saved-frame reload via `Scene.adoptAppearance`, race-free background animation/XRD work, exact minimum-image H-bond detection with spatial acceleration, checked CRYSTAL band/DOS conversions, fail-closed Z-matrix placeholders, 118-element symbol table, export destination alias guards, state/project/BXSF size caps, .mvis-state appearance round-trip, periodic-dimension-aware supercells, 2D culling parity, user k-path preservation through basis tools, convert-all collision skipping; 59 focused tests)**.
+Last updated: **2026-08-09 (v1.2.6: adversarial-review fixes — texQuad vertex-stride corruption in volume slices/color plane, atomic MP4/GIF export, project-save + script-runner alias guards, uniform 200 MB input cap across all parsers incl. C-backed, ORCA fail-closed atom cap, FHI-aims incremental cap, CIF token leak, Z=101..118 covalent radii, UTF-8 BOM handling in C parsers, grapher force-unwrap traps, QE DOS row cap, force finite check; added CIF parsing + multi-light render tests; 62 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-Current v1.2.5 verification: rank-aware exact periodic bonding, animation pixel/frame limits, cancellable background analysis, and the added parser hardening are covered by a passing 60-test suite.
+Current v1.2.6 verification: texQuad stride fix, atomic MP4/GIF export, alias guards on project save and script runner, uniform 200 MB input cap, ORCA fail-closed cap, CIF leak, heavy-element radii, BOM handling, grapher unwraps, DOS/force caps, and the added CIF + multi-light tests are covered by a passing 62-test suite.
 
 ## Implemented foundation (through v1.1.32)
 

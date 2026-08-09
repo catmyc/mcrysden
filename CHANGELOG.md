@@ -2,6 +2,29 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.6] — 2026-08-09
+
+### Fixed
+
+- **texQuad vertex stride** — the textured-quad pipeline (volume slices + 3D color-plane compositing) declared a 24-byte vertex stride while its Swift vertex struct has a 32-byte stride (SIMD4 alignment tail padding), so vertices 1–5 read interleaved garbage. The descriptor now uses a shared `TexQuadVertex` type so descriptor stride and buffer layout always match. Same bug class as the v1.1.1 vertex-stride fix.
+- **Atomic animation export** — MP4 and GIF now write to a temporary file and atomically move to the destination only on successful encode; a failed mid-stream encode no longer deletes the original file or leaves a truncated output. (APNG/PNG were already atomic.)
+- **Project save alias guard** — Save Project now refuses to overwrite the loaded source file, matching the GUI structure/animation export guards.
+- **Script runner + Converter alias guards** — the `--script` `convert` and `export-anim` commands now run the same inode-based `sameFile` check as the CLI argument path; `Converter.convert`'s internal alias check resolves symlinks/hardlinks via inodes instead of a path-string comparison.
+- **Uniform 200 MB input cap** — all parsers, including the C-backed XSF/XYZ/PDB/AXSF/PWI/CIF/POSCAR paths that previously had no cap, now reject oversized files at the load entry.
+- **ORCA fail-closed atom cap** — the ORCA loader now throws on >500K atoms instead of silently truncating, matching FHI-aims/CRYSCAL.
+- **FHI-aims geometry.in incremental cap** — the 500K-atom check now fires per-atom during collection rather than only after.
+- **CIF token leak** — the unterminated-CIF-token error path now frees accumulated loop-data row tokens, matching the EOF partial-row path.
+- **Heavy-element covalent radii** — the bond-radii table now covers Z=101..118 (Md–Og) instead of stopping at Z=100, so superheavy elements form bonds.
+- **UTF-8 BOM in C parsers** — a leading UTF-8 BOM is now skipped in all C-backed parsers so BOM-prefixed XYZ/XSF/etc. files parse instead of failing with a misleading atom-count error.
+- **Grapher force-unwraps** — `BandGrapherView` and `DOSGrapherView` no longer trap on a malformed band/DOS file that reports bands but yields an empty energies array.
+- **QE DOS row cap** — `DOSParser` now caps at 100K rows / 1M values (matching `CrystalDOSParser`) instead of allocating unboundedly on a giant `.dos` file.
+- **Force parser finite check** — non-finite (NaN/inf) force components are now rejected per-atom triple rather than poisoning renderer force-arrow vertices.
+
+### Added
+
+- **CIF parsing test** — `CIFParserTests` (NaCl fixture) restores parse-side coverage removed during test consolidation.
+- **Multi-light render test** — `MultiLightTests` exercises the multi-light rig through the offscreen render path (skipped when no Metal device).
+
 ## [1.2.5] — 2026-08-09
 
 ### Fixed
