@@ -335,7 +335,7 @@ enum Parser {
             return try loadFHIaims(url)
         }
         // QE PWscf band structure: parsed in Swift into a BandStructure for the
-        // 2D Grapher (no atoms/cell -> no C MolEnvScene).
+        // 2D Grapher; uniform meshes also produce a total DOS directly.
         if effective == .bands {
             return try loadBands(url)
         }
@@ -396,7 +396,20 @@ enum Parser {
         // the scene. Forces correspond to the final SCF iteration (the one the
         // user sees). Without this the .pwo path would return forces nowhere.
         if effective == .pwo {
-            return try loadPWO(url, frameIndex: 0)
+            do {
+                return try loadPWO(url, frameIndex: 0)
+            } catch let error as ParseError {
+                // QE `bands.x` commonly writes a band-only `.out` with no
+                // ATOMIC_POSITIONS block. `.out` is intentionally routed to
+                // PWO first because it is ambiguous; recover that specific
+                // case through the Swift band/DOS reader without masking other
+                // structural parse failures.
+                if case .parse(_, _, let reason) = error,
+                   reason.contains("no (target) ATOMIC_POSITIONS found") {
+                    return try loadBands(url)
+                }
+                throw error
+            }
         }
         let cPath = url.path.cString(using: .utf8)!
         let scene: UnsafeMutablePointer<MolEnvScene>?
@@ -452,6 +465,8 @@ enum Parser {
         switch effective {
         case .pwo: return Int(molenv_pwo_frame_count(cPath))
         case .orca: return orcaCycleCount(url)
+        case .bands, .dos, .gzmat, .struct_, .crystal, .crystalBand, .crystalDOS:
+            return 0
         default: return Int(molenv_axsf_frame_count(cPath))
         }
     }
@@ -1513,6 +1528,22 @@ enum Parser {
             }
             out.forceSet = fs
         }
+        // QE PWscf outputs can contain a final band-energy mesh in addition to
+        // structural/SCF data. Preserve both datasets so linked bands + total
+        // DOS work without a separate dos.x run.
+        if let parsedBands = BandParser.parse(raw) {
+            var bands = parsedBands
+            bands.cell = out.cell ?? bands.cell
+            out.bandStructure = bands
+            if bands.isMesh {
+                do {
+                    out.densityOfStates = try DOSCalculator.make(from: bands)
+                } catch {
+                    throw ParseError.parse(path: url.path, line: 0,
+                                           reason: "cannot derive DOS from QE mesh: \(error)")
+                }
+            }
+        }
         return out
     }
 }
@@ -1880,8 +1911,8 @@ internal func loadFHIaimsCoordOut(lines: [String]) throws -> LoadedScene {
 
 /// QE PWscf band structure (`.bands` file, or a `.out` forced with `--bands`):
 /// parse the `bands (ev):` k-point blocks in Swift into a BandStructure and wrap
-/// it in a band-only LoadedScene (no atoms/cell). The MainWindowController swaps
-/// the 3D canvas for the 2D Grapher when scene.bandStructure != nil.
+/// it in a LoadedScene. A uniform mesh also gets a total DOS reconstructed
+/// directly from its eigenvalues.
 internal func loadBands(_ url: URL) throws -> LoadedScene {
     let raw = try readCappedText(url)
     guard let bands = BandParser.parse(raw) else {
@@ -1889,6 +1920,14 @@ internal func loadBands(_ url: URL) throws -> LoadedScene {
     }
     var out = LoadedScene()
     out.bandStructure = bands
+    if bands.isMesh {
+        do {
+            out.densityOfStates = try DOSCalculator.make(from: bands)
+        } catch {
+            throw ParseError.parse(path: url.path, line: 0,
+                                   reason: "cannot derive DOS from QE mesh: \(error)")
+        }
+    }
     out.title = url.lastPathComponent
     return out
 }

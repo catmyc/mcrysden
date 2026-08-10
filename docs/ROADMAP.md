@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-10 (v1.2.8: image-aware bond detection — direct home-cell pairs win over near-tied periodic images, finite supercells rebond against scaled active cells, and undisplayed image bonds are omitted; 63 focused tests)**.
+Last updated: **2026-08-11 (v1.2.9: QE mesh-derived DOS with dimensional normalization; 64 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-Current v1.2.8 verification: direct-home image selection, scaled-supercell rebonding, shared bond display eligibility, and supercell round trips are covered by a passing 63-test suite.
+Current v1.2.9 verification: QE mesh DOS reconstruction, molecule/1D/2D/3D normalization, output-file auto-loading, graph rendering, and the existing image-aware bond regressions are covered by a passing 64-test suite.
 
 ## Implemented foundation (through v1.1.32)
 
@@ -15,7 +15,7 @@ Current v1.2.8 verification: direct-home image selection, scaled-supercell rebon
 - [x] Quantum Espresso PWscf output `.pwo/.out` (final cell + positions; multi-step relax/MD → AXSF frames)
 - [x] Gaussian Cube/G98 multi-orbital grids and BXSF band grids/Fermi surfaces, including `.bxsf.gz`
 - [x] WIEN2k `.struct`, CRYSCAL `.r1`, ORCA output, and FHI-aims `geometry.in`/`coord.out`
-- [x] Quantum Espresso band structures and total/projected DOS tables, including standard projected-DOS filenames
+- [x] Quantum Espresso band structures, total/projected DOS tables, and total DOS reconstructed directly from uniform QE meshes, including standard projected-DOS filenames
 - [x] Force-format CLI flags for all 16 parser families: `--xsf --axsf --xyz --pdb --pwi --pwo --cif --poscar --cube --bxsf --struct --crystal --orca --fhi --bands --dos`
 
 ### Display & appearance
@@ -134,6 +134,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 
 ### Electronic-structure analysis
 - [x] Interactive band/DOS cursor readout, energy windows, Fermi adjustment, and zoom/pan for both graphers; linked plots (v1.1.44) show BOTH graphs side-by-side when a scene carries band + DOS data, with a dashed cross-graph cursor guide line at the hovered energy, a combined report, and linked print/export (one image with both panels, true-vector PDF).
+- [x] Total DOS reconstruction from QE band meshes (v1.2.9): Gaussian broadening uses QE k-point weights and spin channels directly; molecules use states/eV, 1D systems states/(eV·Å), 2D crystals states/(eV·Å²), and 3D crystals states/(eV·Å³), with QE cell measures parsed from `crystal axes`/`CELL_PARAMETERS` and shown in the DOS graph.
 - [x] Band VBM/CBM, direct/indirect gap, metallicity, and effective masses plus DOS center, width, gap estimate, spin moment, and electron-count consistency are surfaced with explicit unavailable/insufficient-data states and text/CSV export. Band extrema and estimated DOS gap edges are linked to graph markers. The combined band+DOS report (v1.1.44) adds "Gap agreement" and "Band-edge agreement" cross-check rows.
 - [x] Projected species/orbital coloring (v1.1.44): QE projwfc filenames (`pdos_atm#N(Species)_wfc#M(orbital)`, `pdos_tot` + spin suffixes) enrich DOS series labels with species+orbital character, and the DOS grapher colors projected series by orbital (s/p/d/f fixed palette) with the legend showing the projection labels. Band-side projected coloring stays unavailable because QE `.out` band tables carry no projection weights.
 

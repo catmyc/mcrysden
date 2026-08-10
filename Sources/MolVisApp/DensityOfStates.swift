@@ -1,5 +1,69 @@
 import Foundation
 
+/// Where a DOS curve came from. A band-mesh DOS is a total DOS reconstructed
+/// from eigenvalues; table data remains supported for QE dos.x/projwfc.x and
+/// the CRYSTAL readers.
+enum DOSSource: String, Codable, Equatable {
+    case table
+    case bandMesh
+}
+
+/// Normalization metadata for a density-of-states curve.
+///
+/// The numerical DOS is always stored in eV and, for periodic systems, per
+/// Angstrom^periodicDim. Thus a 2D curve integrates to states/Å² and a 3D
+/// curve integrates to states/Å³. `cellMeasureAngstrom` is the physical length,
+/// area, or volume of the real-space unit cell in the periodic dimensions.
+struct DOSMetadata: Codable, Equatable {
+    var source: DOSSource
+    var periodicDim: Int
+    var cellMeasureAngstrom: Float?
+
+    static let table = DOSMetadata(source: .table, periodicDim: 0, cellMeasureAngstrom: nil)
+
+    init(source: DOSSource, periodicDim: Int, cellMeasureAngstrom: Float?) {
+        self.source = source
+        self.periodicDim = min(3, max(0, periodicDim))
+        self.cellMeasureAngstrom = cellMeasureAngstrom
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case source, periodicDim, cellMeasureAngstrom
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        source = try c.decodeIfPresent(DOSSource.self, forKey: .source) ?? .table
+        periodicDim = min(3, max(0, try c.decodeIfPresent(Int.self, forKey: .periodicDim) ?? 0))
+        cellMeasureAngstrom = try c.decodeIfPresent(Float.self, forKey: .cellMeasureAngstrom)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(source, forKey: .source)
+        try c.encode(periodicDim, forKey: .periodicDim)
+        try c.encodeIfPresent(cellMeasureAngstrom, forKey: .cellMeasureAngstrom)
+    }
+
+    /// Human-readable units for the horizontal DOS axis.
+    var unitLabel: String {
+        switch periodicDim {
+        case 1: return "states/(eV·Å)"
+        case 2: return "states/(eV·Å²)"
+        case 3: return "states/(eV·Å³)"
+        default: return "states/eV"
+        }
+    }
+
+    /// Convert an energy-integrated dimensional DOS back to states per unit
+    /// cell. Molecules and legacy table data have a unit scale of one.
+    var cellStateScale: Float {
+        guard periodicDim > 0, let measure = cellMeasureAngstrom,
+              measure.isFinite, measure > 0 else { return 1 }
+        return measure
+    }
+}
+
 struct DOSSeries: Codable {
     var label: String
     var values: [Float]
@@ -9,6 +73,29 @@ struct DensityOfStates: Codable {
     var energies: [Float]
     var series: [DOSSeries]
     var fermiEnergy: Float?
+    var metadata: DOSMetadata
+
+    init(energies: [Float], series: [DOSSeries], fermiEnergy: Float?,
+         metadata: DOSMetadata = .table) {
+        self.energies = energies
+        self.series = series
+        self.fermiEnergy = fermiEnergy
+        self.metadata = metadata
+    }
+
+    // Project files written before DOS normalization metadata existed must
+    // continue to load as ordinary states/eV table data.
+    private enum CodingKeys: String, CodingKey {
+        case energies, series, fermiEnergy, metadata
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        energies = try c.decode([Float].self, forKey: .energies)
+        series = try c.decode([DOSSeries].self, forKey: .series)
+        fermiEnergy = try c.decodeIfPresent(Float.self, forKey: .fermiEnergy)
+        metadata = try c.decodeIfPresent(DOSMetadata.self, forKey: .metadata) ?? .table
+    }
 }
 
 /// Parses the whitespace-delimited tables written by Quantum Espresso `dos.x`

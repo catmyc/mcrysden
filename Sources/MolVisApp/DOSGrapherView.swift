@@ -314,7 +314,7 @@ final class DOSGrapherView: NSView {
 
         drawText("Density of States", at: NSPoint(x: plotRect.midX, y: 8), font: titleFont,
                  color: .black, horizontal: .center, vertical: .top)
-        drawText("DOS", at: NSPoint(x: plotRect.midX, y: plotRect.maxY + 27), font: titleFont,
+        drawText("DOS [\(dos.metadata.unitLabel)]", at: NSPoint(x: plotRect.midX, y: plotRect.maxY + 27), font: titleFont,
                  color: .black, horizontal: .center, vertical: .center)
         drawText("E (eV)", at: NSPoint(x: 8, y: plotRect.minY - 20), font: titleFont,
                  color: .black, horizontal: .left, vertical: .center)

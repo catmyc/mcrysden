@@ -160,8 +160,9 @@ enum DOSAnalysis {
     /// grid, the grid edge is used directly.
     ///
     /// Selection rule:
-    /// - If `fermiEnergy` is present, the gap whose midpoint is nearest to the
-    ///   Fermi level is returned (anchors the gap to the physically relevant one).
+    /// - If `fermiEnergy` is present, only a gap containing the Fermi level is
+    ///   returned. A metallic DOS may contain unrelated zero-DOS regions away
+    ///   from E_f; those are not reported as the material gap.
     /// - Otherwise the widest gap (largest gapWidth) is returned.
     ///
     /// Returns nil when no sample lies below the threshold (no gap region).
@@ -212,16 +213,12 @@ enum DOSAnalysis {
 
         let chosen: (start: Float, end: Float)
         if let ef = dos.fermiEnergy, ef.isFinite {
-            // Prefer a gap region that CONTAINS the Fermi level; if none does, fall
-            // back to the gap whose edge is nearest Ef.
+            // A gap away from E_f is not the Fermi gap. Returning nil here is
+            // essential for metallic mesh-derived DOS curves with finite energy
+            // windows and isolated empty regions at high energy.
             let containing = regions.first(where: { ef >= $0.start && ef <= $0.end })
-            if let c = containing {
-                chosen = c
-            } else {
-                chosen = regions.min(by: {
-                    min(abs($0.start - ef), abs($0.end - ef)) < min(abs($1.start - ef), abs($1.end - ef))
-                })!
-            }
+            guard let c = containing else { return nil }
+            chosen = c
         } else {
             // No Fermi level: return the widest gap.
             chosen = regions.max(by: { ($0.end - $0.start) < ($1.end - $1.start) })!
@@ -267,9 +264,9 @@ enum DOSAnalysis {
     /// Check whether the integrated DOS up to the Fermi level is consistent
     /// with a given electron count.
     ///
-    /// The total number of states is ∫_{-inf}^{E_f} DOS(E) dE via trapezoidal
-    /// integration (with boundary interpolation at E_f). For an unpolarized
-    /// calculation each state holds two electrons, so
+    /// For a dimensional DOS, the number of states per unit cell is the
+    /// energy integral multiplied by the stored cell length/area/volume. For
+    /// an unpolarized calculation each state holds two electrons, so
     ///     electrons = totalStates / 2.
     /// Returns true when this is within ±1 of electronsPerAtom * atomCount.
     ///
@@ -287,7 +284,11 @@ enum DOSAnalysis {
         guard let eMin = dos.energies.first, ef >= eMin else {
             return abs(expected) <= 1   // no occupied states; consistent only if none expected
         }
-        let totalStates = integrate(dos, seriesIndex: seriesIndex, range: eMin...ef) { _, v in v } ?? 0
+        let integratedDensity = integrate(dos, seriesIndex: seriesIndex, range: eMin...ef) { _, v in v } ?? 0
+        // A dimensional DOS integrates to states per unit length/area/volume;
+        // restore the number of states in the real-space unit cell before
+        // comparing with an electron count.
+        let totalStates = integratedDensity * dos.metadata.cellStateScale
         let electrons = totalStates * 0.5
         return abs(electrons - expected) <= 1
     }

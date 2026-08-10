@@ -2,6 +2,17 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.9] — 2026-08-11
+
+### Added
+
+- **QE mesh-derived total DOS** — uniform QE k-point meshes now produce a broadened total DOS directly from band eigenvalues and QE integration weights; separate `dos.x` output is not required. DOS units are dimensional: `states/eV` for molecules, `states/(eV·Å)` for 1D systems, `states/(eV·Å²)` for 2D crystals, and `states/(eV·Å³)` for 3D crystals.
+- **DOS normalization metadata** — generated and table DOS curves retain provenance, periodic dimensionality, and unit-cell length/area/volume, with unit labels shown in the DOS graph and dimensional electron-count integration.
+
+### Fixed
+
+- **Metallic DOS gap reporting** — a zero-DOS region away from the Fermi level is no longer reported as the material gap when the DOS is metallic.
+
 ## [1.2.8] — 2026-08-10
 
 ### Fixed

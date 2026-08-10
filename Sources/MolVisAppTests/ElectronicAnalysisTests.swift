@@ -115,6 +115,8 @@ final class ElectronicAnalysisTests: XCTestCase {
             return XCTFail("aligned DOS must yield a DOS gap")
         }
         XCTAssertEqual(dosGap.gapWidth, 1.0, accuracy: 0.1)
+        XCTAssertNil(DOSAnalysis.dosGap(makeGapDOS(width: 1.0, center: 2.0, fermi: 0)),
+                     "a DOS gap away from E_f must not be reported as the Fermi gap")
 
         let bandR = ElectronicAnalysisPresentation.bandReport(band)
         let report = ElectronicAnalysisPresentation.linkedReport(band: band, dos: agreeDOS)
@@ -213,6 +215,94 @@ final class ElectronicAnalysisTests: XCTestCase {
             XCTAssertTrue(parsed!.series.map { $0.label }.contains { $0.contains("PDOS") },
                           "malformed source name must leave labels unchanged, got: \(parsed!.series.map { $0.label })")
         }
+    }
+
+    func testMeshDOSReconstructionAndDimensionalNormalization() throws {
+        let molecule = BandStructure(
+            kPoints: [BandKPoint(k: .zero, weight: 1, label: "", energies: [0])],
+            fermiEnergy: 0, nSpin: 1, kPointsPerSpin: 1, isMesh: true,
+            periodicDim: 0
+        )
+        let moleculeDOS = try DOSCalculator.make(
+            from: molecule,
+            options: DOSCalculationOptions(broadeningEV: 0.03, energyStepEV: 0.01)
+        )
+        XCTAssertEqual(moleculeDOS.metadata.unitLabel, "states/eV")
+        XCTAssertNil(moleculeDOS.metadata.cellMeasureAngstrom)
+
+        let surfaceCell = Cell(a: SIMD3(2, 0, 0), b: SIMD3(0, 3, 0), c: SIMD3(0, 0, 10))
+        let surface = BandStructure(
+            kPoints: [BandKPoint(k: .zero, weight: 1, label: "", energies: [0])],
+            fermiEnergy: 0, nSpin: 1, kPointsPerSpin: 1, isMesh: true,
+            cell: surfaceCell, periodicDim: 2
+        )
+        let surfaceDOS = try DOSCalculator.make(
+            from: surface,
+            options: DOSCalculationOptions(broadeningEV: 0.03, energyStepEV: 0.01)
+        )
+        XCTAssertEqual(surfaceDOS.metadata.unitLabel, "states/(eV·Å²)")
+        XCTAssertEqual(surfaceDOS.metadata.cellMeasureAngstrom!, 6, accuracy: 1e-5)
+
+        let bulk = BandStructure(
+            kPoints: [BandKPoint(k: .zero, weight: 1, label: "", energies: [0])],
+            fermiEnergy: 0, nSpin: 1, kPointsPerSpin: 1, isMesh: true,
+            cell: surfaceCell, periodicDim: 3
+        )
+        let bulkDOS = try DOSCalculator.make(
+            from: bulk,
+            options: DOSCalculationOptions(broadeningEV: 0.03, energyStepEV: 0.01)
+        )
+        XCTAssertEqual(bulkDOS.metadata.unitLabel, "states/(eV·Å³)")
+        XCTAssertEqual(bulkDOS.metadata.cellMeasureAngstrom!, 60, accuracy: 1e-5)
+
+        func trapezoidIntegral(_ dos: DensityOfStates) -> Float {
+            guard let values = dos.series.first?.values, values.count == dos.energies.count else { return .nan }
+            return zip(dos.energies.dropFirst(), dos.energies.dropLast())
+                .enumerated()
+                .reduce(Float(0)) { partial, item in
+                    let i = item.offset
+                    let de = item.element.0 - item.element.1
+                    return partial + 0.5 * (values[i] + values[i + 1]) * de
+                }
+        }
+        XCTAssertEqual(trapezoidIntegral(moleculeDOS), 1, accuracy: 0.01)
+        XCTAssertEqual(trapezoidIntegral(surfaceDOS) * surfaceDOS.metadata.cellStateScale,
+                       1, accuracy: 0.01)
+        XCTAssertEqual(trapezoidIntegral(bulkDOS) * bulkDOS.metadata.cellStateScale,
+                       1, accuracy: 0.01)
+        let dosView = DOSGrapherView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        dosView.densityOfStates = bulkDOS
+        renderHeadless(dosView)
+
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/CH3Rh111.out")
+        let raw = try String(contentsOf: fixtureURL, encoding: .utf8)
+        guard let parsed = BandParser.parse(raw) else {
+            return XCTFail("QE mesh fixture should parse")
+        }
+        XCTAssertTrue(parsed.isMesh)
+        XCTAssertEqual(parsed.periodicDim, 3)
+        XCTAssertNotNil(parsed.cell)
+        let fixtureDOS = try DOSCalculator.make(
+            from: parsed,
+            options: DOSCalculationOptions(broadeningEV: 0.12, energyStepEV: 0.05)
+        )
+        XCTAssertEqual(fixtureDOS.series.first?.label, "Total DOS")
+        XCTAssertEqual(fixtureDOS.metadata.unitLabel, "states/(eV·Å³)")
+        XCTAssertTrue(fixtureDOS.series.first!.values.allSatisfy(\.isFinite))
+
+        XCTAssertEqual(Parser.frameCount(fixtureURL, as: .bands), 0,
+                       "band-only QE outputs are not animated structures")
+        let loaded = try Parser.load(fixtureURL, as: .bands)
+        XCTAssertNotNil(loaded.bandStructure)
+        XCTAssertNotNil(loaded.densityOfStates,
+                        "loading a QE mesh should derive total DOS without dos.x")
+        let autoLoaded = try Parser.load(fixtureURL)
+        XCTAssertNotNil(autoLoaded.bandStructure,
+                        "QE output auto-loading should retain its band mesh")
+        XCTAssertNotNil(autoLoaded.densityOfStates,
+                        "QE output auto-loading should derive total DOS")
     }
 
     // MARK: - Orbital coloring classification and linked-cursor guide-line energy

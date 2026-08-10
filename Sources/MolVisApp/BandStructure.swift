@@ -3,8 +3,8 @@ import simd
 
 // Quantum-EPWscf BAND structure: k-points + eigenvalues parsed from a PWscf
 // `.out` (or bands-output) file. The result feeds the 2D Grapher that draws the
-// band structure. This is the Tier A #5 keystone — once bands are parsed, the
-// reader also underpins the (deferred) Tier B DOS.
+// band structure. This is the Tier A #5 keystone — once bands are parsed, a
+// uniform mesh also directly underpins total-DOS reconstruction.
 
 /// One k-point along the path: fractional coords (`k`), a optional high-symmetry
 /// label (e.g. "Γ","X","M"), and the per-band eigenvalues at this k in eV.
@@ -47,6 +47,63 @@ struct BandStructure: Codable {
     /// a uniform Monkhorst-Pack sampling mesh. The grapher renders such data as
     /// disconnected points (a mesh is not a band path and must not be connected).
     var isMesh: Bool = false
+    /// Real-space QE cell vectors in Angstroms, when the output contains enough
+    /// lattice metadata to reconstruct them. Band-only files can omit this.
+    var cell: Cell? = nil
+    /// Number of physically periodic dimensions used for DOS normalization:
+    /// 0 molecule, 1 wire, 2 slab, 3 bulk crystal.
+    var periodicDim: Int = 0
+
+    init(kPoints: [BandKPoint], fermiEnergy: Float?, nSpin: Int,
+         reciprocal: [SIMD3<Float>]? = nil,
+         kPointsAreCrystal: Bool = false,
+         kPointsPerSpin: Int,
+         isMesh: Bool = false,
+         cell: Cell? = nil,
+         periodicDim: Int = 0) {
+        self.kPoints = kPoints
+        self.fermiEnergy = fermiEnergy
+        self.nSpin = nSpin
+        self.reciprocal = reciprocal
+        self.kPointsAreCrystal = kPointsAreCrystal
+        self.kPointsPerSpin = kPointsPerSpin
+        self.isMesh = isMesh
+        self.cell = cell
+        self.periodicDim = min(3, max(0, periodicDim))
+    }
+
+    // Keep old project files valid after adding the optional real-space cell
+    // and periodic-dimensionality metadata.
+    private enum CodingKeys: String, CodingKey {
+        case kPoints, fermiEnergy, nSpin, reciprocal, kPointsAreCrystal,
+             kPointsPerSpin, isMesh, cell, periodicDim
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kPoints = try c.decode([BandKPoint].self, forKey: .kPoints)
+        fermiEnergy = try c.decodeIfPresent(Float.self, forKey: .fermiEnergy)
+        nSpin = try c.decode(Int.self, forKey: .nSpin)
+        reciprocal = try c.decodeIfPresent([SIMD3<Float>].self, forKey: .reciprocal)
+        kPointsAreCrystal = try c.decodeIfPresent(Bool.self, forKey: .kPointsAreCrystal) ?? false
+        kPointsPerSpin = try c.decode(Int.self, forKey: .kPointsPerSpin)
+        isMesh = try c.decodeIfPresent(Bool.self, forKey: .isMesh) ?? false
+        cell = try c.decodeIfPresent(Cell.self, forKey: .cell)
+        periodicDim = min(3, max(0, try c.decodeIfPresent(Int.self, forKey: .periodicDim) ?? 0))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(kPoints, forKey: .kPoints)
+        try c.encodeIfPresent(fermiEnergy, forKey: .fermiEnergy)
+        try c.encode(nSpin, forKey: .nSpin)
+        try c.encodeIfPresent(reciprocal, forKey: .reciprocal)
+        try c.encode(kPointsAreCrystal, forKey: .kPointsAreCrystal)
+        try c.encode(kPointsPerSpin, forKey: .kPointsPerSpin)
+        try c.encode(isMesh, forKey: .isMesh)
+        try c.encodeIfPresent(cell, forKey: .cell)
+        try c.encode(periodicDim, forKey: .periodicDim)
+    }
 
     /// Number of bands safely shared by every k-point. Parser-produced data is
     /// uniform, but taking the minimum keeps a directly-constructed malformed
@@ -135,6 +192,12 @@ enum BandParser {
         let lines = text.components(separatedBy: "\n")
         // Reciprocal lattice vectors, if present, for crystal-coordinate metric.
         let reciprocal = parseReciprocal(text)
+        let cell = parseRealSpaceCell(text)
+        // Reciprocal axes are enough to establish that this is a periodic QE
+        // calculation even when a bands-only file omitted the real-space axes;
+        // DOS generation will then fail explicitly if the volume/area cannot
+        // be reconstructed.
+        let periodicDim = parsePeriodicDimension(text, hasCell: cell != nil || reciprocal != nil)
 
         // K-list metadata (weights, count, coord system) is captured per SECTION: when a
         // new "number of k points" header appears (concatenated/restarted QE output), the
@@ -323,7 +386,11 @@ enum BandParser {
         // channel (spin 0) — for a well-formed calculation it carries every position —
         // ordered by position, so that weights.count == records.count becomes meaningful.
         let perSpin = chosen.records.filter { $0.spin == 0 }.sorted { $0.position < $1.position }
-        let isMesh = detectUniformMesh(meta.weights, records: perSpin)
+        // A molecule's standard Gamma-only calculation has one k-point and
+        // cannot satisfy the multi-point Monkhorst-Pack detector, but its
+        // discrete eigenvalues are still a valid molecular DOS input.
+        let isGammaMolecule = periodicDim == 0 && meta.weights.count == 1 && perSpin.count == 1
+        let isMesh = detectUniformMesh(meta.weights, records: perSpin) || isGammaMolecule
 
         // Band filtering. A cleanly divisible multi-channel layout drops incomplete groups
         // (positions missing a record in some spin); the single-channel case keeps all.
@@ -357,7 +424,8 @@ enum BandParser {
         let kPointsPerSpin = filtered.count / nSpin
         return BandStructure(kPoints: filtered, fermiEnergy: chosen.fermi, nSpin: nSpin,
                              reciprocal: reciprocal, kPointsAreCrystal: meta.isCrystal,
-                             kPointsPerSpin: kPointsPerSpin, isMesh: isMesh)
+                             kPointsPerSpin: kPointsPerSpin, isMesh: isMesh,
+                             cell: cell, periodicDim: periodicDim)
     }
 
     /// A Monkhorst-Pack sampling mesh is identified by uniform integration weights AND a
@@ -684,6 +752,106 @@ enum BandParser {
             vecs.append(SIMD3<Float>(nums[0], nums[1], nums[2]))
         }
         return vecs.count == 3 ? vecs : nil
+    }
+
+    /// Parse QE real-space lattice vectors into Angstroms. Modern PWscf output
+    /// may provide either `crystal axes` in units of a_0 or a later
+    /// `CELL_PARAMETERS` block; the last complete block wins, matching the C
+    /// QE structure parser's treatment of updated cells.
+    static func parseRealSpaceCell(_ text: String) -> Cell? {
+        let lines = text.components(separatedBy: "\n")
+        let bohrToAngstrom: Float = 0.52917721067
+        var alatBohr: Float?
+        var result: Cell?
+
+        for index in lines.indices {
+            let line = lines[index]
+            let lower = line.lowercased()
+
+            if lower.contains("lattice parameter") {
+                if let equals = line.firstIndex(of: "=") {
+                    let tail = String(line[line.index(after: equals)...])
+                    if let value = finiteNumbers(in: tail).first, value > 0 {
+                        alatBohr = value
+                    }
+                }
+            }
+
+            if lower.contains("crystal axes") {
+                guard index + 3 < lines.count, let alat = alatBohr else { continue }
+                var vectors: [SIMD3<Float>] = []
+                for offset in 1...3 {
+                    let row = lines[index + offset]
+                    guard let lpar = row.lastIndex(of: "("),
+                          let rpar = row.lastIndex(of: ")"), rpar > lpar else {
+                        vectors.removeAll(); break
+                    }
+                    let body = String(row[row.index(after: lpar)..<rpar])
+                    let values = finiteNumbers(in: body)
+                    guard values.count >= 3 else { vectors.removeAll(); break }
+                    vectors.append(SIMD3(values[0], values[1], values[2]) * (alat * bohrToAngstrom))
+                }
+                if vectors.count == 3 { result = Cell(a: vectors[0], b: vectors[1], c: vectors[2]) }
+                continue
+            }
+
+            guard lower.trimmingCharacters(in: .whitespaces).hasPrefix("cell_parameters") else { continue }
+            guard index + 3 < lines.count else { continue }
+            let scale: Float
+            if lower.contains("angstrom") {
+                scale = 1
+            } else if lower.contains("bohr") || lower.contains("a.u.") || lower.contains("atomic") {
+                scale = bohrToAngstrom
+            } else if let equals = lower.firstIndex(of: "=") {
+                let tail = String(lower[lower.index(after: equals)...])
+                guard let localAlat = finiteNumbers(in: tail).first, localAlat > 0 else { continue }
+                scale = localAlat * bohrToAngstrom
+            } else if let alat = alatBohr {
+                scale = alat * bohrToAngstrom
+            } else {
+                continue
+            }
+            var vectors: [SIMD3<Float>] = []
+            for offset in 1...3 {
+                let values = finiteNumbers(in: lines[index + offset])
+                guard values.count >= 3 else { vectors.removeAll(); break }
+                vectors.append(SIMD3(values[0], values[1], values[2]) * scale)
+            }
+            if vectors.count == 3 { result = Cell(a: vectors[0], b: vectors[1], c: vectors[2]) }
+        }
+        guard let cell = result, cell.isFinite else { return nil }
+        return cell
+    }
+
+    /// Infer the physical periodicity when QE states it explicitly. A normal
+    /// QE cell is a 3D periodic crystal; `assume_isolated=2D`/`esm` denotes a
+    /// slab, while molecule-style isolated corrections are treated as 0D.
+    private static func parsePeriodicDimension(_ text: String, hasCell: Bool) -> Int {
+        let lower = text.lowercased()
+        if let range = lower.range(of: "assume_isolated") {
+            let tail = String(lower[range.upperBound...]).prefix(160)
+            if tail.contains("2d") || tail.contains("esm") { return 2 }
+            if tail.contains("1d") { return 1 }
+            if tail.contains("martyna") || tail.contains("tuckerman") ||
+                tail.contains("parabolic") || tail.contains("'mt'") ||
+                tail.contains("\"mt\"") {
+                return 0
+            }
+        }
+        return hasCell ? 3 : 0
+    }
+
+    private static func finiteNumbers(in text: String) -> [Float] {
+        let pattern = #"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = text as NSString
+        return expression.matches(in: text, range: NSRange(location: 0, length: ns.length)).compactMap { match in
+            guard let range = Range(match.range, in: text) else { return nil }
+            let token = String(text[range]).replacingOccurrences(of: "D", with: "e")
+                .replacingOccurrences(of: "d", with: "e")
+            guard let value = Float(token), value.isFinite else { return nil }
+            return value
+        }
     }
 
     /// Parse "  k =  .1250  .2165 -.1852 ( 6180 PWs)   bands (ev):" ->
