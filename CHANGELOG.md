@@ -2,6 +2,12 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.8] — 2026-08-10
+
+### Fixed
+
+- **Image-aware bond detection** — direct home-cell bonds are preferred over near-tied periodic images (including the GaAsH Ga–As pair); finite supercell rebonding uses its scaled lattice and skips bonds to undisplayed images.
+
 ## [1.2.7] — 2026-08-10
 
 ### Fixed

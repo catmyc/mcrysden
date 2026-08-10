@@ -7,7 +7,39 @@ struct Atom: Codable, Equatable { var coord: SIMD3<Float>; var atomicNumber: Int
     /// block when present. Drives the force-arrow overlay.
     var force: SIMD3<Float>?
 }
-struct Bond:  Codable { var i: Int; var j: Int }
+struct Bond: Codable, Equatable {
+    var i: Int
+    var j: Int
+    /// Lattice translation selected for atom j. Zero means the direct pair is
+    /// bonded; non-zero values are periodic-only matches outside the finite
+    /// displayed image set. Explicit supercell copies are rebuilt as zero-image
+    /// pairs, so only those direct endpoints are rendered.
+    var image: SIMD3<Int64> = .zero
+
+    init(i: Int, j: Int, image: SIMD3<Int64> = .zero) {
+        self.i = i
+        self.j = j
+        self.image = image
+    }
+
+    private enum CodingKeys: String, CodingKey { case i, j, image }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        i = try c.decode(Int.self, forKey: .i)
+        j = try c.decode(Int.self, forKey: .j)
+        image = try c.decodeIfPresent(SIMD3<Int64>.self, forKey: .image) ?? .zero
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(i, forKey: .i)
+        try c.encode(j, forKey: .j)
+        // Keep newly written state compact while allowing old states without an
+        // image key to decode as the direct/home pair.
+        if image != .zero { try c.encode(image, forKey: .image) }
+    }
+}
 struct Cell:  Codable, Equatable { var a: SIMD3<Float>; var b: SIMD3<Float>; var c: SIMD3<Float> }
 
 enum DisplayMode: String, Codable, CaseIterable {

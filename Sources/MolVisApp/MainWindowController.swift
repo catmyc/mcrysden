@@ -2670,13 +2670,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             guard labels.count < maxLabels else { break }
             guard bond.i >= 0, bond.i < atoms.count,
                   bond.j >= 0, bond.j < atoms.count else { continue }
+            guard let displacement = scene.directBondDisplacement(for: bond) else { continue }
             let a = atoms[bond.i].coord
-            let b = atoms[bond.j].coord
-            guard a.isFinite, b.isFinite else { continue }
-            // Periodic bonds connect to the closest image: label the wrapped
-            // (true) bond length, not the unwrapped direct separation.
-            let displacement = PeriodicGeometry.minimumImageDisplacement(
-                from: a, to: b, cell: scene.cell, periodicDim: scene.periodicDim) ?? (b - a)
+            // Bond records with a zero image connect two explicitly displayed
+            // atoms, so labels use their direct endpoint displacement. Periodic-
+            // only records are omitted rather than floating over a hidden image.
             let distance = simd_length(displacement)
             guard distance.isFinite, distance > 1e-6 else { continue }
             let midpoint = a + displacement * 0.5

@@ -123,6 +123,40 @@ final class CParserHardeningTests: XCTestCase {
         }
     }
 
+    /// GaAsH exercises direct-vs-periodic image selection at a cell boundary.
+    /// Atoms 6 (Ga) and 12 (As), written 1-based in the fixture, are bonded in
+    /// the home unit cell even though a nearby floating-point periodic image is
+    /// fractionally shorter.
+    func testGaAsHHomeBondAndSupercellToggle() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let loaded = try Parser.load(root.appendingPathComponent("Assets/GaAsH.xsf"), as: .xsf)
+        guard let homeBond = loaded.bonds.first(where: { Set([$0.i, $0.j]) == Set([5, 11]) }) else {
+            return XCTFail("GaAsH atoms 6 (Ga) and 12 (As) must be bonded")
+        }
+        XCTAssertEqual(homeBond.image, .zero, "the in-cell Ga-As pair must use the home image")
+
+        let base = Scene(loaded: loaded)
+        XCTAssertNotNil(base.directBondDisplacement(for: homeBond),
+                        "zero-image home bonds must be eligible for display")
+        if let periodicOnly = loaded.bonds.first(where: { $0.image != .zero }) {
+            XCTAssertNil(base.directBondDisplacement(for: periodicOnly),
+                         "periodic-only bonds must not target a hidden image")
+        }
+
+        let controller = MainWindowController(scene: base, showWindow: false)
+        let baseBonds = controller.scene.bonds
+        controller.state.n1 = 2
+        XCTAssertEqual(controller.scene.atoms.count, base.atoms.count * 2)
+        XCTAssertNotEqual(controller.scene.bonds, baseBonds,
+                          "changing supercell images must rebuild the bond snapshot")
+        controller.state.n1 = 1
+        XCTAssertEqual(controller.scene.atoms, base.atoms)
+        XCTAssertEqual(controller.scene.bonds, baseBonds,
+                       "resetting images must restore the base bonds")
+    }
+
     /// Periodic bonding must honor the active dimensionality. Slab and polymer
     /// cells intentionally have rank-two/rank-one embeddings, so requiring a
     /// full 3D determinant would silently drop boundary-crossing bonds.

@@ -563,7 +563,10 @@ enum Parser {
         let nbonds = Int(s.nbonds)
         guard nbonds > 0, let bondsPtr = s.bonds else { return [] }
         let buf = UnsafeBufferPointer(start: bondsPtr, count: nbonds)
-        return buf.map { Bond(i: Int($0.i), j: Int($0.j)) }
+        return buf.map {
+            Bond(i: Int($0.i), j: Int($0.j),
+                 image: SIMD3<Int64>($0.image.0, $0.image.1, $0.image.2))
+        }
     }
 
     /// Bridge a C `MolEnvGrid` (a 3D `DATAGRID_3D` block) into a Swift

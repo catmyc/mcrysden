@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-10 (v1.2.7: periodic-bond rendering fix — bond cylinders/2D lines/distance labels/polyhedron neighbor geometry now use `PeriodicGeometry.minimumImageDisplacement` instead of direct coordinates, so periodic bonds are drawn at their true ~2.4 Å length instead of the unwrapped 5.6–6.0 Å separation across the cell; `Scene.rebond` drops sub-0.05 Å replica self-bonds in expanded views; 62 focused tests)**.
+Last updated: **2026-08-10 (v1.2.8: image-aware bond detection — direct home-cell pairs win over near-tied periodic images, finite supercells rebond against scaled active cells, and undisplayed image bonds are omitted; 63 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-Current v1.2.7 verification: periodic-bond rendering wrap (3D + 2D + labels + polyhedron neighbors) and the rebond replica-self-bond filter are covered by a passing 62-test suite (the v1.2.6 regression-test + adversarial fixes remain green).
+Current v1.2.8 verification: direct-home image selection, scaled-supercell rebonding, shared bond display eligibility, and supercell round trips are covered by a passing 63-test suite.
 
 ## Implemented foundation (through v1.1.32)
 

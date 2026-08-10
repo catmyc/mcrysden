@@ -3,6 +3,7 @@
 
 #include <float.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,6 +18,10 @@ typedef struct {
 typedef struct {
     int i;                   // index into atoms[]
     int j;
+    // Translation of atom j's lattice image selected by the bond heuristic.
+    // A zero vector means the direct pair is bonded; non-zero values identify
+    // a periodic-only match that is not an explicitly displayed atom image.
+    int64_t image[3];
 } MolEnvBond;
 
 /* A rectilinear scalar grid (XCrySDen `DATAGRID_3D`/`DATAGRID_2D` block as read

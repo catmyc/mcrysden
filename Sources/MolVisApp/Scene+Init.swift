@@ -297,8 +297,12 @@ extension Scene {
         // the identity operation does not wipe a hand-built structure.
         if total <= 1 {
             var out = self
-            out.atoms = baseAtoms.isEmpty ? atoms : baseAtoms
-            out.bonds = baseBonds.isEmpty ? bonds : baseBonds
+            // An existing base atom snapshot is the sentinel for a pristine
+            // geometry. Its bond snapshot may intentionally be empty, so do not
+            // use bond emptiness to decide whether it is present.
+            let hasBaseSnapshot = !baseAtoms.isEmpty
+            out.atoms = hasBaseSnapshot ? baseAtoms : atoms
+            out.bonds = hasBaseSnapshot ? baseBonds : bonds
             out.preslabAtoms = out.atoms
             out.superCell = SuperCell()
             // Shrinking to (1,1,1) restores the base atom set; selection indices into
@@ -352,7 +356,11 @@ extension Scene {
         }}}
         var out = self
         out.atoms = newAtoms
-        out.bonds = Self.rebond(newAtoms, cell: cell, isCrystal: true, periodicDim: periodicDim)
+        // Bond against the finite displayed supercell, not the primitive cell.
+        // Otherwise every translated copy is compared through the primitive
+        // minimum image and produces duplicate/phantom cross-image matches.
+        let bondCell = Self.bondCell(cell, superCell: sc, periodicDim: periodicDim)
+        out.bonds = Self.rebond(newAtoms, cell: bondCell, isCrystal: true, periodicDim: periodicDim)
         out.preslabAtoms = newAtoms    // snapshot for `applySlab`
         out.superCell = sc
         // For a hand-built scene (no pristine base yet), snapshot the pre-expansion
@@ -373,6 +381,31 @@ extension Scene {
         // user-edited. (This is the key lifecycle invariant: display-only
         // replication must not destroy user-edited routes.)
         return out
+    }
+
+    /// Cell basis used by the bond pass for an explicitly displayed supercell.
+    /// Non-periodic dimensions remain unscaled, even though their cell vector is
+    /// retained as a vacuum/embedding vector for slab and polymer scenes.
+    private static func bondCell(_ cell: Cell, superCell: SuperCell, periodicDim: Int) -> Cell {
+        let n1 = periodicDim >= 1 ? max(1, superCell.n1) : 1
+        let n2 = periodicDim >= 2 ? max(1, superCell.n2) : 1
+        let n3 = periodicDim >= 3 ? max(1, superCell.n3) : 1
+        return Cell(a: cell.a * Float(n1), b: cell.b * Float(n2), c: cell.c * Float(n3))
+    }
+
+    /// Return the directly displayed endpoint displacement for a bond.
+    ///
+    /// The C heuristic also records periodic-only matches whose translated atom
+    /// is outside the explicitly displayed finite image set. Those records stay
+    /// available for periodic detection/analysis, but renderers and labels must
+    /// skip them. Explicit supercell replicas are rebonded against the scaled
+    /// active cell and therefore appear as zero-image pairs.
+    func directBondDisplacement(for bond: Bond) -> SIMD3<Float>? {
+        guard bond.image == .zero,
+              bond.i >= 0, bond.i < atoms.count,
+              bond.j >= 0, bond.j < atoms.count else { return nil }
+        let displacement = atoms[bond.j].coord - atoms[bond.i].coord
+        return displacement.isFinite ? displacement : nil
     }
 
     /// Recompute bonds for the given atom set using the C covalent-radii
@@ -435,12 +468,14 @@ extension Scene {
         }
 
         guard nb > 0, let bp = bondPtr else { return [] }
-        let rawBonds = (0..<Int(nb)).map { Bond(i: Int(bp[$0].i), j: Int(bp[$0].j)) }
-        // Expanded views (supercell/slab) hold lattice-equivalent replicas of the
-        // same physical atom; with the primitive lattice the periodic search bonds
-        // those replicas at ~0 distance. Such self-replica bonds are not chemical
-        // bonds — drop any pair whose minimum-image distance is below the 0.05 A
-        // coincidence threshold (far below any real covalent bond).
+        let rawBonds = (0..<Int(nb)).map { index in
+            let bond = bp[index]
+            return Bond(i: Int(bond.i), j: Int(bond.j),
+                        image: SIMD3<Int64>(bond.image.0, bond.image.1, bond.image.2))
+        }
+        // Keep the defensive coincidence filter for malformed/manual atom sets.
+        // Normal supercell expansion uses the scaled bond cell above, so translated
+        // copies are no longer mistaken for zero-distance primitive images.
         guard isCrystal, periodicDim >= 1, let cell else { return rawBonds }
         return rawBonds.filter { bond in
             guard bond.i >= 0, bond.i < atoms.count, bond.j >= 0, bond.j < atoms.count else { return false }
@@ -459,7 +494,11 @@ extension Scene {
             // Removing the slab — restore the full pre-slab atom set.
             var s = self
             s.atoms = preslabAtoms.isEmpty ? s.atoms : preslabAtoms
-            if let c = s.cell { s.bonds = Self.rebond(s.atoms, cell: c, isCrystal: s.isCrystal, periodicDim: s.periodicDim) } else { s.bonds = [] }
+            if let c = s.cell {
+                let bondCell = Self.bondCell(c, superCell: s.superCell, periodicDim: s.periodicDim)
+                s.bonds = Self.rebond(s.atoms, cell: bondCell,
+                                      isCrystal: s.isCrystal, periodicDim: s.periodicDim)
+            } else { s.bonds = [] }
             s.slab = nil
             // Restoring the pre-slab set invalidates indices into the filtered set;
             // leave selection untouched only when the set is genuinely unchanged.
@@ -492,7 +531,8 @@ extension Scene {
         var out = self
         if out.preslabAtoms.isEmpty { out.preslabAtoms = src }
         out.atoms = kept
-        out.bonds = Self.rebond(kept, cell: cell, isCrystal: true, periodicDim: 3)
+        let bondCell = Self.bondCell(cell, superCell: out.superCell, periodicDim: out.periodicDim)
+        out.bonds = Self.rebond(kept, cell: bondCell, isCrystal: true, periodicDim: out.periodicDim)
         out.slab = slab
         // A filter that drops atoms invalidates selection indices; if the filtered
         // set is identical to the current one the indices are still valid.

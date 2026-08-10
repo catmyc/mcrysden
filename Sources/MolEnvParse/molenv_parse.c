@@ -259,14 +259,16 @@ static int periodic_bond_basis_init(const MolEnvScene *s, PeriodicBondBasis *out
     return 1;
 }
 
-/* Return whether a periodic image is within `tol` of d. The coefficient box
-   is derived from the lattice pseudoinverse, so every possible image inside
-   the threshold is enumerated exactly. A pathological box returns -1 rather
-   than falling back to an approximate nearest-image calculation. */
+/* Find the closest periodic image of d that lies within `tol`. The coefficient
+   box is derived from the lattice pseudoinverse, so every possible image inside
+   the threshold is enumerated exactly. `image` is the lattice translation of
+   atom j in the convention used by d = atom_i - atom_j. */
 static int periodic_bond_within(const PeriodicBondBasis *basis,
-                                double dx, double dy, double dz, double tol) {
+                                double dx, double dy, double dz, double tol,
+                                int64_t image[3]) {
     double d[3] = {dx, dy, dz};
     if (!isfinite(dx) || !isfinite(dy) || !isfinite(dz) || !isfinite(tol) || tol < 0.0) return -1;
+    if (image) image[0] = image[1] = image[2] = 0;
     double lo_d[3], hi_d[3];
     int64_t lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
     int64_t total = 1;
@@ -290,6 +292,9 @@ static int periodic_bond_within(const PeriodicBondBasis *basis,
     double tol_sq = tol * tol;
     if (!isfinite(tol_sq)) return -1;
     int64_t n[3] = {lo[0], lo[1], lo[2]};
+    int found = 0;
+    double best = INFINITY;
+    int64_t best_image[3] = {0, 0, 0};
     for (int64_t attempt = 0; attempt < total; attempt++) {
         double cx = d[0], cy = d[1], cz = d[2];
         for (int i = 0; i < basis->dim; i++) {
@@ -299,7 +304,15 @@ static int periodic_bond_within(const PeriodicBondBasis *basis,
             cz -= coefficient * basis->basis[i][2];
         }
         double distance_sq = cx * cx + cy * cy + cz * cz;
-        if (isfinite(distance_sq) && distance_sq <= tol_sq) return 1;
+        if (isfinite(distance_sq) && distance_sq <= tol_sq) {
+            // The enumeration order is deterministic; retain the first image on
+            // an exact tie so skewed/half-cell inputs remain reproducible.
+            if (!found || distance_sq < best) {
+                found = 1;
+                best = distance_sq;
+                best_image[0] = n[0]; best_image[1] = n[1]; best_image[2] = n[2];
+            }
+        }
 
         for (int i = 0; i < basis->dim; i++) {
             if (n[i] < hi[i]) {
@@ -309,7 +322,10 @@ static int periodic_bond_within(const PeriodicBondBasis *basis,
             n[i] = lo[i];
         }
     }
-    return 0;
+    if (found && image) {
+        image[0] = best_image[0]; image[1] = best_image[1]; image[2] = best_image[2];
+    }
+    return found;
 }
 
 static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float factor, int *out_nbonds) {
@@ -356,12 +372,14 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
             free(degree); free(b); set_error(path,0,"non-finite atom coordinate in bond heuristic"); *out_nbonds=0; return NULL;
         }
 
-        int bonded = 0;
-        if (!do_periodic) {
-            double d2=dx*dx+dy*dy+dz*dz;
-            bonded = (d2 <= rcut2);
-        } else {
-            int within = periodic_bond_within(&periodic_basis, dx, dy, dz, tol);
+        int64_t image[3] = {0, 0, 0};
+        double direct_d2 = dx * dx + dy * dy + dz * dz;
+        int bonded = direct_d2 <= rcut2 + 1e-12 * fmax(1.0, rcut2);
+        // Always prefer the direct pair when it is within the covalent cutoff.
+        // This keeps in-cell bonds in the home image for coordinates on a cell
+        // boundary, where a rounded periodic copy can be a few ulps shorter.
+        if (!bonded && do_periodic) {
+            int within = periodic_bond_within(&periodic_basis, dx, dy, dz, tol, image);
             if (within < 0) {
                 free(degree); free(b); set_error(path,0,"periodic bond search exceeded safety limit"); *out_nbonds=0; return NULL;
             }
@@ -380,7 +398,11 @@ static MolEnvBond* make_bonds(const MolEnvScene *s, const char *path, float fact
                 if (!t) { free(degree); free(b); set_error(path,0,"out of memory"); *out_nbonds=0; return NULL; }
                 b=t; cap = ncap;
             }
-            b[nb].i=i; b[nb].j=j; nb++;
+            b[nb].i=i; b[nb].j=j;
+            b[nb].image[0] = image[0];
+            b[nb].image[1] = image[1];
+            b[nb].image[2] = image[2];
+            nb++;
             degree[i]++; degree[j]++;
         }
     }

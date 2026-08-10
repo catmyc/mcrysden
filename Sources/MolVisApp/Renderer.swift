@@ -179,6 +179,12 @@ final class Renderer: NSObject {
         return false
     }
 
+    /// Shared direct-endpoint eligibility lives on Scene so every renderer path
+    /// agrees with bond-distance labels about finite explicit image visibility.
+    private func displayedBondDisplacement(_ bond: Bond) -> SIMD3<Float>? {
+        scene.directBondDisplacement(for: bond)
+    }
+
     /// Pure base-color seam shared by every atom rendering path. The caller passes
     /// nil when the coordination array is not a complete match for the scene.
     static func baseAtomColor(atomicNumber: Int, coordinationNumber: Int?,
@@ -2071,12 +2077,8 @@ final class Renderer: NSObject {
             // Asymmetric-unit filter: drop bonds touching a dropped atom.
             if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
                b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
-            let a = atoms[b.i].coord, b2 = atoms[b.j].coord
-            // Periodic bonds connect atom i to the closest periodic image of j;
-            // drawing the direct (unwrapped) segment renders a long line across
-            // the cell for a genuinely short bond. Wrap to the minimum image.
-            let dir = PeriodicGeometry.minimumImageDisplacement(
-                from: a, to: b2, cell: scene.cell, periodicDim: scene.periodicDim) ?? (b2 - a)
+            guard let dir = displayedBondDisplacement(b) else { continue }
+            let a = atoms[b.i].coord
             let len = length(dir)
             guard len > 1e-5 else { continue }
             let mid = a + dir * 0.5
@@ -2160,10 +2162,8 @@ final class Renderer: NSObject {
             // Asymmetric-unit filter: drop bonds touching a dropped atom.
             if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
                b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
-            let a = scene.atoms[b.i].coord, b2 = scene.atoms[b.j].coord
-            // Wrap to the minimum image (see drawBonds).
-            let dir = PeriodicGeometry.minimumImageDisplacement(
-                from: a, to: b2, cell: scene.cell, periodicDim: scene.periodicDim) ?? (b2 - a)
+            guard let dir = displayedBondDisplacement(b) else { continue }
+            let a = scene.atoms[b.i].coord
             let len = length(dir)
             guard len > 1e-5 else { continue }
             let mid = a + dir * 0.5
@@ -2420,11 +2420,8 @@ final class Renderer: NSObject {
             // Asymmetric-unit filter: drop bonds touching a dropped atom.
             if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
                b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
-            let a = atoms[b.i].coord, b2 = atoms[b.j].coord
-            // Wrap to the minimum image so periodic bonds project as short
-            // segments (see drawBonds).
-            let disp = PeriodicGeometry.minimumImageDisplacement(
-                from: a, to: b2, cell: scene.cell, periodicDim: scene.periodicDim) ?? (b2 - a)
+            guard let disp = displayedBondDisplacement(b) else { continue }
+            let a = atoms[b.i].coord
             guard let ndc0 = projectNDC2D(a, view: view, proj: proj),
                   let ndc1 = projectNDC2D(a + disp, view: view, proj: proj) else { continue }
             let dir = SIMD2<Float>(ndc1.x - ndc0.x, ndc1.y - ndc0.y)
@@ -2470,17 +2467,10 @@ final class Renderer: NSObject {
         var neigh: [[SIMD3<Float>]] = Array(repeating: [], count: atoms.count)
         for b in scene.bonds {
             guard b.i >= 0, b.i < atoms.count, b.j >= 0, b.j < atoms.count else { continue }
+            guard let d = displayedBondDisplacement(b) else { continue }
             let ci = atoms[b.i].coord, cj = atoms[b.j].coord
-            // Use the minimum-image partner position so polyhedra build around
-            // the true (wrapped) neighbor geometry for periodic bonds.
-            if let d = PeriodicGeometry.minimumImageDisplacement(
-                from: ci, to: cj, cell: scene.cell, periodicDim: scene.periodicDim) {
-                neigh[b.i].append(ci + d)
-                neigh[b.j].append(cj - d)
-            } else {
-                neigh[b.i].append(cj)
-                neigh[b.j].append(ci)
-            }
+            neigh[b.i].append(ci + d)
+            neigh[b.j].append(cj - d)
         }
         for i in 0..<neigh.count {
             let c = atoms[i].coord
@@ -2512,7 +2502,7 @@ final class Renderer: NSObject {
            pk.atomScale == key.atomScale,
            pk.elementOverridesFP == key.elementOverridesFP,
            pk.atoms.count == key.atoms.count, zip(pk.atoms, key.atoms).allSatisfy({ $0.coord == $1.coord && $0.atomicNumber == $1.atomicNumber }),
-           pk.bonds.count == key.bonds.count, zip(pk.bonds, key.bonds).allSatisfy({ $0.i == $1.i && $0.j == $1.j }) {
+           pk.bonds == key.bonds {
             // cache hit (possibly an empty mesh). Draw only if geometry is present.
             if cachedPolyVertexCount > 0, let cachedPolyBuffer {
                 enc.setRenderPipelineState(polyPipeline)
@@ -2659,8 +2649,8 @@ final class Renderer: NSObject {
     }
 
     /// Structural-key equality for the transparent polyhedral cache, mirroring the
-    /// opaque `drawPolyhedral` cache's comparison (Bond is not Equatable, so bonds
-    /// are compared field-wise).
+    /// opaque `drawPolyhedral` cache's comparison (Bond equality includes the
+    /// selected lattice image offset).
     private func transparentPolyKeyMatches(_ key: (atoms: [Atom], bonds: [Bond], selected: [Int],
                                             coordinationNumbers: [Int], showCoordinationColors: Bool,
                                             atomColorScheme: AtomColorScheme, atomScale: Float,
@@ -2673,7 +2663,7 @@ final class Renderer: NSObject {
             && pk.atomScale == key.atomScale
             && pk.elementOverridesFP == key.elementOverridesFP
             && pk.atoms.count == key.atoms.count && zip(pk.atoms, key.atoms).allSatisfy { $0.coord == $1.coord && $0.atomicNumber == $1.atomicNumber }
-            && pk.bonds.count == key.bonds.count && zip(pk.bonds, key.bonds).allSatisfy { $0.i == $1.i && $0.j == $1.j }
+            && pk.bonds == key.bonds
     }
 
     // MARK: - Cell frame + axes
@@ -4075,8 +4065,7 @@ final class Renderer: NSObject {
         if let oldPolyKey = cachedPolyKey, oldPolyKey.selected != scene.selectedAtoms
             || oldPolyKey.atoms.count != scene.atoms.count
             || zip(oldPolyKey.atoms, scene.atoms).contains(where: { $0.coord != $1.coord || $0.atomicNumber != $1.atomicNumber })
-            || oldPolyKey.bonds.count != scene.bonds.count
-            || zip(oldPolyKey.bonds, scene.bonds).contains(where: { $0.i != $1.i || $0.j != $1.j }) {
+            || oldPolyKey.bonds != scene.bonds {
             cachedPolyBuffer = nil; cachedPolyVertexCount = 0; cachedPolyKey = nil
         }
         // Transparent polyhedral cache shares the same structural key; clear it on the
@@ -4085,8 +4074,7 @@ final class Renderer: NSObject {
         if let oldTPoly = cachedTransparentPoly, oldTPoly.selected != scene.selectedAtoms
             || oldTPoly.atoms.count != scene.atoms.count
             || zip(oldTPoly.atoms, scene.atoms).contains(where: { $0.coord != $1.coord || $0.atomicNumber != $1.atomicNumber })
-            || oldTPoly.bonds.count != scene.bonds.count
-            || zip(oldTPoly.bonds, scene.bonds).contains(where: { $0.i != $1.i || $0.j != $1.j }) {
+            || oldTPoly.bonds != scene.bonds {
             cachedTransparentPoly = nil
         }
         if !isoInputsUnchanged(old: old) || old.isoSurfaces != scene.isoSurfaces || old.clipPlane != scene.clipPlane {

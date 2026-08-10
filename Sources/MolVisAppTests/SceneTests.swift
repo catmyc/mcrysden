@@ -289,8 +289,11 @@ final class SceneTests: XCTestCase {
         // 2D scene (periodicDim 2): a small orthorhombic cell with a couple of atoms.
         let a: Float = 3.0, b: Float = 4.0, c: Float = 15.0
         let cell = Cell(a: SIMD3(a, 0, 0), b: SIMD3(0, b, 0), c: SIMD3(0, 0, c))
+        // Keep the base bond snapshot intentionally empty even though the
+        // expanded geometry has a detectable C-H pair; shrink must restore []
+        // rather than falling back to the widened bond list.
         let atoms = [Atom(coord: SIMD3(0, 0, 0), atomicNumber: 6, label: "C"),
-                     Atom(coord: SIMD3(a * 0.5, b * 0.5, 0), atomicNumber: 1, label: "H")]
+                     Atom(coord: SIMD3(1, 0, 0), atomicNumber: 1, label: "H")]
         var scene = Scene()
         scene.cell = cell
         scene.atoms = atoms
@@ -309,5 +312,10 @@ final class SceneTests: XCTestCase {
         let expanded = scene.widenSuperCell(SuperCell(n1: 2, n2: 2, n3: 1))
         XCTAssertEqual(expanded.atoms.count, scene.atoms.count * 4,
                        "2D supercell along periodic axes must expand")
+        XCTAssertFalse(expanded.bonds.isEmpty,
+                       "expanded geometry should detect the C-H pair")
+        let restored = expanded.widenSuperCell(SuperCell())
+        XCTAssertTrue(restored.bonds.isEmpty,
+                      "an explicitly empty base bond snapshot must survive a round trip")
     }
 }
