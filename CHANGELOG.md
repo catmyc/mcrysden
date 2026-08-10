@@ -2,6 +2,13 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.7] — 2026-08-10
+
+### Fixed
+
+- **Periodic bond rendering** — bond cylinders, 2D bond lines, bond-distance labels, and polyhedron neighbor geometry now use the minimum-image displacement (via `PeriodicGeometry.minimumImageDisplacement`) instead of the direct coordinate difference. Periodic bonds are no longer drawn as long lines across the cell for genuine short bonds; e.g., the GaAs(001)-H slab's Ga–As bonds that cross the cell boundary are now drawn at their true ~2.4 Å length instead of the unwrapped 5.6–6.0 Å separation.
+- **Supercell/slab replica self-bonds** — `Scene.rebond` now drops pairs whose minimum-image distance is below a 0.05 Å coincidence threshold. Expanded display views (supercell, slab, cluster) contain lattice-equivalent replicas of the same physical atom; with the primitive lattice the periodic search was bonding those replicas at ~0 distance. These were harmless zero-length render artifacts but polluted coordination counts and the bond list with phantom self-bonds (including phantom H–H bonds in the GaAsH supercell).
+
 ## [1.2.6] — 2026-08-09
 
 ### Fixed

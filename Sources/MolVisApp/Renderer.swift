@@ -2072,10 +2072,14 @@ final class Renderer: NSObject {
             if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
                b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
             let a = atoms[b.i].coord, b2 = atoms[b.j].coord
-            let dir = b2 - a
+            // Periodic bonds connect atom i to the closest periodic image of j;
+            // drawing the direct (unwrapped) segment renders a long line across
+            // the cell for a genuinely short bond. Wrap to the minimum image.
+            let dir = PeriodicGeometry.minimumImageDisplacement(
+                from: a, to: b2, cell: scene.cell, periodicDim: scene.periodicDim) ?? (b2 - a)
             let len = length(dir)
             guard len > 1e-5 else { continue }
-            let mid = (a + b2) * 0.5
+            let mid = a + dir * 0.5
             let model = float4x4(translation: mid)
                 * .rotation(fromYTo: dir / len)
                 * float4x4(scale: SIMD3<Float>(scene.bondRadius, len, scene.bondRadius))
@@ -2157,10 +2161,12 @@ final class Renderer: NSObject {
             if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
                b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
             let a = scene.atoms[b.i].coord, b2 = scene.atoms[b.j].coord
-            let dir = b2 - a
+            // Wrap to the minimum image (see drawBonds).
+            let dir = PeriodicGeometry.minimumImageDisplacement(
+                from: a, to: b2, cell: scene.cell, periodicDim: scene.periodicDim) ?? (b2 - a)
             let len = length(dir)
             guard len > 1e-5 else { continue }
-            let mid = (a + b2) * 0.5
+            let mid = a + dir * 0.5
             let model = float4x4(translation: mid)
                 * .rotation(fromYTo: dir / len)
                 * float4x4(scale: SIMD3<Float>(scene.bondRadius, len, scene.bondRadius))
@@ -2414,8 +2420,13 @@ final class Renderer: NSObject {
             // Asymmetric-unit filter: drop bonds touching a dropped atom.
             if b.i < frameRepetitionCull.count && frameRepetitionCull[b.i] ||
                b.j < frameRepetitionCull.count && frameRepetitionCull[b.j] { continue }
-            guard let ndc0 = projectNDC2D(atoms[b.i].coord, view: view, proj: proj),
-                  let ndc1 = projectNDC2D(atoms[b.j].coord, view: view, proj: proj) else { continue }
+            let a = atoms[b.i].coord, b2 = atoms[b.j].coord
+            // Wrap to the minimum image so periodic bonds project as short
+            // segments (see drawBonds).
+            let disp = PeriodicGeometry.minimumImageDisplacement(
+                from: a, to: b2, cell: scene.cell, periodicDim: scene.periodicDim) ?? (b2 - a)
+            guard let ndc0 = projectNDC2D(a, view: view, proj: proj),
+                  let ndc1 = projectNDC2D(a + disp, view: view, proj: proj) else { continue }
             let dir = SIMD2<Float>(ndc1.x - ndc0.x, ndc1.y - ndc0.y)
             let dirLen = simd_length(dir)
             guard dirLen > 1e-6 else { continue }
@@ -2459,8 +2470,17 @@ final class Renderer: NSObject {
         var neigh: [[SIMD3<Float>]] = Array(repeating: [], count: atoms.count)
         for b in scene.bonds {
             guard b.i >= 0, b.i < atoms.count, b.j >= 0, b.j < atoms.count else { continue }
-            neigh[b.i].append(atoms[b.j].coord)
-            neigh[b.j].append(atoms[b.i].coord)
+            let ci = atoms[b.i].coord, cj = atoms[b.j].coord
+            // Use the minimum-image partner position so polyhedra build around
+            // the true (wrapped) neighbor geometry for periodic bonds.
+            if let d = PeriodicGeometry.minimumImageDisplacement(
+                from: ci, to: cj, cell: scene.cell, periodicDim: scene.periodicDim) {
+                neigh[b.i].append(ci + d)
+                neigh[b.j].append(cj - d)
+            } else {
+                neigh[b.i].append(cj)
+                neigh[b.j].append(ci)
+            }
         }
         for i in 0..<neigh.count {
             let c = atoms[i].coord

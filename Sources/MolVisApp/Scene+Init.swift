@@ -435,7 +435,20 @@ extension Scene {
         }
 
         guard nb > 0, let bp = bondPtr else { return [] }
-        return (0..<Int(nb)).map { Bond(i: Int(bp[$0].i), j: Int(bp[$0].j)) }
+        let rawBonds = (0..<Int(nb)).map { Bond(i: Int(bp[$0].i), j: Int(bp[$0].j)) }
+        // Expanded views (supercell/slab) hold lattice-equivalent replicas of the
+        // same physical atom; with the primitive lattice the periodic search bonds
+        // those replicas at ~0 distance. Such self-replica bonds are not chemical
+        // bonds — drop any pair whose minimum-image distance is below the 0.05 A
+        // coincidence threshold (far below any real covalent bond).
+        guard isCrystal, periodicDim >= 1, let cell else { return rawBonds }
+        return rawBonds.filter { bond in
+            guard bond.i >= 0, bond.i < atoms.count, bond.j >= 0, bond.j < atoms.count else { return false }
+            guard let d = PeriodicGeometry.minimumImageDistance(
+                from: atoms[bond.i].coord, to: atoms[bond.j].coord,
+                cell: cell, periodicDim: periodicDim) else { return true }
+            return d >= 0.05
+        }
     }
 
     func applySlab(_ slab: Slab?) -> Scene {

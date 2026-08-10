@@ -2673,9 +2673,13 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             let a = atoms[bond.i].coord
             let b = atoms[bond.j].coord
             guard a.isFinite, b.isFinite else { continue }
-            let distance = simd_length(b - a)
+            // Periodic bonds connect to the closest image: label the wrapped
+            // (true) bond length, not the unwrapped direct separation.
+            let displacement = PeriodicGeometry.minimumImageDisplacement(
+                from: a, to: b, cell: scene.cell, periodicDim: scene.periodicDim) ?? (b - a)
+            let distance = simd_length(displacement)
             guard distance.isFinite, distance > 1e-6 else { continue }
-            let midpoint = (a + b) * 0.5
+            let midpoint = a + displacement * 0.5
             guard let screen = projectPoint(midpoint, camera: camera, viewport: viewport) else {
                 continue
             }

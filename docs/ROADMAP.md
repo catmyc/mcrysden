@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-09 (v1.2.6: adversarial-review fixes — texQuad vertex-stride corruption in volume slices/color plane, atomic MP4/GIF export, project-save + script-runner alias guards, uniform 200 MB input cap across all parsers incl. C-backed, ORCA fail-closed atom cap, FHI-aims incremental cap, CIF token leak, Z=101..118 covalent radii, UTF-8 BOM handling in C parsers, grapher force-unwrap traps, QE DOS row cap, force finite check; added CIF parsing + multi-light render tests; 62 focused tests)**.
+Last updated: **2026-08-10 (v1.2.7: periodic-bond rendering fix — bond cylinders/2D lines/distance labels/polyhedron neighbor geometry now use `PeriodicGeometry.minimumImageDisplacement` instead of direct coordinates, so periodic bonds are drawn at their true ~2.4 Å length instead of the unwrapped 5.6–6.0 Å separation across the cell; `Scene.rebond` drops sub-0.05 Å replica self-bonds in expanded views; 62 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-Current v1.2.6 verification: texQuad stride fix, atomic MP4/GIF export, alias guards on project save and script runner, uniform 200 MB input cap, ORCA fail-closed cap, CIF leak, heavy-element radii, BOM handling, grapher unwraps, DOS/force caps, and the added CIF + multi-light tests are covered by a passing 62-test suite.
+Current v1.2.7 verification: periodic-bond rendering wrap (3D + 2D + labels + polyhedron neighbors) and the rebond replica-self-bond filter are covered by a passing 62-test suite (the v1.2.6 regression-test + adversarial fixes remain green).
 
 ## Implemented foundation (through v1.1.32)
 
