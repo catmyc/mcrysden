@@ -630,10 +630,14 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             guard let region = BandSurfaceBuilder.defaultRegion(path: route) else {
                 throw CLIError.invalid("--band-surf: cannot derive a surface plane from the k-path route")
             }
-            scene.bandSurface = try BandSurfaceBuilder.build(
-                bands: bs, region: region,
-                regionLabels: BandSurfaceBuilder.regionLabels(for: route, region: region),
-                options: BandSurfaceOptions())
+            do {
+                scene.bandSurface = try BandSurfaceBuilder.build(
+                    bands: bs, region: region,
+                    regionLabels: BandSurfaceBuilder.regionLabels(for: route, region: region),
+                    options: BandSurfaceOptions())
+            } catch {
+                throw CLIError.invalid("--band-surf: \(error)")
+            }
             scene.showBandSurface = true
         }
     }
@@ -1957,7 +1961,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
           mcrysden <file> <state.mvis-state>           # open with saved state
           mcrysden <qe-output> --bands                 # plot bands; a k-mesh is interpolated along the default (or --kpath) route
           mcrysden <qe-output> --dos                   # reconstruct the total DOS from a uniform band mesh
-          mcrysden <qe-output> --band-surf             # 3D band-surface plot near the Fermi level (k-mesh only)
+          mcrysden <qe-output> --band-surf             # 3D band-surface plot near the Fermi level (2D k-mesh only)
           mcrysden <file> --export out.png             # headless raster render
           mcrysden <file> --export out.pdf             # true vector export with a raster structure layer (pdf, svg); raster-backed container (eps, ps)
           mcrysden <file> --kpath route.kpf            # import a k-path (QE K_POINTS, VASP KPOINTS, Wannier90 kpoint_path, XCrySDen KPF)
@@ -1982,7 +1986,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         --dos-table (above) force-parses dos.x/projwfc.x DOS tables. --dos and
         --band-surf select derived plots and are only meaningful for QE outputs
         with band energies: combine `--bands --dos` for a linked band+DOS view.
-        --band-surf conflicts with --bands.
+        --band-surf requires a 2D k-point mesh (slab) and conflicts with --bands.
         Structure conversion formats are chosen by the --convert output extension:
           .xsf .cif .poscar/.contcar/.vasp .xyz .pwi/.in/.inp/.qe
         Batch --convert-all requires --format <xsf|cif|poscar|xyz|qe|struct|d12>; with a single-file

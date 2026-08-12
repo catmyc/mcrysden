@@ -200,9 +200,10 @@ final class BandMeshSurfaceTests: XCTestCase {
     // MARK: - 3. Surface builder
 
     func testSurfaceBuilder() {
+        // 2D slab mesh (z degenerate): band surfaces are limited to 2D k-grids.
         let nodes: [[Float]] = [[0, 0.25, 0.5, 0.75],
-                                 [0, 0.25, 0.5, 0.75],
-                                 [0, 0.25, 0.5, 0.75]]
+                                [0, 0.25, 0.5, 0.75],
+                                [0]]
         // 3 bands: band 0 = x (range [0,0.75]), band 1 = x+4 (range [4,4.75]),
         // band 2 = x+10 (range [10,10.75]).
         let bands = Self.makeMesh(nodeLists: nodes, nBands: 3, bandSlope: (1, 0, 0))
@@ -237,6 +238,14 @@ final class BandMeshSurfaceTests: XCTestCase {
         XCTAssertThrowsError(try BandSurfaceBuilder.build(bands: nonMesh, region: region,
                                                            regionLabels: ["", "", ""], options: opts)) { err in
             XCTAssertEqual(err as? BandSurfaceError, .notMesh)
+        }
+
+        // Error: 3D bulk mesh is rejected — band surfaces require a 2D k-grid.
+        let bulkNodes: [[Float]] = [[0, 0.5], [0, 0.5], [0, 0.5]]
+        let bulk = Self.makeMesh(nodeLists: bulkNodes, nBands: 3, bandSlope: (1, 0, 0))
+        XCTAssertThrowsError(try BandSurfaceBuilder.build(bands: bulk, region: region,
+                                                           regionLabels: ["", "", ""], options: opts)) { err in
+            XCTAssertEqual(err as? BandSurfaceError, .requiresTwoDimensionalMesh)
         }
 
         // Error: collinear region.

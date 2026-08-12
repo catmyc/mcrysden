@@ -57,6 +57,7 @@ struct BandSurfaceOptions {
 enum BandSurfaceError: Error, CustomStringConvertible {
     case notMesh
     case notAxisAlignedGrid
+    case requiresTwoDimensionalMesh
     case malformedBandStructure
     case degenerateRegion
     case noBandsNearFermi
@@ -68,6 +69,8 @@ enum BandSurfaceError: Error, CustomStringConvertible {
             return "band interpolation requires a uniform k-point mesh"
         case .notAxisAlignedGrid:
             return "band interpolation requires an axis-aligned Monkhorst-Pack-style mesh"
+        case .requiresTwoDimensionalMesh:
+            return "band surfaces are limited to 2D k-point meshes (slabs); this mesh is not a 2D k-grid"
         case .malformedBandStructure:
             return "band structure has malformed or non-finite data"
         case .degenerateRegion:
@@ -124,7 +127,12 @@ enum BandSurfaceBuilder {
 
     /// Build the band surface. `region` = exactly 3 non-collinear fractional
     /// points (p0,p1,p2); the 4th parallelogram corner is computed inside.
-    /// `regionLabels` must have exactly 3 entries (the 4th is set to "").
+    /// `regionLabels` must have at least 3 entries (the 4th is set to "").
+    ///
+    /// Band surfaces are LIMITED TO 2D SYSTEMS: the mesh must be a 2D k-grid
+    /// (exactly two non-degenerate sampling axes, e.g. a slab). Bulk 3D meshes
+    /// throw `.requiresTwoDimensionalMesh` — a band surface of a 3D BZ would
+    /// need an arbitrary slice plane, which is out of scope.
     static func build(
         bands: BandStructure,
         region: [SIMD3<Float>],
@@ -152,6 +160,13 @@ enum BandSurfaceBuilder {
         guard perSpin > 0, nBands > 0 else { throw BandSurfaceError.malformedBandStructure }
 
         let grid = try BandMeshInterpolator.meshGrid(from: bands)
+
+        // 2D-only gate: band surfaces require a k-grid with exactly two
+        // non-degenerate sampling axes (a slab). A 3D bulk mesh is rejected;
+        // 1D point sets never reach this check (meshGrid rejects them).
+        guard grid.dims.filter({ $0 > 1 }).count == 2 else {
+            throw BandSurfaceError.requiresTwoDimensionalMesh
+        }
 
         // Region: exactly 3 finite, non-collinear points.
         guard region.count == 3,

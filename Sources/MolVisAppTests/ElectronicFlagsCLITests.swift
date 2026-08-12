@@ -10,35 +10,33 @@ final class ElectronicFlagsCLITests: XCTestCase {
 
     // MARK: - Synthetic mesh builder
 
-    /// Build a 2x2x2 axis-aligned mesh (8 k-points) with crystal coords and
-    /// energies linear in x+y+z so interpolation is exact and deterministic.
-    private func makeSyntheticMesh(kPathPoints: [KPoint] = []) -> (Scene, BandStructure) {
+    /// Build an axis-aligned mesh with the given per-axis node lists (crystal
+    /// coords), energies linear in x+y+z per band (4 bands). Defaults to a 2D
+    /// slab mesh (z degenerate); periodicDim follows the mesh dimensionality
+    /// (2 for slabs, 3 for bulk) so DOS normalization uses the right measure.
+    private func makeSyntheticMesh(
+        nodeLists: [[Float]] = [[0, 0.5], [0, 0.5], [0]],
+        kPathPoints: [KPoint] = []
+    ) -> (Scene, BandStructure) {
+        let perSpin = nodeLists[0].count * nodeLists[1].count * nodeLists[2].count
         var kps: [BandKPoint] = []
-        let values: [[Float]] = [
-            [0, 1, 2, 3],
-            [1, 2, 3, 4],
-            [2, 3, 4, 5],
-            [3, 4, 5, 6],
-            [4, 5, 6, 7],
-            [5, 6, 7, 8],
-            [6, 7, 8, 9],
-            [7, 8, 9, 10],
-        ]
-        var idx = 0
-        for i in 0..<2 {
-            for j in 0..<2 {
-                for k in 0..<2 {
-                    let frac = SIMD3(Float(i), Float(j), Float(k)) / 2
-                    kps.append(BandKPoint(k: frac, weight: 1.0 / 8, label: "",
-                                          energies: values[idx]))
-                    idx += 1
+        kps.reserveCapacity(perSpin)
+        for x in nodeLists[0] {
+            for y in nodeLists[1] {
+                for z in nodeLists[2] {
+                    let k = SIMD3(x, y, z)
+                    let base = x + y + z
+                    kps.append(BandKPoint(k: k, weight: 1.0 / Float(perSpin), label: "",
+                                          energies: (0..<4).map { base + Float($0) }))
                 }
             }
         }
         let cell = Cell(a: SIMD3(5, 0, 0), b: SIMD3(0, 5, 0), c: SIMD3(0, 0, 5))
+        let meshDim = nodeLists.filter { $0.count > 1 }.count
         let bands = BandStructure(kPoints: kps, fermiEnergy: 5.0, nSpin: 1,
-                                   kPointsAreCrystal: true, kPointsPerSpin: 8,
-                                   isMesh: true, cell: cell, periodicDim: 3)
+                                   kPointsAreCrystal: true, kPointsPerSpin: perSpin,
+                                   isMesh: true, cell: cell,
+                                   periodicDim: meshDim >= 3 ? 3 : 2)
         var scene = Scene()
         scene.bandStructure = bands
         scene.kPathPoints = kPathPoints
@@ -137,6 +135,18 @@ final class ElectronicFlagsCLITests: XCTestCase {
             scene: &emptyScene,
             flags: ElectronicStructureFlags(bandPlot: false, dosPlot: false, bandSurf: true),
             kPathSampling: 20))
+
+        // bandSurf on a 3D bulk mesh is rejected: band surfaces are limited
+        // to 2D k-grid samplings. The CLI error carries the requirement.
+        let bulkNodes: [[Float]] = [[0, 0.5], [0, 0.5], [0, 0.5]]
+        var bulkScene = makeSyntheticMesh(nodeLists: bulkNodes, kPathPoints: route).0
+        XCTAssertThrowsError(try App.applyElectronicStructureFlags(
+            scene: &bulkScene,
+            flags: ElectronicStructureFlags(bandPlot: false, dosPlot: false, bandSurf: true),
+            kPathSampling: 20)) { error in
+            XCTAssertTrue("\(error)".contains("2D"),
+                          "3D mesh must be rejected with a 2D requirement, got: \(error)")
+        }
     }
 
     // MARK: - Parser gating with a real fixture
