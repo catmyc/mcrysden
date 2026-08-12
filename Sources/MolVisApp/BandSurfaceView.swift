@@ -5,11 +5,15 @@ import simd
 /// same 2D-overlay approach as BandGrapherView. A parallelogram patch of reciprocal
 /// space is parameterized by (s,t) in [0,1]^2; each sheet's energy is sampled on a
 /// grid over that patch and rendered as a shaded triangulated surface using the
-/// painter's algorithm. A translucent Fermi plane and energy axes are overlaid.
+/// painter's algorithm. 3D axes (k_x, k_y, E) are drawn in the rotated frame; a
+/// translucent Fermi plane and title are overlaid.
 ///
 /// Interaction: mouse drag rotates the view (azimuth/elevation). All interaction is
 /// disabled during export (exportBackground != nil) so exported pixels are identical
 /// to the pre-interaction renderer.
+///
+/// An EMPTY `sheets` array is a valid surface: the axes, base plane, and Fermi plane
+/// are drawn without any surface triangles.
 final class BandSurfaceView: NSView {
     var bandSurface: BandSurface? {
         didSet { needsDisplay = true }
@@ -54,12 +58,11 @@ final class BandSurfaceView: NSView {
         guard NSGraphicsContext.current?.cgContext != nil,
               let surface = bandSurface,
               surface.gridSize >= 2,
-              !surface.sheets.isEmpty,
               surface.region.count == 4,
               surface.region.allSatisfy(\.isFinite)
         else { drawEmpty(dirtyRect, "No band surface"); return }
 
-        // Every value must be finite.
+        // Every sheet value must be finite (skip when sheets is empty — that is valid).
         for sheet in surface.sheets {
             if !sheet.values.allSatisfy(\.isFinite) {
                 drawEmpty(dirtyRect, "No band surface")
@@ -104,34 +107,72 @@ final class BandSurfaceView: NSView {
         let Llen = simd_length(L)
         let Lnorm = Llen > 1e-6 ? L / Llen : SIMD3<Float>(0, 0, 1)
 
-        // Precompute the 3D surface points for all sheets.
-        // Point in pre-projection 3D space:
-        //   x = s - 0.5, y = t - 0.5, z = (e - energyCenter) * energyScale
-        // where s,t in [0,1].
+        // --- Ground-plane geometry ---
+        // u, v are the fractional-space edge vectors of the parallelogram.
+        let u = surface.region[1] - surface.region[0]
+        let v = surface.region[2] - surface.region[0]
+
+        // Physical ground vectors: map fractional edges through kBasis when present.
+        let U: SIMD3<Float>
+        let V: SIMD3<Float>
+        let unitLabel: String
+        if let kBasis = surface.kBasis, kBasis.count == 3, kBasis.allSatisfy(\.isFinite) {
+            U = u.x * kBasis[0] + u.y * kBasis[1] + u.z * kBasis[2]
+            V = v.x * kBasis[0] + v.y * kBasis[1] + v.z * kBasis[2]
+            unitLabel = "Å⁻¹"
+        } else {
+            U = u
+            V = v
+            unitLabel = "frac"
+        }
+
+        // Decompose U into length L along x and V into (c, h) so the ground
+        // parallelogram has corners g0=(0,0), g1=(L,0), g2=(c,h), g3=(L+c,h).
+        let Llen0 = simd_length(U)
+        let Lsafe = Llen0 > 1e-6 ? Llen0 : 1
+        let Ueff = Llen0 > 1e-6 ? U : SIMD3<Float>(1, 0, 0)
+        let c = simd_dot(Ueff, V) / Lsafe
+        let VlenSq = simd_length_squared(V)
+        let hraw = sqrt(max(0, VlenSq - c * c))
+        let h = hraw > 1e-6 ? hraw : 1e-3
+        let Vlen = sqrt(c * c + h * h)
+
+        // Ground center for centering the plot.
+        let GC = SIMD2<Float>((Lsafe + c) / 2, h / 2)
+
+        // Energy → z.
+        func zEnergy(_ e: Float) -> Float { (e - energyCenter) * energyScale }
+        let zBase = zEnergy(energyMin)
+        let zTop = zEnergy(energyMax)
+
+        // Map (s,t) in [0,1]^2 to a centered 3D point with energy e.
+        func point3D(_ si: Int, _ ti: Int, _ e: Float) -> SIMD3<Float> {
+            let sf = Float(si) / Float(gridSize - 1)
+            let tf = Float(ti) / Float(gridSize - 1)
+            let gx = sf * Lsafe + tf * c
+            let gy = tf * h
+            return SIMD3<Float>(gx - GC.x, gy - GC.y, zEnergy(e))
+        }
+
+        // --- Projection: azimuth about z, then elevation about x ---
         let cosA = cos(effAzimuth * .pi / 180)
         let sinA = sin(effAzimuth * .pi / 180)
         let cosE = cos(effElevation * .pi / 180)
         let sinE = sin(effElevation * .pi / 180)
 
-        /// Map a pre-projection 3D point to screen space (orthographic projection
-        /// with cx/cy/scale applied later). Returns the projected (x', y', z'') where
-        /// z'' is depth (larger = closer to viewer).
         func project(_ p: SIMD3<Float>) -> (sx: Float, sy: Float, depth: Float) {
-            // Azimuth rotation about z-axis.
             let x1 = p.x * cosA - p.y * sinA
             let y1 = p.x * sinA + p.y * cosA
             let z1 = p.z
-            // Elevation rotation about x-axis.
             let y2 = y1 * cosE - z1 * sinE
             let z2 = y1 * sinE + z1 * cosE
             return (x1, y2, z2)
         }
 
-        // Build all triangles across all sheets. Each triangle stores projected
-        // screen points, depth (mean z''), and color.
+        // --- Build triangles (skipped when sheets is empty) ---
         struct Tri {
-            var pts: [(sx: Float, sy: Float, depth: Float)]   // 3 projected corners
-            var depth: Float     // mean z'' (painter's: larger = closer)
+            var pts: [(sx: Float, sy: Float, depth: Float)]
+            var depth: Float
             var color: NSColor
         }
         var tris: [Tri] = []
@@ -141,16 +182,9 @@ final class BandSurfaceView: NSView {
             let values = sheet.values
             for ti in 0..<(gridSize - 1) {
                 for si in 0..<(gridSize - 1) {
-                    // 4 corners of the cell: (si,ti), (si+1,ti), (si,ti+1), (si+1,ti+1)
                     func val(_ s: Int, _ t: Int) -> Float { values[t * gridSize + s] }
                     let e00 = val(si, ti), e10 = val(si + 1, ti)
                     let e01 = val(si, ti + 1), e11 = val(si + 1, ti + 1)
-
-                    func point3D(_ s: Int, _ t: Int, _ e: Float) -> SIMD3<Float> {
-                        let sf = Float(s) / Float(gridSize - 1)
-                        let tf = Float(t) / Float(gridSize - 1)
-                        return SIMD3<Float>(sf - 0.5, tf - 0.5, (e - energyCenter) * energyScale)
-                    }
 
                     let p00 = point3D(si, ti, e00)
                     let p10 = point3D(si + 1, ti, e10)
@@ -160,7 +194,6 @@ final class BandSurfaceView: NSView {
                     let avgEnergy = (e00 + e10 + e01) / 3
                     let avgEnergy1 = (e10 + e01 + e11) / 3
 
-                    // Normal for triangle 1 (p00, p10, p01).
                     let n1 = simd_normalize(simd_cross(p10 - p00, p01 - p00))
                     let shade1 = 0.55 + 0.45 * max(0, simd_dot(n1, Lnorm))
                     let cmap1 = Colormap.viridis.rgb((avgEnergy - energyMin) / energyRange)
@@ -168,7 +201,6 @@ final class BandSurfaceView: NSView {
                                          green: CGFloat(cmap1.y) * CGFloat(shade1),
                                          blue: CGFloat(cmap1.z) * CGFloat(shade1), alpha: 1)
 
-                    // Normal for triangle 2 (p10, p11, p01).
                     let n2 = simd_normalize(simd_cross(p11 - p10, p01 - p10))
                     let shade2 = 0.55 + 0.45 * max(0, simd_dot(n2, Lnorm))
                     let cmap2 = Colormap.viridis.rgb((avgEnergy1 - energyMin) / energyRange)
@@ -176,43 +208,50 @@ final class BandSurfaceView: NSView {
                                          green: CGFloat(cmap2.y) * CGFloat(shade2),
                                          blue: CGFloat(cmap2.z) * CGFloat(shade2), alpha: 1)
 
-                    tris.append(Tri(pts: [], depth: 0, color: color1))
-                    tris[tris.count - 1].pts = [p00, p10, p01].map { project($0) }
-                    tris[tris.count - 1].depth = (tris[tris.count - 1].pts[0].depth + tris[tris.count - 1].pts[1].depth + tris[tris.count - 1].pts[2].depth) / 3
-                    tris[tris.count - 1].color = color1
-
-                    tris.append(Tri(pts: [], depth: 0, color: color2))
-                    tris[tris.count - 1].pts = [p10, p11, p01].map { project($0) }
-                    tris[tris.count - 1].depth = (tris[tris.count - 1].pts[0].depth + tris[tris.count - 1].pts[1].depth + tris[tris.count - 1].pts[2].depth) / 3
-                    tris[tris.count - 1].color = color2
+                    let tri1 = Tri(pts: [p00, p10, p01].map(project),
+                                   depth: 0, color: color1)
+                    let tri2 = Tri(pts: [p10, p11, p01].map(project),
+                                   depth: 0, color: color2)
+                    var t1 = tri1, t2 = tri2
+                    t1.depth = (t1.pts[0].depth + t1.pts[1].depth + t1.pts[2].depth) / 3
+                    t2.depth = (t2.pts[0].depth + t2.pts[1].depth + t2.pts[2].depth) / 3
+                    tris.append(t1)
+                    tris.append(t2)
                 }
             }
         }
 
-        // Compute projected bounds of all triangles + Fermi plane corners to fit.
+        // --- Fit: compute projected bounds over triangles + base + E-axis ---
         var minSX = Float.greatestFiniteMagnitude, maxSX = -Float.greatestFiniteMagnitude
         var minSY = Float.greatestFiniteMagnitude, maxSY = -Float.greatestFiniteMagnitude
+
+        func include(_ p: SIMD3<Float>) {
+            let proj = project(p)
+            minSX = min(minSX, proj.sx); maxSX = max(maxSX, proj.sx)
+            minSY = min(minSY, proj.sy); maxSY = max(maxSY, proj.sy)
+        }
+
+        // 4 base corners at zBase.
+        include(SIMD3<Float>(0 - GC.x, 0 - GC.y, zBase))
+        include(SIMD3<Float>(Lsafe - GC.x, 0 - GC.y, zBase))
+        include(SIMD3<Float>(c - GC.x, h - GC.y, zBase))
+        include(SIMD3<Float>(Lsafe + c - GC.x, h - GC.y, zBase))
+        // E-axis top at zTop.
+        include(SIMD3<Float>(0 - GC.x, 0 - GC.y, zTop))
+
         for tri in tris {
             for p in tri.pts {
                 minSX = min(minSX, p.sx); maxSX = max(maxSX, p.sx)
                 minSY = min(minSY, p.sy); maxSY = max(maxSY, p.sy)
             }
         }
-        // Include Fermi plane corners in the bounds.
         if let Ef = surface.fermiEnergy {
-            let zf = (Ef - energyCenter) * energyScale
+            let zf = zEnergy(Ef)
             for (si, ti) in [(0,0),(1,0),(0,1),(1,1)] {
-                let p = project(SIMD3<Float>(Float(si) - 0.5, Float(ti) - 0.5, zf))
-                minSX = min(minSX, p.sx); maxSX = max(maxSX, p.sx)
-                minSY = min(minSY, p.sy); maxSY = max(maxSY, p.sy)
+                let gx = Float(si) * Lsafe + Float(ti) * c
+                let gy = Float(ti) * h
+                include(SIMD3<Float>(gx - GC.x, gy - GC.y, zf))
             }
-        }
-        // Include region corner labels' anchor points (at z=0 plane) — these are
-        // the four UNIT-SQUARE (s,t) corners, not the fractional region corners.
-        for (si, ti) in [(0,0),(1,0),(0,1),(1,1)] {
-            let p = project(SIMD3<Float>(Float(si) - 0.5, Float(ti) - 0.5, 0))
-            minSX = min(minSX, p.sx); maxSX = max(maxSX, p.sx)
-            minSY = min(minSY, p.sy); maxSY = max(maxSY, p.sy)
         }
 
         let dataW = maxSX - minSX
@@ -225,17 +264,117 @@ final class BandSurfaceView: NSView {
         let cx = plot.midX - CGFloat((minSX + maxSX) / 2) * scale
         let cy = plot.midY - CGFloat((minSY + maxSY) / 2) * scale
 
-        /// Convert a projected 3D point to a screen NSPoint using the fit transform.
         func toScreen(_ p: (sx: Float, sy: Float, depth: Float)) -> NSPoint {
             NSPoint(x: cx + CGFloat(p.sx) * scale,
                     y: cy - CGFloat(p.sy) * scale)
         }
 
-        // Sort triangles by depth DESCENDING (far first for painter's algorithm).
-        // Stable sort preserves sheet/cell order for ties.
-        tris.sort { $0.depth > $1.depth }
+        // --- Draw order ---
+        // 1. Base plane (all surfaces lie at z >= zBase).
+        let base3D = [
+            SIMD3<Float>(0 - GC.x, 0 - GC.y, zBase),
+            SIMD3<Float>(Lsafe - GC.x, 0 - GC.y, zBase),
+            SIMD3<Float>(Lsafe + c - GC.x, h - GC.y, zBase),
+            SIMD3<Float>(c - GC.x, h - GC.y, zBase)
+        ]
+        let baseScreen = base3D.map { toScreen(project($0)) }
+        let basePath = NSBezierPath()
+        basePath.move(to: baseScreen[0])
+        basePath.line(to: baseScreen[1])
+        basePath.line(to: baseScreen[2])
+        basePath.line(to: baseScreen[3])
+        basePath.close()
+        NSColor(white: 0.9, alpha: 0.25).setFill()
+        basePath.fill()
+        NSColor.gray.withAlphaComponent(0.6).setStroke()
+        basePath.lineWidth = 1
+        basePath.stroke()
 
-        // Draw triangles.
+        // 2. 3D axes (drawn before surfaces so surfaces occlude them).
+        NSColor.black.setStroke()
+        let axisOrigin = toScreen(project(SIMD3<Float>(0 - GC.x, 0 - GC.y, zBase)))
+        let axisKxEnd = toScreen(project(SIMD3<Float>(Lsafe - GC.x, 0 - GC.y, zBase)))
+        let axisKyEnd = toScreen(project(SIMD3<Float>(c - GC.x, h - GC.y, zBase)))
+        let axisETop = toScreen(project(SIMD3<Float>(0 - GC.x, 0 - GC.y, zTop)))
+
+        for (a, b) in [(axisOrigin, axisKxEnd), (axisOrigin, axisKyEnd), (axisOrigin, axisETop)] {
+            let path = NSBezierPath()
+            path.move(to: a)
+            path.line(to: b)
+            path.lineWidth = 1
+            path.stroke()
+        }
+
+        // Ticks: small crosses in the base plane for k axes, screen-space crosses for E.
+        let tickLen = 0.03 * max(Lsafe, h)
+        let tickColor = NSColor.darkGray
+        tickColor.setStroke()
+
+        // k_x ticks at s in {0, 1/4, 1/2, 3/4, 1}.
+        for s in [Float(0), 0.25, 0.5, 0.75, 1.0] {
+            let pos = SIMD3<Float>(s * Lsafe - GC.x, -GC.y, zBase)
+            let cross = [
+                project(SIMD3<Float>(pos.x - tickLen, pos.y, pos.z)),
+                project(SIMD3<Float>(pos.x + tickLen, pos.y, pos.z)),
+                project(SIMD3<Float>(pos.x, pos.y - tickLen, pos.z)),
+                project(SIMD3<Float>(pos.x, pos.y + tickLen, pos.z))
+            ].map(toScreen)
+            let tp = NSBezierPath()
+            tp.move(to: cross[0]); tp.line(to: cross[1])
+            tp.move(to: cross[2]); tp.line(to: cross[3])
+            tp.lineWidth = 1
+            tp.stroke()
+            let lp = toScreen(project(pos))
+            drawLabel(String(format: "%.2f", s * Lsafe), at: NSPoint(x: lp.x - 4, y: lp.y + 6),
+                      font: axisFont, color: .darkGray, rightAligned: false)
+        }
+
+        // k_y ticks at t in {0, 1/4, 1/2, 3/4, 1}.
+        for t in [Float(0), 0.25, 0.5, 0.75, 1.0] {
+            let pos = SIMD3<Float>(t * c - GC.x, t * h - GC.y, zBase)
+            let cross = [
+                project(SIMD3<Float>(pos.x - tickLen, pos.y, pos.z)),
+                project(SIMD3<Float>(pos.x + tickLen, pos.y, pos.z)),
+                project(SIMD3<Float>(pos.x, pos.y - tickLen, pos.z)),
+                project(SIMD3<Float>(pos.x, pos.y + tickLen, pos.z))
+            ].map(toScreen)
+            let tp = NSBezierPath()
+            tp.move(to: cross[0]); tp.line(to: cross[1])
+            tp.move(to: cross[2]); tp.line(to: cross[3])
+            tp.lineWidth = 1
+            tp.stroke()
+            let lp = toScreen(project(pos))
+            drawLabel(String(format: "%.2f", t * Vlen), at: NSPoint(x: lp.x - 4, y: lp.y + 6),
+                      font: axisFont, color: .darkGray, rightAligned: false)
+        }
+
+        // E ticks at 5 evenly spaced energies.
+        let eTickCount = 5
+        for i in 0...eTickCount {
+            let e = energyMin + (energyMax - energyMin) * Float(i) / Float(eTickCount)
+            let lp = toScreen(project(SIMD3<Float>(-GC.x, -GC.y, zEnergy(e))))
+            let tp = NSBezierPath()
+            tp.move(to: NSPoint(x: lp.x - 3, y: lp.y))
+            tp.line(to: NSPoint(x: lp.x + 3, y: lp.y))
+            tp.move(to: NSPoint(x: lp.x, y: lp.y - 3))
+            tp.line(to: NSPoint(x: lp.x, y: lp.y + 3))
+            tp.lineWidth = 1
+            tp.stroke()
+            drawLabel(String(format: "%.1f", e), at: NSPoint(x: lp.x - 8, y: lp.y),
+                      font: axisFont, color: .darkGray, rightAligned: false)
+        }
+
+        // Axis name labels.
+        NSColor.black.setStroke()
+        drawLabel("k_x (\(unitLabel))", at: NSPoint(x: axisKxEnd.x + 6, y: axisKxEnd.y + 6),
+                  font: titleFont, color: .black, rightAligned: false)
+        drawLabel("k_y (\(unitLabel))", at: NSPoint(x: axisKyEnd.x + 6, y: axisKyEnd.y + 6),
+                  font: titleFont, color: .black, rightAligned: false)
+        drawLabel("E (eV)", at: NSPoint(x: axisETop.x - 6, y: axisETop.y - 4),
+                  font: titleFont, color: .black, rightAligned: false)
+
+        // 3. Surfaces (painter's algorithm: far first).
+        tris.sort { $0.depth > $1.depth }
         for tri in tris {
             let path = NSBezierPath()
             let screenPts = tri.pts.map(toScreen)
@@ -247,18 +386,20 @@ final class BandSurfaceView: NSView {
             path.fill()
         }
 
-        // Fermi plane: drawn AFTER all surfaces.
+        // 4. Fermi plane (drawn AFTER surfaces).
         if let Ef = surface.fermiEnergy {
-            let zf = (Ef - energyCenter) * energyScale
-            let corners3D = [(0,0),(1,0),(0,1),(1,1)].map { (si: Int, ti: Int) in
-                project(SIMD3<Float>(Float(si) - 0.5, Float(ti) - 0.5, zf))
+            let zf = zEnergy(Ef)
+            let fermi3D = [(0,0),(1,0),(1,1),(0,1)].map { (si: Int, ti: Int) in
+                let gx = Float(si) * Lsafe + Float(ti) * c
+                let gy = Float(ti) * h
+                return SIMD3<Float>(gx - GC.x, gy - GC.y, zf)
             }
-            let screenCorners = corners3D.map(toScreen)
+            let fermiScreen = fermi3D.map { toScreen(project($0)) }
             let plane = NSBezierPath()
-            plane.move(to: screenCorners[0])
-            plane.line(to: screenCorners[1])
-            plane.line(to: screenCorners[3])
-            plane.line(to: screenCorners[2])
+            plane.move(to: fermiScreen[0])
+            plane.line(to: fermiScreen[1])
+            plane.line(to: fermiScreen[2])
+            plane.line(to: fermiScreen[3])
             plane.close()
             NSColor.red.withAlphaComponent(0.15).setFill()
             plane.fill()
@@ -267,9 +408,14 @@ final class BandSurfaceView: NSView {
             plane.stroke()
         }
 
-        // --- Axes/labels (view space, NOT rotated) ---
-        drawAxes(plot: plot, energyMin: energyMin, energyMax: energyMax,
-                 surface: surface, toScreen: toScreen, project: project)
+        // 5. Title.
+        let titleStr = surface.fermiEnergy.map { "Band Surface\nEf = \(String(format: "%.3f", $0)) eV" }
+            ?? "Band Surface"
+        let titleLines = titleStr.components(separatedBy: "\n")
+        for (i, line) in titleLines.enumerated() {
+            drawLabel(line, at: NSPoint(x: plot.midX, y: marginTop + CGFloat(i) * 16),
+                      font: titleFont, color: .black, rightAligned: false)
+        }
     }
 
     // MARK: - Geometry helpers
@@ -279,61 +425,6 @@ final class BandSurfaceView: NSView {
                y: marginBottom,
                width: bounds.width - marginLeft - marginRight,
                height: bounds.height - marginBottom - marginTop)
-    }
-
-    /// Draw the energy axis, title, region corner labels, and caption.
-    private func drawAxes(plot: NSRect, energyMin: Float, energyMax: Float,
-                          surface: BandSurface,
-                          toScreen: ((sx: Float, sy: Float, depth: Float)) -> NSPoint,
-                          project: (SIMD3<Float>) -> (sx: Float, sy: Float, depth: Float)) {
-        let axis = NSColor.black
-        axis.setStroke()
-
-        // Left vertical axis line.
-        let axisPath = NSBezierPath()
-        axisPath.move(to: NSPoint(x: plot.minX, y: plot.minY))
-        axisPath.line(to: NSPoint(x: plot.minX, y: plot.maxY))
-        axisPath.lineWidth = 1
-        axisPath.stroke()
-
-        // 5 energy ticks + labels.
-        let yTicks = 5
-        for i in 0...yTicks {
-            let frac = CGFloat(i) / CGFloat(yTicks)
-            let e = energyMin + (energyMax - energyMin) * Float(frac)
-            let py = plot.maxY - plot.height * frac
-            let tick = NSBezierPath()
-            tick.move(to: NSPoint(x: plot.minX, y: py))
-            tick.line(to: NSPoint(x: plot.minX - 4, y: py))
-            tick.stroke()
-            drawLabel(String(format: "%.1f eV", e), at: NSPoint(x: plot.minX - 8, y: py),
-                      font: axisFont, color: axis, rightAligned: true)
-        }
-        drawLabel("E (eV)", at: NSPoint(x: 6, y: plot.minY - 14), font: titleFont, color: axis, rightAligned: false)
-
-        // Title centered at top.
-        let titleStr = surface.fermiEnergy.map { "Band Surface\nEf = \(String(format: "%.3f", $0)) eV" }
-            ?? "Band Surface"
-        let titleLines = titleStr.components(separatedBy: "\n")
-        for (i, line) in titleLines.enumerated() {
-            drawLabel(line, at: NSPoint(x: plot.midX, y: marginTop + CGFloat(i) * 16),
-                      font: titleFont, color: axis, rightAligned: false)
-        }
-
-        // Region corner labels near projected corners — anchored at the four
-        // UNIT-SQUARE (s,t) corners (p0=(0,0), p1=(1,0), p2=(0,1), p3=(1,1)).
-        let unitCorners: [(Float, Float)] = [(0,0),(1,0),(0,1),(1,1)]
-        for (i, (si, ti)) in unitCorners.enumerated() {
-            let label = i < surface.regionLabels.count ? surface.regionLabels[i] : ""
-            guard !label.isEmpty else { continue }
-            let p = toScreen(project(SIMD3<Float>(si - 0.5, ti - 0.5, 0)))
-            drawLabel(label, at: NSPoint(x: p.x, y: p.y), font: axisFont, color: .darkGray, rightAligned: false)
-        }
-
-        // Caption at bottom.
-        drawLabel("k-plane: (s,t) ∈ [0,1]² over the surface region",
-                  at: NSPoint(x: plot.midX, y: bounds.height - 8),
-                  font: axisFont, color: .gray, rightAligned: false)
     }
 
     private func drawEmpty(_ dirtyRect: NSRect, _ message: String) {

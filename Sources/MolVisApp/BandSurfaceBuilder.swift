@@ -17,6 +17,21 @@ struct BandSurfaceSheet: Codable, Equatable {
     var values: [Float]
 }
 
+/// One candidate band offered by the band-surface band picker: identity,
+/// label, energy range, and occupancy relative to the Fermi level (nil when
+/// E_f is unknown). `selectionKey` is the stable key used by
+/// `BandSurfaceOptions.selectedBands` (spin*10_000+band).
+struct BandSurfaceBandInfo: Equatable, Identifiable {
+    var spin: Int
+    var band: Int
+    var label: String
+    var minEnergy: Float
+    var maxEnergy: Float
+    var isOccupied: Bool?
+    var selectionKey: Int { spin * 10_000 + band }
+    var id: Int { selectionKey }
+}
+
 /// A band-surface region with all its sampled sheets.
 struct BandSurface: Codable, Equatable {
     /// Exactly 4 parallelogram corners (fractional): p0, p1, p2, p0+(p1-p0)+(p2-p0).
@@ -35,21 +50,82 @@ struct BandSurface: Codable, Equatable {
     var energyMin: Float
     /// Max energy across ALL sheet values.
     var energyMax: Float
+    /// Reciprocal-lattice basis rows in Angstrom^-1 (3 vectors) when the source
+    /// carried a real-space cell; the 3D view uses it to draw the k_x/k_y axes
+    /// in physical units. nil -> the view falls back to fractional units.
+    var kBasis: [SIMD3<Float>]? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case region, regionLabels, gridSize, sheets, fermiEnergy, spinCount,
+             energyMin, energyMax, kBasis
+    }
+
+    init(region: [SIMD3<Float>], regionLabels: [String], gridSize: Int,
+         sheets: [BandSurfaceSheet], fermiEnergy: Float?, spinCount: Int,
+         energyMin: Float, energyMax: Float, kBasis: [SIMD3<Float>?]? = nil) {
+        self.region = region
+        self.regionLabels = regionLabels
+        self.gridSize = gridSize
+        self.sheets = sheets
+        self.fermiEnergy = fermiEnergy
+        self.spinCount = spinCount
+        self.energyMin = energyMin
+        self.energyMax = energyMax
+        self.kBasis = kBasis?.compactMap { $0 }
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        region = try c.decode([SIMD3<Float>].self, forKey: .region)
+        regionLabels = try c.decode([String].self, forKey: .regionLabels)
+        gridSize = try c.decode(Int.self, forKey: .gridSize)
+        sheets = try c.decode([BandSurfaceSheet].self, forKey: .sheets)
+        fermiEnergy = try c.decodeIfPresent(Float.self, forKey: .fermiEnergy)
+        spinCount = try c.decode(Int.self, forKey: .spinCount)
+        energyMin = try c.decode(Float.self, forKey: .energyMin)
+        energyMax = try c.decode(Float.self, forKey: .energyMax)
+        kBasis = try c.decodeIfPresent([SIMD3<Float>].self, forKey: .kBasis)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(region, forKey: .region)
+        try c.encode(regionLabels, forKey: .regionLabels)
+        try c.encode(gridSize, forKey: .gridSize)
+        try c.encode(sheets, forKey: .sheets)
+        try c.encodeIfPresent(fermiEnergy, forKey: .fermiEnergy)
+        try c.encode(spinCount, forKey: .spinCount)
+        try c.encode(energyMin, forKey: .energyMin)
+        try c.encode(energyMax, forKey: .energyMax)
+        try c.encodeIfPresent(kBasis, forKey: .kBasis)
+    }
 }
 
 /// Construction options. Defaults match the typical UI surface panel.
 struct BandSurfaceOptions {
-    /// Half-width around E_f (used only when E_f exists).
+    /// Half-width around E_f (kept for compatibility). Band selection no longer
+    /// uses it; `bandCount` / `selectedBands` drives selection instead.
     var energyWindowEV: Float
     /// Max total sheets when no Fermi level drives selection.
     var maxBands: Int
     /// Samples per side of the patch.
     var gridSize: Int
+    /// Number of bands closest to E_f selected when `selectedBands` is nil.
+    /// Clamped to 1...maxBands inside build(). Default 2 = the spec default
+    /// ("plot only the 2 bands closest to the Fermi level").
+    var bandCount: Int
+    /// Explicit (spin,band) selection keys (spin*10_000+band), or nil for the
+    /// `bandCount`-closest rule. An EMPTY set is a valid request: build() then
+    /// returns a BandSurface with NO sheets (the view draws axes only).
+    var selectedBands: Set<Int>?
 
-    init(energyWindowEV: Float = 3.0, maxBands: Int = 16, gridSize: Int = 56) {
+    init(energyWindowEV: Float = 3.0, maxBands: Int = 16, gridSize: Int = 56,
+         bandCount: Int = 2, selectedBands: Set<Int>? = nil) {
         self.energyWindowEV = energyWindowEV
         self.maxBands = maxBands
         self.gridSize = gridSize
+        self.bandCount = bandCount
+        self.selectedBands = selectedBands
     }
 }
 
@@ -125,7 +201,7 @@ enum BandSurfaceBuilder {
         return [labels[0], labels[1], labels[2], ""]
     }
 
-    /// Build the band surface. `region` = exactly 3 non-collinear fractional
+/// Build the band surface. `region` = exactly 3 non-collinear fractional
     /// points (p0,p1,p2); the 4th parallelogram corner is computed inside.
     /// `regionLabels` must have at least 3 entries (the 4th is set to "").
     ///
@@ -133,6 +209,11 @@ enum BandSurfaceBuilder {
     /// (exactly two non-degenerate sampling axes, e.g. a slab). Bulk 3D meshes
     /// throw `.requiresTwoDimensionalMesh` — a band surface of a 3D BZ would
     /// need an arbitrary slice plane, which is out of scope.
+    ///
+    /// Default selection = the `bandCount` (default 2) bands closest to E_f. An
+    /// explicit `selectedBands` set (including empty) overrides: the keys are
+    /// `spin*10_000+band`. An empty set builds a surface with no sheets (axes
+    /// only). Selection keys outside range are silently ignored.
     static func build(
         bands: BandStructure,
         region: [SIMD3<Float>],
@@ -140,11 +221,6 @@ enum BandSurfaceBuilder {
         options: BandSurfaceOptions
     ) throws -> BandSurface {
         // Option validation.
-        if bands.fermiEnergy != nil {
-            guard options.energyWindowEV.isFinite, options.energyWindowEV > 0 else {
-                throw BandSurfaceError.invalidOptions
-            }
-        }
         guard options.gridSize >= 2, options.gridSize <= 256 else {
             throw BandSurfaceError.invalidOptions
         }
@@ -185,46 +261,56 @@ enum BandSurfaceBuilder {
         let d1 = p2 - p0
         let gridSize = options.gridSize
 
-        // Band selection: Fermi-window filter when E_f exists, else all bands
-        // capped at maxBands total (spin-major, band-minor).
-        struct Sel { let spin: Int; let band: Int }
-        var selected: [Sel] = []
-        if let Ef = bands.fermiEnergy {
-            let lo = Ef - options.energyWindowEV
-            let hi = Ef + options.energyWindowEV
-            for s in 0..<nSpin {
-                let base = s * perSpin
-                let channel = Array(bands.kPoints[base..<base + perSpin])
+        // Per-(spin,band) min/max in one pass over channels.
+        var bandMins = [Float](repeating: .infinity, count: nSpin * nBands)
+        var bandMaxs = [Float](repeating: -.infinity, count: nSpin * nBands)
+        for s in 0..<nSpin {
+            let base = s * perSpin
+            for kp in bands.kPoints[base..<base + perSpin] {
                 for b in 0..<nBands {
-                    var bandMin = Float.infinity, bandMax = -Float.infinity
-                    for kp in channel {
-                        let e = kp.energies[b]
-                        if e < bandMin { bandMin = e }
-                        if e > bandMax { bandMax = e }
-                    }
-                    // Include iff [bandMin, bandMax] intersects [lo, hi].
-                    if bandMin <= hi && bandMax >= lo {
-                        selected.append(Sel(spin: s, band: b))
-                        if selected.count >= options.maxBands { break }
-                    }
+                    let e = kp.energies[b]
+                    let idx = s * nBands + b
+                    if e < bandMins[idx] { bandMins[idx] = e }
+                    if e > bandMaxs[idx] { bandMaxs[idx] = e }
                 }
-                if selected.count >= options.maxBands { break }
-            }
-        } else {
-            for s in 0..<nSpin {
-                for b in 0..<nBands {
-                    selected.append(Sel(spin: s, band: b))
-                    if selected.count >= options.maxBands { break }
-                }
-                if selected.count >= options.maxBands { break }
             }
         }
-        guard !selected.isEmpty else { throw BandSurfaceError.noBandsNearFermi }
+
+        // Band selection.
+        struct Sel { let spin: Int; let band: Int }
+        var selected: [Sel]
+        if let keys = options.selectedBands {
+            // Explicit selection (possibly empty). Keep keys present in the set,
+            // spin-major then band-minor, capped at maxBands.
+            var out: [Sel] = []
+            for s in 0..<nSpin {
+                for b in 0..<nBands {
+                    if keys.contains(s * 10_000 + b) {
+                        out.append(Sel(spin: s, band: b))
+                        if out.count >= options.maxBands { break }
+                    }
+                }
+                if out.count >= options.maxBands { break }
+            }
+            selected = out
+        } else {
+            // bandCount-closest rule; clamped 1...maxBands.
+            let count = min(options.maxBands, max(1, options.bandCount))
+            let keys = closestBands(bands, count: count)
+            guard !keys.isEmpty else { throw BandSurfaceError.noBandsNearFermi }
+            // closestBands keys already sort by distance; re-sort by (spin, band).
+            selected = keys.compactMap { key in
+                let s = key / 10_000
+                let b = key % 10_000
+                guard s >= 0, s < nSpin, b >= 0, b < nBands else { return nil }
+                return Sel(spin: s, band: b)
+            }.sorted { $0.spin != $1.spin ? $0.spin < $1.spin : $0.band < $1.band }
+        }
 
         // Sample each selected sheet over (s,t) in [0,1]^2.
         var sheets: [BandSurfaceSheet] = []
-        var globalMin = Float.infinity
-        var globalMax = -Float.infinity
+        var sampleMin = Float.infinity
+        var sampleMax = -Float.infinity
         for sel in selected {
             let base = sel.spin * perSpin
             let channel = Array(bands.kPoints[base..<base + perSpin])
@@ -240,8 +326,8 @@ enum BandSurfaceBuilder {
                         throw BandSurfaceError.malformedBandStructure
                     }
                     gridVals.append(v)
-                    if v < globalMin { globalMin = v }
-                    if v > globalMax { globalMax = v }
+                    if v < sampleMin { sampleMin = v }
+                    if v > sampleMax { sampleMax = v }
                 }
             }
             let spinLabel: String
@@ -251,6 +337,28 @@ enum BandSurfaceBuilder {
                                            values: gridVals))
         }
 
+        // energyMin/energyMax: sampled range when sheets non-empty, else the
+        // global min/max over all bands so the view's energy axis is well-defined.
+        let energyMin: Float
+        let energyMax: Float
+        if sheets.isEmpty {
+            energyMin = bandMins.min() ?? 0
+            energyMax = bandMaxs.max() ?? 0
+        } else {
+            energyMin = sampleMin
+            energyMax = sampleMax
+        }
+
+        // kBasis from the source cell when all 9 components are finite.
+        let kBasis: [SIMD3<Float>]? = bands.cell.map { cell -> [SIMD3<Float>] in
+            let rv = cell.reciprocalVectors
+            let vecs = [rv.a, rv.b, rv.c]
+            guard vecs.allSatisfy({ v in v.x.isFinite && v.y.isFinite && v.z.isFinite }) else {
+                return []
+            }
+            return vecs
+        } ?? nil
+
         let p3 = p0 + d0 + d1
         return BandSurface(
             region: [p0, p1, p2, p3],
@@ -259,9 +367,136 @@ enum BandSurfaceBuilder {
             sheets: sheets,
             fermiEnergy: bands.fermiEnergy,
             spinCount: nSpin,
-            energyMin: globalMin,
-            energyMax: globalMax
+            energyMin: energyMin,
+            energyMax: energyMax,
+            kBasis: kBasis
         )
+    }
+
+    /// Candidate bands for the UI band picker: every (spin, band) whose
+    /// [minEnergy, maxEnergy] intersects [Ef-windowEV, Ef+windowEV] when E_f
+    /// exists (windowEV > 0, default 4.0), ordered spin-major then band-minor,
+    /// capped at maxCandidates (default 32). Without E_f, the first
+    /// maxCandidates bands. Uses the SAME per-channel min/max pass as build().
+    static func bandInfos(_ bands: BandStructure, windowEV: Float = 4.0,
+                          maxCandidates: Int = 32) -> [BandSurfaceBandInfo] {
+        guard bands.hasValidChannelLayout, bands.nBands > 0 else { return [] }
+        let perSpin = bands.kPointsPerSpin
+        let nBands = bands.nBands
+        let nSpin = bands.nSpin
+        guard perSpin > 0, nSpin > 0 else { return [] }
+
+        // Per-(spin,band) min/max.
+        var bandMins = [Float](repeating: .infinity, count: nSpin * nBands)
+        var bandMaxs = [Float](repeating: -.infinity, count: nSpin * nBands)
+        for s in 0..<nSpin {
+            let base = s * perSpin
+            guard base + perSpin <= bands.kPoints.count else { return [] }
+            for kp in bands.kPoints[base..<base + perSpin] {
+                for b in 0..<nBands {
+                    let e = kp.energies[b]
+                    guard e.isFinite else { continue }
+                    let idx = s * nBands + b
+                    if e < bandMins[idx] { bandMins[idx] = e }
+                    if e > bandMaxs[idx] { bandMaxs[idx] = e }
+                }
+            }
+        }
+
+        let ef = bands.fermiEnergy
+        var out: [BandSurfaceBandInfo] = []
+        for s in 0..<nSpin {
+            for b in 0..<nBands {
+                let idx = s * nBands + b
+                let mn = bandMins[idx]
+                let mx = bandMaxs[idx]
+                // Skip bands with non-finite min/max (all non-finite energies).
+                guard mn.isFinite, mx.isFinite else { continue }
+
+                var include: Bool
+                if let ef = ef, windowEV > 0 {
+                    let lo = ef - windowEV
+                    let hi = ef + windowEV
+                    include = mn <= hi && mx >= lo
+                } else {
+                    include = true
+                }
+                guard include else { continue }
+
+                let spinLabel: String
+                if nSpin > 1 { spinLabel = s == 0 ? " (spin up)" : " (spin down)" } else { spinLabel = "" }
+                let info = BandSurfaceBandInfo(
+                    spin: s, band: b,
+                    label: "band \(b + 1)\(spinLabel)",
+                    minEnergy: mn, maxEnergy: mx,
+                    isOccupied: ef.map { mx <= $0 }
+                )
+                out.append(info)
+                if out.count >= maxCandidates { return out }
+            }
+        }
+        return out
+    }
+
+    /// Selection keys (spin*10_000+band) of the `count` bands closest to E_f:
+    /// distance = 0 when the band crosses E_f, Ef - maxE when fully occupied,
+    /// minE - Ef when fully unoccupied; sorted by (distance, spin, band).
+    /// Without E_f the `count` lowest-energy bands. count clamped 1...64;
+    /// returns [] when the mesh has no bands.
+    static func closestBands(_ bands: BandStructure, count: Int) -> [Int] {
+        guard bands.hasValidChannelLayout, bands.nBands > 0 else { return [] }
+        let perSpin = bands.kPointsPerSpin
+        let nBands = bands.nBands
+        let nSpin = bands.nSpin
+        guard perSpin > 0, nSpin > 0 else { return [] }
+
+        // Per-(spin,band) min/max.
+        var bandMins = [Float](repeating: .infinity, count: nSpin * nBands)
+        var bandMaxs = [Float](repeating: -.infinity, count: nSpin * nBands)
+        for s in 0..<nSpin {
+            let base = s * perSpin
+            guard base + perSpin <= bands.kPoints.count else { return [] }
+            for kp in bands.kPoints[base..<base + perSpin] {
+                for b in 0..<nBands {
+                    let e = kp.energies[b]
+                    guard e.isFinite else { continue }
+                    let idx = s * nBands + b
+                    if e < bandMins[idx] { bandMins[idx] = e }
+                    if e > bandMaxs[idx] { bandMaxs[idx] = e }
+                }
+            }
+        }
+
+        let clampedCount = min(64, max(1, count))
+        let ef = bands.fermiEnergy
+        struct Cand { let key: Int; let dist: Float; let spin: Int; let band: Int }
+        var cands: [Cand] = []
+        for s in 0..<nSpin {
+            for b in 0..<nBands {
+                let idx = s * nBands + b
+                let mn = bandMins[idx]
+                let mx = bandMaxs[idx]
+                // Non-finite energies -> distance +inf (sorted last).
+                let dist: Float
+                if !mn.isFinite || !mx.isFinite {
+                    dist = .infinity
+                } else if let ef = ef {
+                    if mx <= ef {
+                        dist = ef - mx       // fully occupied
+                    } else if mn >= ef {
+                        dist = mn - ef       // fully unoccupied
+                    } else {
+                        dist = 0             // crosses E_f
+                    }
+                } else {
+                    dist = mn               // lowest-energy bands
+                }
+                cands.append(Cand(key: s * 10_000 + b, dist: dist, spin: s, band: b))
+            }
+        }
+        cands.sort { $0.dist != $1.dist ? $0.dist < $1.dist
+                  : ($0.spin != $1.spin ? $0.spin < $1.spin : $0.band < $1.band) }
+        return cands.prefix(clampedCount).map { $0.key }
     }
 }
 

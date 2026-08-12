@@ -873,6 +873,32 @@ struct SideBar: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
+                    if !state.bandSurfaceCandidates.isEmpty {
+                        Divider()
+                        Text("Band surface bands")
+                            .font(.subheadline)
+                        Stepper(value: Binding(
+                            get: { min(max(1, state.bandSurfaceBandSelection.count), 8) },
+                            set: { newCount in state.onBandSurfaceClosestCount?(newCount) }
+                        ), in: 1...max(1, min(8, state.bandSurfaceCandidates.count))) {
+                            Text("Bands closest to E\u{2091}: \(state.bandSurfaceBandSelection.count)")
+                        }
+                        ForEach(state.bandSurfaceCandidates) { candidate in
+                            Toggle(isOn: Binding(
+                                get: { state.bandSurfaceEffectiveSelection.contains(candidate.selectionKey) },
+                                set: { checked in
+                                    var selection = state.bandSurfaceBandSelection
+                                    if selection.isEmpty { selection = state.bandSurfaceEffectiveSelection }
+                                    if checked { selection.insert(candidate.selectionKey) }
+                                    else { selection.remove(candidate.selectionKey) }
+                                    state.bandSurfaceBandSelection = selection
+                                }
+                            )) {
+                                Text(candidate.label)
+                                    .font(.caption)
+                            }
+                        }
+                    }
                     if let report = state.electronicAnalysisReport {
                         Divider()
                         Text(report.summaryText)

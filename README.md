@@ -25,7 +25,7 @@ Local install: `swift build -c release && cp .build/release/mcrysden /usr/local/
 ## Highlights
 
 - 18 parser families with force-format CLI flags (`--xsf --xyz --pwi --pwo --cif --cube --bxsf --struct --crystal --orca --fhi --bands --dos-table --crystal-band --crystal-dos`, …) and a 200 MB input cap
-- Electronic-structure plots: `--bands` (paths shown directly; k-meshes interpolated along the default or `--kpath` high-symmetry route), `--dos` (mesh-derived total DOS, now opt-in), and `--band-surf` (3D band-surface sheets near the Fermi level with a Fermi plane, drag-to-rotate, print/export; limited to 2D k-grids)
+- Electronic-structure plots: `--bands` (paths shown directly; k-meshes interpolated along the default or `--kpath` high-symmetry route), `--dos` (mesh-derived total DOS, now opt-in), and `--band-surf` (true 3D surface plot in k_x/k_y/E axes near the Fermi level with a Fermi plane and drag-to-rotate; limited to 2D k-grids; default 2 bands closest to E_f with a sidebar band picker)
 - Metal rendering: ball-stick/space-fill/wireframe/polyhedral/2D modes, Blinn-Phong lighting, MSAA, depth cueing, AO and soft shadows, image/gradient/solid backgrounds, stereo and anaglyph
 - Supercell expansion, slab generation, cluster cutting, defect workflows, lattice editing
 - Crystal symmetry (space group, Wyckoff), canonical HPKOT k-paths, BZ overlay, structure summary, powder XRD

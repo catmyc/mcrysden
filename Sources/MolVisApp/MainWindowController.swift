@@ -478,6 +478,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             guard let self else { return }
             self.exportElectronicAnalysisCSV(report.csv)
         }
+        state.onBandSurfaceClosestCount = { [weak self] count in
+            guard let self, let mesh = self.scene.bandStructure, mesh.isMesh else { return }
+            let keys = BandSurfaceBuilder.closestBands(mesh, count: count)
+            self.state.bandSurfaceBandSelection = Set(keys)
+        }
         state.onShowXRDWindow = { [weak self] in self?.showPowderXRD() }
         state.onExportXRDCSV = { [weak self] in self?.exportPowderXRDCSV() }
         state.onSeekToThumbnail = { [weak self] index in
@@ -539,6 +544,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         state.electronicStructureEnabled = initHasBands || scene.densityOfStates != nil || scene.bandSurface != nil
         updateContentVisibility()
         updateElectronicStructureGraphs()
+        refreshBandSurfaceBandUI()
         updatePowderXRD()
         atomTable.onSelectionChange = { [weak self] indices in
             guard let self else { return }
@@ -697,6 +703,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // persisting view-only availability into the scene.)
         state.electronicStructureEnabled = hasBands || scene.densityOfStates != nil || scene.bandSurface != nil
         updateElectronicStructureGraphs()
+        refreshBandSurfaceBandUI()
         updatePowderXRD()
         // A 2D scalar grid: the color-plane is now drawn as a textured quad in the
         // Metal scene by the renderer (gated on scene.showColorPlane). No separate
@@ -3783,7 +3790,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         // Electronic-structure graph interaction (energy window, Fermi shift) is
         // view-only state -> push it to the grapher views and recompute readouts.
-        if state.electronicStructureEnabled { updateElectronicStructureGraphs() }
+        if state.electronicStructureEnabled {
+            updateElectronicStructureGraphs()
+            rebuildBandSurface()
+        }
         // Powder XRD is cheap (a few ms) and gated on isCrystal internally, so it
         // recomputes on every sidebar/scene change without a debounce.
         updatePowderXRD()
@@ -4837,6 +4847,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         linkedGraphs.dosView.densityOfStates = next.densityOfStates
         bandSurfaceView.bandSurface = next.bandSurface
         state.electronicStructureEnabled = next.bandStructure != nil || next.densityOfStates != nil || next.bandSurface != nil
+        if let mesh = next.bandStructure, mesh.isMesh, next.bandSurface != nil {
+            state.bandSurfaceCandidates = BandSurfaceBuilder.bandInfos(mesh)
+        }
+        lastBandSurfaceBuildKey = nil
+        rebuildBandSurface()
         bzEpoch += 1   // freshly parsed frame: cell/baseAtoms may differ, rebuild the editor BZ
         if wasReciprocalEditing {
             camera = scene.defaultCamera()
@@ -5386,6 +5401,69 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         } else {
             state.electronicAnalysisReport = nil
         }
+    }
+
+    /// Recompute the band-picker candidates for the displayed mesh and install
+    /// the effective selection from the current surface sheets. Called at
+    /// install and after frame reloads.
+    private func refreshBandSurfaceBandUI() {
+        guard let surface = scene.bandSurface, let mesh = scene.bandStructure, mesh.isMesh else {
+            state.bandSurfaceCandidates = []
+            state.setBandSurfaceEffectiveSelection([])
+            return
+        }
+        state.bandSurfaceCandidates = BandSurfaceBuilder.bandInfos(mesh)
+        let displayed = Set(surface.sheets.map { $0.spin * 10_000 + $0.band })
+        state.bandSurfaceBandSelection = displayed
+        state.setBandSurfaceEffectiveSelection(displayed)
+    }
+
+    /// Rebuild the band surface from the mesh + the sidebar's explicit band
+    /// selection (an empty selection builds a sheets-less surface). Skips the
+    /// work when the selection and mesh content are unchanged. Called from
+    /// syncFromState and after frame reloads.
+    private var lastBandSurfaceBuildKey: (selection: Set<Int>, content: UInt64)? = nil
+    private func rebuildBandSurface() {
+        guard scene.bandSurface != nil, let mesh = scene.bandStructure, mesh.isMesh,
+              let surface = scene.bandSurface, surface.region.count == 4 else { return }
+        let selection = state.bandSurfaceBandSelection
+        let content = meshContentHash(mesh)
+        let key = (selection, content)
+        if let last = lastBandSurfaceBuildKey, last == key { return }
+        lastBandSurfaceBuildKey = key
+        do {
+            var opts = BandSurfaceOptions()
+            opts.selectedBands = selection
+            let rebuilt = try BandSurfaceBuilder.build(
+                bands: mesh, region: Array(surface.region.prefix(3)),
+                regionLabels: Array(surface.regionLabels.prefix(3)), options: opts)
+            scene.bandSurface = rebuilt
+            bandSurfaceView.bandSurface = rebuilt
+            state.setBandSurfaceEffectiveSelection(Set(rebuilt.sheets.map { $0.spin * 10_000 + $0.band }))
+            updateContentVisibility()
+        } catch {
+            print("[mcrysden] warning: band-surface rebuild failed: \(error)")
+        }
+    }
+
+    /// FNV-1a hash over the mesh identity + a few eigenvalues so frame changes
+    /// with equal k-point counts still invalidate the rebuild cache.
+    private func meshContentHash(_ mesh: BandStructure) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        func mix(_ value: UInt64) {
+            hash = (hash ^ value) &* 0x100000001b3
+        }
+        func mixFloat(_ v: Float) { mix(UInt64(v.bitPattern)) }
+        mix(UInt64(mesh.kPoints.count))
+        mix(UInt64(mesh.nSpin)); mix(UInt64(mesh.nBands)); mix(UInt64(mesh.kPointsPerSpin))
+        mixFloat(mesh.fermiEnergy ?? .nan)
+        if let first = mesh.kPoints.first, let last = mesh.kPoints.last {
+            mixFloat(first.k.x); mixFloat(first.k.y); mixFloat(first.k.z)
+            mixFloat(last.k.x); mixFloat(last.k.y); mixFloat(last.k.z)
+            for e in first.energies.prefix(4) { mixFloat(e) }
+            for e in last.energies.prefix(4) { mixFloat(e) }
+        }
+        return hash
     }
 
     // MARK: - Electronic-analysis export

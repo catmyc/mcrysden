@@ -146,6 +146,24 @@ final class SideBarState: ObservableObject {
     /// Computed band-gap summary text (e.g. "Eg = 1.23 eV (direct)").
     /// Set by the controller; not a scene field.
     @Published var bandGapSummary: String = ""
+    /// Explicit band selection for the band-surface plot. Keys are
+    /// spin*10_000+band (BandSurfaceBandInfo.selectionKey). The controller
+    /// installs the effective selection (default: the 2 bands closest to E_f)
+    /// at load, so the picker mirrors the displayed sheets. User edits flow
+    /// through onChange -> the controller rebuilds the surface.
+    @Published var bandSurfaceBandSelection: Set<Int> = [] { didSet { onChange?() } }
+    /// Candidate bands offered by the band-surface band picker (near E_f).
+    /// Controller-set display state; not user-editable, not persisted.
+    @Published var bandSurfaceCandidates: [BandSurfaceBandInfo] = []
+    /// Selection currently displayed (keys of the built sheets). Controller-set.
+    @Published private(set) var bandSurfaceEffectiveSelection: Set<Int> = []
+    /// Install the effective selection (keys of the built sheets). Controller-set;
+    /// not user-editable, not persisted.
+    func setBandSurfaceEffectiveSelection(_ selection: Set<Int>) {
+        bandSurfaceEffectiveSelection = selection
+    }
+    /// Ask the controller to re-select the N bands closest to E_f.
+    var onBandSurfaceClosestCount: ((Int) -> Void)?
     /// Runtime-only distribution analysis derived from the coordination result.
     /// Nil when coordination is disabled or analysis is unavailable. Not a
     /// scene field and not persisted.

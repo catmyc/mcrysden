@@ -93,6 +93,22 @@ final class BandSurfaceViewTests: XCTestCase {
         return count
     }
 
+    /// Count non-white pixels within an x-range.
+    private func nonWhitePixels(in rep: NSBitmapImageRep, xRange: Range<Int>) -> Int {
+        let h = rep.pixelsHigh
+        let rowBytes = rep.bytesPerRow
+        var count = 0
+        guard let base = rep.bitmapData else { return 0 }
+        for y in 0..<h {
+            let row = base.advanced(by: y * rowBytes)
+            for x in xRange {
+                let p = row.advanced(by: x * 4)
+                if p[0] != 255 || p[1] != 255 || p[2] != 255 { count += 1 }
+            }
+        }
+        return count
+    }
+
     /// Raw pixel data for byte comparison.
     private func pixelData(_ rep: NSBitmapImageRep) -> Data {
         let h = rep.pixelsHigh
@@ -116,6 +132,13 @@ final class BandSurfaceViewTests: XCTestCase {
         XCTAssertGreaterThan(distinctColors(rep), 20, "expected > 20 distinct colors, got \(distinctColors(rep))")
         XCTAssertGreaterThan(nonWhitePixels(rep), 100, "expected > 100 non-white pixels")
 
+        // Content spans the whole plot (3D axes + surface), not a 2D axis at the left margin.
+        let halfW = rep.pixelsWide / 2
+        XCTAssertGreaterThan(nonWhitePixels(in: rep, xRange: 0..<halfW), 10,
+                              "left half should have drawn content")
+        XCTAssertGreaterThan(nonWhitePixels(in: rep, xRange: halfW..<rep.pixelsWide), 10,
+                              "right half should have drawn content")
+
         // Mouse-drag rotation: horizontal drag orbits (azimuth), vertical drag
         // tilts (elevation); dragging up raises the viewpoint and elevation is
         // clamped to ±89°.
@@ -126,6 +149,22 @@ final class BandSurfaceViewTests: XCTestCase {
         XCTAssertEqual(view.elevationDegrees, -89, accuracy: 1e-4)
         view.rotate(byDeltaX: 0, deltaY: -10_000)
         XCTAssertEqual(view.elevationDegrees, 89, accuracy: 1e-4)
+
+        // Physical-unit path: a finite kBasis renders without error.
+        var surfaceWithBasis = makeSurface()
+        surfaceWithBasis.kBasis = [SIMD3<Float>(0.5, 0, 0), SIMD3<Float>(0, 0.5, 0), SIMD3<Float>(0, 0, 0.5)]
+        let viewB = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        viewB.bandSurface = surfaceWithBasis
+        guard let repB = renderToBitmap(viewB) else { return XCTFail("kBasis render failed") }
+        XCTAssertGreaterThan(nonWhitePixels(repB), 100, "kBasis surface should render")
+
+        // Empty-sheets surface: axes-only, no placeholder, no crash.
+        var emptySheets = makeSurface()
+        emptySheets.sheets = []
+        let viewE = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        viewE.bandSurface = emptySheets
+        guard let repE = renderToBitmap(viewE) else { return XCTFail("empty-sheets render failed") }
+        XCTAssertGreaterThan(nonWhitePixels(repE), 50, "empty-sheets surface should render axes")
     }
 
     func testExportRotationIdentity() {

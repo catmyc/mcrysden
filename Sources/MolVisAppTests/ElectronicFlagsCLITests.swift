@@ -91,7 +91,7 @@ final class ElectronicFlagsCLITests: XCTestCase {
         // With k-path route for interpolation / surface derivation.
         let route = [KPoint(SIMD3(0, 0, 0), "G"), KPoint(SIMD3(0.5, 0, 0), "X"),
                      KPoint(SIMD3(0.5, 0.5, 0), "M")]
-        let (scene, _) = makeSyntheticMesh(kPathPoints: route)
+        let (scene, mesh) = makeSyntheticMesh(kPathPoints: route)
 
         // dosPlot -> densityOfStates non-nil with source == .bandMesh
         var dosScene = scene
@@ -124,6 +124,51 @@ final class ElectronicFlagsCLITests: XCTestCase {
         XCTAssertNotNil(surfScene.bandSurface)
         XCTAssertEqual(surfScene.bandSurface?.region.count, 4)
         XCTAssertTrue(surfScene.showBandSurface)
+
+        // NEW DEFAULT: 2 bands closest to E_f (Ef=5.0; band 3 at d=1, band 2 at d=2).
+        // Sheets are spin-major/band-minor ordered, so [2, 3].
+        XCTAssertEqual(surfScene.bandSurface?.sheets.count, 2)
+        XCTAssertEqual(surfScene.bandSurface?.sheets.map(\.band), [2, 3])
+
+        // Explicit selection via BandSurfaceBuilder directly: pick band 1.
+        var opts = BandSurfaceOptions()
+        opts.selectedBands = [0 * 10_000 + 1]
+        let singleBand = try BandSurfaceBuilder.build(
+            bands: mesh,
+            region: [SIMD3(0, 0, 0), SIMD3(0.5, 0, 0), SIMD3(0.5, 0.5, 0)],
+            regionLabels: ["G", "X", "M"],
+            options: opts)
+        XCTAssertEqual(singleBand.sheets.map(\.band), [1])
+        // Empty selection -> no sheets, region still has 4 corners.
+        var emptyOpts = BandSurfaceOptions()
+        emptyOpts.selectedBands = []
+        let emptySheets = try BandSurfaceBuilder.build(
+            bands: mesh,
+            region: [SIMD3(0, 0, 0), SIMD3(0.5, 0, 0), SIMD3(0.5, 0.5, 0)],
+            regionLabels: ["G", "X", "M"],
+            options: emptyOpts)
+        XCTAssertTrue(emptySheets.sheets.isEmpty)
+        XCTAssertEqual(emptySheets.region.count, 4)
+
+        // closestBands: distance order (band 3 closest, then band 2).
+        XCTAssertEqual(BandSurfaceBuilder.closestBands(mesh, count: 2),
+                       [0 * 10_000 + 3, 0 * 10_000 + 2])
+
+        // bandInfos: window [1,9] intersects all 4 bands; keys + labels correct.
+        let infos = BandSurfaceBuilder.bandInfos(mesh, windowEV: 4.0)
+        XCTAssertEqual(infos.count, 4)
+        XCTAssertTrue(infos.allSatisfy {
+            $0.selectionKey == $0.spin * 10_000 + $0.band && $0.label.contains("band")
+        })
+
+        // Controller round trip: install a default-built surface, then pick band 0.
+        var controllerScene = Scene()
+        controllerScene.bandStructure = mesh
+        controllerScene.bandSurface = surfScene.bandSurface
+        let wc = MainWindowController(scene: controllerScene, showWindow: false)
+        wc.state.bandSurfaceBandSelection = [0 * 10_000 + 0]
+        XCTAssertEqual(wc.scene.bandSurface?.sheets.map(\.band), [0])
+        XCTAssertEqual(wc.state.bandSurfaceEffectiveSelection, [0 * 10_000 + 0])
 
         // Error: flags with no bandStructure throw
         var emptyScene = Scene()
