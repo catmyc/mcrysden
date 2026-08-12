@@ -115,6 +115,17 @@ final class BandSurfaceViewTests: XCTestCase {
         // Surface + shading produce non-uniform coloring.
         XCTAssertGreaterThan(distinctColors(rep), 20, "expected > 20 distinct colors, got \(distinctColors(rep))")
         XCTAssertGreaterThan(nonWhitePixels(rep), 100, "expected > 100 non-white pixels")
+
+        // Mouse-drag rotation: horizontal drag orbits (azimuth), vertical drag
+        // tilts (elevation); dragging up raises the viewpoint and elevation is
+        // clamped to ±89°.
+        view.rotate(byDeltaX: 20, deltaY: -40)
+        XCTAssertEqual(view.azimuthDegrees, 30 - 20 * 0.5, accuracy: 1e-4)
+        XCTAssertEqual(view.elevationDegrees, 24 + 40 * 0.5, accuracy: 1e-4)
+        view.rotate(byDeltaX: 0, deltaY: 10_000)
+        XCTAssertEqual(view.elevationDegrees, -89, accuracy: 1e-4)
+        view.rotate(byDeltaX: 0, deltaY: -10_000)
+        XCTAssertEqual(view.elevationDegrees, 89, accuracy: 1e-4)
     }
 
     func testExportRotationIdentity() {

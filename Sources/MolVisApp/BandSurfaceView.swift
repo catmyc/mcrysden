@@ -35,8 +35,18 @@ final class BandSurfaceView: NSView {
     override var isFlipped: Bool { true }
 
     override func mouseDragged(with event: NSEvent) {
-        azimuthDegrees -= Float(event.deltaX) * 0.5
-        elevationDegrees = max(-89, min(89, elevationDegrees + Float(event.deltaY) * 0.5))
+        rotate(byDeltaX: Float(event.deltaX), deltaY: Float(event.deltaY))
+    }
+
+    /// Apply a mouse-drag rotation. Horizontal motion orbits the view
+    /// (azimuth); vertical motion tilts it (elevation, clamped to ±89°).
+    /// Dragging UP raises the viewpoint (standard 3D-plot convention:
+    /// `deltaY` is positive downward in AppKit, so it is subtracted).
+    /// Internal so tests can exercise the rotation without synthesizing
+    /// NSEvent deltas (which the NSEvent factory cannot set).
+    func rotate(byDeltaX dx: Float, deltaY dy: Float) {
+        azimuthDegrees -= dx * 0.5
+        elevationDegrees = max(-89, min(89, elevationDegrees - dy * 0.5))
         needsDisplay = true
     }
 

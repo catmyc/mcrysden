@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-12 (v1.3.0: band-surface plots, k-mesh band interpolation, opt-in mesh DOS; 63 focused tests)**.
+Last updated: **2026-08-12 (v1.2.10: band-surface plots, k-mesh band interpolation, opt-in mesh DOS; 63 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-Current v1.3.0 verification: `--bands`/`--dos`/`--band-surf` CLI selection, mesh→path interpolation, band-surface construction and rendering, opt-in mesh DOS gating, and the existing band/DOS/bond regressions are covered by a passing 63-test suite.
+Current v1.2.10 verification: `--bands`/`--dos`/`--band-surf` CLI selection, mesh→path interpolation, band-surface construction and rendering, opt-in mesh DOS gating, and the existing band/DOS/bond regressions are covered by a passing 63-test suite.
 
 ## Implemented foundation (through v1.1.32)
 
@@ -15,7 +15,7 @@ Current v1.3.0 verification: `--bands`/`--dos`/`--band-surf` CLI selection, mesh
 - [x] Quantum Espresso PWscf output `.pwo/.out` (final cell + positions; multi-step relax/MD → AXSF frames)
 - [x] Gaussian Cube/G98 multi-orbital grids and BXSF band grids/Fermi surfaces, including `.bxsf.gz`
 - [x] WIEN2k `.struct`, CRYSCAL `.r1`, ORCA output, and FHI-aims `geometry.in`/`coord.out`
-- [x] Quantum Espresso band structures, total/projected DOS tables, and total DOS reconstructed from uniform QE meshes on request (`--dos`; v1.3.0 made the reconstruction opt-in), including standard projected-DOS filenames
+- [x] Quantum Espresso band structures, total/projected DOS tables, and total DOS reconstructed from uniform QE meshes on request (`--dos`; v1.2.10 made the reconstruction opt-in), including standard projected-DOS filenames
 - [x] Force-format CLI flags for all 16 parser families: `--xsf --axsf --xyz --pdb --pwi --pwo --cif --poscar --cube --bxsf --struct --crystal --orca --fhi --bands --dos-table`
 
 ### Display & appearance
@@ -135,7 +135,7 @@ The maintained coordinate, lifecycle, persistence, and export contract is docume
 ### Electronic-structure analysis
 - [x] Interactive band/DOS cursor readout, energy windows, Fermi adjustment, and zoom/pan for both graphers; linked plots (v1.1.44) show BOTH graphs side-by-side when a scene carries band + DOS data, with a dashed cross-graph cursor guide line at the hovered energy, a combined report, and linked print/export (one image with both panels, true-vector PDF).
 - [x] Total DOS reconstruction from QE band meshes (v1.2.9): Gaussian broadening uses QE k-point weights and spin channels directly; molecules use states/eV, 1D systems states/(eV·Å), 2D crystals states/(eV·Å²), and 3D crystals states/(eV·Å³), with QE cell measures parsed from `crystal axes`/`CELL_PARAMETERS` and shown in the DOS graph.
-- [x] Electronic-structure plot selection (v1.3.0): `--bands` shows a band path directly and interpolates a uniform k-mesh along the default canonical route (or the `--kpath` route) via periodic trilinear interpolation of the axis-aligned MP mesh; `--dos` reconstructs the mesh-derived total DOS on request; `--band-surf` builds 3D band-surface sheets near E_f over the first non-collinear route plane, rendered as a shaded viridis surface with a Fermi plane, drag-to-rotate, print and PNG/vector export. Derived data survives GUI re-parses (frame changes, revert).
+- [x] Electronic-structure plot selection (v1.2.10): `--bands` shows a band path directly and interpolates a uniform k-mesh along the default canonical route (or the `--kpath` route) via periodic trilinear interpolation of the axis-aligned MP mesh; `--dos` reconstructs the mesh-derived total DOS on request; `--band-surf` builds 3D band-surface sheets near E_f over the first non-collinear route plane, rendered as a shaded viridis surface with a Fermi plane, drag-to-rotate, print and PNG/vector export. Derived data survives GUI re-parses (frame changes, revert).
 - [x] Band VBM/CBM, direct/indirect gap, metallicity, and effective masses plus DOS center, width, gap estimate, spin moment, and electron-count consistency are surfaced with explicit unavailable/insufficient-data states and text/CSV export. Band extrema and estimated DOS gap edges are linked to graph markers. The combined band+DOS report (v1.1.44) adds "Gap agreement" and "Band-edge agreement" cross-check rows.
 - [x] Projected species/orbital coloring (v1.1.44): QE projwfc filenames (`pdos_atm#N(Species)_wfc#M(orbital)`, `pdos_tot` + spin suffixes) enrich DOS series labels with species+orbital character, and the DOS grapher colors projected series by orbital (s/p/d/f fixed palette) with the legend showing the projection labels. Band-side projected coloring stays unavailable because QE `.out` band tables carry no projection weights.
 
