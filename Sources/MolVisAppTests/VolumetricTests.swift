@@ -13,7 +13,9 @@ final class VolumetricTests: XCTestCase {
 
     // MARK: - clipTriangles straddle/keep-side
 
-    func testClipTrianglesAndPlaneCulling() throws {
+    /// Consolidated: clipTriangles straddle/keep-side, clip-plane structure culling,
+    /// composited color-plane render, and color-plane texture cache behavior.
+    func testClipTrianglesPlaneCullingAndColorPlaneCache() throws {
         let v: [Float] = [
             0, 0, -1,   0, 0, 1,   1, 0, 0,
             1, 0, 1,    0, 0, 1,   0, 1, 0,
@@ -81,59 +83,58 @@ final class VolumetricTests: XCTestCase {
         XCTAssertEqual(planeBytes.count, 4 * 4 * 4)
         for i in stride(from: 3, to: planeBytes.count, by: 4) { XCTAssertEqual(planeBytes[i], 255) }
         XCTAssertNotEqual(withPlane, encodeHash(withoutPlane), "color plane must change the rendered frame")
+
+        // --- Color-plane texture cache behavior ---
+        // Fix 1 regression: the color-plane texture must rebuild when grid CONTENT changes
+        // and must HIT the cache (reuse the prior texture) when content is stable.
+        do {
+            guard let device2 = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal not available") }
+            guard let tex2 = device2.makeTexture(descriptor: wtx(64, 64)) else { throw XCTSkip("Metal texture unavailable") }
+            guard let queue2 = device2.makeCommandQueue() else { throw XCTSkip("Metal command queue unavailable") }
+            let renderer2 = try Renderer(device: device2)
+
+            func makeGrid(_ values: [[Float]]) -> Grid2D {
+                Grid2D(cols: 4, rows: 4, origin: .zero,
+                       vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0)],
+                       values: values, minValue: 0, maxValue: 15, ident: "regress")
+            }
+            func makeScene(_ grid: Grid2D) -> Scene {
+                var s = Scene()
+                s.showStructure = false; s.showAxes = false; s.showCellFrame = false
+                s.showBrillouinZone = false; s.background = "#000000"
+                s.grid2D = grid
+                s.showColorPlane = true
+                s.colorPlaneColormap = .viridis
+                return s
+            }
+            func encodeCacheHash(_ scene: Scene) -> UInt64 {
+                renderer2.scene = scene
+                let cb = queue2.makeCommandBuffer()!
+                XCTAssertTrue(renderer2.encode(to: cb, target: tex2,
+                                              viewport: MTLViewport(originX: 0, originY: 0,
+                                                                    width: 64, height: 64, znear: 0, zfar: 1),
+                                              camera: renderer2.currentCamera))
+                cb.commit(); cb.waitUntilCompleted()
+                return pixelHash(tex2)
+            }
+
+            // First build with content A.
+            let gridA = makeGrid([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]])
+            let hashA = encodeCacheHash(makeScene(gridA))
+            // Reassign the SAME content → cache must hit (no rebuild) → identical hash.
+            let hashAgainA = encodeCacheHash(makeScene(gridA))
+            XCTAssertEqual(hashA, hashAgainA, "stable content must hit the color-plane cache")
+            // Change grid content (values shifted, all within [min,max]) → cache must miss and
+            // rebuild → different hash.
+            let gridB = makeGrid([[15, 14, 13, 12], [11, 10, 9, 8], [7, 6, 5, 4], [3, 2, 1, 0]])
+            let hashB = encodeCacheHash(makeScene(gridB))
+            XCTAssertNotEqual(hashA, hashB, "changed content must rebuild the color-plane texture")
+        }
     }
 
     // MARK: - Color-plane texture cache (retained flat, no dangling pointer)
 
     /// Fix 1 regression: the color-plane texture must rebuild when grid CONTENT changes
-    /// and must HIT the cache (reuse the prior texture) when content is stable. The old bug
-    /// keyed the cache on a transient flatMap array's baseAddress — that array died at
-    /// function return, so malloc address reuse either served a stale texture or forced a
-    /// rebuild every frame.
-    func testColorPlaneTextureRebuildsOnContentChange() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal not available") }
-        guard let tex = device.makeTexture(descriptor: wtx(64, 64)) else { throw XCTSkip("Metal texture unavailable") }
-        guard let queue = device.makeCommandQueue() else { throw XCTSkip("Metal command queue unavailable") }
-        let renderer = try Renderer(device: device)
-
-        func makeGrid(_ values: [[Float]]) -> Grid2D {
-            Grid2D(cols: 4, rows: 4, origin: .zero,
-                   vec: [SIMD3(1, 0, 0), SIMD3(0, 1, 0)],
-                   values: values, minValue: 0, maxValue: 15, ident: "regress")
-        }
-        func makeScene(_ grid: Grid2D) -> Scene {
-            var s = Scene()
-            s.showStructure = false; s.showAxes = false; s.showCellFrame = false
-            s.showBrillouinZone = false; s.background = "#000000"
-            s.grid2D = grid
-            s.showColorPlane = true
-            s.colorPlaneColormap = .viridis
-            return s
-        }
-        func encodeHash(_ scene: Scene) -> UInt64 {
-            renderer.scene = scene
-            let cb = queue.makeCommandBuffer()!
-            XCTAssertTrue(renderer.encode(to: cb, target: tex,
-                                          viewport: MTLViewport(originX: 0, originY: 0,
-                                                                width: 64, height: 64, znear: 0, zfar: 1),
-                                          camera: renderer.currentCamera))
-            cb.commit(); cb.waitUntilCompleted()
-            return pixelHash(tex)
-        }
-
-        // First build with content A.
-        let gridA = makeGrid([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]])
-        let hashA = encodeHash(makeScene(gridA))
-        // Reassign the SAME content → cache must hit (no rebuild) → identical hash.
-        let hashAgainA = encodeHash(makeScene(gridA))
-        XCTAssertEqual(hashA, hashAgainA, "stable content must hit the color-plane cache")
-        // Change grid content (values shifted, all within [min,max]) → cache must miss and
-        // rebuild → different hash.
-        let gridB = makeGrid([[15, 14, 13, 12], [11, 10, 9, 8], [7, 6, 5, 4], [3, 2, 1, 0]])
-        let hashB = encodeHash(makeScene(gridB))
-        XCTAssertNotEqual(hashA, hashB, "changed content must rebuild the color-plane texture")
-    }
-
     // MARK: - Helpers
 
     private func wtx(_ width: Int, _ height: Int) -> MTLTextureDescriptor {

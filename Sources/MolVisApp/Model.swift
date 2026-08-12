@@ -487,6 +487,11 @@ struct Scene: Codable {
       /// Toggle the color-plane overlay (DATAGRID_2D only). When on, the 2D
       /// ColorPlaneView replaces the 3D canvas; gated in the UI on `grid2D != nil`.
       @DefaultTrue var showColorPlane: Bool = true
+    /// Precomputed 3D band-surface sheets (--band-surf) built from a uniform
+    /// k-point mesh near the Fermi level. Gated in the UI on its presence.
+    var bandSurface: BandSurface? = nil
+    /// Whether the band-surface plot is displayed when `bandSurface` is present.
+    @DefaultTrue var showBandSurface: Bool = true
     /// Colormap for the 2D color plane. Defaults to .viridis (byte-identical output).
     var colorPlaneColormap: Colormap = .viridis
     /// Whether contour lines are drawn over the color plane.
@@ -584,6 +589,8 @@ struct Scene: Codable {
         forceSet = try c.decodeIfPresent(ForceSet.self, forKey: .forceSet) ?? nil
         showForces = try c.decodeIfPresent(Bool.self, forKey: .showForces) ?? false
         showColorPlane = (try c.decode(DefaultTrue.self, forKey: .showColorPlane)).wrappedValue
+        bandSurface = try c.decodeIfPresent(BandSurface.self, forKey: .bandSurface) ?? nil
+        showBandSurface = (try c.decode(DefaultTrue.self, forKey: .showBandSurface)).wrappedValue
         colorPlaneColormap = try c.decodeIfPresent(Colormap.self, forKey: .colorPlaneColormap) ?? .viridis
         colorPlaneContourEnabled = try c.decodeIfPresent(Bool.self, forKey: .colorPlaneContourEnabled) ?? true
         colorPlaneContourCount = try c.decodeIfPresent(Int.self, forKey: .colorPlaneContourCount) ?? 6

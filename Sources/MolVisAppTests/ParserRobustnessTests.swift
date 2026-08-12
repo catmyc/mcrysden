@@ -72,11 +72,10 @@ final class ParserRobustnessTests: XCTestCase {
         XCTAssertEqual(scene.atoms[0].label, "Ag")
     }
 
-    /// Adversarial review: the CRYSTAL DOS gate must accept the canonical
-    /// "DENSITY OF STATES" / "... PER ATOM" / "... PERCELL" headers, accept a
-    /// DOSS(INTEGRATED) table with its integrated column dropped, and must NOT
-    /// accept a band file ("BAND STRUCTURE") as DOS.
-    func testCrystalDosGateAndIntegratedColumn() throws {
+    /// Consolidated: CRYSTAL DOS gate (accept/reject headers + integrated column),
+    /// CRYSTAL BAND minimal-file positive path, and GZMatrix malformed-row loud failure.
+    func testParserAuxiliaryFormatsAndGates() throws {
+        // --- CRYSTAL DOS gate ---
         let dossTable = """
             -20.0  0.0  0.1
             -19.0  0.0  0.3
@@ -101,14 +100,9 @@ final class ParserRobustnessTests: XCTestCase {
         }
         XCTAssertEqual(parsed.series.count, 1, "integrated column must be dropped")
         XCTAssertEqual(parsed.series[0].values, [0.0, 0.1, 0.3])
-    }
 
-    /// Adversarial review: the CRYSTAL band gate has negative coverage only, so
-    /// pin the positive path — a labelled BAND STRUCTURE header with explicit
-    /// band/k-point counts, one k row and its wrapped energy row must yield a
-    /// `BandStructure` with those counts and energies (eV, single spin).
-    func testCrystalBandParsesMinimalFile() throws {
-        let text = """
+        // --- CRYSTAL BAND minimal-file positive path ---
+        let bandText = """
         BAND STRUCTURE - CRYSTAL PROPERTIES
         N. OF BANDS = 2
         N. OF K POINTS = 1
@@ -116,7 +110,7 @@ final class ParserRobustnessTests: XCTestCase {
          -5.000000  3.000000
 
         """
-        guard let bands = CrystalBandParser.parse(text) else {
+        guard let bands = CrystalBandParser.parse(bandText) else {
             return XCTFail("a minimal CRYSTAL BAND file must parse")
         }
         XCTAssertEqual(bands.kPoints.count, 1)
@@ -125,13 +119,8 @@ final class ParserRobustnessTests: XCTestCase {
         XCTAssertTrue(bands.kPointsAreCrystal)
         XCTAssertEqual(bands.kPoints[0].k, SIMD3<Float>(0, 0, 0))
         XCTAssertEqual(bands.kPoints[0].energies, [-5.0, 3.0])
-    }
 
-    /// Finding 5: a malformed coordinate row must fail the whole file loudly
-    /// (nil) rather than silently truncating later rows; the diagnostic must be
-    /// surfaced through `GZMatrixError` / `ParseError`.
-    func testGzmatrixMalformedRowFailsLoudly() throws {
-        // Good O/H/H then a row with a non-numeric value.
+        // --- GZMatrix malformed-row loud failure ---
         let broken = """
             O
             H  1  r2
@@ -152,9 +141,9 @@ final class ParserRobustnessTests: XCTestCase {
         XCTAssertNil(GZMatrixParser.parse(nanRow))
     }
 
-    /// Finding 6: XcrysdenScript.load must reject non-finite numeric fields
-    /// (NaN, Inf) — they get skipped and reported, not applied.
-    func testXcrysdenScriptRejectsNonFinite() {
+    /// Consolidated: XcrysdenScript non-finite rejection and heavy-element symbol resolution.
+    func testXcrysdenScriptAndElementResolution() {
+        // --- XcrysdenScript non-finite rejection ---
         let base = XcrysdenViewState()
         let script = """
             set azimuth NaN
@@ -168,6 +157,26 @@ final class ParserRobustnessTests: XCTestCase {
         XCTAssertEqual(result.state.azimuth, base.azimuth, "NaN must be skipped")
         XCTAssertEqual(result.state.elevation, base.elevation, "Inf must be skipped")
         XCTAssertEqual(result.skipped.count, 2)
+
+        // --- Heavy-element symbol resolution ---
+        // Forward: Z -> symbol
+        XCTAssertEqual(Table.id(79), "Au")
+        XCTAssertEqual(Table.id(92), "U")
+        XCTAssertEqual(Table.id(118), "Og")
+        XCTAssertEqual(Table.id(1), "H")
+        XCTAssertEqual(Table.id(36), "Kr")
+        // Fallback: out-of-range Z -> "\(z)"
+        XCTAssertEqual(Table.id(0), "0")
+        XCTAssertEqual(Table.id(-1), "-1")
+        XCTAssertEqual(Table.id(119), "119")
+        // Reverse: symbol -> Z (case-insensitive via .capitalized)
+        XCTAssertEqual(Table.z("Au"), 79)
+        XCTAssertEqual(Table.z("U"), 92)
+        XCTAssertEqual(Table.z("au"), 79)
+        XCTAssertEqual(Table.z("AU"), 79)
+        XCTAssertEqual(Table.z("og"), 118)
+        // Unknown symbol -> 0
+        XCTAssertEqual(Table.z("Xx"), 0)
     }
 
     /// Finding 1: NaN/Inf coordinates must be rejected at parse time — not
@@ -236,30 +245,6 @@ final class ParserRobustnessTests: XCTestCase {
             """.write(to: wienURL, atomically: true, encoding: .utf8)
         XCTAssertThrowsError(try Parser.load(wienURL, as: .struct_),
                             "non-finite lattice params must be rejected")
-    }
-
-    /// Finding 3: Table must resolve heavy-element symbols (Z > 42) that were
-    /// previously unknown, returning numeric placeholders like "92" instead
-    /// of "U". Delegates to ElementTable (full 118-element table).
-    func testHeavyElementSymbolResolution() {
-        // Forward: Z -> symbol
-        XCTAssertEqual(Table.id(79), "Au")
-        XCTAssertEqual(Table.id(92), "U")
-        XCTAssertEqual(Table.id(118), "Og")
-        XCTAssertEqual(Table.id(1), "H")
-        XCTAssertEqual(Table.id(36), "Kr")
-        // Fallback: out-of-range Z -> "\(z)"
-        XCTAssertEqual(Table.id(0), "0")
-        XCTAssertEqual(Table.id(-1), "-1")
-        XCTAssertEqual(Table.id(119), "119")
-        // Reverse: symbol -> Z (case-insensitive via .capitalized)
-        XCTAssertEqual(Table.z("Au"), 79)
-        XCTAssertEqual(Table.z("U"), 92)
-        XCTAssertEqual(Table.z("au"), 79)
-        XCTAssertEqual(Table.z("AU"), 79)
-        XCTAssertEqual(Table.z("og"), 118)
-        // Unknown symbol -> 0
-        XCTAssertEqual(Table.z("Xx"), 0)
     }
 
     /// Finding 2/4: atom-count sanity caps must reject absurd values before

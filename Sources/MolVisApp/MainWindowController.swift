@@ -44,6 +44,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     let bandGrapher: BandGrapherView    // 2D band-structure diagram (shown when bandStructure != nil)
     let dosGrapher: DOSGrapherView      // total/projected DOS graph (shown when densityOfStates != nil)
     let linkedGraphs: LinkedGraphsView   // side-by-side band+DOS container (or single child)
+    let bandSurfaceView: BandSurfaceView // 3D band-surface plot (shown when scene.bandSurface != nil)
+    /// Electronic-structure display flags carried across GUI re-parses so derived
+    /// data (DOS, interpolated bands, band surface) survives frame/revert reloads.
+    /// Set by App from the CLI options (--bands/--dos/--band-surf).
+    var electronicStructureFlags = ElectronicStructureFlags()
     let xrdGrapher: PowderXRDGrapherView // powder XRD diagram (shown in its own auxiliary window)
     let infoPanel: NSTextView           // measurement/selection readout
     let infoWindow: NSWindow            // pop-out window hosting the readout
@@ -359,6 +364,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         labelOverlay.autoresizingMask = [.width, .height]
         bandGrapher = BandGrapherView(frame: .zero)
         dosGrapher = DOSGrapherView(frame: .zero)
+        bandSurfaceView = BandSurfaceView(frame: .zero)
+        bandSurfaceView.autoresizingMask = [.width, .height]
+        bandSurfaceView.isHidden = true
+        viewport.addSubview(bandSurfaceView)
         linkedGraphs = LinkedGraphsView(frame: .zero, bandView: bandGrapher, dosView: dosGrapher,
                                         band: nil, dos: nil, bandPresent: false, dosPresent: false)
         linkedGraphs.autoresizingMask = [.width, .height]
@@ -524,9 +533,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let initHasBands = scene.bandStructure != nil
         bandGrapher.bandStructure = scene.bandStructure
         dosGrapher.densityOfStates = scene.densityOfStates
+        bandSurfaceView.bandSurface = scene.bandSurface
         linkedGraphs.bandView.bandStructure = scene.bandStructure
         linkedGraphs.dosView.densityOfStates = scene.densityOfStates
-        state.electronicStructureEnabled = initHasBands || scene.densityOfStates != nil
+        state.electronicStructureEnabled = initHasBands || scene.densityOfStates != nil || scene.bandSurface != nil
         updateContentVisibility()
         updateElectronicStructureGraphs()
         updatePowderXRD()
@@ -631,6 +641,21 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
                      frameCount: url.map { Parser.frameCount($0, as: format) } ?? 1)
     }
 
+    /// Re-apply the CLI electronic-structure display flags (--bands/--dos/--band-surf)
+    /// to a scene that is about to be installed, so derived data survives GUI
+    /// re-parses (revert, frame changes). Failures are non-fatal here: the GUI
+    /// already reported them at open time; a reload leaves the scene unchanged.
+    private func applyElectronicStructureFlags(to scene: inout Scene) {
+        let flags = electronicStructureFlags
+        guard flags.bandPlot || flags.dosPlot || flags.bandSurf else { return }
+        do {
+            try App.applyElectronicStructureFlags(scene: &scene, flags: flags,
+                                                  kPathSampling: state.kPathSampling)
+        } catch {
+            print("[mcrysden] warning: electronic-structure flags failed on reload: \(error)")
+        }
+    }
+
     /// Everything that follows the source/url bookkeeping in `loadFile`: installs the
     /// scene, rebuilds the editor BZ, syncs the sidebar, reframes the camera, installs
     /// graph data, and initialises the animation controls. Extracted so that in-scene
@@ -638,6 +663,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
     /// through the exact same path without re-opening the source file. Byte-identical
     /// to the former tail of `loadFile` for the primary open/revert/drop paths.
     private func installScene(_ scene: Scene, frameIndex: Int, frameCount: Int) {
+        var scene = scene
+        applyElectronicStructureFlags(to: &scene)
         self.scene = scene
         bzEpoch += 1   // new scene: cell/baseAtoms may differ, rebuild the editor BZ
         state.syncFromScene(scene)
@@ -660,14 +687,15 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // scene ever contains both DOS and band data.
         let hasBands = scene.bandStructure != nil
         bandGrapher.bandStructure = scene.bandStructure
-        if hasBands {
-            bandGrapher.highSymmetryIndices = []   // parsed labels go here once k-labels are read
-        }
+        bandGrapher.highSymmetryIndices = scene.bandStructure.map { bs in
+            bs.kPoints.indices.filter { !bs.kPoints[$0].label.isEmpty }
+        } ?? []
         dosGrapher.densityOfStates = scene.densityOfStates
-        // Electronic-structure section is available when either graph is populated.
+        bandSurfaceView.bandSurface = scene.bandSurface
+        // Electronic-structure section is available when any graph/surface is populated.
         // (Not a @Published scene field — set directly, not via state, to avoid
         // persisting view-only availability into the scene.)
-        state.electronicStructureEnabled = hasBands || scene.densityOfStates != nil
+        state.electronicStructureEnabled = hasBands || scene.densityOfStates != nil || scene.bandSurface != nil
         updateElectronicStructureGraphs()
         updatePowderXRD()
         // A 2D scalar grid: the color-plane is now drawn as a textured quad in the
@@ -1882,7 +1910,12 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             // Graph branches guard on the payload so an empty/hidden graph view
             // does not supersede the Metal canvas. When the linked container is
             // visible, print it so both panels (or the single present one) render.
-            if !linkedGraphs.isHidden {
+            if !bandSurfaceView.isHidden, let surface = scene.bandSurface {
+                let printView = BandSurfaceView(frame: NSRect(origin: .zero, size: pageRect.size))
+                printView.bandSurface = surface
+                printView.exportBackground = .white
+                nsImage = try PrintSupport.renderGraph(printView, pageRect: pageRect)
+            } else if !linkedGraphs.isHidden {
                 let printView = LinkedGraphsView(
                     frame: NSRect(origin: .zero, size: pageRect.size),
                     bandView: BandGrapherView(frame: .zero),
@@ -4514,6 +4547,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         var visibleScene = scene
         if linkedGraphs.isHidden || !linkedGraphs.dosPresent { visibleScene.densityOfStates = nil }
         if linkedGraphs.isHidden || !linkedGraphs.bandPresent { visibleScene.bandStructure = nil }
+        if bandSurfaceView.isHidden || !scene.showBandSurface { visibleScene.bandSurface = nil }
         // The color plane is now drawn by the renderer in the Metal scene, so the
         // exported scene keeps grid2D intact (the renderer gates on showColorPlane).
         // Apply export options: if the caller passes explicit options, use them;
@@ -4671,6 +4705,9 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         // space when this frame changed that basis.  (Supercell/slab are applied
         // later and intentionally do not affect this base-cell decision.)
         next.transferKPathAcrossGeometryChange(from: scene)
+        // Re-apply the CLI electronic-structure display flags (--bands/--dos/--band-surf)
+        // to the freshly parsed frame so derived data survives frame changes.
+        applyElectronicStructureFlags(to: &next)
         // The freshly parsed frame may carry a scalar field whose value range differs
         // from the frame we carried the level over (e.g. animated XSF). Clamp the
         // carried level into the new field's range so it stays meaningful; when the
@@ -4789,6 +4826,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         canvas.invalidateReciprocalAccessibilityFocus()
         loadGeneration += 1   // cancel any pending background drop loads
         self.scene = next
+        // Refresh the graph views so the reloaded frame reflects the electronic-structure
+        // flags (bands/DOS/band-surface) carried over from the previous frame.
+        bandGrapher.bandStructure = next.bandStructure
+        bandGrapher.highSymmetryIndices = next.bandStructure.map { bs in
+            bs.kPoints.indices.filter { !bs.kPoints[$0].label.isEmpty }
+        } ?? []
+        dosGrapher.densityOfStates = next.densityOfStates
+        linkedGraphs.bandView.bandStructure = next.bandStructure
+        linkedGraphs.dosView.densityOfStates = next.densityOfStates
+        bandSurfaceView.bandSurface = next.bandSurface
+        state.electronicStructureEnabled = next.bandStructure != nil || next.densityOfStates != nil || next.bandSurface != nil
         bzEpoch += 1   // freshly parsed frame: cell/baseAtoms may differ, rebuild the editor BZ
         if wasReciprocalEditing {
             camera = scene.defaultCamera()
@@ -5286,15 +5334,17 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         let editingReciprocal = state.editKPathOnBZ && scene.isCrystal
         let hasDOS = scene.densityOfStates != nil
         let hasBands = scene.bandStructure != nil
-        let showGraphs = !editingReciprocal && (hasDOS || hasBands)
+        let showSurface = !editingReciprocal && scene.showBandSurface && scene.bandSurface != nil
+        bandSurfaceView.isHidden = !showSurface
+        let showGraphs = !editingReciprocal && !showSurface && (hasDOS || hasBands)
         linkedGraphs.isHidden = !showGraphs
         if showGraphs {
             linkedGraphs.bandPresent = hasBands
             linkedGraphs.dosPresent = hasDOS
             linkedGraphs.needsDisplay = true
         }
-        // Hiding the canvas never hides a visible graph (canvas yields to graphs).
-        canvas.isHidden = editingReciprocal ? false : showGraphs
+        // Canvas yields to graphs and the band surface (band surface wins).
+        canvas.isHidden = editingReciprocal ? false : (showGraphs || showSurface)
     }
 
     /// Push the sidebar's electronic-structure interaction state into the grapher

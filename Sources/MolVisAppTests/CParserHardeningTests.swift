@@ -27,15 +27,13 @@ final class CParserHardeningTests: XCTestCase {
         }
     }
 
-    // Finding 4: valid uppercase QE unit tokens (BOHR), (CRYSTAL), {Alat} must
-    // resolve correctly instead of silently falling through to angstrom.
-    func testPwiUppercaseUnitTokens() throws {
-        // A minimal QE input with uppercase (BOHR) for CELL_PARAMETERS and
-        // {Alat} for ATOMIC_POSITIONS. With the old strcmp-based dispatch these
-        // would silently default to angstrom and mis-scale the structure.
-        let url = FileManager.default.temporaryDirectory
+    // Consolidated: valid uppercase QE unit tokens resolve correctly, unknown
+    // unit tokens are hard errors, and non-finite celldm values are rejected.
+    func testPwiUnitTokensAndNonFiniteCelldmRejected() throws {
+        // --- Valid uppercase unit tokens (BOHR, {Alat}) ---
+        let urlUpper = FileManager.default.temporaryDirectory
             .appendingPathComponent("mcrysden-test-\(UUID().uuidString).pwi")
-        defer { try? FileManager.default.removeItem(at: url) }
+        defer { try? FileManager.default.removeItem(at: urlUpper) }
         // bohr=0.529177 A. A 5.431 bohr cell edge = 2.874 A (Si). If the unit
         // were ignored and treated as angstrom, the cell would be 5.431 A.
         try """
@@ -53,8 +51,8 @@ final class CParserHardeningTests: XCTestCase {
         ATOMIC_POSITIONS angstrom
          Si 0.0 0.0 0.0
         K_POINTS gamma
-        """.write(to: url, atomically: true, encoding: .utf8)
-        let scene = try Parser.load(url)
+        """.write(to: urlUpper, atomically: true, encoding: .utf8)
+        let scene = try Parser.load(urlUpper)
         // With correct unit handling: cell = 5.431 bohr * 0.529177 = 2.874 A.
         // With the bug (treated as angstrom): cell = 5.431 A.
         guard let cell = scene.cell else {
@@ -63,12 +61,7 @@ final class CParserHardeningTests: XCTestCase {
         let cellA = cell.a.x
         XCTAssertEqual(cellA, 5.431 * 0.529177, accuracy: 0.01,
                        "CELL_PARAMETERS {BOHR} must scale by bohr->angstrom, got \(cellA)")
-    }
 
-    // Finding 4: an unknown QE unit token must be a hard parse error, not a
-    // silent default to angstrom. Also covers Finding 5: a non-finite celldm
-    // value must be rejected.
-    func testPwiUnknownUnitAndNonFiniteCelldmRejected() throws {
         // --- Unknown unit token ---
         let url1 = FileManager.default.temporaryDirectory
             .appendingPathComponent("mcrysden-test-\(UUID().uuidString).pwi")

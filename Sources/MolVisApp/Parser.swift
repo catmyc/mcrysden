@@ -259,7 +259,8 @@ enum Parser {
     /// requested via --frame N and is always routed through the indexed loader, so
     /// --frame 0 returns the first cycle rather than ORCA's final geometry. This is
     /// what lets the open view, the scrubber and --frame N agree on frame N.
-    static func load(_ url: URL, as format: ParseFormat? = nil, frameIndex: Int = -1) throws -> LoadedScene {
+    static func load(_ url: URL, as format: ParseFormat? = nil, frameIndex: Int = -1,
+                      computeMeshDOS: Bool = false) throws -> LoadedScene {
         if frameIndex >= 0 {
             // An explicit frame was requested -- honor the forced format too (e.g. a
             // renamed .pwo passed as --pwo --frame 1) and route to the per-format
@@ -268,15 +269,15 @@ enum Parser {
             let effective = format ?? ParseFormat.from(url: url)
             switch effective {
             case .orca, .pwo, .axsf:
-                return try load(url, frameIndex: frameIndex, as: format)
+                return try load(url, frameIndex: frameIndex, as: format, computeMeshDOS: computeMeshDOS)
             default:
                 break   // non-animated format: fall through to the single-frame path
             }
         }
-        return try load(url, as: format)
+        return try load(url, as: format, computeMeshDOS: computeMeshDOS)
     }
 
-    static func load(_ url: URL, as format: ParseFormat? = nil) throws -> LoadedScene {
+    static func load(_ url: URL, as format: ParseFormat? = nil, computeMeshDOS: Bool = false) throws -> LoadedScene {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
@@ -335,9 +336,10 @@ enum Parser {
             return try loadFHIaims(url)
         }
         // QE PWscf band structure: parsed in Swift into a BandStructure for the
-        // 2D Grapher; uniform meshes also produce a total DOS directly.
+        // 2D Grapher. A uniform mesh's total DOS is reconstructed only when
+        // explicitly requested (`computeMeshDOS`, i.e. the --dos CLI flag).
         if effective == .bands {
-            return try loadBands(url)
+            return try loadBands(url, computeMeshDOS: computeMeshDOS)
         }
         // Total/projected DOS text is parsed in Swift and displayed by the DOS
         // grapher; it intentionally carries no atom or cell geometry.
@@ -397,7 +399,7 @@ enum Parser {
         // user sees). Without this the .pwo path would return forces nowhere.
         if effective == .pwo {
             do {
-                return try loadPWO(url, frameIndex: 0)
+                return try loadPWO(url, frameIndex: 0, computeMeshDOS: computeMeshDOS)
             } catch let error as ParseError {
                 // QE `bands.x` commonly writes a band-only `.out` with no
                 // ATOMIC_POSITIONS block. `.out` is intentionally routed to
@@ -406,7 +408,7 @@ enum Parser {
                 // structural parse failures.
                 if case .parse(_, _, let reason) = error,
                    reason.contains("no (target) ATOMIC_POSITIONS found") {
-                    return try loadBands(url)
+                    return try loadBands(url, computeMeshDOS: computeMeshDOS)
                 }
                 throw error
             }
@@ -471,7 +473,8 @@ enum Parser {
         }
     }
 
-    static func load(_ url: URL, frameIndex: Int, as format: ParseFormat? = nil) throws -> LoadedScene {
+    static func load(_ url: URL, frameIndex: Int, as format: ParseFormat? = nil,
+                      computeMeshDOS: Bool = false) throws -> LoadedScene {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
@@ -488,7 +491,7 @@ enum Parser {
         // QE .pwo: structure via C, forces/energy/stress in Swift. Routed here
         // (before the C switch) so frameIndex reaches loadPWO for animated output.
         if effective == .pwo {
-            return try loadPWO(url, frameIndex: frameIndex)
+            return try loadPWO(url, frameIndex: frameIndex, computeMeshDOS: computeMeshDOS)
         }
         let scene: UnsafeMutablePointer<MolEnvScene>?
         switch effective {
@@ -1501,7 +1504,7 @@ enum Parser {
     /// printed index (`atom N` -> atom N-1), so they stay aligned even if an earlier
     /// block is malformed. The whole LoadedScene (structure + forceSet) bridges to
     /// `Scene`, so a QE output can finally expose forces, energy and arrows.
-    private static func loadPWO(_ url: URL, frameIndex: Int) throws -> LoadedScene {
+    private static func loadPWO(_ url: URL, frameIndex: Int, computeMeshDOS: Bool = false) throws -> LoadedScene {
         let raw = try readCappedText(url)
         let cPath = url.path.cString(using: .utf8)!
         guard let scene = parse_pwo(cPath, Int32(frameIndex)) else {
@@ -1529,13 +1532,14 @@ enum Parser {
             out.forceSet = fs
         }
         // QE PWscf outputs can contain a final band-energy mesh in addition to
-        // structural/SCF data. Preserve both datasets so linked bands + total
-        // DOS work without a separate dos.x run.
+        // structural/SCF data. The band mesh is always preserved; the total DOS
+        // reconstruction is opt-in via --dos (computeMeshDOS) so opening an SCF
+        // output is cheap and the DOS appears only when asked for.
         if let parsedBands = BandParser.parse(raw) {
             var bands = parsedBands
             bands.cell = out.cell ?? bands.cell
             out.bandStructure = bands
-            if bands.isMesh {
+            if computeMeshDOS, bands.isMesh {
                 do {
                     out.densityOfStates = try DOSCalculator.make(from: bands)
                 } catch {
@@ -1911,16 +1915,16 @@ internal func loadFHIaimsCoordOut(lines: [String]) throws -> LoadedScene {
 
 /// QE PWscf band structure (`.bands` file, or a `.out` forced with `--bands`):
 /// parse the `bands (ev):` k-point blocks in Swift into a BandStructure and wrap
-/// it in a LoadedScene. A uniform mesh also gets a total DOS reconstructed
-/// directly from its eigenvalues.
-internal func loadBands(_ url: URL) throws -> LoadedScene {
+/// it in a LoadedScene. A uniform mesh's total DOS is reconstructed only when
+/// `computeMeshDOS` is true (the --dos CLI flag).
+internal func loadBands(_ url: URL, computeMeshDOS: Bool = false) throws -> LoadedScene {
     let raw = try readCappedText(url)
     guard let bands = BandParser.parse(raw) else {
         throw ParseError.parse(path: url.path, line: 0, reason: "no `bands (ev):` block found")
     }
     var out = LoadedScene()
     out.bandStructure = bands
-    if bands.isMesh {
+    if computeMeshDOS, bands.isMesh {
         do {
             out.densityOfStates = try DOSCalculator.make(from: bands)
         } catch {

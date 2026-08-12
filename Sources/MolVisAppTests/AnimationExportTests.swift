@@ -210,7 +210,8 @@ final class AnimationExportTests: XCTestCase {
         XCTAssertTrue(foundDelay, "must find at least one fcTL chunk to verify delay")
     }
 
-    func testFpsBoundsEnforced() throws {
+    /// Consolidated: fps bounds enforcement and frame-count cap.
+    func testFpsBoundsAndFrameCountCapEnforced() throws {
         let frames = [Self.makeSyntheticScene(seed: 0)]
         let size = CGSize(width: 64, height: 64)
 
@@ -239,9 +240,8 @@ final class AnimationExportTests: XCTestCase {
         try AnimationExporter.export(frames: frames, camera: nil, size: size, fps: 600,
                                      format: .apng, to: apngURL)
         XCTAssertGreaterThan(try Data(contentsOf: apngURL).count, 8)
-    }
 
-    func testFrameCountCap() throws {
+        // --- Frame-count cap ---
         // Build 1001 single-atom scenes. The exporter must refuse before
         // materializing them all into CGImages.
         var scenes: [Scene] = []
@@ -250,9 +250,9 @@ final class AnimationExportTests: XCTestCase {
             s.atoms = [Atom(coord: SIMD3<Float>(Float(i), 0, 0), atomicNumber: 1, label: "H")]
             scenes.append(s)
         }
-        let size = CGSize(width: 32, height: 32)
+        let smallSize = CGSize(width: 32, height: 32)
         do {
-            try AnimationExporter.export(frames: scenes, camera: nil, size: size, fps: 10,
+            try AnimationExporter.export(frames: scenes, camera: nil, size: smallSize, fps: 10,
                                          format: .apng, to: URL(fileURLWithPath: "/dev/null"))
             XCTFail("1001 frames should have thrown")
         } catch AnimationExportError.invalidSize {
@@ -261,10 +261,10 @@ final class AnimationExportTests: XCTestCase {
 
         // Exactly 1000 frames must be accepted.
         scenes.removeLast()
-        let apngURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        let apngURL2 = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("mcrysden_test_\(UUID().uuidString).apng")
-        try AnimationExporter.export(frames: scenes, camera: nil, size: size, fps: 10,
-                                     format: .apng, to: apngURL)
-        XCTAssertGreaterThan(try Data(contentsOf: apngURL).count, 8)
+        try AnimationExporter.export(frames: scenes, camera: nil, size: smallSize, fps: 10,
+                                     format: .apng, to: apngURL2)
+        XCTAssertGreaterThan(try Data(contentsOf: apngURL2).count, 8)
     }
 }

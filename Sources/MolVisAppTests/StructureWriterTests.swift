@@ -165,9 +165,9 @@ final class StructureWriterTests: XCTestCase {
         XCTAssertEqual(StructureExportFormat.qeInput.fileExtension, "in")
     }
 
-    // MARK: - WIEN2k struct round-trip
-
-    func testWIEN2kStructRoundTripsThroughParser() throws {
+    // Consolidated: WIEN2k struct round-trip and CRYSTAL d12 structural sanity.
+    func testWIENAndCRYSTALRoundTrips() throws {
+        // --- WIEN2k struct round-trip ---
         // Rocksalt-like FeO (4 atoms, 2 species) so the species list, not just the
         // count, is exercised.
         let a: Float = 4.31
@@ -179,33 +179,29 @@ final class StructureWriterTests: XCTestCase {
             Atom(coord: SIMD3<Float>(0.5 * a, 0.5 * a, 0), atomicNumber: 8, label: "O"),
         ]
 
-        let text = try StructureWriter.write(atoms: atoms, cell: cell, title: "FeO",
-                                             isCrystal: true, periodicDim: 3, as: .wienStruct)
-        let url = tempURL(ext: "struct")
-        defer { try? FileManager.default.removeItem(at: url) }
-        try text.write(to: url, atomically: true, encoding: .utf8)
-        let parsed = try Parser.load(url, as: .struct_)
+        let wienText = try StructureWriter.write(atoms: atoms, cell: cell, title: "FeO",
+                                                isCrystal: true, periodicDim: 3, as: .wienStruct)
+        let wienURL = tempURL(ext: "struct")
+        defer { try? FileManager.default.removeItem(at: wienURL) }
+        try wienText.write(to: wienURL, atomically: true, encoding: .utf8)
+        let parsed = try Parser.load(wienURL, as: .struct_)
 
         XCTAssertEqual(parsed.atoms.count, atoms.count, "WIEN2k struct atom count")
         let origZ = atoms.map { $0.atomicNumber }.sorted()
         let backZ = parsed.atoms.map { $0.atomicNumber }.sorted()
         XCTAssertEqual(origZ, backZ, "WIEN2k struct species")
-    }
 
-    // MARK: - CRYSTAL d12 structural sanity
-
-    func testCRYSTAL03TextAndCRYSTALNewEmptyTemplate() throws {
-        // crystal03: text-level assertions (no in-app .d12 reader).
+        // --- CRYSTAL03 text and CRYSTAL NEW empty template ---
         let si = makeSiScene()
-        let text = try StructureWriter.write(si, as: .crystal03)
-        XCTAssertTrue(text.contains("CRYSTAL 03"))
-        XCTAssertTrue(text.contains("LATTICE"))
-        XCTAssertTrue(text.contains("FRACCOORD"))
-        XCTAssertTrue(text.contains("Si"))
-        XCTAssertTrue(text.contains("END"))
+        let crystal03Text = try StructureWriter.write(si, as: .crystal03)
+        XCTAssertTrue(crystal03Text.contains("CRYSTAL 03"))
+        XCTAssertTrue(crystal03Text.contains("LATTICE"))
+        XCTAssertTrue(crystal03Text.contains("FRACCOORD"))
+        XCTAssertTrue(crystal03Text.contains("Si"))
+        XCTAssertTrue(crystal03Text.contains("END"))
 
         // Every atom carries one "<sym> <frac>" line in the FRACCOORD block.
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let lines = crystal03Text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard let fracIdx = lines.firstIndex(of: "FRACCOORD"),
               let endIdx = lines.firstIndex(of: "END") else {
             return XCTFail("missing FRACCOORD or END marker")
@@ -216,7 +212,7 @@ final class StructureWriterTests: XCTestCase {
 
         // Ends cleanly: the last non-empty line is END, with no trailing blank line.
         XCTAssertEqual(lines[endIdx].trimmingCharacters(in: .whitespaces), "END")
-        XCTAssertTrue(text.hasSuffix("END\n"), "crystal03 ends cleanly")
+        XCTAssertTrue(crystal03Text.hasSuffix("END\n"), "crystal03 ends cleanly")
 
         // crystalNew with an empty scene: empty-template by design, must not throw
         // and must NOT carry a FRACCOORD block.

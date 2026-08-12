@@ -294,15 +294,15 @@ final class ElectronicAnalysisTests: XCTestCase {
 
         XCTAssertEqual(Parser.frameCount(fixtureURL, as: .bands), 0,
                        "band-only QE outputs are not animated structures")
-        let loaded = try Parser.load(fixtureURL, as: .bands)
+        let loaded = try Parser.load(fixtureURL, as: .bands, computeMeshDOS: true)
         XCTAssertNotNil(loaded.bandStructure)
         XCTAssertNotNil(loaded.densityOfStates,
-                        "loading a QE mesh should derive total DOS without dos.x")
-        let autoLoaded = try Parser.load(fixtureURL)
-        XCTAssertNotNil(autoLoaded.bandStructure,
-                        "QE output auto-loading should retain its band mesh")
-        XCTAssertNotNil(autoLoaded.densityOfStates,
-                        "QE output auto-loading should derive total DOS")
+                        "loading a QE mesh with computeMeshDOS should derive total DOS")
+        // Default behavior: band data is parsed, but mesh DOS is NOT auto-computed.
+        let defaultLoad = try Parser.load(fixtureURL, as: .bands)
+        XCTAssertNotNil(defaultLoad.bandStructure)
+        XCTAssertNil(defaultLoad.densityOfStates,
+                     "default load should NOT derive total DOS (opt-in via --dos)")
     }
 
     // MARK: - Orbital coloring classification and linked-cursor guide-line energy

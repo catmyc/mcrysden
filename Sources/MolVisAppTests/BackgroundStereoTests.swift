@@ -95,7 +95,8 @@ final class BackgroundStereoTests: XCTestCase {
 
     // MARK: - Background image rendering
 
-    func testBackgroundImageDownsampleCap() throws {
+    /// Consolidated: background-image downsample cap and transparent-image fallback.
+    func testBackgroundImageDownsampleAndTransparentFallback() throws {
         // Over-cap image (8192x32) is downsampled so the largest dimension is
         // exactly the cap, preserving aspect.
         guard let over = makeSyntheticCGImage(w: 8192, h: 32) else {
@@ -115,9 +116,7 @@ final class BackgroundStereoTests: XCTestCase {
         XCTAssertNotNil(unchanged)
         XCTAssertEqual(unchanged!.width, 256)
         XCTAssertEqual(unchanged!.height, 128)
-    }
 
-    func testTransparentBackgroundImageFallsBackToSolid() throws {
         // A fully-transparent PNG must composite to the solid background.
         let imagePath = try makeTempPNG(r: 200, g: 50, b: 50, a: 0.0)
         defer { try? FileManager.default.removeItem(at: URL(fileURLWithPath: imagePath)) }

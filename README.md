@@ -13,6 +13,9 @@ swift build              # debug build
 swift run mcrysden            # empty viewer
 swift run mcrysden file.xsf   # open a structure
 swift run mcrysden file.xsf --export out.png   # headless render
+swift run mcrysden nscf.out --bands            # plot bands (k-meshes interpolated along the default/--kpath route)
+swift run mcrysden nscf.out --dos              # reconstruct the total DOS from a uniform k-mesh
+swift run mcrysden nscf.out --band-surf        # 3D band-surface plot near the Fermi level (k-mesh only)
 swift test                # run all tests
 zsh scripts/smoke.sh      # CI smoke test (release build + headless export)
 ```
@@ -21,7 +24,8 @@ Local install: `swift build -c release && cp .build/release/mcrysden /usr/local/
 
 ## Highlights
 
-- 18 parser families with force-format CLI flags (`--xsf --xyz --pwi --pwo --cif --cube --bxsf --struct --crystal --orca --fhi --bands --dos --crystal-band --crystal-dos`, …) and a 200 MB input cap
+- 18 parser families with force-format CLI flags (`--xsf --xyz --pwi --pwo --cif --cube --bxsf --struct --crystal --orca --fhi --bands --dos-table --crystal-band --crystal-dos`, …) and a 200 MB input cap
+- Electronic-structure plots: `--bands` (paths shown directly; k-meshes interpolated along the default or `--kpath` high-symmetry route), `--dos` (mesh-derived total DOS, now opt-in), and `--band-surf` (3D band-surface sheets near the Fermi level with a Fermi plane, drag-to-rotate, print/export)
 - Metal rendering: ball-stick/space-fill/wireframe/polyhedral/2D modes, Blinn-Phong lighting, MSAA, depth cueing, AO and soft shadows, image/gradient/solid backgrounds, stereo and anaglyph
 - Supercell expansion, slab generation, cluster cutting, defect workflows, lattice editing
 - Crystal symmetry (space group, Wyckoff), canonical HPKOT k-paths, BZ overlay, structure summary, powder XRD

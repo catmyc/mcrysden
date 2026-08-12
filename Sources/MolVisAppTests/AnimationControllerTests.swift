@@ -4,7 +4,7 @@ import XCTest
 
 final class AnimationControllerTests: XCTestCase {
     @MainActor
-    func testReloadFrameIsNonReentrantAndMutatesOnce() throws {
+    func testReloadFrameIsNonReentrantAndExportGuard() throws {
         let relaxURL = URL(fileURLWithPath: #file)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -263,6 +263,14 @@ final class AnimationControllerTests: XCTestCase {
         try assertMultiOrbitalSelectionAppliedDuringReload()
         }   // end merged block
 
+        // --- Export destination overwrite guard ---
+        // Writing an exported structure back onto the loaded source URL must be
+        // blocked by the destination-validation guard, not silently allowed to
+        // destroy the source.
+        let original = try String(contentsOf: relaxURL, encoding: .utf8)
+        relaxController.exportStructure(.xyz, to: relaxURL)
+        let after = try String(contentsOf: relaxURL, encoding: .utf8)
+        XCTAssertEqual(after, original, "export must not overwrite the loaded source")
     }
 
     /// Find a CRYSCAL fixture that parses as asymmetric-unit (incomplete).
@@ -373,34 +381,6 @@ final class AnimationControllerTests: XCTestCase {
         XCTAssertEqual(next3.currentOrbital, 0, "single-field reload leaves selection at default")
         XCTAssertEqual(next3.isoLevel, 0.0, accuracy: 1e-4,
                        "single-field clamp bounds the iso level")
-    }
-
-    // MARK: - Export destination overwrite guard
-
-    /// Writing an exported structure back onto the loaded source URL must be
-    /// blocked by the destination-validation guard, not silently allowed to
-    /// destroy the source. The guard lives in `App.validateGUIWriteDestination`
-    /// and is invoked before any bytes are written.
-    @MainActor
-    func testExportStructureRefusesToOverwriteSource() throws {
-        // A real multi-frame source the parser accepts.
-        let src = URL(fileURLWithPath: #file)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Assets/si_relax.out")
-        let initial = Scene(loaded: try Parser.load(src, as: nil, frameIndex: 0))
-        let controller = MainWindowController(scene: Scene(), showWindow: false)
-        controller.loadFile(initial, from: src, format: nil, frameIndex: 0)
-
-        // Snapshot the source content, then attempt to export onto it.
-        let original = try String(contentsOf: src, encoding: .utf8)
-        controller.exportStructure(.xyz, to: src)
-
-        // The guard must block the write: the file is unchanged. (If the guard
-        // were missing, the .xyz text — a different format — would overwrite it.)
-        let after = try String(contentsOf: src, encoding: .utf8)
-        XCTAssertEqual(after, original, "export must not overwrite the loaded source")
     }
 
     // MARK: - Frame-reload appearance parity

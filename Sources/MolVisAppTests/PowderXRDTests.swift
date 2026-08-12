@@ -10,7 +10,9 @@ final class PowderXRDTests: XCTestCase {
 
     private static let cuAlpha: Float = 1.540598
 
-    func testXRDPeakPositionsMultiplicityAbsencesAndWavelengthFormFactors() {
+    /// Consolidated: peak positions, multiplicities, systematic absences,
+    /// wavelength/form-factor rules, and the atom-cap guard.
+    func testXRDPeakPositionsMultiplicityAbsencesWavelengthAndAtomCap() {
         // MARK: - Peak positions, multiplicities, and systematic absences
         //
         // Rock-salt NaCl (Fm-3m, a = 5.6402 Å, Cl 0 0 0, Na ½ ½ ½). Asserts the
@@ -175,29 +177,28 @@ final class PowderXRDTests: XCTestCase {
             let p100 = idPattern.peaks.first(where: { $0.h == 1 && $0.k == 0 && $0.l == 0 })
             XCTAssertEqual(p100?.multiplicity, 2, "(100) with identity op")
         }
-    }
 
-    func testXRDAtomCapReturnsUnavailable() {
+        // --- Atom cap ---
         // The atomic-form-factor path is O(reflections × atoms); a 100k-atom
         // cell would hang. The cap must fail closed with .unavailable.
-        let a: Float = 5.0
-        let cell = Cell(a: SIMD3(a, 0, 0), b: SIMD3(0, a, 0), c: SIMD3(0, 0, a))
-        var atoms: [Atom] = []
-        atoms.reserveCapacity(2001)
+        let capA: Float = 5.0
+        let capCell = Cell(a: SIMD3(capA, 0, 0), b: SIMD3(0, capA, 0), c: SIMD3(0, 0, capA))
+        var capAtoms: [Atom] = []
+        capAtoms.reserveCapacity(2001)
         for i in 0..<2001 {
-            atoms.append(Atom(coord: SIMD3(Float(i % 10) * 0.5, Float((i / 10) % 10) * 0.5, Float(i / 100) * 0.5),
-                              atomicNumber: 6, label: "C"))
+            capAtoms.append(Atom(coord: SIMD3(Float(i % 10) * 0.5, Float((i / 10) % 10) * 0.5, Float(i / 100) * 0.5),
+                                 atomicNumber: 6, label: "C"))
         }
-        let pattern = PowderXRD.analyze(cell: cell, atoms: atoms, periodicDim: 3,
-                                        wavelength: Self.cuAlpha, maxTwoTheta: 90, hklLimit: 6)
-        XCTAssertFalse(pattern.isAvailable)
-        XCTAssertNotNil(pattern.unavailableReason)
-        XCTAssertTrue((pattern.unavailableReason ?? "").contains("too many atoms"),
-                      "reason should name the atom cap, got: \(pattern.unavailableReason ?? "")")
+        let capPattern = PowderXRD.analyze(cell: capCell, atoms: capAtoms, periodicDim: 3,
+                                           wavelength: Self.cuAlpha, maxTwoTheta: 90, hklLimit: 6)
+        XCTAssertFalse(capPattern.isAvailable)
+        XCTAssertNotNil(capPattern.unavailableReason)
+        XCTAssertTrue((capPattern.unavailableReason ?? "").contains("too many atoms"),
+                      "reason should name the atom cap, got: \(capPattern.unavailableReason ?? "")")
 
         // Just under the cap: should proceed (and produce a valid pattern).
-        let okAtoms = Array(atoms.prefix(2000))
-        let okPattern = PowderXRD.analyze(cell: cell, atoms: okAtoms, periodicDim: 3,
+        let okAtoms = Array(capAtoms.prefix(2000))
+        let okPattern = PowderXRD.analyze(cell: capCell, atoms: okAtoms, periodicDim: 3,
                                           wavelength: Self.cuAlpha, maxTwoTheta: 90, hklLimit: 6)
         XCTAssertTrue(okPattern.isAvailable, "2000 atoms should be within the cap")
     }

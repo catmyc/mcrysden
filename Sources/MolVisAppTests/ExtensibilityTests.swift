@@ -21,7 +21,8 @@ final class ExtensibilityTests: XCTestCase {
                                fermiEnergy: 0.0)
     }
 
-    func testProjectRoundTripCombinesDatasets() throws {
+    /// Consolidated: project round-trip (combines datasets) and script runner + plugin registry.
+    func testProjectAndExtensibility() throws {
         var scene = Scene()
         scene.atoms = [Atom(coord: SIMD3(0.1, 0.2, 0.3), atomicNumber: 14, label: "Si"),
                        Atom(coord: SIMD3(0.6, 0.7, 0.8), atomicNumber: 14, label: "Si")]
@@ -56,9 +57,7 @@ final class ExtensibilityTests: XCTestCase {
         let corrupt = dir.appendingPathComponent("corrupt.txt")
         try Data(#"{"version": 1, "scene": {"atoms":"#.utf8).write(to: corrupt)
         XCTAssertThrowsError(try ProjectStore.load(from: corrupt))
-    }
 
-    func testScriptRunnerAndPluginRegistry() throws {
         // --- Plugin registry ---
         struct FakePlugin: AnalysisPlugin {
             let name = "fake-plugin"
@@ -71,9 +70,9 @@ final class ExtensibilityTests: XCTestCase {
         let names = PluginRegistry.plugins().map { $0.name }
         XCTAssertTrue(names.contains("fake-plugin"))
 
-        var scene = Scene()
-        scene.atoms = [Atom(coord: .zero, atomicNumber: 1, label: "H")]
-        let results = PluginRegistry.runAll(scene: scene)
+        var pluginScene = Scene()
+        pluginScene.atoms = [Atom(coord: .zero, atomicNumber: 1, label: "H")]
+        let results = PluginRegistry.runAll(scene: pluginScene)
         let fakeResult = results.first { $0.name == "fake-plugin" }
         XCTAssertEqual(fakeResult?.output, "fake-output")
 
@@ -84,7 +83,7 @@ final class ExtensibilityTests: XCTestCase {
         XCTAssertTrue(listLines.contains { $0.hasPrefix("dos-gap —") })
 
         // band-gap returns nil on a scene without bands.
-        XCTAssertNil(PluginRegistry.plugin(named: "band-gap")?.run(scene: scene))
+        XCTAssertNil(PluginRegistry.plugin(named: "band-gap")?.run(scene: pluginScene))
 
         // --- Script runner ---
         var emitted: [String] = []

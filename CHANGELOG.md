@@ -2,6 +2,21 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-08-12
+
+### Added
+
+- **Band-surface plots (`--band-surf`)** — 3D surface sheets of the bands near the Fermi level for QE calculations on uniform k-point meshes. The surface region defaults to the first non-collinear plane of the scene's high-symmetry route (canonical, or user-defined via `--kpath`); each band within ±3 eV of E_f is sampled on a gridded parallelogram and rendered with a viridis colormap, lighting shading, painter's-algorithm depth sorting, a translucent Fermi plane, energy axis, corner labels, drag-to-rotate, printing, and PNG/PDF/SVG/EPS/PS export. Requires a `.pwo`/`.out`/`.bands` input with `bands (ev):` mesh data.
+- **K-mesh band interpolation (`--bands`)** — a band structure computed on a k-grid is no longer rendered as disconnected dots: `--bands` interpolates every band along the default high-symmetry route (or the route imported with `--kpath`) via periodic trilinear interpolation of the axis-aligned Monkhorst-Pack mesh, producing a connected path with labeled high-symmetry points, working band-gap analysis, and the existing band plot/export pipeline.
+- **Opt-in mesh DOS (`--dos`)** — the total DOS is no longer reconstructed automatically when a k-mesh band structure is opened. `--dos` triggers the reconstruction explicitly (combined with `--bands` for the linked band+DOS view); `--dos-table` force-parses dos.x/projwfc.x table files, taking over `--dos`'s previous force-format role. Plain DOS table inputs satisfy `--dos` as-is.
+- **Band-surface persistence** — the computed `BandSurface` and its display toggle serialize into scene/project documents and state files.
+
+### Changed
+
+- `--dos` is now a plot-selection flag rather than a force-format flag; table files are opened by extension as before.
+- The electronic-structure sidebar section is available whenever band, DOS, or band-surface data is present; graph views refresh on animation-frame reloads.
+
+
 ## [1.2.9] — 2026-08-11
 
 ### Added

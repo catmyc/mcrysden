@@ -84,6 +84,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var animFrameCount: Int = 0
         /// Explicit viewport size for --export-anim (--anim-size WxH).
         var animSize: CGSize?
+        /// Electronic-structure display flags: --bands interpolates a k-mesh along
+        /// a route; --dos reconstructs the total DOS from a mesh; --band-surf
+        /// builds 3D band-surface sheets near the Fermi level.
+        var bandPlot = false
+        var dosPlot = false
+        var bandSurf = false
     }
 
     enum CLIError: Error, CustomStringConvertible {
@@ -149,7 +155,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         FormatInfo(flag: "--orca",    extensions: ["orca"],                      format: .orca),
         FormatInfo(flag: "--fhi",     extensions: ["fhi", "coord"],              format: .fhi),
         FormatInfo(flag: "--bands",   extensions: ["bands"],                     format: .bands),
-        FormatInfo(flag: "--dos",     extensions: ["dos", "pdos", "pdos_tot"], format: .dos),
+        FormatInfo(flag: "--dos-table", extensions: ["dos", "pdos", "pdos_tot"], format: .dos),
         FormatInfo(flag: "--gzmat",   extensions: ["gzmat", "zmat"],             format: .gzmat),
         FormatInfo(flag: "--crystal-band", extensions: ["band", "fort9"],        format: .crystalBand),
         FormatInfo(flag: "--crystal-dos", extensions: ["doss", "fort8"],         format: .crystalDOS),
@@ -334,6 +340,22 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 }
                 index += 1
                 options.preset = preset
+            } else if !optionsEnded && argument == "--band-surf" {
+                guard !options.bandSurf else {
+                    throw CLIError.invalid("--band-surf may be given only once")
+                }
+                options.bandSurf = true
+            } else if !optionsEnded && argument == "--dos" {
+                guard !options.dosPlot else {
+                    throw CLIError.invalid("--dos may be given only once")
+                }
+                options.dosPlot = true
+            } else if !optionsEnded && argument == "--bands" {
+                guard forced == nil, !options.bandPlot else {
+                    throw CLIError.invalid("multiple force-format flags are not allowed")
+                }
+                options.bandPlot = true
+                forced = .bands
             } else if !optionsEnded, let info = formatTable.first(where: { $0.flag == argument }) {
                 guard forced == nil else { throw CLIError.invalid("multiple force-format flags are not allowed") }
                 forced = info.format
@@ -440,6 +462,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         // and must not be silently dropped.
         if options.convertFormat != nil, options.convertURL == nil, options.convertAllURL == nil {
             throw CLIError.invalid("--format requires --convert or --convert-all")
+        }
+        if options.bandSurf && options.bandPlot {
+            throw CLIError.invalid("--band-surf cannot be combined with --bands; they select different plots")
+        }
+        if (options.bandPlot || options.dosPlot || options.bandSurf), options.inputURL == nil {
+            throw CLIError.invalid("--bands/--dos/--band-surf require an input file")
         }
         return options
     }
@@ -555,6 +583,61 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         return (iw, ih)
     }
 
+    /// Apply the electronic-structure display flags to a freshly-loaded scene.
+    /// --dos reconstructs the total DOS from a uniform band mesh (kept if a table
+    /// DOS is already present); --bands interpolates a mesh along the scene's
+    /// k-path route (default simple-cubic route when the scene has no route);
+    /// --band-surf builds the 3D band-surface sheets near the Fermi level.
+    static func applyElectronicStructureFlags(scene: inout Scene, flags: ElectronicStructureFlags,
+                                              kPathSampling: Int) throws {
+        guard let bs = scene.bandStructure else {
+            if flags.bandPlot {
+                throw CLIError.invalid("--bands: input contains no QE band data (no `bands (ev):` sections)")
+            }
+            if flags.dosPlot {
+                if scene.densityOfStates != nil { return }   // direct DOS table input satisfies --dos
+                throw CLIError.invalid("--dos: input contains no band energies (use a QE output with a k-mesh, or a DOS table file)")
+            }
+            if flags.bandSurf {
+                throw CLIError.invalid("--band-surf: input contains no QE band energies on a k-point mesh")
+            }
+            return
+        }
+        if flags.dosPlot {
+            guard bs.isMesh else {
+                throw CLIError.invalid("--dos: DOS reconstruction requires a uniform k-point mesh; this calculation is a band path")
+            }
+            if scene.densityOfStates == nil {
+                scene.densityOfStates = try DOSCalculator.make(from: bs)
+            }
+        }
+        if flags.bandPlot {
+            if bs.isMesh {
+                let route: KPath = scene.kPathPoints.isEmpty
+                    ? KPath.defaultPath(lattice: .sc)
+                    : KPath(points: scene.kPathPoints, pointsPerSegment: kPathSampling, breaks: scene.kPathBreaks)
+                scene.bandStructure = try BandMeshInterpolator.interpolateAlongPath(
+                    bands: bs, path: route, pointsPerSegment: kPathSampling)
+            }
+        }
+        if flags.bandSurf {
+            guard bs.isMesh else {
+                throw CLIError.invalid("--band-surf: requires a uniform k-point mesh; this calculation is a band path")
+            }
+            let route: KPath = scene.kPathPoints.isEmpty
+                ? KPath.defaultPath(lattice: .sc)
+                : KPath(points: scene.kPathPoints, pointsPerSegment: kPathSampling, breaks: scene.kPathBreaks)
+            guard let region = BandSurfaceBuilder.defaultRegion(path: route) else {
+                throw CLIError.invalid("--band-surf: cannot derive a surface plane from the k-path route")
+            }
+            scene.bandSurface = try BandSurfaceBuilder.build(
+                bands: bs, region: region,
+                regionLabels: BandSurfaceBuilder.regionLabels(for: route, region: region),
+                options: BandSurfaceOptions())
+            scene.showBandSurface = true
+        }
+    }
+
     /// Parse a structure at the CLI frame, apply a companion state (which widens
     /// the supercell, applies the slab, and may encode a saved animation frame),
     /// then — if the state restored a saved frame — re-parse THAT frame and
@@ -566,7 +649,8 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         cliFrame: Int,
         stateURL: URL?,
         kPathImportURL: URL? = nil,
-        kPathSampling: inout Int
+        kPathSampling: inout Int,
+        electronicFlags: ElectronicStructureFlags = ElectronicStructureFlags()
     ) throws -> (scene: Scene, camera: Camera?, cameraBookmarks: [CameraBookmark?]) {
         if let stateURL, sameFile(url, stateURL) {
             throw CLIError.invalid("input and state alias the same file: \(url.path)")
@@ -603,6 +687,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         // so apply it last (after the state's route has been carried onto the scene).
         if let kPathImportURL {
             try applyKPathImport(to: &scene, from: kPathImportURL, kPathSampling: &kPathSampling)
+        }
+        if electronicFlags.bandPlot || electronicFlags.dosPlot || electronicFlags.bandSurf {
+            try applyElectronicStructureFlags(scene: &scene, flags: electronicFlags, kPathSampling: kPathSampling)
         }
         return (scene, camera, cameraBookmarks)
     }
@@ -769,7 +856,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     cliFrame: options.frame,
                     stateURL: options.stateURL,
                     kPathImportURL: options.kPathImportURL,
-                    kPathSampling: &kPathSampling
+                    kPathSampling: &kPathSampling,
+                    electronicFlags: ElectronicStructureFlags(bandPlot: options.bandPlot,
+                                                             dosPlot: options.dosPlot,
+                                                             bandSurf: options.bandSurf)
                 )
                 let exportSize = CGSize(width: 800, height: 800)
                 // Apply a --preset override to the scene's rendering quality.
@@ -835,7 +925,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     cliFrame: options.frame,
                     stateURL: options.stateURL,
                     kPathImportURL: options.kPathImportURL,
-                    kPathSampling: &kPathSampling
+                    kPathSampling: &kPathSampling,
+                    electronicFlags: ElectronicStructureFlags(bandPlot: options.bandPlot,
+                                                             dosPlot: options.dosPlot,
+                                                             bandSurf: options.bandSurf)
                 )
                 let fc = Parser.frameCount(inURL, as: options.format)
                 let total = fc > 0 ? fc : 1
@@ -1010,7 +1103,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     cliFrame: options.frame,
                     stateURL: options.stateURL,
                     kPathImportURL: options.kPathImportURL,
-                    kPathSampling: &kPathSampling
+                    kPathSampling: &kPathSampling,
+                    electronicFlags: ElectronicStructureFlags(bandPlot: options.bandPlot,
+                                                             dosPlot: options.dosPlot,
+                                                             bandSurf: options.bandSurf)
                 )
                 // Apply a --msaa override to the document scene in GUI mode. The
                 // sidebar picker (Appearance > MSAA) writes the same field, so a CLI
@@ -1025,6 +1121,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     preset.apply(to: &scene)
                 }
                 let wc = MainWindowController(scene: Scene())
+                wc.electronicStructureFlags = ElectronicStructureFlags(bandPlot: options.bandPlot,
+                                                                       dosPlot: options.dosPlot,
+                                                                       bandSurf: options.bandSurf)
                 windowRegistry.add(wc)
                 wc.loadFile(
                     scene,
@@ -1583,6 +1682,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         if let msaa = exportOptions?.msaaSampleCount {
             effectiveOptions.msaaSampleCount = msaa
         }
+        if scene.showBandSurface, let surface = scene.bandSurface {
+            return try exportGraph(BandSurfaceView(frame: NSRect(origin: .zero, size: size)), configure: {
+                $0.bandSurface = surface
+                $0.exportBackground = graphBackground
+                $0.isExportTransparent = isTransparent
+            }, to: url, size: size)
+        }
         if let dos = scene.densityOfStates, let bands = scene.bandStructure {
             // Both present: one side-by-side image containing both panels. exportGraph
             // routes PDF through writeGraphVectorPDF (true vector for both graphs) and
@@ -1836,7 +1942,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.9"
+    static let appVersion = "1.3.0"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -1849,6 +1955,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
           mcrysden                                    # empty viewer
           mcrysden <file>                             # open a structure (by extension)
           mcrysden <file> <state.mvis-state>           # open with saved state
+          mcrysden <qe-output> --bands                 # plot bands; a k-mesh is interpolated along the default (or --kpath) route
+          mcrysden <qe-output> --dos                   # reconstruct the total DOS from a uniform band mesh
+          mcrysden <qe-output> --band-surf             # 3D band-surface plot near the Fermi level (k-mesh only)
           mcrysden <file> --export out.png             # headless raster render
           mcrysden <file> --export out.pdf             # true vector export with a raster structure layer (pdf, svg); raster-backed container (eps, ps)
           mcrysden <file> --kpath route.kpf            # import a k-path (QE K_POINTS, VASP KPOINTS, Wannier90 kpoint_path, XCrySDen KPF)
@@ -1869,6 +1978,11 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         Export format is chosen by extension: .png (raster) or .pdf/.svg (true vector with raster structure layer) or .eps/.ps (raster-backed containers).
         Control multisampled antialiasing with --msaa 1|2|4|8 (1 = explicit Off override; omit to use scene default).
         Apply rendering-quality settings with --preset default|journal|presentation|print.
+        --bands forces the QE bands parse and interpolates a mesh along the route;
+        --dos-table (above) force-parses dos.x/projwfc.x DOS tables. --dos and
+        --band-surf select derived plots and are only meaningful for QE outputs
+        with band energies: combine `--bands --dos` for a linked band+DOS view.
+        --band-surf conflicts with --bands.
         Structure conversion formats are chosen by the --convert output extension:
           .xsf .cif .poscar/.contcar/.vasp .xyz .pwi/.in/.inp/.qe
         Batch --convert-all requires --format <xsf|cif|poscar|xyz|qe|struct|d12>; with a single-file
@@ -1880,6 +1994,17 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         Only one of --export, --convert, --convert-all, --export-anim, --script may be used at once.
         """)
     }
+}
+
+/// Display-data flags for electronic-structure plots requested on the command
+/// line: `--bands` (plot bands; interpolate a k-mesh along a route), `--dos`
+/// (reconstruct the total DOS from a mesh), `--band-surf` (3D band-surface
+/// plot near the Fermi level). Carried on the window controller so derived
+/// data survives GUI re-parses (frame changes, revert).
+struct ElectronicStructureFlags {
+    var bandPlot = false
+    var dosPlot = false
+    var bandSurf = false
 }
 
 extension App.CLIError: LocalizedError {

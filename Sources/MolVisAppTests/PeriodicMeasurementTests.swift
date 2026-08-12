@@ -19,7 +19,10 @@ final class PeriodicMeasurementTests: XCTestCase {
         return best
     }
 
-    func testMoleculeOrthogonalAndTwoDimensionalDistanceBehavior() {
+    /// Consolidated: molecule/orthogonal/2D distance behavior, skew-cell minimum
+    /// image, singular-cell rejection, angle/dihedral measurements, distribution
+    /// analysis, and H-bond periodic-image minimum-image displacement.
+    func testPeriodicMeasurementAndHBondBehavior() {
         // Molecules use direct Cartesian distance when no periodic cell exists.
         let moleculeAtoms = [
             Atom(coord: .zero, atomicNumber: 1, label: "H"),
@@ -414,28 +417,27 @@ final class PeriodicMeasurementTests: XCTestCase {
         tv.tableView(tv.tableView, sortDescriptorsDidChange: [])
         XCTAssertFalse(tv.tableView.sortDescriptors.first!.ascending)
         }
-}
 
-    func testHBondPeriodicImageUsesMinimumImageDisplacement() {
+        // --- H-bond periodic-image minimum-image displacement ---
         // A skew cell where the acceptor's nearest periodic image — not its base
         // position — satisfies the H-bond criteria. The acceptor O1 sits near the
         // -a boundary; its image at (10.4, 2.4) is only ~1.28 Å from the H while
         // the base position is ~9.3 Å away. The donor O0 is near the H, so the
         // D-H-A angle via the wrapped image is obtuse (>= 90°) while the reverse
         // donor assignment fails the angle gate, leaving exactly one pair.
-        let skewCell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(2, 8, 0), c: SIMD3(0, 0, 12))
-        let atoms = [
+        let hbondSkewCell = Cell(a: SIMD3(10, 0, 0), b: SIMD3(2, 8, 0), c: SIMD3(0, 0, 12))
+        let hbondAtoms = [
             Atom(coord: SIMD3(9.2, 4.2, 0), atomicNumber: 8, label: "O"),  // donor (index 0)
             Atom(coord: SIMD3(0.4, 2.4, 0), atomicNumber: 8, label: "O"),  // acceptor (index 1)
             Atom(coord: SIMD3(9.6, 3.4, 0), atomicNumber: 1, label: "H"),  // H near donor (index 2)
         ]
-        var scene = Scene()
-        scene.atoms = atoms
-        scene.cell = skewCell
-        scene.periodicDim = 3
-        scene.hbondSettings = HbondSettings(enabled: true, maxDistance: 3.0, minAngleDegrees: 90)
+        var hbondScene = Scene()
+        hbondScene.atoms = hbondAtoms
+        hbondScene.cell = hbondSkewCell
+        hbondScene.periodicDim = 3
+        hbondScene.hbondSettings = HbondSettings(enabled: true, maxDistance: 3.0, minAngleDegrees: 90)
 
-        let pairs = HbondAnalysis.detect(scene: scene)
+        let pairs = HbondAnalysis.detect(scene: hbondScene)
         // Exactly one pair: donor O0 -- H -- acceptor O1 via the wrapped image.
         XCTAssertEqual(pairs.count, 1, "expected exactly one H-bond pair")
         if let pair = pairs.first {
@@ -445,7 +447,7 @@ final class PeriodicMeasurementTests: XCTestCase {
             // The acceptor image must be the wrapped nearest image (10.4, 2.4, 0),
             // not the base position (0.4, 2.4, 0) which is ~9.3 Å from the H.
             XCTAssertNotNil(pair.acceptorImage)
-            let base = atoms[1].coord
+            let base = hbondAtoms[1].coord
             XCTAssertNotEqual(pair.acceptorImage, base, "acceptor image should be the wrapped nearest image")
             XCTAssertEqual(pair.acceptorImage?.x ?? -1, Float(10.4), accuracy: 0.01)
             XCTAssertEqual(pair.acceptorImage?.y ?? -1, Float(2.4), accuracy: 0.01)
