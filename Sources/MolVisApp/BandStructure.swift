@@ -54,8 +54,10 @@ struct BandStructure: Codable {
     /// 0 molecule, 1 wire, 2 slab, 3 bulk crystal.
     var periodicDim: Int = 0
     /// Whether the calculation is KNOWN to obey time-reversal symmetry
-    /// (E(k) = E(-k)): non-magnetic, collinear, spin-orbit-free, as established
-    /// by the QE parser from the output's magnetic/SOC/noncollinear markers.
+    /// (E(k) = E(-k)), as established by the QE parser from the output's
+    /// magnetization values and run mode: any actual magnetization breaks TR;
+    /// zero-magnetization noncollinear/SOC runs still preserve it (QE enforces
+    /// TRS in those modes).
     /// Defaults to FALSE — absence of evidence is not evidence of symmetry, so
     /// metadata-less band structures (and legacy state files) are never
     /// auto-unfolded. TR-reduced k-meshes are only unfolded when this is true.
@@ -207,8 +209,8 @@ enum BandParser {
         let reciprocal = parseReciprocal(text)
         let cell = parseRealSpaceCell(text)
         // A reduced k-mesh may only be unfolded when the calculation obeys
-        // time reversal (E(k) = E(-k)). Magnetic, spin-orbit/noncollinear, and
-        // field-driven calculations break it even for a single spin channel.
+        // time reversal (E(k) = E(-k)). Actual magnetization breaks it even for
+        // a single spin channel; unmagnetized noncollinear/SOC runs preserve it.
         //
         // Detection is bound to the LAST calculation in the file: QE marks a new
         // run with a "Program PWSCF <version>" banner — either the classic form

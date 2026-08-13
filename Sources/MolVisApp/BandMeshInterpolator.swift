@@ -251,8 +251,9 @@ enum BandMeshInterpolator {
         // Time-reversal half-grid unfolding: if exactly ONE axis is incomplete and
         // its negated nodes complete it into a uniformly-spaced superset AND the
         // structure is single-spin AND known to obey time reversal, unfold that
-        // axis (double it). Magnetic/SOC/noncollinear calculations break TR even
-        // at nSpin == 1 and fall through to the rejection below.
+        // axis (double it). Magnetized calculations break TR even at nSpin == 1
+        // (unmagnetized SOC/noncollinear runs still preserve it) and fall
+        // through to the rejection below.
         var unfolded = false
         var unfoldedAxis: Int? = nil
         // For the unfolded axis: partnerIndex[k] = original node index whose value
