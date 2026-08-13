@@ -214,8 +214,9 @@ final class BandMeshSurfaceTests: XCTestCase {
 
         let region = [SIMD3<Float>(0, 0, 0), SIMD3<Float>(0.5, 0, 0), SIMD3<Float>(0.5, 0.5, 0)]
 
-        // --- Default bandCount = 2: the 2 bands closest to E_f ---
-        // Distances: band 1 = 6-5.75 = 0.25, band 2 = 10-6 = 4.0, band 0 = 6-0.75 = 5.25.
+        // --- Default fs.x-style ±1 eV window around E_f ---
+        // Window [5,7] intersects only band 1 (range [5,5.75]); band 2 starts
+        // at 10 and band 0 ends at 0.75.
         let opts = BandSurfaceOptions(maxBands: 16, gridSize: 16)
         let surface = try! BandSurfaceBuilder.build(bands: bandsWithFermi, region: region,
                                                      regionLabels: ["G", "X", "M"], options: opts)
@@ -224,9 +225,8 @@ final class BandMeshSurfaceTests: XCTestCase {
         XCTAssertEqual(surface.gridSize, 16)
         XCTAssertEqual(surface.spinCount, 1)
         XCTAssertEqual(surface.fermiEnergy, 6.0)
-        XCTAssertEqual(surface.sheets.count, 2)
+        XCTAssertEqual(surface.sheets.count, 1)
         XCTAssertEqual(surface.sheets[0].band, 1)
-        XCTAssertEqual(surface.sheets[1].band, 2)
         XCTAssertEqual(surface.sheets[0].label, "band 2")
         XCTAssertEqual(surface.sheets[0].values.count, 16 * 16)
         XCTAssertTrue(surface.sheets[0].values.allSatisfy { $0.isFinite })
@@ -237,12 +237,23 @@ final class BandMeshSurfaceTests: XCTestCase {
         let expectedP3 = region[0] + (region[1] - region[0]) + (region[2] - region[0])
         Self.assertVecEqual(p3, expectedP3, 1e-5)
 
-        // --- bandCount = 1 -> single sheet, band 1 ---
+        // --- bandCount = 1 -> still the window-selected single sheet, band 1 ---
         let oneOpts = BandSurfaceOptions(maxBands: 16, gridSize: 16, bandCount: 1)
         let oneSurface = try! BandSurfaceBuilder.build(bands: bandsWithFermi, region: region,
                                                         regionLabels: ["G", "X", "M"], options: oneOpts)
         XCTAssertEqual(oneSurface.sheets.count, 1)
         XCTAssertEqual(oneSurface.sheets[0].band, 1)
+
+        // An empty window (Ef far from every band) falls back to bandCount
+        // closest-to-Ef ordering.
+        var distantEf = bandsWithFermi
+        distantEf.fermiEnergy = 100
+        let fallbackSurface = try! BandSurfaceBuilder.build(
+            bands: distantEf, region: region,
+            regionLabels: ["G", "X", "M"],
+            options: BandSurfaceOptions(maxBands: 16, gridSize: 16))
+        // closestBands order [2,1] is re-sorted spin-major/band-minor by build().
+        XCTAssertEqual(fallbackSurface.sheets.map(\.band), [1, 2])
 
         // --- Explicit selectedBands: keys {band 0, band 2} -> sheets [0, 2] ---
         let explicitOpts = BandSurfaceOptions(maxBands: 16, gridSize: 16,
@@ -464,7 +475,9 @@ final class BandMeshSurfaceTests: XCTestCase {
         }
 
         // Surface builder with defaultRegion. CH3Rh111.out reports a Fermi
-        // energy, so the default bandCount=2 rule yields exactly 2 sheets.
+        // energy, so the fs.x-style ±1 eV window selects the 27 bands that
+        // intersect [Ef-1, Ef+1]; maxBands=16 caps them at the first 16
+        // (0-based band indices 41...56).
         guard let region = BandSurfaceBuilder.defaultRegion(path: path) else {
             return XCTFail("SC path should yield a default region")
         }
@@ -476,7 +489,9 @@ final class BandMeshSurfaceTests: XCTestCase {
                                                      regionLabels: Array(labels.prefix(3)), options: opts)
         XCTAssertEqual(surface.region.count, 4)
         if parsed.fermiEnergy != nil {
-            XCTAssertEqual(surface.sheets.count, 2)
+            XCTAssertEqual(surface.sheets.count, 16)
+            XCTAssertEqual(surface.sheets.first?.band, 41)
+            XCTAssertEqual(surface.sheets.last?.band, 56)
         } else {
             XCTAssertTrue(surface.sheets.count > 0)
         }

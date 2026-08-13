@@ -533,6 +533,16 @@ final class BandSurfaceView: NSView {
         let axisK2End = axisK2EndP.0
         let axisETop = axisETopP.0
 
+        // High-symmetry / reciprocal-vector labels at the four parallelogram
+        // corners: p0, p0+b1, p0+b1+b2, p0+b2 in that order (the rasterized
+        // base corners follow the same order). Labels may be empty for
+        // computed corners. Drawn AFTER the raster blit so the surface fill
+        // cannot paint over them.
+        for (corner, label) in zip([b0, b1, b2, b3], surface.regionLabels) where !label.isEmpty {
+            drawLabel(label, at: NSPoint(x: corner.0.x - 2, y: corner.0.y + 8),
+                      font: axisFont, color: .darkGray, rightAligned: false)
+        }
+
         // Ticks: small screen-space crosses for the k axes and E axis.
         for s in [Float(0), 0.25, 0.5, 0.75, 1.0] {
             let lp = toScreen(vert(SIMD3<Float>(s * Lsafe - GC.x, -GC.y, zBase)))
@@ -566,6 +576,82 @@ final class BandSurfaceView: NSView {
                   font: titleFont, color: .black, rightAligned: false)
         drawLabel("E (eV)", at: NSPoint(x: axisETop.x - 6, y: axisETop.y - 4),
                   font: titleFont, color: .black, rightAligned: false)
+
+        // Colorbar: the viridis energy scale used by the surface sheets, drawn as
+        // a compact overlay in the top-right corner of the plot. Overlay placement
+        // preserves the plot geometry (and its calibrated axis pixel counts) while
+        // still giving the energy scale a key.
+        let barWidth: CGFloat = 14
+        let barHeight: CGFloat = 64
+        let barX = plot.maxX - barWidth - 6
+        let barBottom = plot.maxY - barHeight - 4
+        let barSteps = 64
+        for step in 0..<barSteps {
+            let t = Float(step) / Float(barSteps - 1)
+            let rgb = Colormap.viridis.rgb(t)
+            NSColor(calibratedRed: CGFloat(rgb.x), green: CGFloat(rgb.y),
+                    blue: CGFloat(rgb.z), alpha: 1).setFill()
+            let y = barBottom + CGFloat(step) * barHeight / CGFloat(barSteps - 1)
+            let h = barHeight / CGFloat(barSteps - 1) + 1
+            NSBezierPath(rect: NSRect(x: barX, y: y, width: barWidth, height: h)).fill()
+        }
+        NSColor(calibratedWhite: 0.25, alpha: 1).setStroke()
+        let barOutline = NSBezierPath(rect: NSRect(x: barX, y: barBottom, width: barWidth, height: barHeight))
+        barOutline.lineWidth = 1
+        barOutline.stroke()
+        for i in 0...4 {
+            let t = Float(i) / 4
+            let e = energyMin + (energyMax - energyMin) * t
+            let y = barBottom + CGFloat(t) * barHeight
+            NSColor(calibratedWhite: 0.25, alpha: 1).setStroke()
+            let tick = NSBezierPath()
+            tick.move(to: NSPoint(x: barX + barWidth, y: y))
+            tick.line(to: NSPoint(x: barX + barWidth + 4, y: y))
+            tick.lineWidth = 1
+            tick.stroke()
+            drawLabel(String(format: "%.1f", e), at: NSPoint(x: barX + barWidth + 10, y: y),
+                      font: axisFont, color: .darkGray, rightAligned: false)
+        }
+        drawLabel("E (eV)", at: NSPoint(x: barX + barWidth + 8, y: barBottom - 10),
+                  font: axisFont, color: .darkGray, rightAligned: false)
+
+        // Fermi-level tick on the colorbar when it is inside the domain.
+        if drawFermi, let Ef = surface.fermiEnergy {
+            let t = (Ef - energyMin) / energyRange
+            let y = barBottom + CGFloat(t) * barHeight
+            NSColor(calibratedRed: 0.7, green: 0, blue: 0, alpha: 1).setStroke()
+            let tick = NSBezierPath()
+            tick.move(to: NSPoint(x: barX - 6, y: y))
+            tick.line(to: NSPoint(x: barX + barWidth + 6, y: y))
+            tick.lineWidth = 1
+            tick.stroke()
+        }
+
+        // Band legend: one swatch per displayed sheet, colored by that sheet's
+        // mid-range energy (the same viridis map the surface uses), listed in
+        // the top-left corner under the title.
+        if !surface.sheets.isEmpty {
+            var legendY = marginTop + 30
+            drawLabel("Bands", at: NSPoint(x: marginLeft, y: marginTop + 18),
+                      font: axisFont, color: .darkGray, rightAligned: false)
+            for sheet in surface.sheets.prefix(12) {
+                let mn = sheet.values.min() ?? 0
+                let mx = sheet.values.max() ?? 0
+                let mid = (mn + mx) / 2
+                let t = min(1, max(0, (mid - energyMin) / energyRange))
+                let rgb = Colormap.viridis.rgb(t)
+                NSColor(calibratedRed: CGFloat(rgb.x), green: CGFloat(rgb.y),
+                        blue: CGFloat(rgb.z), alpha: 1).setFill()
+                NSBezierPath(rect: NSRect(x: marginLeft, y: legendY - 9, width: 12, height: 12)).fill()
+                drawLabel(sheet.label, at: NSPoint(x: marginLeft + 18, y: legendY - 3),
+                          font: axisFont, color: .darkGray, rightAligned: false)
+                legendY += 14
+            }
+            if surface.sheets.count > 12 {
+                drawLabel("…", at: NSPoint(x: marginLeft + 18, y: legendY - 3),
+                          font: axisFont, color: .darkGray, rightAligned: false)
+            }
+        }
 
         // Title.
         let titleStr = surface.fermiEnergy.map { "Band Surface\nEf = \(String(format: "%.3f", $0)) eV" }

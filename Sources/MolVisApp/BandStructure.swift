@@ -62,6 +62,15 @@ struct BandStructure: Codable {
     /// metadata-less band structures (and legacy state files) are never
     /// auto-unfolded. TR-reduced k-meshes are only unfolded when this is true.
     var timeReversalSymmetric: Bool = false
+    /// Space-group symmetry matrices parsed from the QE output (fractional
+    /// rotations + fractional translations). Used to expand a symmetry-reduced
+    /// irreducible k-point wedge to the full Monkhorst-Pack grid (the fs.x
+    /// `fill_fs_grid` reconstruction). Empty when the output prints none.
+    var symmetryOperations: [QESymmetryOp] = []
+    /// The explicit full-grid specification echoed by a QE `K_POINTS
+    /// {automatic}` / `{gamma}` card, when present. nil means the grid must be
+    /// inferred from the symmetry orbit of the irreducible points.
+    var kGridSpec: QEKGridSpec? = nil
 
     init(kPoints: [BandKPoint], fermiEnergy: Float?, nSpin: Int,
          reciprocal: [SIMD3<Float>]? = nil,
@@ -70,7 +79,9 @@ struct BandStructure: Codable {
          isMesh: Bool = false,
          cell: Cell? = nil,
          periodicDim: Int = 0,
-         timeReversalSymmetric: Bool = false) {
+         timeReversalSymmetric: Bool = false,
+         symmetryOperations: [QESymmetryOp] = [],
+         kGridSpec: QEKGridSpec? = nil) {
         self.kPoints = kPoints
         self.fermiEnergy = fermiEnergy
         self.nSpin = nSpin
@@ -81,13 +92,16 @@ struct BandStructure: Codable {
         self.cell = cell
         self.periodicDim = min(3, max(0, periodicDim))
         self.timeReversalSymmetric = timeReversalSymmetric
+        self.symmetryOperations = symmetryOperations
+        self.kGridSpec = kGridSpec
     }
 
     // Keep old project files valid after adding the optional real-space cell
     // and periodic-dimensionality metadata.
     private enum CodingKeys: String, CodingKey {
         case kPoints, fermiEnergy, nSpin, reciprocal, kPointsAreCrystal,
-             kPointsPerSpin, isMesh, cell, periodicDim, timeReversalSymmetric
+             kPointsPerSpin, isMesh, cell, periodicDim, timeReversalSymmetric,
+             symmetryOperations, kGridSpec
     }
 
     init(from decoder: Decoder) throws {
@@ -104,6 +118,8 @@ struct BandStructure: Codable {
         // Unknown (missing key in legacy files) must NOT claim symmetry: reduced
         // meshes are only unfolded on explicit parser-verified evidence.
         timeReversalSymmetric = try c.decodeIfPresent(Bool.self, forKey: .timeReversalSymmetric) ?? false
+        symmetryOperations = try c.decodeIfPresent([QESymmetryOp].self, forKey: .symmetryOperations) ?? []
+        kGridSpec = try c.decodeIfPresent(QEKGridSpec.self, forKey: .kGridSpec)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -118,6 +134,8 @@ struct BandStructure: Codable {
         try c.encodeIfPresent(cell, forKey: .cell)
         try c.encode(periodicDim, forKey: .periodicDim)
         try c.encode(timeReversalSymmetric, forKey: .timeReversalSymmetric)
+        try c.encode(symmetryOperations, forKey: .symmetryOperations)
+        try c.encodeIfPresent(kGridSpec, forKey: .kGridSpec)
     }
 
     /// Number of bands safely shared by every k-point. Parser-produced data is
@@ -238,6 +256,8 @@ enum BandParser {
         }) ?? 0
         let calcText = lines[calcStart...].joined(separator: "\n")
         let timeReversalSymmetric = !detectTimeReversalBreaking(calcText)
+        let symmetryOperations = BandGridSymmetry.parseSymmetryOps(calcText)
+        let kGridSpec = BandGridSymmetry.parseKGridSpec(calcText)
         // Reciprocal axes are enough to establish that this is a periodic QE
         // calculation even when a bands-only file omitted the real-space axes;
         // DOS generation will then fail explicitly if the volume/area cannot
@@ -467,11 +487,25 @@ enum BandParser {
         guard !filtered.isEmpty else { return nil }
 
         let kPointsPerSpin = filtered.count / nSpin
-        return BandStructure(kPoints: filtered, fermiEnergy: chosen.fermi, nSpin: nSpin,
-                             reciprocal: reciprocal, kPointsAreCrystal: meta.isCrystal,
-                             kPointsPerSpin: kPointsPerSpin, isMesh: isMesh,
-                             cell: cell, periodicDim: periodicDim,
-                             timeReversalSymmetric: timeReversalSymmetric)
+        var result = BandStructure(kPoints: filtered, fermiEnergy: chosen.fermi, nSpin: nSpin,
+                                   reciprocal: reciprocal, kPointsAreCrystal: meta.isCrystal,
+                                   kPointsPerSpin: kPointsPerSpin, isMesh: isMesh,
+                                   cell: cell, periodicDim: periodicDim,
+                                   timeReversalSymmetric: timeReversalSymmetric,
+                                   symmetryOperations: symmetryOperations,
+                                   kGridSpec: kGridSpec)
+        // A symmetry-reduced wedge can carry NON-uniform integration weights
+        // (each irreducible point has its own multiplicity), so the uniform-
+        // weight mesh test alone under-classifies it. When symmetry matrices
+        // are present, attempt the full-grid reconstruction: a successful
+        // expansion upgrades the result to a mesh and replaces the wedge.
+        if !result.isMesh, !symmetryOperations.isEmpty {
+            if let expanded = try? BandGridSymmetry.expand(result) {
+                result = expanded
+                result.isMesh = true
+            }
+        }
+        return result
     }
 
     /// A Monkhorst-Pack sampling mesh is identified by uniform integration weights AND a

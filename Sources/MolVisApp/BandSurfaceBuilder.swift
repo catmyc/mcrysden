@@ -54,15 +54,20 @@ struct BandSurface: Codable, Equatable {
     /// carried a real-space cell; the 3D view uses it to draw the k_x/k_y axes
     /// in physical units. nil -> the view falls back to fractional units.
     var kBasis: [SIMD3<Float>]? = nil
+    /// Band-numbering offset of the source (0 for QE band arrays; nonzero for
+    /// BXSF files whose bands start above 1). Displayed band numbers and
+    /// selection keys include it.
+    var bandOffset: Int = 0
 
     private enum CodingKeys: String, CodingKey {
         case region, regionLabels, gridSize, sheets, fermiEnergy, spinCount,
-             energyMin, energyMax, kBasis
+             energyMin, energyMax, kBasis, bandOffset
     }
 
     init(region: [SIMD3<Float>], regionLabels: [String], gridSize: Int,
          sheets: [BandSurfaceSheet], fermiEnergy: Float?, spinCount: Int,
-         energyMin: Float, energyMax: Float, kBasis: [SIMD3<Float>?]? = nil) {
+         energyMin: Float, energyMax: Float, kBasis: [SIMD3<Float>?]? = nil,
+         bandOffset: Int = 0) {
         self.region = region
         self.regionLabels = regionLabels
         self.gridSize = gridSize
@@ -72,6 +77,7 @@ struct BandSurface: Codable, Equatable {
         self.energyMin = energyMin
         self.energyMax = energyMax
         self.kBasis = kBasis?.compactMap { $0 }
+        self.bandOffset = bandOffset
     }
 
     init(from decoder: Decoder) throws {
@@ -85,6 +91,7 @@ struct BandSurface: Codable, Equatable {
         energyMin = try c.decode(Float.self, forKey: .energyMin)
         energyMax = try c.decode(Float.self, forKey: .energyMax)
         kBasis = try c.decodeIfPresent([SIMD3<Float>].self, forKey: .kBasis)
+        bandOffset = try c.decodeIfPresent(Int.self, forKey: .bandOffset) ?? 0
 
         // Low-level sanity so malformed persisted data can't trap the view.
         guard gridSize >= 2, gridSize <= 256 else {
@@ -139,6 +146,7 @@ struct BandSurface: Codable, Equatable {
         try c.encode(energyMin, forKey: .energyMin)
         try c.encode(energyMax, forKey: .energyMax)
         try c.encodeIfPresent(kBasis, forKey: .kBasis)
+        try c.encode(bandOffset, forKey: .bandOffset)
     }
 }
 
@@ -159,19 +167,24 @@ struct BandSurfaceOptions {
     /// `bandCount`-closest rule. An EMPTY set is a valid request: build() then
     /// returns a BandSurface with NO sheets (the view draws axes only).
     var selectedBands: Set<Int>?
+    /// Offset added to the zero-based band index for sources whose band
+    /// numbering does not start at 1 (e.g. BXSF files that begin at band 6).
+    /// Selection keys, sheet bands, and labels all use the offset numbering.
+    var bandOffset: Int
 
-    init(energyWindowEV: Float = 3.0, maxBands: Int = 16, gridSize: Int = 56,
-         bandCount: Int = 2, selectedBands: Set<Int>? = nil) {
+    init(energyWindowEV: Float = 1.0, maxBands: Int = 32, gridSize: Int = 56,
+         bandCount: Int = 2, selectedBands: Set<Int>? = nil, bandOffset: Int = 0) {
         self.energyWindowEV = energyWindowEV
         self.maxBands = maxBands
         self.gridSize = gridSize
         self.bandCount = bandCount
         self.selectedBands = selectedBands
+        self.bandOffset = bandOffset
     }
 }
 
 /// Errors thrown by band-surface construction.
-enum BandSurfaceError: Error, CustomStringConvertible {
+enum BandSurfaceError: Error, Equatable, CustomStringConvertible {
     case notMesh
     case notAxisAlignedGrid
     case requiresTwoDimensionalMesh
@@ -303,8 +316,8 @@ enum BandSurfaceBuilder {
         }
         let p0 = region[0], p1 = region[1], p2 = region[2]
         guard !areCollinear(p0, p1, p2) else { throw BandSurfaceError.degenerateRegion }
-        // Accept a 3-label list or a 4-label list (the 4th computed-corner label
-        // from `regionLabels(for:)` is ignored here and reset to "" below).
+        // Accept a 3-label list or a 4-label list; an explicit fourth label is
+        // preserved, otherwise the computed corner keeps "".
         guard regionLabels.count >= 3 else { throw BandSurfaceError.degenerateRegion }
 
         let d0 = p1 - p0
@@ -328,8 +341,6 @@ enum BandSurfaceBuilder {
             throw BandSurfaceError.degenerateRegion
         }
 
-        let gridSize = options.gridSize
-
         // Per-(spin,band) min/max in one pass over channels.
         var bandMins = [Float](repeating: .infinity, count: nSpin * nBands)
         var bandMaxs = [Float](repeating: -.infinity, count: nSpin * nBands)
@@ -346,7 +357,7 @@ enum BandSurfaceBuilder {
         }
 
         // Band selection.
-        struct Sel { let spin: Int; let band: Int }
+        struct Sel { let spin: Int; let baseBand: Int; let displayBand: Int }
         var selected: [Sel]
         if let keys = options.selectedBands {
             // Explicit selection (possibly empty). Keep keys present in the set,
@@ -354,8 +365,8 @@ enum BandSurfaceBuilder {
             var out: [Sel] = []
             for s in 0..<nSpin {
                 for b in 0..<nBands {
-                    if keys.contains(s * 10_000 + b) {
-                        out.append(Sel(spin: s, band: b))
+                    if keys.contains(s * 10_000 + b + options.bandOffset) {
+                        out.append(Sel(spin: s, baseBand: b, displayBand: b + options.bandOffset))
                         if out.count >= options.maxBands { break }
                     }
                 }
@@ -363,18 +374,62 @@ enum BandSurfaceBuilder {
             }
             selected = out
         } else {
-            // bandCount-closest rule; clamped 1...maxBands.
-            let count = min(options.maxBands, max(1, options.bandCount))
-            let keys = closestBands(bands, count: count)
+            // fs.x convention: with a Fermi level, include every band whose
+            // energy range intersects [Ef - window, Ef + window]. Without one
+            // (an insulating output), select the manifolds adjacent to the
+            // largest inter-band gap instead: the valence band(s) at the gap's
+            // lower bound and the conduction band(s) at its upper bound. An
+            // empty selection falls back to the bandCount bands closest to the
+            // reference so pathological inputs still produce a useful plot.
+            var keys: [Int] = []
+            if let ef = bands.fermiEnergy, options.energyWindowEV > 0 {
+                let lo = ef - options.energyWindowEV
+                let hi = ef + options.energyWindowEV
+                for s in 0..<nSpin {
+                    for b in 0..<nBands {
+                        let idx = s * nBands + b
+                        guard bandMins[idx].isFinite, bandMaxs[idx].isFinite else { continue }
+                        if bandMins[idx] <= hi && bandMaxs[idx] >= lo {
+                            keys.append(s * 10_000 + b + options.bandOffset)
+                        }
+                    }
+                }
+            } else if let gap = largestGapBounds(bands) {
+                for s in 0..<nSpin {
+                    for b in 0..<nBands {
+                        let idx = s * nBands + b
+                        guard bandMins[idx].isFinite, bandMaxs[idx].isFinite else { continue }
+                        let atVBM = abs(bandMaxs[idx] - gap.lower) < 1e-3
+                        let atCBM = abs(bandMins[idx] - gap.upper) < 1e-3
+                        if atVBM || atCBM {
+                            keys.append(s * 10_000 + b + options.bandOffset)
+                        }
+                    }
+                }
+            }
+            if keys.isEmpty {
+                // Legacy bandCount-closest fallback; clamped 1...maxBands.
+                let count = min(options.maxBands, max(1, options.bandCount))
+                keys = closestBands(bands, count: count, bandOffset: options.bandOffset)
+            } else if keys.count > options.maxBands {
+                keys = Array(keys.prefix(options.maxBands))
+            }
             guard !keys.isEmpty else { throw BandSurfaceError.noBandsNearFermi }
-            // closestBands keys already sort by distance; re-sort by (spin, band).
+            // Window keys are already spin-major/band-minor; closest-band keys
+            // are re-sorted by (spin, band) for a stable sheet order.
             selected = keys.compactMap { key in
                 let s = key / 10_000
-                let b = key % 10_000
+                let b = key % 10_000 - options.bandOffset
                 guard s >= 0, s < nSpin, b >= 0, b < nBands else { return nil }
-                return Sel(spin: s, band: b)
-            }.sorted { $0.spin != $1.spin ? $0.spin < $1.spin : $0.band < $1.band }
+                return Sel(spin: s, baseBand: b, displayBand: b + options.bandOffset)
+            }.sorted { $0.spin != $1.spin ? $0.spin < $1.spin : $0.baseBand < $1.baseBand }
         }
+
+        // Adaptive sampling density: keep the triangle count interactive when
+        // the window selects many sheets, while preserving the requested
+        // resolution for 1-2 sheets.
+        let maxGridByTriangles = Int(floor(sqrt(160_000 / Float(2 * max(1, selected.count))))) - 1
+        let gridSize = min(options.gridSize, max(16, maxGridByTriangles))
 
         // Sample each selected sheet over (s,t) in [0,1]^2.
         var sheets: [BandSurfaceSheet] = []
@@ -383,7 +438,7 @@ enum BandSurfaceBuilder {
         for sel in selected {
             let base = sel.spin * perSpin
             let channel = Array(bands.kPoints[base..<base + perSpin])
-            let values = channel.map { $0.energies[sel.band] }
+            let values = channel.map { $0.energies[sel.baseBand] }
             var gridVals: [Float] = []
             gridVals.reserveCapacity(gridSize * gridSize)
             for ti in 0..<gridSize {
@@ -401,8 +456,8 @@ enum BandSurfaceBuilder {
             }
             let spinLabel: String
             if nSpin > 1 { spinLabel = sel.spin == 0 ? " (spin up)" : " (spin down)" } else { spinLabel = "" }
-            sheets.append(BandSurfaceSheet(band: sel.band, spin: sel.spin,
-                                           label: "band \(sel.band + 1)\(spinLabel)",
+            sheets.append(BandSurfaceSheet(band: sel.displayBand, spin: sel.spin,
+                                           label: "band \(sel.displayBand + 1)\(spinLabel)",
                                            values: gridVals))
         }
 
@@ -429,16 +484,21 @@ enum BandSurfaceBuilder {
         } ?? nil
 
         let p3 = p0 + d0 + d1
+        // Preserve an explicit fourth label when the caller supplied a full
+        // 4-entry list (e.g. the hexagonal full-cell presentation region);
+        // legacy 3-entry callers keep the computed-corner "" label.
+        let fourthLabel = regionLabels.count >= 4 ? regionLabels[3] : ""
         return BandSurface(
             region: [p0, p1, p2, p3],
-            regionLabels: [regionLabels[0], regionLabels[1], regionLabels[2], ""],
+            regionLabels: [regionLabels[0], regionLabels[1], regionLabels[2], fourthLabel],
             gridSize: gridSize,
             sheets: sheets,
             fermiEnergy: bands.fermiEnergy,
             spinCount: nSpin,
             energyMin: energyMin,
             energyMax: energyMax,
-            kBasis: kBasis
+            kBasis: kBasis,
+            bandOffset: options.bandOffset
         )
     }
 
@@ -447,8 +507,8 @@ enum BandSurfaceBuilder {
     /// exists (windowEV > 0, default 4.0), ordered spin-major then band-minor,
     /// capped at maxCandidates (default 32). Without E_f, the first
     /// maxCandidates bands. Uses the SAME per-channel min/max pass as build().
-    static func bandInfos(_ bands: BandStructure, windowEV: Float = 4.0,
-                          maxCandidates: Int = 32) -> [BandSurfaceBandInfo] {
+    static func bandInfos(_ bands: BandStructure, windowEV: Float = 1.0,
+                          maxCandidates: Int = 32, bandOffset: Int = 0) -> [BandSurfaceBandInfo] {
         guard bands.hasValidChannelLayout, bands.nBands > 0 else { return [] }
         let perSpin = bands.kPointsPerSpin
         let nBands = bands.nBands
@@ -495,8 +555,8 @@ enum BandSurfaceBuilder {
                 let spinLabel: String
                 if nSpin > 1 { spinLabel = s == 0 ? " (spin up)" : " (spin down)" } else { spinLabel = "" }
                 let info = BandSurfaceBandInfo(
-                    spin: s, band: b,
-                    label: "band \(b + 1)\(spinLabel)",
+                    spin: s, band: b + bandOffset,
+                    label: "band \(b + 1 + bandOffset)\(spinLabel)",
                     minEnergy: mn, maxEnergy: mx,
                     isOccupied: ef.map { mx <= $0 }
                 )
@@ -512,7 +572,7 @@ enum BandSurfaceBuilder {
     /// minE - Ef when fully unoccupied; sorted by (distance, spin, band).
     /// Without E_f the `count` lowest-energy bands. count clamped 1...64;
     /// returns [] when the mesh has no bands.
-    static func closestBands(_ bands: BandStructure, count: Int) -> [Int] {
+    static func closestBands(_ bands: BandStructure, count: Int, bandOffset: Int = 0) -> [Int] {
         guard bands.hasValidChannelLayout, bands.nBands > 0 else { return [] }
         let perSpin = bands.kPointsPerSpin
         let nBands = bands.nBands
@@ -560,12 +620,61 @@ enum BandSurfaceBuilder {
                 } else {
                     dist = mn               // lowest-energy bands
                 }
-                cands.append(Cand(key: s * 10_000 + b, dist: dist, spin: s, band: b))
+                cands.append(Cand(key: s * 10_000 + b + bandOffset, dist: dist, spin: s, band: b))
             }
         }
         cands.sort { $0.dist != $1.dist ? $0.dist < $1.dist
                   : ($0.spin != $1.spin ? $0.spin < $1.spin : $0.band < $1.band) }
         return cands.prefix(clampedCount).map { $0.key }
+    }
+
+    /// Bounds of the largest gap between consecutive band MAX energies. For an
+    /// insulator this is the valence/conduction boundary: `lower` is the VBM
+    /// manifold maximum and `upper` the CBM manifold minimum.
+    static func largestGapBounds(_ bands: BandStructure) -> (lower: Float, upper: Float)? {
+        guard bands.hasValidChannelLayout, bands.nBands > 0 else { return nil }
+        let perSpin = bands.kPointsPerSpin
+        let nBands = bands.nBands
+        let nSpin = bands.nSpin
+        guard perSpin > 0, nSpin > 0 else { return nil }
+
+        // Per-(spin,band) extrema, ordered by band maximum.
+        var extents: [(min: Float, max: Float)] = []
+        for s in 0..<nSpin {
+            let base = s * perSpin
+            guard base + perSpin <= bands.kPoints.count else { return nil }
+            for b in 0..<nBands {
+                var mn = Float.infinity
+                var mx = -Float.infinity
+                for kp in bands.kPoints[base..<base + perSpin] where kp.energies[b].isFinite {
+                    mn = min(mn, kp.energies[b])
+                    mx = max(mx, kp.energies[b])
+                }
+                if mn.isFinite, mx.isFinite { extents.append((min: mn, max: mx)) }
+            }
+        }
+        guard extents.count >= 2 else { return nil }
+        let sorted = extents.sorted { $0.max < $1.max }
+        // The gap between consecutive band-maxima uses the NEXT band's MINIMUM
+        // as the conduction bound; overlapping manifolds produce non-positive
+        // gaps and are skipped (a metal has no positive inter-band gap).
+        var best: (lower: Float, upper: Float)? = nil
+        var bestGap = -Float.infinity
+        for i in 0..<(sorted.count - 1) {
+            let gap = sorted[i + 1].min - sorted[i].max
+            if gap.isFinite, gap > 0, gap > bestGap {
+                bestGap = gap
+                best = (lower: sorted[i].max, upper: sorted[i + 1].min)
+            }
+        }
+        return best
+    }
+
+    /// Midpoint of `largestGapBounds` (kept as a convenience for callers that
+    /// only need an energy reference).
+    static func largestGapReference(_ bands: BandStructure) -> Float? {
+        guard let gap = largestGapBounds(bands) else { return nil }
+        return (gap.lower + gap.upper) / 2
     }
 
     /// Derive a band-surface region spanning exactly one reciprocal primitive

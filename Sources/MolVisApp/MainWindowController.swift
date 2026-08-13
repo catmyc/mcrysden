@@ -480,7 +480,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         }
         state.onBandSurfaceClosestCount = { [weak self] count in
             guard let self, let mesh = self.scene.bandStructure, mesh.isMesh else { return }
-            let keys = BandSurfaceBuilder.closestBands(mesh, count: count)
+            let keys = BandSurfaceBuilder.closestBands(mesh, count: count,
+                                                       bandOffset: self.scene.bandSurface?.bandOffset ?? 0)
             self.state.bandSurfaceBandSelection = Set(keys)
         }
         state.onShowXRDWindow = { [weak self] in self?.showPowderXRD() }
@@ -4879,7 +4880,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         bandSurfaceView.bandSurface = next.bandSurface
         state.electronicStructureEnabled = next.bandStructure != nil || next.densityOfStates != nil || next.bandSurface != nil
         if let mesh = next.bandStructure, mesh.isMesh, next.bandSurface != nil {
-            state.bandSurfaceCandidates = BandSurfaceBuilder.bandInfos(mesh)
+            state.bandSurfaceCandidates = BandSurfaceBuilder.bandInfos(mesh,
+                                                                       bandOffset: next.bandSurface?.bandOffset ?? 0)
         }
         lastBandSurfaceBuildKey = nil
         rebuildBandSurface()
@@ -5443,7 +5445,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             state.setBandSurfaceEffectiveSelection([])
             return
         }
-        state.bandSurfaceCandidates = BandSurfaceBuilder.bandInfos(mesh)
+        state.bandSurfaceCandidates = BandSurfaceBuilder.bandInfos(mesh,
+                                                                   bandOffset: surface.bandOffset)
         let displayed = Set(surface.sheets.map { $0.spin * 10_000 + $0.band })
         state.bandSurfaceBandSelection = displayed
         state.setBandSurfaceEffectiveSelection(displayed)
@@ -5465,6 +5468,7 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         do {
             var opts = BandSurfaceOptions()
             opts.selectedBands = selection
+            opts.bandOffset = surface.bandOffset
             let rebuilt = try BandSurfaceBuilder.build(
                 bands: mesh, region: Array(surface.region.prefix(3)),
                 regionLabels: Array(surface.regionLabels.prefix(3)), options: opts)

@@ -282,6 +282,10 @@ private func normalFromGradient(_ field: ScalarField, _ f: SIMD3<Float>, sign: F
 struct FermiSurface: Codable {
     var fermiEnergy: Float
     var bands: [ScalarField]       // index == band number (parallel to orig file)
+    /// Original BXSF `BAND:` indices, parallel to `bands`, when the file
+    /// carries them (older decodings may not). Used to preserve source band
+    /// numbering in band-surface labels and selection keys.
+    var bandIndices: [Int] = []
 
     /// Parse the "<index>" token of a "BAND:" <index> marker. The token may carry
     /// surrounding non-digits (e.g. a trailing ":"); only a pure non-empty digit
@@ -428,6 +432,7 @@ struct FermiSurface: Codable {
         // wrong Fermi level. Physical band indices may start above one, but must
         // be positive, unique, and contiguous.
         var bands: [ScalarField] = []
+        var bandIndices: [Int] = []
         let needed = Int(perBand)
         var previousBandIndex: Int?
         for _ in 0..<nband {
@@ -435,6 +440,7 @@ struct FermiSurface: Codable {
             guard p < stream.count, case .band(let bi) = stream[p], bi > 0,
                   previousBandIndex.map({ bi > $0 }) ?? true else { break }
             previousBandIndex = bi
+            bandIndices.append(bi)
             p += 1
             var vals: [Float] = []
             while vals.count < needed, p < stream.count {
@@ -452,7 +458,7 @@ struct FermiSurface: Codable {
         if bands.isEmpty { throw E.malformed("no usable bands in BXSF") }
         guard bands.count == nband else { throw E.malformed("BXSF truncated (\(bands.count)/\(nband) bands)") }
         guard p == stream.count else { throw E.malformed("surplus BXSF band data") }
-        return FermiSurface(fermiEnergy: fermi, bands: bands)
+        return FermiSurface(fermiEnergy: fermi, bands: bands, bandIndices: bandIndices)
     }
 }
 

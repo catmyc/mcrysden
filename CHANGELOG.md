@@ -2,6 +2,22 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.16] — 2026-08-13
+
+### Added
+
+- **Full-grid reconstruction of symmetry-reduced QE meshes** — the PWscf symmetry block (`cryst. s(N) = ...` matrices, including fractional translations and per-operation `Time Reversal` flags) and the echoed `K_POINTS {automatic|gamma}` grid spec (4- or 6-number cards, scoped to the last calculation) are now parsed into `BandStructure`. Incomplete meshes are expanded to the full Monkhorst-Pack grid with the QE `fs.x` `fill_fs_grid` method: every full-grid point is mapped to an equivalent irreducible point under the space-group rotations plus time reversal (global TR, and per-operation TR in magnetized runs; fractional translations act on atoms, not k-points). Non-uniform-weight irreducible wedges that the uniform-weight mesh test under-classified are upgraded to meshes after a successful expansion.
+- **`--band-surf` from fs.x BXSF files** — a 2D-slab `.bxsf` is sliced into the band-surface plot directly (per-band full-grid eigenvalues, original `BAND:` numbering preserved). The vacuum axis may carry one node or the duplicated periodic endpoint (`nz = nk3+1 = 2`); the two slices must coincide modulo a reciprocal-lattice vector and carry identical eigenvalues. 3D BXSF grids are rejected with the same 2D k-grid requirement.
+- **Band-surface presentation** — viridis colorbar with energy scale, Fermi-level marker, band legend, and high-symmetry reciprocal-corner labels; square/rectangular cells plot the Γ-X-Y-M quadrant, hexagonal cells label the full-cell corners Γ/Γ+b₁/Γ+b₂/Γ+b₁+b₂, and oblique cells keep the reciprocal-basis labels. The default selection is now the fs.x convention: every band intersecting E_f ± 1 eV; without a Fermi level the VBM/CBM manifolds adjacent to the largest inter-band gap are selected, and an empty window falls back to the N bands closest to E_f.
+
+### Fixed
+
+- QE `K_POINTS` shift convention corrected: `s=1` is a half-step offset (`s/2n`), and `{gamma}` grids are Gamma-centered, matching QE's Monkhorst-Pack construction.
+- BXSF band grids store both periodic endpoints; the surface conversion now emits the unique periodic nodes (dims `n-1`) so mesh closure and interpolation succeed.
+- BXSF fractional positions now come from the DATAGRID `origin + vec·i/(n−1)` convention through the span matrix, and the sampling grid adapts to the number of selected sheets so many-band windows stay interactive.
+- A symmetry-reduced wedge from a default-verbosity run (no symmetry matrices printed) now fails `--band-surf` with the actionable fix — rerun with `verbosity='high'`, use `nosym/noinv`, or pass the `fs.x` `.bxsf` — instead of being misreported as a band path.
+- Band-number offsets (e.g. BXSF bands 6–8) now propagate through sheet labels, selection keys, the sidebar picker, and persisted band surfaces instead of renumbering bands from zero.
+
 ## [1.2.15] — 2026-08-13
 
 ### Fixed

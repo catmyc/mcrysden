@@ -86,7 +86,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         var animSize: CGSize?
         /// Electronic-structure display flags: --bands interpolates a k-mesh along
         /// a route; --dos reconstructs the total DOS from a mesh; --band-surf
-        /// builds 3D band-surface sheets near the Fermi level.
+        /// builds 3D band-surface sheets near the Fermi level from a QE 2D
+        /// k-grid (symmetry-reduced meshes are expanded to the full grid) or a
+        /// 2D fs.x .bxsf output.
         var bandPlot = false
         var dosPlot = false
         var bandSurf = false
@@ -599,6 +601,17 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 throw CLIError.invalid("--dos: input contains no band energies (use a QE output with a k-mesh, or a DOS table file)")
             }
             if flags.bandSurf {
+                // fs.x BXSF input carries per-band full-grid eigenvalues without
+                // QE `bands (ev):` sections; slice the 2D slab grid directly.
+                if let fs = scene.fermiSurface {
+                    do {
+                        scene.bandSurface = try BXSFBandSurface.build(from: fs, cell: scene.cell)
+                    } catch {
+                        throw CLIError.invalid("--band-surf: \(error)")
+                    }
+                    scene.showBandSurface = true
+                    return
+                }
                 throw CLIError.invalid("--band-surf: input contains no QE band energies on a k-point mesh")
             }
             return
@@ -622,12 +635,33 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         }
         if flags.bandSurf {
             guard bs.isMesh else {
+                // A QE irreducible wedge carries symmetry-multiplicity weights,
+                // which the uniform-weight mesh test cannot classify. Point at
+                // the canonical fixes instead of calling it a band path.
+                let distinctWeights = Set(bs.kPoints.map(\.weight))
+                if bs.kPoints.count > 2, distinctWeights.count > 1 {
+                    throw CLIError.invalid(
+                        "--band-surf: the k-points are symmetry-reduced (irreducible wedge with multiplicity weights). Rerun pw.x with verbosity='high' so the symmetry matrices are printed (mcrysden then expands the full grid), or use nosym/noinv, or postprocess with fs.x and pass the resulting .bxsf.")
+                }
                 throw CLIError.invalid("--band-surf: requires a uniform k-point mesh; this calculation is a band path")
             }
             do {
-                // The surface domain is derived from the two active mesh axes (one
-                // reciprocal primitive cell), never from arbitrary k-path vertices.
-                let region = try BandSurfaceBuilder.meshRegion(from: bs)
+                // Prefer the metric-aware presentation region (the Gamma-X-M
+                // quadrant of a square/rectangular BZ, or the full hexagonal
+                // reciprocal cell, with high-symmetry corner labels) when the
+                // mesh origin is exactly Gamma; shifted Monkhorst-Pack grids
+                // keep the full reciprocal primitive cell from the active mesh
+                // axes and its descriptive origin labels.
+                let grid = try BandMeshInterpolator.meshGrid(from: bs)
+                let active = (0..<3).filter { grid.dims[$0] > 1 }
+                let gammaCentered = active.allSatisfy { abs(grid.nodes[$0][0]) < 1e-4 }
+                let region: (region: [SIMD3<Float>], labels: [String])
+                if gammaCentered, let cell = scene.cell,
+                   let presentation = BandSurfaceRegion.presentationRegion(for: cell) {
+                    region = presentation
+                } else {
+                    region = try BandSurfaceBuilder.meshRegion(from: bs)
+                }
                 scene.bandSurface = try BandSurfaceBuilder.build(
                     bands: bs, region: region.region,
                     regionLabels: region.labels,
@@ -1949,7 +1983,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.15"
+    static let appVersion = "1.2.16"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the
@@ -1964,7 +1998,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
           mcrysden <file> <state.mvis-state>           # open with saved state
           mcrysden <qe-output> --bands                 # plot bands; a k-mesh is interpolated along the default (or --kpath) route
           mcrysden <qe-output> --dos                   # reconstruct the total DOS from a uniform band mesh
-          mcrysden <qe-output> --band-surf             # 3D band-surface plot near the Fermi level (2D k-mesh only)
+          mcrysden <qe-output|.bxsf> --band-surf        # 3D band-surface plot near the Fermi level (2D k-grid, incl. symmetry-reduced meshes)
           mcrysden <file> --export out.png             # headless raster render
           mcrysden <file> --export out.pdf             # true vector export with a raster structure layer (pdf, svg); raster-backed container (eps, ps)
           mcrysden <file> --kpath route.kpf            # import a k-path (QE K_POINTS, VASP KPOINTS, Wannier90 kpoint_path, XCrySDen KPF)
@@ -1989,7 +2023,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
         --dos-table (above) force-parses dos.x/projwfc.x DOS tables. --dos and
         --band-surf select derived plots and are only meaningful for QE outputs
         with band energies: combine `--bands --dos` for a linked band+DOS view.
-        --band-surf requires a 2D k-point mesh (slab) and conflicts with --bands.
+        --band-surf plots a 2D k-grid (slab): QE symmetry-reduced meshes are
+        expanded to the full grid from the printed symmetry matrices (the fs.x
+        method), and a 2D .bxsf produced by fs.x is sliced directly. It conflicts
+        with --bands.
         Structure conversion formats are chosen by the --convert output extension:
           .xsf .cif .poscar/.contcar/.vasp .xyz .pwi/.in/.inp/.qe
         Batch --convert-all requires --format <xsf|cif|poscar|xyz|qe|struct|d12>; with a single-file

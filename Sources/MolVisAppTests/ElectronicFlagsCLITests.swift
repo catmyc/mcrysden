@@ -125,10 +125,11 @@ final class ElectronicFlagsCLITests: XCTestCase {
         XCTAssertEqual(surfScene.bandSurface?.region.count, 4)
         XCTAssertTrue(surfScene.showBandSurface)
 
-        // NEW DEFAULT: 2 bands closest to E_f (Ef=5.0; band 3 at d=1, band 2 at d=2).
-        // Sheets are spin-major/band-minor ordered, so [2, 3].
-        XCTAssertEqual(surfScene.bandSurface?.sheets.count, 2)
-        XCTAssertEqual(surfScene.bandSurface?.sheets.map(\.band), [2, 3])
+        // NEW DEFAULT: fs.x-style ±1 eV window around E_f (Ef=5.0). Only band
+        // index 3 (energies [3,4]) intersects [4,6]; sheets are spin-major/
+        // band-minor ordered.
+        XCTAssertEqual(surfScene.bandSurface?.sheets.count, 1)
+        XCTAssertEqual(surfScene.bandSurface?.sheets.map(\.band), [3])
 
         // Explicit selection via BandSurfaceBuilder directly: pick band 1.
         var opts = BandSurfaceOptions()
@@ -191,6 +192,24 @@ final class ElectronicFlagsCLITests: XCTestCase {
             kPathSampling: 20)) { error in
             XCTAssertTrue("\(error)".contains("2D"),
                           "3D mesh must be rejected with a 2D requirement, got: \(error)")
+        }
+
+        // A non-mesh k-list with symmetry-multiplicity weights gets the
+        // actionable symmetry-reduced-wedge error, not the band-path error.
+        var wedgeScene = Scene()
+        var wedge = mesh
+        wedge.isMesh = false
+        wedge.kPoints[0] = BandKPoint(k: wedge.kPoints[0].k, weight: 0.5,
+                                      label: "", energies: wedge.kPoints[0].energies)
+        wedge.kPoints[1] = BandKPoint(k: wedge.kPoints[1].k, weight: 0.5,
+                                      label: "", energies: wedge.kPoints[1].energies)
+        wedgeScene.bandStructure = wedge
+        XCTAssertThrowsError(try App.applyElectronicStructureFlags(
+            scene: &wedgeScene,
+            flags: ElectronicStructureFlags(bandPlot: false, dosPlot: false, bandSurf: true),
+            kPathSampling: 20)) { error in
+            XCTAssertTrue("\(error)".contains("symmetry-reduced"),
+                          "wedge error must name the symmetry reduction, got: \(error)")
         }
     }
 

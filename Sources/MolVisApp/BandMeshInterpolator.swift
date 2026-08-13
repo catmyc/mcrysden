@@ -305,8 +305,19 @@ enum BandMeshInterpolator {
             }
         }
 
-        // Incomplete mesh that could not be unfolded -> reject.
+        // Incomplete mesh that could not be TR-unfolded: before rejecting, try
+        // the general space-group reconstruction (QE fs.x fill_fs_grid): expand
+        // the irreducible wedge to the full Monkhorst-Pack grid from the parsed
+        // symmetry matrices, then re-detect on the expanded, complete structure.
+        // TR-half inputs that carry no symmetry matrices (e.g. older outputs
+        // that print "No symmetry!") keep the legacy rejection.
         if !incompleteAxes.isEmpty && !unfolded {
+            do {
+                let expanded = try BandGridSymmetry.expand(bands)
+                return try meshGrid(from: expanded)
+            } catch BandGridSymmetryError.noSymmetryData {
+                // No symmetry metadata: fall through to the legacy error.
+            }
             throw BandMeshInterpolationError.symmetryReducedMesh
         }
 
