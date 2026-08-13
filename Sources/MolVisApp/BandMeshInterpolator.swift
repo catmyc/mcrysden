@@ -250,15 +250,16 @@ enum BandMeshInterpolator {
 
         // Time-reversal half-grid unfolding: if exactly ONE axis is incomplete and
         // its negated nodes complete it into a uniformly-spaced superset AND the
-        // structure is single-spin, unfold that axis (double it). The new lattice
-        // points reuse the partner original node's channel index so E(-k) = E(k).
+        // structure is single-spin AND known to obey time reversal, unfold that
+        // axis (double it). Magnetic/SOC/noncollinear calculations break TR even
+        // at nSpin == 1 and fall through to the rejection below.
         var unfolded = false
         var unfoldedAxis: Int? = nil
         // For the unfolded axis: partnerIndex[k] = original node index whose value
         // (or negation) produced union node k; isNewUnionNode[k] = true for negated.
         var partnerIndex: [Int] = []
         var isNewUnionNode: [Bool] = []
-        if incompleteAxes.count == 1, bands.nSpin == 1 {
+        if incompleteAxes.count == 1, bands.nSpin == 1, bands.timeReversalSymmetric {
             let a = incompleteAxes[0]
             let n = dims[a]
             let step = nodes[a][1] - nodes[a][0]
@@ -358,7 +359,17 @@ enum BandMeshInterpolator {
             let b = others[0], c = others[1]
             func negationMapping(_ axis: Int) throws -> [Int] {
                 let n = dims[axis]
-                guard n > 1 else { return [0] }
+                guard n > 1 else {
+                    // A one-node axis is TR-invariant only when its sole coordinate
+                    // satisfies k == -k (mod 1), i.e. ≈ 0 or ≈ 0.5. A slice at
+                    // e.g. k = 0.25 maps to 0.75, which is absent from the mesh,
+                    // so the unfolded grid would not be TR-closed — reject.
+                    let node = nodes[axis][0]
+                    guard abs(normalize(1 - node) - node) < 1e-3 else {
+                        throw BandMeshInterpolationError.symmetryReducedMesh
+                    }
+                    return [0]
+                }
                 return try (0..<n).map { i in
                     let target = normalize(1 - nodes[axis][i])
                     if let j = nodes[axis].firstIndex(where: { abs($0 - target) < 1e-3 }) {
@@ -373,14 +384,24 @@ enum BandMeshInterpolator {
                 for ib in 0..<max(1, dims[b]) {
                     for ic in 0..<max(1, dims[c]) {
                         // The energy partner of the new point (k, ib, ic) is the
-                        // present point (-k_a, -k_b, -k_c) = (partner, negB[ib], negC[ic]).
-                        let partnerTriple = [partnerIndex[k], negB[ib], negC[ic]]
+                        // present point (-k_a, -k_b, -k_c). Every component is
+                        // assigned through the DYNAMIC axis indices — a, b, c are
+                        // not necessarily x, y, z in that order.
+                        var partnerTriple = [0, 0, 0]
+                        partnerTriple[a] = partnerIndex[k]
+                        partnerTriple[b] = negB[ib]
+                        partnerTriple[c] = negC[ic]
                         let partnerKey = partnerTriple[0] * 10_000_000
                                        + partnerTriple[1] * 10_000 + partnerTriple[2]
                         if let srcIdx = indexMapping[partnerKey] {
                             // The new point keeps its own (ib, ic) indices; only the
                             // unfolded axis coordinate changes to k.
-                            let newKey = k * 10_000_000 + ib * 10_000 + ic
+                            var newTriple = [0, 0, 0]
+                            newTriple[a] = k
+                            newTriple[b] = ib
+                            newTriple[c] = ic
+                            let newKey = newTriple[0] * 10_000_000
+                                       + newTriple[1] * 10_000 + newTriple[2]
                             indexMapping[newKey] = srcIdx
                         }
                     }

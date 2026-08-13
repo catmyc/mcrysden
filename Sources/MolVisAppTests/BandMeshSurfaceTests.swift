@@ -318,6 +318,35 @@ final class BandMeshSurfaceTests: XCTestCase {
 
     // MARK: - 4. Fixture integration
 
+    /// Magnetic, spin-orbit/noncollinear, or nonzero starting-magnetization QE
+    /// output breaks time-reversal symmetry; the parser must flag it so reduced
+    /// k-meshes are never auto-unfolded for such calculations.
+    func testParserDetectsTimeReversalBreaking() {
+        let fixtureURL = Self.fixtureURL("CH3Rh111.out")
+        let raw = try! String(contentsOf: fixtureURL, encoding: .utf8)
+
+        XCTAssertTrue(BandParser.parse(raw)!.timeReversalSymmetric,
+                      "non-magnetic fixture must claim TR symmetry")
+
+        let magnetic = "total magnetization      =      1.2345\n" + raw
+        XCTAssertFalse(BandParser.parse(magnetic)!.timeReversalSymmetric,
+                       "magnetization output breaks TR")
+
+        let soc = "Noncollinear calculation\n" + raw
+        XCTAssertFalse(BandParser.parse(soc)!.timeReversalSymmetric,
+                       "noncollinear/SOC breaks TR")
+
+        // QE echoes zero starting magnetizations even for non-magnetic runs.
+        let zeroMag = "starting_magnetization(1)=0.0\nstarting_magnetization(2)=0.0\n" + raw
+        XCTAssertTrue(BandParser.parse(zeroMag)!.timeReversalSymmetric,
+                      "zero starting magnetization is not magnetic")
+
+        // A nonzero value marks a magnetic calculation.
+        let nonzeroMag = "starting_magnetization(1)=0.0\nstarting_magnetization(2)=0.7\n" + raw
+        XCTAssertFalse(BandParser.parse(nonzeroMag)!.timeReversalSymmetric,
+                       "nonzero starting magnetization breaks TR")
+    }
+
     /// Restarted/concatenated QE outputs can print several "reciprocal axes"
     /// blocks; the LAST complete one must win (matching the final band iteration
     /// and last real-space cell the parser selects). A stale earlier block must

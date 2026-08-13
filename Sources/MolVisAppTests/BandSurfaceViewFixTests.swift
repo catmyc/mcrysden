@@ -245,10 +245,10 @@ final class BandSurfaceViewFixTests: XCTestCase {
                              "nearer sheet B should dominate: B-like \(likeB) vs A-like \(likeA)")
     }
 
-    /// Pure-red (Fermi outline) pixels in the rows below the title strip. The
-    /// Fermi outline is red 0.6 premultiplied over the light base/white, so
-    /// g ≈ b with a large red excess. The viridis(≈1) sheet pink has b > g and
-    /// is excluded by requiring g ≈ b.
+    /// Red (Fermi outline) pixels in the rows below the title strip. The
+    /// outline is red 0.6 premultiplied over base/sheet/background — r stays
+    /// high, g stays low, and the blue channel stays low over every backdrop.
+    /// The top sheet's viridis(≈1) pink (218,85,130) is excluded by b < 90.
     private func strongRedPixels(_ rep: NSBitmapImageRep, rowMin: Int) -> Int {
         let w = rep.pixelsWide, h = rep.pixelsHigh, rb = rep.bytesPerRow
         var count = 0
@@ -258,7 +258,7 @@ final class BandSurfaceViewFixTests: XCTestCase {
             for x in 0..<w {
                 let p = row.advanced(by: x * 4)
                 let r = Int(p[0]), g = Int(p[1]), b = Int(p[2])
-                if r > 170 && g < 170 && abs(g - b) <= 10 { count += 1 }
+                if r > 170 && g < 170 && b < 90 { count += 1 }
             }
         }
         return count
@@ -288,7 +288,7 @@ final class BandSurfaceViewFixTests: XCTestCase {
         let repIn = render(inside), repOut = render(outside)
         let redIn = strongRedPixels(repIn, rowMin: 60)
         let redOut = strongRedPixels(repOut, rowMin: 60)
-        XCTAssertGreaterThan(redIn, 100,
+        XCTAssertGreaterThan(redIn, 150,
                              "Fermi plane inside domain must render red pixels (\(redIn))")
         XCTAssertLessThan(redOut, 30,
                           "Fermi plane outside domain must not be drawn (\(redOut) red px)")
@@ -432,6 +432,86 @@ final class BandSurfaceViewFixTests: XCTestCase {
         XCTAssertLessThanOrEqual(dx1, 2, "fill right \(fillBox.1) vs outline \(outlineBox.1)")
         XCTAssertLessThanOrEqual(dy0, 2, "fill top \(fillBox.2) vs outline \(outlineBox.2)")
         XCTAssertLessThanOrEqual(dy1, 2, "fill bottom \(fillBox.3) vs outline \(outlineBox.3)")
+    }
+
+    /// A band fragment exactly AT energyMin is coplanar with the base plane.
+    /// The floor must not occlude it (strict `>` depth test against a
+    /// depth-writing floor would hide it); the sheet must render with its own
+    /// viridis color.
+    func testBandAtEnergyMinVisibleOverBasePlane() {
+        let gridSize = 8
+        let region: [SIMD3<Float>] = [SIMD3(0, 0, 0), SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0)]
+        let sheet = BandSurfaceSheet(band: 0, spin: 0, label: "min",
+                                     values: [Float](repeating: 0, count: gridSize * gridSize))
+        let surface = BandSurface(region: region, regionLabels: ["G", "X", "Y", ""],
+                                  gridSize: gridSize, sheets: [sheet],
+                                  fermiEnergy: nil, spinCount: 1, energyMin: 0, energyMax: 1)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        guard let rep = renderToBitmap(view) else { return XCTFail("render failed") }
+
+        // Sheet color: viridis(t=0) shaded with the +z normal.
+        let c = Colormap.viridis.rgb(0)
+        let shade = 0.55 + 0.45 * max(0, simd_dot(SIMD3<Float>(0, 0, 1),
+                                                   simd_normalize(SIMD3<Float>(0.35, 0.45, 0.85))))
+        let er = Int(min(255, (c.x * shade * 255).rounded()))
+        let eg = Int(min(255, (c.y * shade * 255).rounded()))
+        let eb = Int(min(255, (c.z * shade * 255).rounded()))
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rb = rep.bytesPerRow
+        guard let base = rep.bitmapData else { return }
+        var count = 0
+        var floorPx = 0
+        for y in 24..<h {
+            let row = base.advanced(by: y * rb)
+            for x in 0..<w {
+                let p = row.advanced(by: x * 4)
+                let r = Int(p[0]), g = Int(p[1]), b = Int(p[2])
+                if abs(r - er) <= 25 && abs(g - eg) <= 25 && abs(b - eb) <= 25 {
+                    count += 1
+                }
+                // The floor's 249-gray must NOT speckle through the coplanar
+                // sheet: a depth-writing floor z-fights and leaves ~half the
+                // patch (thousands of pixels) showing the floor color.
+                if max(r, g, b) - min(r, g, b) <= 2 && r >= 240 && r <= 253 {
+                    floorPx += 1
+                }
+            }
+        }
+        XCTAssertGreaterThan(count, 2000,
+                             "band at energyMin must be visible over the base plane (\(count) px)")
+        XCTAssertLessThan(floorPx, 500,
+                          "the floor must not z-fight with the coplanar band (\(floorPx) floor px)")
+    }
+
+    /// The translucent Fermi plane is rasterized as one quadrilateral, so its
+    /// interior is blended exactly once everywhere. A two-triangle split shares
+    /// a diagonal; any pixel that lands exactly on it would be double-blended
+    /// (≈(251,180,180) vs the single-blend ≈(250,212,212)) into a darker seam.
+    /// The quad removes that edge by construction; this asserts no
+    /// double-blended pixels appear.
+    func testFermiPlaneHasNoDiagonalSeam() {
+        let gridSize = 8
+        let region: [SIMD3<Float>] = [SIMD3(0, 0, 0), SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0)]
+        let surface = BandSurface(region: region, regionLabels: ["G", "X", "Y", ""],
+                                  gridSize: gridSize, sheets: [],
+                                  fermiEnergy: 0.5, spinCount: 1, energyMin: 0, energyMax: 1)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        guard let rep = renderToBitmap(view) else { return XCTFail("render failed") }
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rb = rep.bytesPerRow
+        guard let base = rep.bitmapData else { return }
+        var seam = 0
+        for y in 24..<h {
+            let row = base.advanced(by: y * rb)
+            for x in 0..<w {
+                let p = row.advanced(by: x * 4)
+                let r = Int(p[0]), g = Int(p[1]), b = Int(p[2])
+                // Double-blended diagonal pixels read g/b ≈ 180; single-blended
+                // fill reads g/b ≈ 212; the red outline reads g/b ≈ 99.
+                if r > 240 && g >= 165 && g <= 195 && abs(g - b) <= 8 { seam += 1 }
+            }
+        }
+        XCTAssertLessThan(seam, 10, "Fermi plane must not show a double-blended diagonal seam (\(seam) px)")
     }
 
     /// The translucent base-plane fill must be premultiplied: 0.9 gray at 0.25

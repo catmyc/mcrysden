@@ -410,13 +410,58 @@ final class BandSurfaceView: NSView {
             (toScreen(pr), pr.depth)
         }
 
-        // 1. Base plane (floor): 2 triangles, translucent gray, writes depth.
+        // Rasterize a convex quadrilateral (parallelogram in screen space — the
+        // affine image of the model-space patch under orthographic projection)
+        // with bilinear depth. Rasterizing the quad as ONE primitive avoids the
+        // shared-diagonal double-blend of a two-triangle split: translucent
+        // planes (base, Fermi) would otherwise show a darker seam along the
+        // diagonal. Depth is bilinear over the parallelogram, which is exact for
+        // the affine screen mapping of a flat plane.
+        func rasterQuad(_ p0: NSPoint, _ d0: Float, _ p1: NSPoint, _ d1: Float,
+                        _ p2: NSPoint, _ d2: Float, _ p3: NSPoint, _ d3: Float,
+                        _ sr: Float, _ sg: Float, _ sb: Float, _ sa: Float,
+                        _ writeDepth: Bool) {
+            // Corners in parameter order (0,0), (1,0), (1,1), (0,1):
+            // p1 = p0 + U, p3 = p0 + V.
+            let x0 = p0.x - originX, y0 = p0.y - originY
+            let x1 = p1.x - originX, y1 = p1.y - originY
+            let x2 = p2.x - originX, y2 = p2.y - originY
+            let x3 = p3.x - originX, y3 = p3.y - originY
+            let ux = x1 - x0, uy = y1 - y0
+            let vx = x3 - x0, vy = y3 - y0
+            let denom = ux * vy - uy * vx
+            guard abs(denom) > 1e-6 else { return }   // edge-on: nothing to fill
+            let minX = max(0, Int(min(x0, x1, x2, x3).rounded(.down)))
+            let maxX = min(W - 1, Int(max(x0, x1, x2, x3).rounded(.up)))
+            let minY = max(0, Int(min(y0, y1, y2, y3).rounded(.down)))
+            let maxY = min(H - 1, Int(max(y0, y1, y2, y3).rounded(.up)))
+            guard minX <= maxX, minY <= maxY else { return }
+            let invDenom = 1 / denom
+            for y in minY...maxY {
+                for x in minX...maxX {
+                    let qx = CGFloat(x) - x0, qy = CGFloat(y) - y0
+                    let s = (qx * vy - qy * vx) * invDenom
+                    let t = (ux * qy - uy * qx) * invDenom
+                    guard s >= 0, t >= 0, s <= 1, t <= 1 else { continue }
+                    let w00 = Float((1 - s) * (1 - t))
+                    let w10 = Float(s * (1 - t))
+                    let w11 = Float(s * t)
+                    let w01 = Float((1 - s) * t)
+                    let depth = w00 * d0 + w10 * d1 + w11 * d2 + w01 * d3
+                    writePx(x, y, sr, sg, sb, sa, depth, writeDepth)
+                }
+            }
+        }
+
+        // 1. Base plane (floor): translucent gray quad, NO depth write. A band
+        //    fragment exactly at energyMin is coplanar with the floor; the
+        //    strict `>` depth test would hide it. Nothing lies behind the floor,
+        //    so it never needs to occlude anything.
         let b0 = projToScreen(vert(baseCorners3D[0]))
         let b1 = projToScreen(vert(baseCorners3D[1]))
         let b2 = projToScreen(vert(baseCorners3D[2]))
         let b3 = projToScreen(vert(baseCorners3D[3]))
-        rasterTri(b0.0, b0.1, b1.0, b1.1, b2.0, b2.1, 0.9, 0.9, 0.9, 0.25, true)
-        rasterTri(b0.0, b0.1, b2.0, b2.1, b3.0, b3.1, 0.9, 0.9, 0.9, 0.25, true)
+        rasterQuad(b0.0, b0.1, b1.0, b1.1, b2.0, b2.1, b3.0, b3.1, 0.9, 0.9, 0.9, 0.25, false)
 
         // 2. Surface triangles (opaque, depth write).
         for tri in surfTris {
@@ -445,8 +490,9 @@ final class BandSurfaceView: NSView {
         rasterLine(b2.0, b3.0, b2.1, b3.1, baseOutline, baseOutline, baseOutline, 0.6, false, axisDepthBias)
         rasterLine(b3.0, b0.0, b3.1, b0.1, baseOutline, baseOutline, baseOutline, 0.6, false, axisDepthBias)
 
-        // 4. Fermi plane (only inside the displayed domain): translucent red fill +
-        //    outline, depth-tested but NO depth write (never overpaints surfaces).
+        // 4. Fermi plane (only inside the displayed domain): translucent red quad
+        //    + outline, depth-tested but NO depth write (never overpaints
+        //    surfaces). One primitive => no shared-diagonal double blend.
         if drawFermi, let Ef = surface.fermiEnergy {
             let zf = zEnergy(Ef)
             let f3D = [(0,0),(1,0),(1,1),(0,1)].map { (si: Int, ti: Int) -> ProjVert in
@@ -455,8 +501,8 @@ final class BandSurfaceView: NSView {
                 return vert(SIMD3<Float>(gx - GC.x, gy - GC.y, zf))
             }
             let f = f3D.map { projToScreen($0) }
-            rasterTri(f[0].0, f[0].1, f[1].0, f[1].1, f[2].0, f[2].1, 1, 0, 0, 0.15, false)
-            rasterTri(f[0].0, f[0].1, f[2].0, f[2].1, f[3].0, f[3].1, 1, 0, 0, 0.15, false)
+            rasterQuad(f[0].0, f[0].1, f[1].0, f[1].1, f[2].0, f[2].1, f[3].0, f[3].1,
+                       1, 0, 0, 0.15, false)
             for (p, q) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[3]), (f[3], f[0])] {
                 rasterLine(p.0, q.0, p.1, q.1, 1, 0, 0, 0.6, false)
             }

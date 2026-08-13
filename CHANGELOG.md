@@ -2,6 +2,17 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.13] — 2026-08-13
+
+### Fixed
+
+- **Time-reversal unfolding works on any reduced axis** — the negated-node fill previously assumed the incomplete axis was x; y- and z-reduced meshes permuted lattice keys and left the unfolded grid unusable. Partner and new keys are now assembled through the dynamic axis indices, with y- and z-unfold regressions.
+- **Degenerate axes must be time-reversal invariant** — a one-node axis (e.g. a `k_z = 0.25` slice) is only unfoldable when its coordinate satisfies `k ≡ −k (mod 1)` (≈ 0 or ≈ 0.5); anything else is rejected instead of fabricating the missing `−k` slice.
+- **Time-reversal gate for automatic unfolding** — the QE parser now flags calculations that break TR (magnetization output, nonzero `starting_magnetization`, spin-orbit/noncollinear markers) as `timeReversalSymmetric = false`; reduced meshes from such calculations are rejected rather than auto-unfolded, since a single spin channel alone does not prove E(k) = E(−k).
+- **Base plane no longer occludes coplanar bands** — the floor writes no depth, so a band fragment exactly at `energyMin` renders with its own color instead of z-fighting into the gray base plane.
+- **Translucent planes rasterized as single quads** — the base and Fermi planes are filled as one quadrilateral each, eliminating the shared-diagonal double blend (≈27.75 % vs 15 % red) of a two-triangle split.
+- **README** — `--band-surf` documented with local `k₁/k₂` axes (matching the implementation) instead of Cartesian `k_x/k_y`.
+
 ## [1.2.12] — 2026-08-13
 
 ### Fixed

@@ -53,6 +53,13 @@ struct BandStructure: Codable {
     /// Number of physically periodic dimensions used for DOS normalization:
     /// 0 molecule, 1 wire, 2 slab, 3 bulk crystal.
     var periodicDim: Int = 0
+    /// Whether the calculation is known to obey time-reversal symmetry
+    /// (E(k) = E(-k)): non-magnetic, collinear, spin-orbit-free. Set by the QE
+    /// parser from the output's magnetic/SOC/noncollinear markers; default true
+    /// for sources that carry no such metadata. TR-reduced k-meshes are only
+    /// unfolded when this holds — magnetic/SOC calculations break it and must
+    /// not have their half-meshes auto-unfolded.
+    var timeReversalSymmetric: Bool = true
 
     init(kPoints: [BandKPoint], fermiEnergy: Float?, nSpin: Int,
          reciprocal: [SIMD3<Float>]? = nil,
@@ -60,7 +67,8 @@ struct BandStructure: Codable {
          kPointsPerSpin: Int,
          isMesh: Bool = false,
          cell: Cell? = nil,
-         periodicDim: Int = 0) {
+         periodicDim: Int = 0,
+         timeReversalSymmetric: Bool = true) {
         self.kPoints = kPoints
         self.fermiEnergy = fermiEnergy
         self.nSpin = nSpin
@@ -70,13 +78,14 @@ struct BandStructure: Codable {
         self.isMesh = isMesh
         self.cell = cell
         self.periodicDim = min(3, max(0, periodicDim))
+        self.timeReversalSymmetric = timeReversalSymmetric
     }
 
     // Keep old project files valid after adding the optional real-space cell
     // and periodic-dimensionality metadata.
     private enum CodingKeys: String, CodingKey {
         case kPoints, fermiEnergy, nSpin, reciprocal, kPointsAreCrystal,
-             kPointsPerSpin, isMesh, cell, periodicDim
+             kPointsPerSpin, isMesh, cell, periodicDim, timeReversalSymmetric
     }
 
     init(from decoder: Decoder) throws {
@@ -90,6 +99,7 @@ struct BandStructure: Codable {
         isMesh = try c.decodeIfPresent(Bool.self, forKey: .isMesh) ?? false
         cell = try c.decodeIfPresent(Cell.self, forKey: .cell)
         periodicDim = min(3, max(0, try c.decodeIfPresent(Int.self, forKey: .periodicDim) ?? 0))
+        timeReversalSymmetric = try c.decodeIfPresent(Bool.self, forKey: .timeReversalSymmetric) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -103,6 +113,7 @@ struct BandStructure: Codable {
         try c.encode(isMesh, forKey: .isMesh)
         try c.encodeIfPresent(cell, forKey: .cell)
         try c.encode(periodicDim, forKey: .periodicDim)
+        try c.encode(timeReversalSymmetric, forKey: .timeReversalSymmetric)
     }
 
     /// Number of bands safely shared by every k-point. Parser-produced data is
@@ -193,6 +204,10 @@ enum BandParser {
         // Reciprocal lattice vectors, if present, for crystal-coordinate metric.
         let reciprocal = parseReciprocal(text)
         let cell = parseRealSpaceCell(text)
+        // A reduced k-mesh may only be unfolded when the calculation obeys
+        // time reversal (E(k) = E(-k)). Magnetic, spin-orbit/noncollinear, and
+        // field-driven calculations break it even for a single spin channel.
+        let timeReversalSymmetric = !detectTimeReversalBreaking(text)
         // Reciprocal axes are enough to establish that this is a periodic QE
         // calculation even when a bands-only file omitted the real-space axes;
         // DOS generation will then fail explicitly if the volume/area cannot
@@ -425,7 +440,8 @@ enum BandParser {
         return BandStructure(kPoints: filtered, fermiEnergy: chosen.fermi, nSpin: nSpin,
                              reciprocal: reciprocal, kPointsAreCrystal: meta.isCrystal,
                              kPointsPerSpin: kPointsPerSpin, isMesh: isMesh,
-                             cell: cell, periodicDim: periodicDim)
+                             cell: cell, periodicDim: periodicDim,
+                             timeReversalSymmetric: timeReversalSymmetric)
     }
 
     /// A Monkhorst-Pack sampling mesh is identified by uniform integration weights AND a
@@ -731,6 +747,33 @@ enum BandParser {
         let after = String(line[wkRange.upperBound...])
         return after.split(whereSeparator: { $0 == " " || $0 == "\t" }).first
             .flatMap { Float($0) }.flatMap { $0.isFinite ? $0 : nil }
+    }
+
+    /// True when the QE text indicates a calculation without time-reversal
+    /// symmetry, where E(k) = E(-k) does not hold: magnetic (nonzero
+    /// magnetization), spin-orbit/noncollinear, or field-driven runs. Such
+    /// calculations must not have symmetry-reduced k-meshes unfolded.
+    private static func detectTimeReversalBreaking(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        if lower.contains("noncollinear") || lower.contains("non-collinear") { return true }
+        if lower.contains("spin-orbit") || lower.contains("lspinorb") { return true }
+        if lower.contains("magnetization (x)") || lower.contains("total magnetization") { return true }
+        // QE echoes "starting_magnetization(i)=0.0" even for non-magnetic runs,
+        // so only a NONZERO value marks a magnetic calculation.
+        var scan = lower.startIndex
+        while let range = lower.range(of: "starting_magnetization", range: scan..<lower.endIndex) {
+            scan = range.upperBound
+            guard let eq = lower.range(of: "=", range: scan..<lower.endIndex) else { break }
+            let tail = String(lower[eq.upperBound...]).prefix(24)
+            // The value may be separated by spaces ("= 0.0000") or end the line
+            // ("=0.7\n"); split on whitespace and newlines so the numeric token
+            // never carries trailing whitespace.
+            if let token = tail.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }).first,
+               let value = Float(token), value != 0 {
+                return true
+            }
+        }
+        return false
     }
 
     /// Parse the reciprocal lattice vectors b1..b3 from the QE "reciprocal axes"

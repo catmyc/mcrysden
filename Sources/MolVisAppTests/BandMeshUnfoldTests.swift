@@ -174,6 +174,85 @@ final class BandMeshUnfoldTests: XCTestCase {
         }
     }
 
+    // MARK: - (h) Y-axis and Z-axis unfolding (axis position must not be hard-coded)
+
+    func testTRHalfUnfoldYAxis() {
+        // y is the TR-reduced half grid; x is complete; z is a TR-invariant slice.
+        let nodes: [[Float]] = [[0.125, 0.375, 0.625, 0.875],
+                                 [0.125, 0.375],
+                                 [0.5]]
+        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0))
+        let grid = try! BandMeshInterpolator.meshGrid(from: bands)
+        XCTAssertEqual(grid.dims, [4, 4, 1])
+        XCTAssertEqual(grid.pointCount, 16)
+        XCTAssertEqual(grid.nodes[1].count, 4)
+        for j in 0..<4 {
+            XCTAssertEqual(grid.nodes[1][j], [0.125, 0.375, 0.625, 0.875][j], accuracy: 1e-3)
+        }
+        let perSpin = bands.kPointsPerSpin
+        let channel = Array(bands.kPoints[0..<perSpin])
+        let values = channel.map { $0.energies[0] }
+        // (0.375, 0.625, 0.5) = -k with k = (0.625, 0.375, 0.5): E = 0.625 + 0.375 = 1.0.
+        let e = grid.interpolate(values, at: SIMD3<Float>(0.375, 0.625, 0.5))!
+        XCTAssertEqual(e, 1.0, accuracy: 1e-4)
+        // (0.625, 0.875, 0.5): x partner 0.375, y partner 0.125 -> E = 0.5.
+        let e2 = grid.interpolate(values, at: SIMD3<Float>(0.625, 0.875, 0.5))!
+        XCTAssertEqual(e2, 0.5, accuracy: 1e-4)
+        // (0.875, 0.625, 0.5): x partner 0.125, y partner 0.375 -> E = 0.5.
+        let e3 = grid.interpolate(values, at: SIMD3<Float>(0.875, 0.625, 0.5))!
+        XCTAssertEqual(e3, 0.5, accuracy: 1e-4)
+    }
+
+    func testTRHalfUnfoldZAxis() {
+        // z is the TR-reduced half grid; x and y are complete.
+        let nodes: [[Float]] = [[0.125, 0.375, 0.625, 0.875],
+                                 [0.125, 0.375, 0.625, 0.875],
+                                 [0.125, 0.375]]
+        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 1))
+        let grid = try! BandMeshInterpolator.meshGrid(from: bands)
+        XCTAssertEqual(grid.dims, [4, 4, 4])
+        XCTAssertEqual(grid.pointCount, 64)
+        XCTAssertEqual(grid.nodes[2].count, 4)
+        let perSpin = bands.kPointsPerSpin
+        let channel = Array(bands.kPoints[0..<perSpin])
+        let values = channel.map { $0.energies[0] }
+        // (0.375, 0.375, 0.625) = -k with k = (0.625, 0.625, 0.375):
+        // E = 0.625 + 0.625 + 0.375 = 1.625.
+        let e = grid.interpolate(values, at: SIMD3<Float>(0.375, 0.375, 0.625))!
+        XCTAssertEqual(e, 1.625, accuracy: 1e-4)
+        // (0.625, 0.375, 0.875): k = (0.375, 0.625, 0.125): E = 0.375+0.625+0.125 = 1.125.
+        let e2 = grid.interpolate(values, at: SIMD3<Float>(0.625, 0.375, 0.875))!
+        XCTAssertEqual(e2, 1.125, accuracy: 1e-4)
+    }
+
+    // MARK: - (i) Degenerate axis must be time-reversal invariant
+
+    func testTRHalfUnfoldRejectsNonInvariantDegenerateAxis() {
+        // x half-reduced, y complete, z = {0.25}: z is degenerate but NOT
+        // TR-invariant (0.25 maps to 0.75, which is absent), so unfolding must
+        // be rejected rather than fabricate the 0.75 slice's energies.
+        let nodes: [[Float]] = [[0.125, 0.375],
+                                 [0.125, 0.375, 0.625, 0.875],
+                                 [0.25]]
+        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0))
+        XCTAssertThrowsError(try BandMeshInterpolator.meshGrid(from: bands)) { err in
+            XCTAssertEqual(err as? BandMeshInterpolationError, .symmetryReducedMesh)
+        }
+    }
+
+    // MARK: - (j) Time-reversal-breaking calculations must not unfold
+
+    func testMagneticMeshNotUnfolded() {
+        let nodes: [[Float]] = [[0.125, 0.375],
+                                 [0.125, 0.375, 0.625, 0.875],
+                                 [0.5]]
+        var bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0))
+        bands.timeReversalSymmetric = false
+        XCTAssertThrowsError(try BandMeshInterpolator.meshGrid(from: bands)) { err in
+            XCTAssertEqual(err as? BandMeshInterpolationError, .symmetryReducedMesh)
+        }
+    }
+
     // MARK: - (g) Cartesian k-points require a reciprocal basis
 
     func testCartesianMeshRequiresReciprocal() {
