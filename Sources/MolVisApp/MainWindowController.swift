@@ -539,6 +539,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         bandGrapher.bandStructure = scene.bandStructure
         dosGrapher.densityOfStates = scene.densityOfStates
         bandSurfaceView.bandSurface = scene.bandSurface
+        if let o = scene.bandSurfaceOrientation {
+            bandSurfaceView.azimuthDegrees = o.azimuthDegrees
+            bandSurfaceView.elevationDegrees = o.elevationDegrees
+        }
         linkedGraphs.bandView.bandStructure = scene.bandStructure
         linkedGraphs.dosView.densityOfStates = scene.densityOfStates
         state.electronicStructureEnabled = initHasBands || scene.densityOfStates != nil || scene.bandSurface != nil
@@ -698,6 +702,10 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         } ?? []
         dosGrapher.densityOfStates = scene.densityOfStates
         bandSurfaceView.bandSurface = scene.bandSurface
+        if let o = scene.bandSurfaceOrientation {
+            bandSurfaceView.azimuthDegrees = o.azimuthDegrees
+            bandSurfaceView.elevationDegrees = o.elevationDegrees
+        }
         // Electronic-structure section is available when any graph/surface is populated.
         // (Not a @Published scene field — set directly, not via state, to avoid
         // persisting view-only availability into the scene.)
@@ -1920,6 +1928,8 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
             if !bandSurfaceView.isHidden, let surface = scene.bandSurface {
                 let printView = BandSurfaceView(frame: NSRect(origin: .zero, size: pageRect.size))
                 printView.bandSurface = surface
+                printView.azimuthDegrees = bandSurfaceView.azimuthDegrees
+                printView.elevationDegrees = bandSurfaceView.elevationDegrees
                 printView.exportBackground = .white
                 nsImage = try PrintSupport.renderGraph(printView, pageRect: pageRect)
             } else if !linkedGraphs.isHidden {
@@ -4558,6 +4568,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if linkedGraphs.isHidden || !linkedGraphs.dosPresent { visibleScene.densityOfStates = nil }
         if linkedGraphs.isHidden || !linkedGraphs.bandPresent { visibleScene.bandStructure = nil }
         if bandSurfaceView.isHidden || !scene.showBandSurface { visibleScene.bandSurface = nil }
+        if !bandSurfaceView.isHidden, scene.showBandSurface {
+            visibleScene.bandSurfaceOrientation = BandSurfaceOrientation(
+                azimuthDegrees: bandSurfaceView.azimuthDegrees,
+                elevationDegrees: bandSurfaceView.elevationDegrees)
+        }
         // The color plane is now drawn by the renderer in the Metal scene, so the
         // exported scene keeps grid2D intact (the renderer gates on showColorPlane).
         // Apply export options: if the caller passes explicit options, use them;

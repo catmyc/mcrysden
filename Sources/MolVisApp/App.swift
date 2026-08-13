@@ -624,16 +624,13 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
             guard bs.isMesh else {
                 throw CLIError.invalid("--band-surf: requires a uniform k-point mesh; this calculation is a band path")
             }
-            let route: KPath = scene.kPathPoints.isEmpty
-                ? KPath.defaultPath(lattice: .sc)
-                : KPath(points: scene.kPathPoints, pointsPerSegment: kPathSampling, breaks: scene.kPathBreaks)
-            guard let region = BandSurfaceBuilder.defaultRegion(path: route) else {
-                throw CLIError.invalid("--band-surf: cannot derive a surface plane from the k-path route")
-            }
             do {
+                // The surface domain is derived from the two active mesh axes (one
+                // reciprocal primitive cell), never from arbitrary k-path vertices.
+                let region = try BandSurfaceBuilder.meshRegion(from: bs)
                 scene.bandSurface = try BandSurfaceBuilder.build(
-                    bands: bs, region: region,
-                    regionLabels: BandSurfaceBuilder.regionLabels(for: route, region: region),
+                    bands: bs, region: region.region,
+                    regionLabels: region.labels,
                     options: BandSurfaceOptions())
             } catch {
                 throw CLIError.invalid("--band-surf: \(error)")
@@ -1691,6 +1688,12 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 $0.bandSurface = surface
                 $0.exportBackground = graphBackground
                 $0.isExportTransparent = isTransparent
+                // WYSIWYG: honor the orientation the interactive view (or a saved
+                // state) had, instead of resetting to the built-in defaults.
+                if let orientation = scene.bandSurfaceOrientation {
+                    $0.azimuthDegrees = orientation.azimuthDegrees
+                    $0.elevationDegrees = orientation.elevationDegrees
+                }
             }, to: url, size: size)
         }
         if let dos = scene.densityOfStates, let bands = scene.bandStructure {
@@ -1946,7 +1949,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.10"
+    static let appVersion = "1.2.11"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

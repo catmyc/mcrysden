@@ -367,6 +367,14 @@ struct VolumeSlice: Codable, Equatable {
     var distance: Float = 0.5
 }
 
+/// Interactive camera orientation for the 3D band-surface plot. Persisted on the
+/// Scene (optional, decode-if-present) so a saved state restores the user's view.
+/// When nil the plot uses its built-in defaults (azimuth 30°, elevation 24°).
+struct BandSurfaceOrientation: Codable, Equatable {
+    var azimuthDegrees: Float = 30
+    var elevationDegrees: Float = 24
+}
+
 struct Scene: Codable {
     var atoms: [Atom] = []
     var bonds: [Bond] = []
@@ -492,6 +500,9 @@ struct Scene: Codable {
     var bandSurface: BandSurface? = nil
     /// Whether the band-surface plot is displayed when `bandSurface` is present.
     @DefaultTrue var showBandSurface: Bool = true
+    /// Persisted interactive orientation of the 3D band-surface plot. Optional so
+    /// state files written before this field existed still decode (to nil/defaults).
+    var bandSurfaceOrientation: BandSurfaceOrientation? = nil
     /// Colormap for the 2D color plane. Defaults to .viridis (byte-identical output).
     var colorPlaneColormap: Colormap = .viridis
     /// Whether contour lines are drawn over the color plane.
@@ -591,6 +602,7 @@ struct Scene: Codable {
         showColorPlane = (try c.decode(DefaultTrue.self, forKey: .showColorPlane)).wrappedValue
         bandSurface = try c.decodeIfPresent(BandSurface.self, forKey: .bandSurface) ?? nil
         showBandSurface = (try c.decode(DefaultTrue.self, forKey: .showBandSurface)).wrappedValue
+        bandSurfaceOrientation = try c.decodeIfPresent(BandSurfaceOrientation.self, forKey: .bandSurfaceOrientation) ?? nil
         colorPlaneColormap = try c.decodeIfPresent(Colormap.self, forKey: .colorPlaneColormap) ?? .viridis
         colorPlaneContourEnabled = try c.decodeIfPresent(Bool.self, forKey: .colorPlaneContourEnabled) ?? true
         colorPlaneContourCount = try c.decodeIfPresent(Int.self, forKey: .colorPlaneContourCount) ?? 6

@@ -644,5 +644,6 @@ extension Scene {
         backgroundImagePath = other.backgroundImagePath
         anaglyphMode = other.anaglyphMode
         showBandSurface = other.showBandSurface
+        bandSurfaceOrientation = other.bandSurfaceOrientation
     }
 }

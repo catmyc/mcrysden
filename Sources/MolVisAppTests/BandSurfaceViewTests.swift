@@ -171,21 +171,27 @@ final class BandSurfaceViewTests: XCTestCase {
         let surface = makeSurface()
         let size = CGRect(x: 0, y: 0, width: 240, height: 200)
 
-        // Default draw with export background.
+        // Same orientation with export background -> identical pixels (export is WYSIWYG).
         let view1 = BandSurfaceView(frame: size)
         view1.bandSurface = surface
         view1.exportBackground = .white
         guard let rep1 = renderToBitmap(view1) else { return XCTFail("render 1 failed") }
 
-        // Different rotation but export forces defaults.
+        let view1b = BandSurfaceView(frame: size)
+        view1b.bandSurface = surface
+        view1b.exportBackground = .white
+        guard let rep1b = renderToBitmap(view1b) else { return XCTFail("render 1b failed") }
+        XCTAssertEqual(pixelData(rep1), pixelData(rep1b),
+                       "same orientation must produce identical exported pixels")
+
+        // Different rotation -> export reflects it, so pixels must DIFFER.
         let view2 = BandSurfaceView(frame: size)
         view2.bandSurface = surface
         view2.azimuthDegrees = 90
         view2.exportBackground = .white
         guard let rep2 = renderToBitmap(view2) else { return XCTFail("render 2 failed") }
-
-        // Byte-identical: export forces default rotation.
-        XCTAssertEqual(pixelData(rep1), pixelData(rep2), "export must force default rotation")
+        XCTAssertNotEqual(pixelData(rep1), pixelData(rep2),
+                          "different rotation must produce different exported pixels (WYSIWYG)")
     }
 
     func testControllerAndExportWiring() throws {

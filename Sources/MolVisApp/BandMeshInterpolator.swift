@@ -6,9 +6,17 @@ import simd
 // A band-structure mesh (Monkhorst-Pack sampling) is a COMPLETE multidimensional
 // lattice: every integer combination of its per-axis node spacings. Detection
 // normalizes each k-coordinate mod 1, finds the per-axis sorted unique node list,
-// verifies uniform spacing AND a completely filled product box, then builds a
-// lattice-index -> source-index mapping so values can be interpolated by channel
-// order regardless of how the source k-points were ordered.
+// verifies uniform internal spacing AND a complete periodic closure (the closing
+// gap between the last node and the wrapped-first node must equal the internal
+// step), then builds a lattice-index -> source-index mapping so values can be
+// interpolated by channel order regardless of how the source k-points were ordered.
+//
+// Meshes internally uniform but incomplete along exactly ONE axis may be a
+// time-reversal-reduced half-grid (QE noinv): if the negated nodes complete it
+// into a uniformly-spaced superset AND the structure is single-spin, the half axis
+// is unfolded (doubled) and the new lattice points reuse the partner original
+// node's channel index so E(-k) = E(k). Other incomplete meshes throw
+// .symmetryReducedMesh.
 
 /// Errors thrown by band-mesh interpolation.
 enum BandMeshInterpolationError: Error, CustomStringConvertible {
@@ -18,6 +26,7 @@ enum BandMeshInterpolationError: Error, CustomStringConvertible {
     case emptyRoute
     case nonFiniteRoute
     case invalidSampling
+    case symmetryReducedMesh
 
     var description: String {
         switch self {
@@ -33,6 +42,8 @@ enum BandMeshInterpolationError: Error, CustomStringConvertible {
             return "interpolation route contains non-finite coordinates"
         case .invalidSampling:
             return "invalid sampling density requested"
+        case .symmetryReducedMesh:
+            return "k-point mesh is symmetry-reduced (incomplete periodic grid); rerun the calculation with a full k-grid (nosym/noinv) or provide a single spin channel"
         }
     }
 }
@@ -49,23 +60,30 @@ struct BandMeshGrid {
     /// matter how the source k-points were ordered.
     private let indexMapping: [Int: Int]
 
-    /// Total mesh points (product of dims).
+    /// Number of source channel k-points (per-spin). After TR unfolding the
+    /// grid has more lattice points than source points; interpolation indexes
+    /// the channel `values` (length == sourcePointCount) via indexMapping.
+    let sourcePointCount: Int
+
+    /// Total mesh points (product of dims); >= sourcePointCount.
     var pointCount: Int { dims.reduce(1, *) }
     /// Indices of axes with count <= 1 (degenerate).
     var degenerateAxes: [Int] { (0..<3).filter { dims[$0] <= 1 } }
 
-    init(dims: [Int], nodes: [[Float]], indexMapping: [Int: Int]) {
+    init(dims: [Int], nodes: [[Float]], indexMapping: [Int: Int], sourcePointCount: Int) {
         self.dims = dims
         self.nodes = nodes
         self.indexMapping = indexMapping
+        self.sourcePointCount = sourcePointCount
     }
 
     /// Periodic trilinear interpolation of one value per mesh point. `values`
     /// MUST be in the same order as the channel k-points the grid was detected
-    /// from (index = channel k-point index). `k` components are wrapped mod 1
-    /// first. Returns nil for non-finite input or an out-of-range value array.
+    /// from (index = channel k-point index; values.count == sourcePointCount).
+    /// `k` components are wrapped mod 1 first. Returns nil for non-finite input
+    /// or an out-of-range value array.
     func interpolate(_ values: [Float], at k: SIMD3<Float>) -> Float? {
-        guard values.count == pointCount else { return nil }
+        guard values.count == sourcePointCount else { return nil }
         guard k.x.isFinite && k.y.isFinite && k.z.isFinite else { return nil }
 
         // Wrap k mod 1, mapping values within 1e-4 of 1 to 0.
@@ -76,7 +94,9 @@ struct BandMeshGrid {
         }
         let kw = SIMD3<Float>(wrap(k.x), wrap(k.y), wrap(k.z))
 
-        // Per-axis cell index and interpolation fraction.
+        // Per-axis cell index and interpolation fraction. Cell computation is
+        // relative to nodes[a][0] and unwrapped so that shifted Monkhorst-Pack
+        // grids (first node != 0) interpolate correctly across the closing cell.
         var cellIndex: [Int] = []
         var frac: [Float] = []
         for a in 0..<3 {
@@ -87,13 +107,12 @@ struct BandMeshGrid {
             } else {
                 let v = nodes[a]
                 let step = v[1] - v[0]
-                let raw = kw[a] / step
-                var i = Int(floor(raw))
-                if i < 0 { i = 0 }
-                if i > n - 1 { i = n - 1 }
+                var q = kw[a]
+                if q + 1e-5 < v[0] { q += 1 }   // unwrap into [v[0], v[0]+1)
+                let i = min(n - 1, max(0, Int(floor((q - v[0]) / step))))
+                let f = min(1, max(0, (q - v[i]) / step))
                 cellIndex.append(i)
-                let f = (kw[a] - v[i]) / step
-                frac.append(min(1, max(0, f)))
+                frac.append(f)
             }
         }
 
@@ -187,7 +206,7 @@ enum BandMeshInterpolator {
             })
         }
 
-        let dims = nodes.map { $0.count }
+        var dims = nodes.map { $0.count }
         // A mesh spans >= 2 dimensions; a 1D point set is a path, not a mesh.
         guard dims.filter({ $0 > 1 }).count >= 2 else {
             throw BandMeshInterpolationError.notAxisAlignedGrid
@@ -207,9 +226,89 @@ enum BandMeshInterpolator {
             }
         }
 
-        // Product of per-axis counts must equal the channel point count.
+        // Closing-gap (completeness) check: for every axis with n > 1 nodes, the
+        // gap between the last node and the wrapped-first node must equal the
+        // internal step. Degenerate axes (n <= 1) are always complete.
+        var completeAxes: [Bool] = []
+        for a in 0..<3 {
+            let n = dims[a]
+            if n <= 1 {
+                completeAxes.append(true)
+            } else {
+                let step = nodes[a][1] - nodes[a][0]
+                let closingGap = normalize(nodes[a][0] + 1 - nodes[a][n - 1])
+                completeAxes.append(abs(closingGap - step) < 1e-3)
+            }
+        }
+        let incompleteAxes = (0..<3).filter { !completeAxes[$0] }
+
+        // Time-reversal half-grid unfolding: if exactly ONE axis is incomplete and
+        // its negated nodes complete it into a uniformly-spaced superset AND the
+        // structure is single-spin, unfold that axis (double it). The new lattice
+        // points reuse the partner original node's channel index so E(-k) = E(k).
+        var unfolded = false
+        var unfoldedAxis: Int? = nil
+        // For the unfolded axis: partnerIndex[k] = original node index whose value
+        // (or negation) produced union node k; isNewUnionNode[k] = true for negated.
+        var partnerIndex: [Int] = []
+        var isNewUnionNode: [Bool] = []
+        if incompleteAxes.count == 1, bands.nSpin == 1 {
+            let a = incompleteAxes[0]
+            let n = dims[a]
+            let step = nodes[a][1] - nodes[a][0]
+            // Negated nodes, normalized mod 1.
+            let neg = nodes[a].map { normalize(1 - $0) }
+            // Sorted union of original + negated, quantized to merge near-duplicates.
+            var buckets: [Float: Float] = [:]
+            for v in nodes[a] { buckets[(v * 1000).rounded() / 1000] = v }
+            for v in neg { buckets[(v * 1000).rounded() / 1000] = v }
+            let union = buckets.sorted { $0.key < $1.key }.map { $0.value }
+            // TR-half signature: union has exactly 2n uniformly-spaced nodes.
+            if union.count == 2 * n {
+                var uniform = true
+                for i in 1..<union.count {
+                    if abs(union[i] - union[i - 1] - step) >= 1e-3 { uniform = false; break }
+                }
+                if uniform {
+                    // Map each union node back to its partner original node index.
+                    // Defensive: a union node must be either an original node or the
+                    // negation of one. If neither matches (should not happen by
+                    // construction), leave a sentinel and reject below rather than trap.
+                    partnerIndex = union.map { u in
+                        if let j = nodes[a].firstIndex(where: { abs($0 - u) < 1e-3 }) {
+                            return j
+                        }
+                        if let j = nodes[a].firstIndex(where: { abs(normalize(1 - $0) - u) < 1e-3 }) {
+                            return j
+                        }
+                        return -1
+                    }
+                    guard !partnerIndex.contains(-1) else {
+                        throw BandMeshInterpolationError.symmetryReducedMesh
+                    }
+                    isNewUnionNode = union.map { u in
+                        !nodes[a].contains { abs($0 - u) < 1e-3 }
+                    }
+                    nodes[a] = union
+                    dims[a] = union.count
+                    unfolded = true
+                    unfoldedAxis = a
+                }
+            }
+        }
+
+        // Incomplete mesh that could not be unfolded -> reject.
+        if !incompleteAxes.isEmpty && !unfolded {
+            throw BandMeshInterpolationError.symmetryReducedMesh
+        }
+
+        // Product of per-axis counts must equal the channel point count (times 2
+        // if a single axis was unfolded: channel point count is unchanged but the
+        // grid grew by the negated nodes).
         let prod = dims[0] * dims[1] * dims[2]
-        guard prod == perSpin else { throw BandMeshInterpolationError.notAxisAlignedGrid }
+        guard prod == perSpin * (unfolded ? 2 : 1) else {
+            throw BandMeshInterpolationError.notAxisAlignedGrid
+        }
 
         // Map each k-point to a lattice index triple; require all combos present
         // exactly once (no dups, no gaps).
@@ -241,7 +340,30 @@ enum BandMeshInterpolator {
             throw BandMeshInterpolationError.notAxisAlignedGrid  // gap in the box
         }
 
-        return BandMeshGrid(dims: dims, nodes: nodes, indexMapping: indexMapping)
+        // For the unfolded axis, fill in the negated lattice triples: each newly
+        // added node reuses its partner original node's channel index so that
+        // interpolation at -k reads the same energies as +k (time reversal).
+        if unfolded, let a = unfoldedAxis {
+            let others = (0..<3).filter { $0 != a }
+            let b = others[0], c = others[1]
+            for k in 0..<dims[a] where isNewUnionNode[k] {
+                let partner = partnerIndex[k]
+                for ib in 0..<max(1, dims[b]) {
+                    for ic in 0..<max(1, dims[c]) {
+                        var t = [0, 0, 0]
+                        t[a] = partner; t[b] = ib; t[c] = ic
+                        let partnerKey = t[0] * 10_000_000 + t[1] * 10_000 + t[2]
+                        if let srcIdx = indexMapping[partnerKey] {
+                            t[a] = k
+                            let newKey = t[0] * 10_000_000 + t[1] * 10_000 + t[2]
+                            indexMapping[newKey] = srcIdx
+                        }
+                    }
+                }
+            }
+        }
+
+        return BandMeshGrid(dims: dims, nodes: nodes, indexMapping: indexMapping, sourcePointCount: perSpin)
     }
 
     /// Interpolate every band along `path`; returns a NEW non-mesh BandStructure.

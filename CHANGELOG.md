@@ -2,6 +2,17 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.11] — 2026-08-13
+
+### Fixed
+
+- **TR-reduced k-mesh unfolding** — symmetry/time-reversal-reduced half meshes (e.g. QE `noinv`) are no longer mistaken for complete grids: mesh detection validates each axis's periodic closing gap, and when exactly one axis is a clean time-reversal half of a single-spin calculation it is unfolded by copying E(−k)=E(k) onto the negated nodes; other incomplete meshes are rejected with an actionable error instead of interpolating a nonexistent half of the Brillouin zone.
+- **Shifted Monkhorst–Pack interpolation** — cell location is now anchored to each axis's first node with unwrapped periodic queries, fixing flat strips and closing-cell discontinuities on shifted grids such as {1/6, 1/2, 5/6}.
+- **Correct band-surface domain** — `--band-surf` derives its patch from the two active mesh axes (one reciprocal primitive cell) instead of sheared route-triangle domains; explicitly supplied regions are validated against the sampled 2D plane (nonzero 2D determinant on the active axes, degenerate coordinate fixed modulo a lattice vector).
+- **Band-surface rendering** — the plot now rasterizes with a per-pixel CPU z-buffer (correct visibility for crossing bands, depth-tested axes, base plane, and Fermi plane), the energy axis is scaled relative to the reciprocal-plane extent instead of being normalized twice, horizontal axes are labelled k₁/k₂ rather than k_x/k_y, and the Fermi plane is drawn only inside the displayed energy domain and never overpaints nearer geometry.
+- **WYSIWYG band-surface export/print** — exports and prints honor the interactive rotation (persisted on the scene/state via `bandSurfaceOrientation`) instead of resetting to default azimuth/elevation.
+- **Malformed band-surface data** — persisted surfaces are validated during decoding and again before drawing (sheet value counts, finite ordered energy bounds, region geometry, reciprocal basis), so corrupt state files fail cleanly instead of crashing the plot.
+
 ## [1.2.10] — 2026-08-12
 
 ### Added

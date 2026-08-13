@@ -1,0 +1,377 @@
+import AppKit
+import Foundation
+import simd
+import XCTest
+@testable import MolVisApp
+
+/// Regression coverage for the CPU z-buffer rewrite of BandSurfaceView: malformed
+/// data rejection, z-buffer occlusion, Fermi-plane domain gating + occlusion,
+/// the energy-axis aspect fix, WYSIWYG export orientation, and Scene persistence
+/// of the band-surface orientation.
+@MainActor
+final class BandSurfaceViewFixTests: XCTestCase {
+
+    // MARK: - Helpers (mirror BandSurfaceViewTests)
+
+    private func renderToBitmap(_ view: NSView, background: NSColor = .white) -> NSBitmapImageRep? {
+        let w = Int(view.bounds.width), h = Int(view.bounds.height)
+        guard w > 0, h > 0,
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx.cgContext, flipped: true)
+        ctx.cgContext.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        ctx.cgContext.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        view.draw(view.bounds)
+        ctx.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        return rep
+    }
+
+    private func distinctColors(_ rep: NSBitmapImageRep) -> Int {
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rowBytes = rep.bytesPerRow
+        var colors = Set<UInt64>()
+        guard let base = rep.bitmapData else { return 0 }
+        for y in 0..<h {
+            let row = base.advanced(by: y * rowBytes)
+            for x in 0..<w {
+                let p = row.advanced(by: x * 4)
+                colors.insert(UInt64(p[0]) | (UInt64(p[1]) << 8) | (UInt64(p[2]) << 16) | (UInt64(p[3]) << 24))
+            }
+        }
+        return colors.count
+    }
+
+    private func nonWhitePixels(_ rep: NSBitmapImageRep) -> Int {
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rowBytes = rep.bytesPerRow
+        var count = 0
+        guard let base = rep.bitmapData else { return 0 }
+        for y in 0..<h {
+            let row = base.advanced(by: y * rowBytes)
+            for x in 0..<w {
+                let p = row.advanced(by: x * 4)
+                if p[0] != 255 || p[1] != 255 || p[2] != 255 { count += 1 }
+            }
+        }
+        return count
+    }
+
+    private func pixelData(_ rep: NSBitmapImageRep) -> Data {
+        let h = rep.pixelsHigh, rowBytes = rep.bytesPerRow
+        var data = Data(capacity: h * rowBytes)
+        guard let base = rep.bitmapData else { return data }
+        for y in 0..<h { data.append(base.advanced(by: y * rowBytes), count: rowBytes) }
+        return data
+    }
+
+    /// Pixel content only (excludes row-alignment padding bytes), so two renders of
+    /// the same scene compare equal even when the bitmap's bytesPerRow has padding.
+    private func rawPixels(_ rep: NSBitmapImageRep) -> Data {
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rowBytes = rep.bytesPerRow
+        var data = Data(capacity: h * w * 4)
+        guard let base = rep.bitmapData else { return data }
+        for y in 0..<h {
+            for x in 0..<w {
+                let p = base.advanced(by: y * rowBytes + x * 4)
+                data.append(contentsOf: [p[0], p[1], p[2], p[3]])
+            }
+        }
+        return data
+    }
+
+    /// Pixel content restricted to rows [rowMin, H). The title is drawn near the top
+    /// of the view, so cropping lets two renders whose titles differ be compared over
+    /// just the plot body.
+    private func rawPixelsBelow(_ rep: NSBitmapImageRep, _ rowMin: Int) -> Data {
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rowBytes = rep.bytesPerRow
+        var data = Data(capacity: (h - rowMin) * w * 4)
+        guard let base = rep.bitmapData else { return data }
+        for y in rowMin..<h {
+            for x in 0..<w {
+                let p = base.advanced(by: y * rowBytes + x * 4)
+                data.append(contentsOf: [p[0], p[1], p[2], p[3]])
+            }
+        }
+        return data
+    }
+
+    /// Build a unit-patch surface with two flat sheets at fixed energies.
+    private func makeTwoSheetSurface(sheetA: Float, sheetB: Float,
+                                     fermi: Float?) -> BandSurface {
+        let gridSize = 8
+        func vals(_ e: Float) -> [Float] { [Float](repeating: e, count: gridSize * gridSize) }
+        let lo = min(sheetA, sheetB), hi = max(sheetA, sheetB)
+        return BandSurface(
+            region: [SIMD3<Float>(0, 0, 0), SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0),
+                     SIMD3<Float>(1, 1, 0)],
+            regionLabels: ["G", "X", "Y", ""],
+            gridSize: gridSize,
+            sheets: [BandSurfaceSheet(band: 0, spin: 0, label: "A", values: vals(sheetA)),
+                     BandSurfaceSheet(band: 1, spin: 0, label: "B", values: vals(sheetB))],
+            fermiEnergy: fermi, spinCount: 1, energyMin: lo, energyMax: hi)
+    }
+
+    // MARK: - Tests
+
+    /// Count pure-black (r==0 && g==0 && b==0) pixels below the title strip. The 3D
+    /// axes are the only large pure-black raster elements, so this isolates them from
+    /// antialiased text/tick contributions.
+    private func pureBlackPixels(_ rep: NSBitmapImageRep, rowMin: Int) -> Int {
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rb = rep.bytesPerRow
+        var count = 0
+        guard let base = rep.bitmapData else { return 0 }
+        for y in rowMin..<h {
+            let row = base.advanced(by: y * rb)
+            for x in 0..<w {
+                let p = row.advanced(by: x * 4)
+                if p[0] == 0 && p[1] == 0 && p[2] == 0 { count += 1 }
+            }
+        }
+        return count
+    }
+
+    /// EMPTY-sheets surface: axes-only, no placeholder, no crash. The k₁/k₂ axes
+    /// are coplanar with the base plane, so without a viewer-depth bias they would
+    /// z-fight the base fill and flicker/vanish. With the bias they render as solid
+    /// pure-black geometry. Calibrated: ~394 pure-black px below the title strip.
+    func testAxesVisibleWhenCoplanar() {
+        let surface = BandSurface(
+            region: [SIMD3<Float>(0, 0, 0), SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0),
+                     SIMD3<Float>(1, 1, 0)],
+            regionLabels: ["G", "X", "Y", ""], gridSize: 4, sheets: [],
+            fermiEnergy: nil, spinCount: 1, energyMin: 0, energyMax: 1)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        guard let rep = renderToBitmap(view) else { return XCTFail("render failed") }
+        // Title occupies the top ~60 px of the 260px view; count axes below it.
+        let black = pureBlackPixels(rep, rowMin: 60)
+        print("testAxesVisibleWhenCoplanar pure-black px below title = \(black)")
+        XCTAssertGreaterThan(black, 300,
+                             "coplanar 3D axes should render solid pure-black geometry (\(black) px)")
+    }
+
+    /// With two flat sheets (A at z=-10 base plane, B at z=+10 raised), the k₁/k₂
+    /// axes lie on the base plane. Sheet B (nearer, depth margin ~0.75 >> 1e-3 bias)
+    /// dominates surface pixels — proven separately by testDepthOcclusionNearerSheetWins.
+    /// In this projection the raised sheet B does not overlap the base-plane floor
+    /// edges in screen space, so the coplanar axes stay visible (bias wins their
+    /// ties). The bias is small enough that it does NOT punch the axes through sheet
+    /// B where they genuinely overlap — i.e. the visible black count stays modest and
+    /// bounded by what the axes themselves contribute. Calibrated: ~382 px.
+    func testAxesOccludedByNearerSurface() {
+        let surface = makeTwoSheetSurface(sheetA: -10, sheetB: 10, fermi: nil)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        guard let rep = renderToBitmap(view) else { return XCTFail("render failed") }
+        let black = pureBlackPixels(rep, rowMin: 60)
+        print("testAxesOccludedByNearerSurface pure-black px below title = \(black)")
+        // Small bias (1e-3) must not inflate axis visibility past what the geometry
+        // actually contributes; it stays bounded near the bare-axes count.
+        XCTAssertLessThan(black, 500,
+                          "small depth bias must not punch axes through nearer surfaces (\(black) px)")
+    }
+
+    /// Malformed sheet (wrong value count) must not crash and must draw the
+    /// placeholder, not a corrupted frame. The placeholder is near-uniform
+    /// background + overlay text, so it has far fewer distinct colors and non-white
+    /// pixels than a valid surface of the same grid.
+    func testMalformedSheetDrawsEmptyPlaceholder() {
+        let gridSize = 4
+        let sheet = BandSurfaceSheet(band: 0, spin: 0, label: "bad",
+                                     values: [Float](repeating: 0, count: gridSize))
+        let surface = BandSurface(
+            region: [SIMD3<Float>(0, 0, 0), SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0),
+                     SIMD3<Float>(1, 1, 0)],
+            regionLabels: ["G", "X", "Y", ""], gridSize: gridSize, sheets: [sheet],
+            fermiEnergy: nil, spinCount: 1, energyMin: 0, energyMax: 1)
+
+        func render(_ s: BandSurface) -> NSBitmapImageRep {
+            let v = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+            v.bandSurface = s
+            guard let r = self.renderToBitmap(v) else { XCTFail("render failed"); fatalError() }
+            return r
+        }
+
+        let repBad = render(surface)
+        // Same geometry but a well-formed sheet (gridSize^2 values).
+        let goodSheet = BandSurfaceSheet(band: 0, spin: 0, label: "good",
+                                         values: [Float](repeating: 0.5, count: gridSize * gridSize))
+        var goodSurface = surface
+        goodSurface.sheets = [goodSheet]
+        let repGood = render(goodSurface)
+
+        // No crash + placeholder is far less populated than a valid surface.
+        XCTAssertLessThan(distinctColors(repBad), distinctColors(repGood),
+                          "malformed placeholder (\(distinctColors(repBad)) colors) should be sparser than valid (\(distinctColors(repGood)))")
+        XCTAssertLessThan(nonWhitePixels(repBad), nonWhitePixels(repGood),
+                          "malformed placeholder (\(nonWhitePixels(repBad)) px) should be sparser than valid (\(nonWhitePixels(repGood)))")
+    }
+
+    /// The nearer (higher-energy) sheet must win the z-buffer on overlapping pixels.
+    func testDepthOcclusionNearerSheetWins() {
+        let surface = makeTwoSheetSurface(sheetA: -10, sheetB: 10, fermi: 0)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        guard let rep = renderToBitmap(view) else { return XCTFail("render failed") }
+
+        // Flat sheets: normal ±z. With the default elevation tilt, both faces are
+        // lit; viridis(-10) and viridis(+10) differ strongly, so count which dominates.
+        func expectedRGB(_ e: Float) -> (Float, Float, Float) {
+            let t = (e - surface.energyMin) / max(1e-6, surface.energyMax - surface.energyMin)
+            let c = Colormap.viridis.rgb(t)
+            let shade = 0.55 + 0.45 * max(0, simd_dot(SIMD3<Float>(0, 0, 1),
+                                                       simd_normalize(SIMD3<Float>(0.35, 0.45, 0.85))))
+            return (c.x * shade, c.y * shade, c.z * shade)
+        }
+        let colA = expectedRGB(-10), colB = expectedRGB(10)
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rowBytes = rep.bytesPerRow
+        guard let base = rep.bitmapData else { return }
+        var likeA = 0, likeB = 0
+        for y in 0..<h {
+            let row = base.advanced(by: y * rowBytes)
+            for x in 0..<w {
+                let p = row.advanced(by: x * 4)
+                if p[0] == 255 && p[1] == 255 && p[2] == 255 { continue }  // background
+                let r = Float(p[0]) / 255, g = Float(p[1]) / 255, b = Float(p[2]) / 255
+                let dA = abs(r - colA.0) + abs(g - colA.1) + abs(b - colA.2)
+                let dB = abs(r - colB.0) + abs(g - colB.1) + abs(b - colB.2)
+                if dA < dB { likeA += 1 } else { likeB += 1 }
+            }
+        }
+        XCTAssertGreaterThan(likeB, likeA * 2,
+                             "nearer sheet B should dominate: B-like \(likeB) vs A-like \(likeA)")
+    }
+
+    /// Strongly-red (pure red) pixels in the rows below the title strip. The Fermi
+    /// plane is drawn pure red; viridis sheets never produce pure-red pixels, so
+    /// this isolates the Fermi plane's visual contribution.
+    private func strongRedPixels(_ rep: NSBitmapImageRep, rowMin: Int) -> Int {
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rb = rep.bytesPerRow
+        var count = 0
+        guard let base = rep.bitmapData else { return 0 }
+        for y in rowMin..<h {
+            let row = base.advanced(by: y * rb)
+            for x in 0..<w {
+                let p = row.advanced(by: x * 4)
+                if p[0] > 150 && p[1] < 120 && p[2] < 120 { count += 1 }
+            }
+        }
+        return count
+    }
+
+    /// Fermi plane is drawn only when E_f lies inside the displayed energy domain.
+    /// We assert the domain gate directly (pure, raster-independent) and confirm the
+    /// visual consequence: an inside-domain surface shows strongly-red Fermi-plane
+    /// pixels in the plot body, while an outside-domain surface shows none.
+    func testFermiDomainAndColor() {
+        let inside = makeTwoSheetSurface(sheetA: -10, sheetB: 10, fermi: 0)
+        let outside = makeTwoSheetSurface(sheetA: -10, sheetB: 10, fermi: 15)
+
+        // Domain gate (the actual Finding-7 fix), tested as a pure predicate.
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        XCTAssertTrue(view.isFermiPlaneInDomain(inside), "Ef=0 must be inside [-10,10]")
+        XCTAssertFalse(view.isFermiPlaneInDomain(outside), "Ef=15 must be outside [-10,10]")
+
+        // Visual consequence: inside-domain renders the red Fermi plane; outside does not.
+        func render(_ s: BandSurface) -> NSBitmapImageRep {
+            let v = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+            v.bandSurface = s
+            guard let r = self.renderToBitmap(v) else { XCTFail("render failed"); fatalError() }
+            return r
+        }
+        // Title occupies the top ~60 px; the Fermi plane lives in the rows below it.
+        let repIn = render(inside), repOut = render(outside)
+        let redIn = strongRedPixels(repIn, rowMin: 60)
+        let redOut = strongRedPixels(repOut, rowMin: 60)
+        XCTAssertGreaterThan(redIn, 1000,
+                             "Fermi plane inside domain must render red pixels (\(redIn))")
+        XCTAssertLessThan(redOut, 300,
+                          "Fermi plane outside domain must not be drawn (\(redOut) red px)")
+    }
+
+    /// Wide energy range must occupy a substantial vertical extent (not a collapsed sliver).
+    func testEnergyAxisAspect() {
+        let gridSize = 6
+        func vals(_ e: Float) -> [Float] { [Float](repeating: e, count: gridSize * gridSize) }
+        // One sheet sweeping 0..50 eV over the unit patch.
+        var values: [Float] = []
+        values.reserveCapacity(gridSize * gridSize)
+        for ti in 0..<gridSize {
+            for si in 0..<gridSize {
+                let s = Float(si) / Float(gridSize - 1)
+                let t = Float(ti) / Float(gridSize - 1)
+                values.append((s + t) * 25.0)  // 0..50
+            }
+        }
+        let surface = BandSurface(
+            region: [SIMD3<Float>(0, 0, 0), SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0),
+                     SIMD3<Float>(1, 1, 0)],
+            regionLabels: ["G", "X", "Y", ""], gridSize: gridSize,
+            sheets: [BandSurfaceSheet(band: 0, spin: 0, label: "sweep", values: values)],
+            fermiEnergy: nil, spinCount: 1, energyMin: 0, energyMax: 50)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        guard let rep = renderToBitmap(view) else { return XCTFail("render failed") }
+        let thirdH = rep.pixelsHigh / 3
+        // Count non-white pixels in the top third and bottom third.
+        func nonWhite(inRowRange: Range<Int>) -> Int {
+            var count = 0
+            guard let base = rep.bitmapData else { return 0 }
+            for y in inRowRange {
+                let row = base.advanced(by: y * rep.bytesPerRow)
+                for x in 0..<rep.pixelsWide {
+                    let p = row.advanced(by: x * 4)
+                    if p[0] != 255 || p[1] != 255 || p[2] != 255 { count += 1 }
+                }
+            }
+            return count
+        }
+        let top = nonWhite(inRowRange: 0..<thirdH)
+        let bot = nonWhite(inRowRange: (rep.pixelsHigh - thirdH)..<rep.pixelsHigh)
+        XCTAssertGreaterThan(top, 5, "top third should contain surface content, got \(top)")
+        XCTAssertGreaterThan(bot, 5, "bottom third should contain surface content, got \(bot)")
+    }
+
+    /// Export must reflect the interactive rotation (WYSIWYG), not force defaults.
+    func testExportRotationReflectsOrientation() {
+        let surface = makeTwoSheetSurface(sheetA: -5, sheetB: 5, fermi: 0)
+        let size = CGRect(x: 0, y: 0, width: 240, height: 200)
+
+        let viewA = BandSurfaceView(frame: size)
+        viewA.bandSurface = surface
+        viewA.exportBackground = .white
+        guard let repA = renderToBitmap(viewA) else { return XCTFail("render A failed") }
+
+        let viewB = BandSurfaceView(frame: size)
+        viewB.bandSurface = surface
+        viewB.azimuthDegrees = 90
+        viewB.exportBackground = .white
+        guard let repB = renderToBitmap(viewB) else { return XCTFail("render B failed") }
+
+        XCTAssertNotEqual(pixelData(repA), pixelData(repB),
+                          "export must reflect rotation, not force defaults")
+    }
+
+    /// BandSurfaceOrientation must round-trip through Scene Codable and be optional.
+    func testBandSurfaceOrientationPersistence() {
+        var scene = Scene()
+        scene.bandSurfaceOrientation = BandSurfaceOrientation(azimuthDegrees: 42, elevationDegrees: -30)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(scene) else { return XCTFail("encode failed") }
+        guard let decoded = try? JSONDecoder().decode(Scene.self, from: data) else {
+            return XCTFail("decode failed")
+        }
+        XCTAssertEqual(decoded.bandSurfaceOrientation, scene.bandSurfaceOrientation)
+
+        // JSON without the key decodes to nil (Optionals are decode-if-present).
+        let minimal = #"{"title":"x"}"#
+        guard let scene2 = try? JSONDecoder().decode(Scene.self, from: minimal.data(using: .utf8)!) else {
+            return XCTFail("decode minimal failed")
+        }
+        XCTAssertNil(scene2.bandSurfaceOrientation, "absent key must decode to nil")
+    }
+}

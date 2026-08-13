@@ -326,7 +326,15 @@ final class BandMeshSurfaceTests: XCTestCase {
         XCTAssertEqual(parsed.periodicDim, 3)
 
         let grid = try! BandMeshInterpolator.meshGrid(from: parsed)
-        XCTAssertEqual(grid.pointCount, parsed.kPointsPerSpin)
+        // CH3Rh111.out is a TR-reduced half mesh: x={0.125,0.375} is the half of a
+        // 4x4x1 grid. meshGrid unfolds it to 16 points; kPointsPerSpin stays 8.
+        XCTAssertEqual(grid.pointCount, 16)
+        XCTAssertEqual(grid.dims, [4, 4, 1])
+        let xNodes: [Float] = [0.125, 0.375, 0.625, 0.875]
+        XCTAssertEqual(grid.nodes[0].count, xNodes.count)
+        for j in 0..<xNodes.count {
+            XCTAssertEqual(grid.nodes[0][j], xNodes[j], accuracy: 1e-3)
+        }
 
         // Path interpolation over the SC canonical path succeeds with finite energies.
         let path = KPath.defaultPath(lattice: .sc)

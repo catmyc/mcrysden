@@ -85,6 +85,47 @@ struct BandSurface: Codable, Equatable {
         energyMin = try c.decode(Float.self, forKey: .energyMin)
         energyMax = try c.decode(Float.self, forKey: .energyMax)
         kBasis = try c.decodeIfPresent([SIMD3<Float>].self, forKey: .kBasis)
+
+        // Low-level sanity so malformed persisted data can't trap the view.
+        guard gridSize >= 2, gridSize <= 256 else {
+            let ctx = DecodingError.Context(codingPath: c.codingPath,
+                debugDescription: "gridSize \(gridSize) out of [2,256]")
+            throw DecodingError.dataCorrupted(ctx)
+        }
+        guard region.count == 4, region.allSatisfy({
+            $0.x.isFinite && $0.y.isFinite && $0.z.isFinite
+        }) else {
+            let ctx = DecodingError.Context(codingPath: c.codingPath,
+                debugDescription: "region must be exactly 4 finite SIMD3 corners")
+            throw DecodingError.dataCorrupted(ctx)
+        }
+        guard regionLabels.count == 4 else {
+            let ctx = DecodingError.Context(codingPath: c.codingPath,
+                debugDescription: "regionLabels must have exactly 4 entries")
+            throw DecodingError.dataCorrupted(ctx)
+        }
+        guard energyMin.isFinite, energyMax.isFinite, energyMin <= energyMax else {
+            let ctx = DecodingError.Context(codingPath: c.codingPath,
+                debugDescription: "energyMin/energyMax non-finite or inverted")
+            throw DecodingError.dataCorrupted(ctx)
+        }
+        for sheet in sheets {
+            guard sheet.values.count == gridSize * gridSize,
+                  sheet.values.allSatisfy(\.isFinite) else {
+                let ctx = DecodingError.Context(codingPath: c.codingPath,
+                    debugDescription: "sheet '\(sheet.label)' values count/finiteness mismatch")
+                throw DecodingError.dataCorrupted(ctx)
+            }
+        }
+        if let kBasis = kBasis {
+            guard kBasis.count == 3, kBasis.allSatisfy({
+                $0.x.isFinite && $0.y.isFinite && $0.z.isFinite
+            }) else {
+                let ctx = DecodingError.Context(codingPath: c.codingPath,
+                    debugDescription: "kBasis must be exactly 3 finite SIMD3 vectors")
+                throw DecodingError.dataCorrupted(ctx)
+            }
+        }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -201,7 +242,7 @@ enum BandSurfaceBuilder {
         return [labels[0], labels[1], labels[2], ""]
     }
 
-/// Build the band surface. `region` = exactly 3 non-collinear fractional
+    /// Build the band surface. `region` = exactly 3 non-collinear fractional
     /// points (p0,p1,p2); the 4th parallelogram corner is computed inside.
     /// `regionLabels` must have at least 3 entries (the 4th is set to "").
     ///
@@ -209,6 +250,12 @@ enum BandSurfaceBuilder {
     /// (exactly two non-degenerate sampling axes, e.g. a slab). Bulk 3D meshes
     /// throw `.requiresTwoDimensionalMesh` — a band surface of a 3D BZ would
     /// need an arbitrary slice plane, which is out of scope.
+    ///
+    /// The region is validated against the sampled plane: degenerate-axis
+    /// components of both edge vectors must be integer (mod 1), and the
+    /// 2D determinant on the two active mesh axes must be nonzero. This
+    /// rejects patches that vary along a direction the mesh does not sample,
+    /// or that project to a degenerate line in the sampling plane.
     ///
     /// Default selection = the `bandCount` (default 2) bands closest to E_f. An
     /// explicit `selectedBands` set (including empty) overrides: the keys are
@@ -259,6 +306,25 @@ enum BandSurfaceBuilder {
 
         let d0 = p1 - p0
         let d1 = p2 - p0
+
+        // Validate the region against the sampled 2D plane. The degenerate
+        // axes (count <= 1) must stay fixed modulo a reciprocal-lattice
+        // translation (their edge components must be integers), otherwise the
+        // patch varies along a direction the mesh does not sample. The 2D
+        // determinant on the two active mesh axes must be nonzero, so the patch
+        // is a genuine parallelogram in the sampling plane, not a line.
+        let active = (0..<3).filter { grid.dims[$0] > 1 }
+        for d in 0..<3 where grid.dims[d] <= 1 {
+            guard abs(d0[d] - d0[d].rounded()) < 1e-3,
+                  abs(d1[d] - d1[d].rounded()) < 1e-3 else {
+                throw BandSurfaceError.degenerateRegion
+            }
+        }
+        let det = d0[active[0]] * d1[active[1]] - d0[active[1]] * d1[active[0]]
+        guard abs(det) > 1e-4 else {
+            throw BandSurfaceError.degenerateRegion
+        }
+
         let gridSize = options.gridSize
 
         // Per-(spin,band) min/max in one pass over channels.
@@ -497,6 +563,45 @@ enum BandSurfaceBuilder {
         cands.sort { $0.dist != $1.dist ? $0.dist < $1.dist
                   : ($0.spin != $1.spin ? $0.spin < $1.spin : $0.band < $1.band) }
         return cands.prefix(clampedCount).map { $0.key }
+    }
+
+    /// Derive a band-surface region spanning exactly one reciprocal primitive
+    /// cell from a 2D mesh grid. The two non-degenerate axes define the cell;
+    /// the degenerate axis is carried verbatim. Returns 3 parallelogram corners
+    /// (p0, p0+b₁, p0+b₂) and 4 labels (the 4th corner label is "").
+    ///
+    /// p0 is the mesh minimum corner ((nodes[0][0], nodes[1][0], nodes[2][0]));
+    /// the edge vectors are full reciprocal-lattice steps (+1.0 along each
+    /// active axis). All corners are equivalent modulo 1 in the degenerate
+    /// direction, so the patch samples exactly one reciprocal primitive cell of
+    /// the 2D mesh. Labels describe the origin and the two active reciprocal
+    /// basis directions (b₁, b₂) — NOT high-symmetry points, since the mesh
+    /// origin need not be Γ.
+    ///
+    /// Throws `.requiresTwoDimensionalMesh` when the grid is not 2D (not
+    /// exactly two non-degenerate sampling axes).
+    static func meshRegion(grid: BandMeshGrid) throws -> (region: [SIMD3<Float>], labels: [String]) {
+        let active = (0..<3).filter { grid.dims[$0] > 1 }
+        guard active.count == 2 else { throw BandSurfaceError.requiresTwoDimensionalMesh }
+        let a0 = active[0]
+        let a1 = active[1]
+        let p0 = SIMD3<Float>(grid.nodes[0][0], grid.nodes[1][0], grid.nodes[2][0])
+        func unit(_ i: Int) -> SIMD3<Float> {
+            var v = SIMD3<Float>.zero
+            v[i] = 1
+            return v
+        }
+        let labels = ["origin", "origin+b₁", "origin+b₂", ""]
+        return (region: [p0, p0 + unit(a0), p0 + unit(a1)], labels: labels)
+    }
+
+    /// Convenience: derive the mesh region directly from a band structure by
+    /// first detecting its mesh grid. Propagates mesh-detection errors.
+    static func meshRegion(
+        from bands: BandStructure
+    ) throws -> (region: [SIMD3<Float>], labels: [String]) {
+        let grid = try BandMeshInterpolator.meshGrid(from: bands)
+        return try meshRegion(grid: grid)
     }
 }
 
