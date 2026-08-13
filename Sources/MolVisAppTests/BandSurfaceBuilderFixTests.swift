@@ -37,6 +37,7 @@ final class BandSurfaceBuilderFixTests: XCTestCase {
             }
         }
         return BandStructure(kPoints: kPoints, fermiEnergy: fermiEnergy, nSpin: nSpin,
+                             kPointsAreCrystal: true,
                              kPointsPerSpin: perSpin, isMesh: true, periodicDim: 3)
     }
 

@@ -250,4 +250,74 @@ final class StateStoreTests: XCTestCase {
         }   // end merged block
 
     }
+
+    /// The flat state format must persist the band-surface interactive orientation
+    /// (WYSIWYG round trip) and reject/clamp malformed values.
+    @MainActor
+    func testStateRoundTripBandSurfaceOrientation() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let sourceURL = dir.appendingPathComponent("Fixtures/si110.xsf")
+        var scene = Scene(loaded: try Parser.load(sourceURL))
+        scene.bandSurfaceOrientation = BandSurfaceOrientation(azimuthDegrees: 123.5, elevationDegrees: -31)
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mvis-band-orient-\(UUID().uuidString).mvis-state")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try StateStore.save(scene, camera: nil, sourceURL: sourceURL, to: tmp)
+
+        var loaded = Scene()
+        var loadedCamera: Camera? = nil
+        _ = try StateStore.load(into: &loaded, camera: &loadedCamera, from: tmp)
+        XCTAssertEqual(loaded.bandSurfaceOrientation?.azimuthDegrees ?? -1, 123.5, accuracy: 1e-5)
+        XCTAssertEqual(loaded.bandSurfaceOrientation?.elevationDegrees ?? -999, -31, accuracy: 1e-5)
+
+        // Elevation is clamped to the view's ±89° range on load.
+        let clamped = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mvis-band-orient-clamp-\(UUID().uuidString).mvis-state")
+        defer { try? FileManager.default.removeItem(at: clamped) }
+        let payload: [String: Any] = [
+            "bandSurfaceOrientation": ["azimuthDegrees": 10, "elevationDegrees": 500],
+        ]
+        try JSONSerialization.data(withJSONObject: payload, options: []).write(to: clamped)
+        var scene2 = Scene()
+        var camera2: Camera? = nil
+        _ = try StateStore.load(into: &scene2, camera: &camera2, from: clamped)
+        XCTAssertEqual(scene2.bandSurfaceOrientation?.elevationDegrees ?? -999, 89, accuracy: 1e-5)
+        XCTAssertEqual(scene2.bandSurfaceOrientation?.azimuthDegrees ?? -999, 10, accuracy: 1e-5)
+
+        // Non-finite angle rejects the whole load transactionally. JSONSerialization
+        // refuses to write NaN, so craft the payload as raw JSON text.
+        let bad = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mvis-band-orient-bad-\(UUID().uuidString).mvis-state")
+        defer { try? FileManager.default.removeItem(at: bad) }
+        let badJSON = #"{"bandSurfaceOrientation":{"azimuthDegrees":1e999,"elevationDegrees":10}}"#
+        try badJSON.data(using: .utf8)!.write(to: bad)
+        var scene3 = Scene()
+        var camera3: Camera? = nil
+        XCTAssertThrowsError(try StateStore.load(into: &scene3, camera: &camera3, from: bad))
+        XCTAssertNil(scene3.bandSurfaceOrientation, "failed load must not mutate the scene")
+    }
+
+    /// Opening a scene WITHOUT a persisted orientation must reset the live view to
+    /// defaults — the previous document's angles must not leak across loads.
+    @MainActor
+    func testSceneInstallResetsOrientationWhenAbsent() throws {
+        let dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        let sourceURL = dir.appendingPathComponent("Fixtures/si110.xsf")
+        let plain = Scene(loaded: try Parser.load(sourceURL))          // no orientation
+        let oriented = Scene(loaded: try Parser.load(sourceURL))
+        // Scene is a value type; set the orientation on the copy.
+        var orientedScene = oriented
+        orientedScene.bandSurfaceOrientation = BandSurfaceOrientation(azimuthDegrees: 77, elevationDegrees: -12)
+
+        let wc = MainWindowController(scene: orientedScene, showWindow: false)
+        XCTAssertEqual(wc.bandSurfaceView.azimuthDegrees, 77, accuracy: 1e-4)
+        XCTAssertEqual(wc.bandSurfaceView.elevationDegrees, -12, accuracy: 1e-4)
+
+        // Reinstall a scene without an orientation: the view must fall back to
+        // the built-in defaults instead of keeping 77°/-12°.
+        wc.loadFile(plain, from: nil, format: nil, frameIndex: 0)
+        XCTAssertEqual(wc.bandSurfaceView.azimuthDegrees, 30, accuracy: 1e-4)
+        XCTAssertEqual(wc.bandSurfaceView.elevationDegrees, 24, accuracy: 1e-4)
+    }
 }

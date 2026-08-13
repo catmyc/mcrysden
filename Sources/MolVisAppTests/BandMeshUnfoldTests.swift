@@ -34,6 +34,7 @@ final class BandMeshUnfoldTests: XCTestCase {
             }
         }
         return BandStructure(kPoints: kPoints, fermiEnergy: nil, nSpin: nSpin,
+                             kPointsAreCrystal: true,
                              kPointsPerSpin: perSpin, isMesh: true, periodicDim: 3)
     }
 
@@ -94,9 +95,18 @@ final class BandMeshUnfoldTests: XCTestCase {
         let srcEnergy = grid.interpolate(values, at: SIMD3<Float>(0.375, 0.375, 0.5))!
         XCTAssertEqual(srcEnergy, 0.75, accuracy: 1e-4)
 
-        // TR copy: (0.625, 0.375, 0.5) reads same as (0.375, 0.375, 0.5).
+        // TR copy applies to the FULL k-vector: (0.625, 0.375, 0.5) = -k where
+        // k = (0.375, 0.625, 0.5) mod 1, so it must read E(0.375, 0.625, 0.5)
+        // = 0.375 + 0.625 = 1.0 — NOT E(0.375, 0.375, 0.5). The other axes are
+        // negated too (only x is unfolded, but y maps 0.375 <-> 0.625).
         let trEnergy = grid.interpolate(values, at: SIMD3<Float>(0.625, 0.375, 0.5))!
-        XCTAssertEqual(trEnergy, srcEnergy, accuracy: 1e-4)
+        XCTAssertEqual(trEnergy, 1.0, accuracy: 1e-4)
+        let trEnergy2 = grid.interpolate(values, at: SIMD3<Float>(0.875, 0.125, 0.5))!
+        // partner = (0.125, 0.875, 0.5), energy = 0.125 + 0.875 = 1.0
+        XCTAssertEqual(trEnergy2, 1.0, accuracy: 1e-4)
+        let trEnergy3 = grid.interpolate(values, at: SIMD3<Float>(0.875, 0.875, 0.5))!
+        // partner = (0.125, 0.125, 0.5), energy = 0.125 + 0.125 = 0.25
+        XCTAssertEqual(trEnergy3, 0.25, accuracy: 1e-4)
 
         // Seam continuity across the x=0.375/0.625 boundary. The TR copy maps the
         // negated half onto its partner so E(-k)=E(k) holds exactly — the seam value
@@ -162,5 +172,38 @@ final class BandMeshUnfoldTests: XCTestCase {
         XCTAssertThrowsError(try BandMeshInterpolator.meshGrid(from: bands)) { err in
             XCTAssertEqual(err as? BandMeshInterpolationError, .symmetryReducedMesh)
         }
+    }
+
+    // MARK: - (g) Cartesian k-points require a reciprocal basis
+
+    func testCartesianMeshRequiresReciprocal() {
+        let nodes: [[Float]] = [[0, 0.5], [0, 0.5], [0]]
+        var kPoints: [BandKPoint] = []
+        for x in nodes[0] {
+            for y in nodes[1] {
+                for z in nodes[2] {
+                    kPoints.append(BandKPoint(k: SIMD3(x, y, z), weight: 1, label: "",
+                                              energies: [x + y]))
+                }
+            }
+        }
+        let makeBands = { (recip: [SIMD3<Float>]?) -> BandStructure in
+            BandStructure(kPoints: kPoints, fermiEnergy: nil, nSpin: 1,
+                          reciprocal: recip, kPointsAreCrystal: false,
+                          kPointsPerSpin: 4, isMesh: true, periodicDim: 2)
+        }
+        // No reciprocal basis: raw Cartesian coordinates cannot be interpreted.
+        XCTAssertThrowsError(try BandMeshInterpolator.meshGrid(from: makeBands(nil))) { err in
+            XCTAssertEqual(err as? BandMeshInterpolationError, .missingReciprocalBasis)
+        }
+        // Singular reciprocal basis: the Cartesian -> fractional conversion fails.
+        XCTAssertThrowsError(try BandMeshInterpolator.meshGrid(from: makeBands([
+            SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 0, 0)]))) { err in
+            XCTAssertEqual(err as? BandMeshInterpolationError, .missingReciprocalBasis)
+        }
+        // Valid identity basis (2pi/a == 1): Cartesian == fractional here.
+        let grid = try! BandMeshInterpolator.meshGrid(from: makeBands([
+            SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 0, 1)]))
+        XCTAssertEqual(grid.dims, [2, 2, 1])
     }
 }

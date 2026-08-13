@@ -735,23 +735,32 @@ enum BandParser {
 
     /// Parse the reciprocal lattice vectors b1..b3 from the QE "reciprocal axes"
     /// block (in units of 2π/a_0). Returns nil if the block is absent/malformed.
+    ///
+    /// Restarted, concatenated, or variable-cell outputs can print several
+    /// "reciprocal axes" blocks. Band parsing selects the FINAL band iteration
+    /// and real-space parsing keeps the LAST complete cell, so the reciprocal
+    /// basis must come from the LAST complete block too — an earlier block can
+    /// describe a different (stale) lattice.
     private static func parseReciprocal(_ text: String) -> [SIMD3<Float>]? {
         let lines = text.components(separatedBy: "\n")
-        guard let marker = lines.firstIndex(where: { $0.contains("reciprocal axes") }) else { return nil }
-        // The three vector rows follow the marker: "b(1) = ( x y z )".
-        var vecs: [SIMD3<Float>] = []
-        for offset in 1...3 {
-            let idx = marker + offset
-            guard idx < lines.count else { return nil }
-            // Isolate the parenthesised triple.
-            guard let lpar = lines[idx].firstIndex(of: "("),
-                  let rpar = lines[idx].lastIndex(of: ")"), rpar > lpar else { return nil }
-            let body = String(lines[idx][lines[idx].index(after: lpar)..<rpar])
-            let nums = body.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "," }).compactMap { Float($0) }
-            guard nums.count >= 3, nums[0].isFinite, nums[1].isFinite, nums[2].isFinite else { return nil }
-            vecs.append(SIMD3<Float>(nums[0], nums[1], nums[2]))
+        var best: [SIMD3<Float>]? = nil
+        for (marker, line) in lines.enumerated() where line.contains("reciprocal axes") {
+            // The three vector rows follow the marker: "b(1) = ( x y z )".
+            var vecs: [SIMD3<Float>] = []
+            for offset in 1...3 {
+                let idx = marker + offset
+                guard idx < lines.count else { break }
+                // Isolate the parenthesised triple.
+                guard let lpar = lines[idx].firstIndex(of: "("),
+                      let rpar = lines[idx].lastIndex(of: ")"), rpar > lpar else { break }
+                let body = String(lines[idx][lines[idx].index(after: lpar)..<rpar])
+                let nums = body.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "," }).compactMap { Float($0) }
+                guard nums.count >= 3, nums[0].isFinite, nums[1].isFinite, nums[2].isFinite else { break }
+                vecs.append(SIMD3<Float>(nums[0], nums[1], nums[2]))
+            }
+            if vecs.count == 3 { best = vecs }
         }
-        return vecs.count == 3 ? vecs : nil
+        return best
     }
 
     /// Parse QE real-space lattice vectors into Angstroms. Modern PWscf output

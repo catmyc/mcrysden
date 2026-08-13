@@ -245,9 +245,10 @@ final class BandSurfaceViewFixTests: XCTestCase {
                              "nearer sheet B should dominate: B-like \(likeB) vs A-like \(likeA)")
     }
 
-    /// Strongly-red (pure red) pixels in the rows below the title strip. The Fermi
-    /// plane is drawn pure red; viridis sheets never produce pure-red pixels, so
-    /// this isolates the Fermi plane's visual contribution.
+    /// Pure-red (Fermi outline) pixels in the rows below the title strip. The
+    /// Fermi outline is red 0.6 premultiplied over the light base/white, so
+    /// g ≈ b with a large red excess. The viridis(≈1) sheet pink has b > g and
+    /// is excluded by requiring g ≈ b.
     private func strongRedPixels(_ rep: NSBitmapImageRep, rowMin: Int) -> Int {
         let w = rep.pixelsWide, h = rep.pixelsHigh, rb = rep.bytesPerRow
         var count = 0
@@ -256,7 +257,8 @@ final class BandSurfaceViewFixTests: XCTestCase {
             let row = base.advanced(by: y * rb)
             for x in 0..<w {
                 let p = row.advanced(by: x * 4)
-                if p[0] > 150 && p[1] < 120 && p[2] < 120 { count += 1 }
+                let r = Int(p[0]), g = Int(p[1]), b = Int(p[2])
+                if r > 170 && g < 170 && abs(g - b) <= 10 { count += 1 }
             }
         }
         return count
@@ -286,9 +288,9 @@ final class BandSurfaceViewFixTests: XCTestCase {
         let repIn = render(inside), repOut = render(outside)
         let redIn = strongRedPixels(repIn, rowMin: 60)
         let redOut = strongRedPixels(repOut, rowMin: 60)
-        XCTAssertGreaterThan(redIn, 1000,
+        XCTAssertGreaterThan(redIn, 100,
                              "Fermi plane inside domain must render red pixels (\(redIn))")
-        XCTAssertLessThan(redOut, 300,
+        XCTAssertLessThan(redOut, 30,
                           "Fermi plane outside domain must not be drawn (\(redOut) red px)")
     }
 
@@ -373,5 +375,92 @@ final class BandSurfaceViewFixTests: XCTestCase {
             return XCTFail("decode minimal failed")
         }
         XCTAssertNil(scene2.bandSurfaceOrientation, "absent key must decode to nil")
+    }
+
+    /// Triangle fills must land exactly where the plot-local line path draws.
+    /// The Fermi plane is rendered BOTH ways in one draw call: its fill goes
+    /// through triangle rasterization (rasterTri) and its boundary through the
+    /// line path (rasterLine/bufXY). Both describe the same (s,t) plane at the
+    /// same energy, so their screen footprints must coincide. A coordinate
+    /// misregistration (absolute view coords used as buffer indices) shifts the
+    /// fill by the plot origin (~56 px right, ~44 px down) relative to its own
+    /// outline — which this asserts against.
+    func testFermiFillAlignedWithOutline() {
+        let gridSize = 8
+        let region: [SIMD3<Float>] = [SIMD3(0, 0, 0), SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0)]
+        let surface = BandSurface(region: region, regionLabels: ["G", "X", "Y", ""],
+                                  gridSize: gridSize, sheets: [],
+                                  fermiEnergy: 0.5, spinCount: 1, energyMin: 0, energyMax: 1)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        guard let rep = renderToBitmap(view) else { return XCTFail("render failed") }
+
+        // Fermi fill: red 0.15 premultiplied over the 0.975-gray base plane
+        // ≈ (250, 211, 211). Fermi outline: red 0.6 over the base ≈ (252, 99, 99).
+        func isFill(_ p: UnsafePointer<UInt8>) -> Bool {
+            let r = Int(p[0]), g = Int(p[1]), b = Int(p[2])
+            return r >= 240 && g >= 195 && g <= 228 && b >= 195 && b <= 228
+                && r - g >= 20
+        }
+        func isOutline(_ p: UnsafePointer<UInt8>) -> Bool {
+            let r = Int(p[0]), g = Int(p[1]), b = Int(p[2])
+            return r >= 240 && g < 160 && b < 160 && g == b
+        }
+        func bbox(_ match: (UnsafePointer<UInt8>) -> Bool) -> (Int, Int, Int, Int)? {
+            let w = rep.pixelsWide, h = rep.pixelsHigh, rb = rep.bytesPerRow
+            guard let base = rep.bitmapData else { return nil }
+            var b: (Int, Int, Int, Int)?
+            for y in 24..<h {
+                let row = base.advanced(by: y * rb)
+                for x in 0..<w {
+                    let p = row.advanced(by: x * 4)
+                    guard match(p) else { continue }
+                    if let cur = b {
+                        b = (min(cur.0, x), max(cur.1, x), min(cur.2, y), max(cur.3, y))
+                    } else {
+                        b = (x, x, y, y)
+                    }
+                }
+            }
+            return b
+        }
+        guard let fillBox = bbox(isFill) else { return XCTFail("no Fermi fill pixels found") }
+        guard let outlineBox = bbox(isOutline) else { return XCTFail("no Fermi outline pixels found") }
+        let dx0 = abs(fillBox.0 - outlineBox.0), dx1 = abs(fillBox.1 - outlineBox.1)
+        let dy0 = abs(fillBox.2 - outlineBox.2), dy1 = abs(fillBox.3 - outlineBox.3)
+        XCTAssertLessThanOrEqual(dx0, 2, "fill left \(fillBox.0) vs outline \(outlineBox.0)")
+        XCTAssertLessThanOrEqual(dx1, 2, "fill right \(fillBox.1) vs outline \(outlineBox.1)")
+        XCTAssertLessThanOrEqual(dy0, 2, "fill top \(fillBox.2) vs outline \(outlineBox.2)")
+        XCTAssertLessThanOrEqual(dy1, 2, "fill bottom \(fillBox.3) vs outline \(outlineBox.3)")
+    }
+
+    /// The translucent base-plane fill must be premultiplied: 0.9 gray at 0.25
+    /// alpha over white ≈ 0.975 → (249,249,249). A straight-RGB blend would
+    /// clamp to (255,255,255) and be indistinguishable from the background.
+    func testTranslucentBasePlaneIsPremultiplied() {
+        let gridSize = 8
+        let region: [SIMD3<Float>] = [SIMD3(0, 0, 0), SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0)]
+        let surface = BandSurface(region: region, regionLabels: ["G", "X", "Y", ""],
+                                  gridSize: gridSize, sheets: [],
+                                  fermiEnergy: nil, spinCount: 1, energyMin: 0, energyMax: 1)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        guard let rep = renderToBitmap(view) else { return XCTFail("render failed") }
+        let w = rep.pixelsWide, h = rep.pixelsHigh, rb = rep.bytesPerRow
+        guard let base = rep.bitmapData else { return }
+        var near = 0
+        for y in 24..<h {
+            let row = base.advanced(by: y * rb)
+            for x in 0..<w {
+                let p = row.advanced(by: x * 4)
+                let r = Int(p[0]), g = Int(p[1]), b = Int(p[2])
+                if r >= 245 && r <= 253 && g >= 245 && g <= 253 && b >= 245 && b <= 253
+                    && max(r, g, b) - min(r, g, b) <= 2 {
+                    near += 1
+                }
+            }
+        }
+        XCTAssertGreaterThan(near, 5000,
+                             "premultiplied base fill should produce a large near-249 region, got \(near)")
     }
 }

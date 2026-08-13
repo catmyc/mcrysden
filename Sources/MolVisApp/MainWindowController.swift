@@ -542,6 +542,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if let o = scene.bandSurfaceOrientation {
             bandSurfaceView.azimuthDegrees = o.azimuthDegrees
             bandSurfaceView.elevationDegrees = o.elevationDegrees
+        } else {
+            // A scene without a persisted orientation must not inherit the previous
+            // document's angles: reset to the view defaults.
+            bandSurfaceView.azimuthDegrees = 30
+            bandSurfaceView.elevationDegrees = 24
         }
         linkedGraphs.bandView.bandStructure = scene.bandStructure
         linkedGraphs.dosView.densityOfStates = scene.densityOfStates
@@ -705,6 +710,11 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
         if let o = scene.bandSurfaceOrientation {
             bandSurfaceView.azimuthDegrees = o.azimuthDegrees
             bandSurfaceView.elevationDegrees = o.elevationDegrees
+        } else {
+            // A scene without a persisted orientation must not inherit the previous
+            // document's angles: reset to the view defaults.
+            bandSurfaceView.azimuthDegrees = 30
+            bandSurfaceView.elevationDegrees = 24
         }
         // Electronic-structure section is available when any graph/surface is populated.
         // (Not a @Published scene field — set directly, not via state, to avoid
@@ -4471,9 +4481,15 @@ final class MainWindowController: NSObject, World, NSWindowDelegate {
 
     /// Capture the live scene, camera, and current source URL and persist the
     /// view-state to `url` via StateStore. Wired to AppDelegate save actions.
+    /// The band-surface plot's live rotation is snapshotted into the scene first
+    /// so the saved state restores the exact interactive view (WYSIWYG).
     @MainActor
     internal func saveState(to url: URL) throws {
-        try StateStore.save(scene, camera: camera, sourceURL: sourceURL, to: url,
+        var snapshot = scene
+        snapshot.bandSurfaceOrientation = BandSurfaceOrientation(
+            azimuthDegrees: bandSurfaceView.azimuthDegrees,
+            elevationDegrees: bandSurfaceView.elevationDegrees)
+        try StateStore.save(snapshot, camera: camera, sourceURL: sourceURL, to: url,
                             kPathSampling: state.kPathSampling,
                             cameraBookmarks: cameraBookmarks)
     }

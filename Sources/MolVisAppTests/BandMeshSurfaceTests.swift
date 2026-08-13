@@ -38,6 +38,7 @@ final class BandMeshSurfaceTests: XCTestCase {
             }
         }
         return BandStructure(kPoints: kPoints, fermiEnergy: nil, nSpin: nSpin,
+                             kPointsAreCrystal: true,
                              kPointsPerSpin: perSpin, isMesh: true, periodicDim: 3)
     }
 
@@ -53,6 +54,7 @@ final class BandMeshSurfaceTests: XCTestCase {
             kPoints.append(contentsOf: channel)
         }
         return BandStructure(kPoints: kPoints, fermiEnergy: bands.fermiEnergy, nSpin: nSpin,
+                             kPointsAreCrystal: bands.kPointsAreCrystal,
                              kPointsPerSpin: perSpin, isMesh: bands.isMesh,
                              cell: bands.cell, periodicDim: bands.periodicDim)
     }
@@ -315,6 +317,33 @@ final class BandMeshSurfaceTests: XCTestCase {
     }
 
     // MARK: - 4. Fixture integration
+
+    /// Restarted/concatenated QE outputs can print several "reciprocal axes"
+    /// blocks; the LAST complete one must win (matching the final band iteration
+    /// and last real-space cell the parser selects). A stale earlier block must
+    /// not leak into the reciprocal basis.
+    func testFixtureReciprocalUsesLastBlock() {
+        let fixtureURL = Self.fixtureURL("CH3Rh111.out")
+        let raw = try! String(contentsOf: fixtureURL, encoding: .utf8)
+        // Prepend a stale reciprocal-axes block with an unmistakable basis.
+        let stale = """
+        reciprocal axes: (cart. coord. in units 2 pi/a_0)
+                     b(1) = (   7.0000   7.0000   7.0000 )
+                     b(2) = (   7.0000   7.0000   7.0000 )
+                     b(3) = (   7.0000   7.0000   7.0000 )
+
+        """
+        guard let parsed = BandParser.parse(stale + raw) else {
+            return XCTFail("QE mesh fixture should parse")
+        }
+        let recip = parsed.reciprocal
+        XCTAssertEqual(recip?.count, 3)
+        // The LAST (real) block wins: b1 = (1.0, 0.5774, 0.0), b3.z = 0.3704.
+        XCTAssertEqual(recip?[0].x ?? 0, 1.0, accuracy: 1e-3)
+        XCTAssertEqual(recip?[0].y ?? 0, 0.5774, accuracy: 1e-3)
+        XCTAssertEqual(recip?[0].z ?? 0, 0.0, accuracy: 1e-3)
+        XCTAssertEqual(recip?[2].z ?? 0, 0.3704, accuracy: 1e-3)
+    }
 
     func testFixtureIntegration() {
         let fixtureURL = Self.fixtureURL("CH3Rh111.out")

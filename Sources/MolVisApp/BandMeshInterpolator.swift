@@ -14,9 +14,9 @@ import simd
 // Meshes internally uniform but incomplete along exactly ONE axis may be a
 // time-reversal-reduced half-grid (QE noinv): if the negated nodes complete it
 // into a uniformly-spaced superset AND the structure is single-spin, the half axis
-// is unfolded (doubled) and the new lattice points reuse the partner original
-// node's channel index so E(-k) = E(k). Other incomplete meshes throw
-// .symmetryReducedMesh.
+// is unfolded (doubled) and every new lattice point k reuses the channel index of
+// its full time-reversal partner -k (E(k) = E(-k), applied on all coordinates).
+// Other incomplete meshes throw .symmetryReducedMesh.
 
 /// Errors thrown by band-mesh interpolation.
 enum BandMeshInterpolationError: Error, CustomStringConvertible {
@@ -27,6 +27,7 @@ enum BandMeshInterpolationError: Error, CustomStringConvertible {
     case nonFiniteRoute
     case invalidSampling
     case symmetryReducedMesh
+    case missingReciprocalBasis
 
     var description: String {
         switch self {
@@ -44,6 +45,8 @@ enum BandMeshInterpolationError: Error, CustomStringConvertible {
             return "invalid sampling density requested"
         case .symmetryReducedMesh:
             return "k-point mesh is symmetry-reduced (incomplete periodic grid); rerun the calculation with a full k-grid (nosym/noinv) or provide a single spin channel"
+        case .missingReciprocalBasis:
+            return "Cartesian k-points require a finite, nonsingular reciprocal lattice basis to convert to fractional coordinates"
         }
     }
 }
@@ -158,18 +161,21 @@ enum BandMeshInterpolator {
             }
         }
 
-        // If the k-points are Cartesian (units of 2pi/a_0) and we have the
-        // reciprocal lattice, convert to fractional coordinates first: a mesh
-        // is axis-aligned in fractional space but generally sheared in Cartesian.
+        // If the k-points are Cartesian (units of 2pi/a_0) we MUST convert to
+        // fractional coordinates first: a mesh is axis-aligned in fractional
+        // space but generally sheared in Cartesian. A missing or singular
+        // reciprocal basis makes the coordinates uninterpretable — fail
+        // explicitly rather than silently sampling raw Cartesian values as if
+        // they were fractional.
         let rawPoints: [SIMD3<Float>]
-        if !bands.kPointsAreCrystal, let recip = bands.reciprocal {
-            if let converted = cartesianToFractional(channel.map { $0.k }, reciprocal: recip) {
-                rawPoints = converted
-            } else {
-                rawPoints = channel.map { $0.k }
-            }
-        } else {
+        if bands.kPointsAreCrystal {
             rawPoints = channel.map { $0.k }
+        } else {
+            guard let recip = bands.reciprocal,
+                  let converted = cartesianToFractional(channel.map { $0.k }, reciprocal: recip) else {
+                throw BandMeshInterpolationError.missingReciprocalBasis
+            }
+            rawPoints = converted
         }
         for p in rawPoints {
             guard p.x.isFinite && p.y.isFinite && p.z.isFinite else {
@@ -340,22 +346,41 @@ enum BandMeshInterpolator {
             throw BandMeshInterpolationError.notAxisAlignedGrid  // gap in the box
         }
 
-        // For the unfolded axis, fill in the negated lattice triples: each newly
-        // added node reuses its partner original node's channel index so that
-        // interpolation at -k reads the same energies as +k (time reversal).
+        // For the unfolded axis, fill in the negated lattice triples: time
+        // reversal maps k -> -k on EVERY reciprocal coordinate, so the energy
+        // partner of a new point (k_a, k_b, k_c) is the present point
+        // (-k_a, -k_b, -k_c). Each newly added node on the unfolded axis reuses
+        // the channel index of its negation partner; the OTHER axes must be
+        // closed under negation too (a complete axis whose negated nodes are not
+        // in the mesh cannot come from a time-reversal-reduced calculation).
         if unfolded, let a = unfoldedAxis {
             let others = (0..<3).filter { $0 != a }
             let b = others[0], c = others[1]
+            func negationMapping(_ axis: Int) throws -> [Int] {
+                let n = dims[axis]
+                guard n > 1 else { return [0] }
+                return try (0..<n).map { i in
+                    let target = normalize(1 - nodes[axis][i])
+                    if let j = nodes[axis].firstIndex(where: { abs($0 - target) < 1e-3 }) {
+                        return j
+                    }
+                    throw BandMeshInterpolationError.symmetryReducedMesh
+                }
+            }
+            let negB = try negationMapping(b)
+            let negC = try negationMapping(c)
             for k in 0..<dims[a] where isNewUnionNode[k] {
-                let partner = partnerIndex[k]
                 for ib in 0..<max(1, dims[b]) {
                     for ic in 0..<max(1, dims[c]) {
-                        var t = [0, 0, 0]
-                        t[a] = partner; t[b] = ib; t[c] = ic
-                        let partnerKey = t[0] * 10_000_000 + t[1] * 10_000 + t[2]
+                        // The energy partner of the new point (k, ib, ic) is the
+                        // present point (-k_a, -k_b, -k_c) = (partner, negB[ib], negC[ic]).
+                        let partnerTriple = [partnerIndex[k], negB[ib], negC[ic]]
+                        let partnerKey = partnerTriple[0] * 10_000_000
+                                       + partnerTriple[1] * 10_000 + partnerTriple[2]
                         if let srcIdx = indexMapping[partnerKey] {
-                            t[a] = k
-                            let newKey = t[0] * 10_000_000 + t[1] * 10_000 + t[2]
+                            // The new point keeps its own (ib, ic) indices; only the
+                            // unfolded axis coordinate changes to k.
+                            let newKey = k * 10_000_000 + ib * 10_000 + ic
                             indexMapping[newKey] = srcIdx
                         }
                     }

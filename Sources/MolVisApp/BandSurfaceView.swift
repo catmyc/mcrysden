@@ -316,8 +316,12 @@ final class BandSurfaceView: NSView {
         func idx(_ x: Int, _ y: Int) -> Int { y * W + x }
 
         // Write a pixel with depth testing. `depth` larger = nearer. When the test
-        // passes, blend the (premultiplied) source over the existing pixel and,
-        // optionally, update the depth buffer.
+        // passes, blend the source over the existing pixel and, optionally, update
+        // the depth buffer. Source colors arrive STRAIGHT (non-premultiplied):
+        // translucent primitives (base plane, Fermi plane) pass e.g. (1,0,0,0.15),
+        // so RGB is premultiplied by alpha here — the blend equation and the final
+        // premultipliedLast CGImage both require premultiplied values, otherwise
+        // transparent pixels carry invalid (too-bright) RGB.
         func writePx(_ x: Int, _ y: Int, _ sr: Float, _ sg: Float, _ sb: Float, _ sa: Float,
                      _ depth: Float, _ writeDepth: Bool) {
             let i = idx(x, y)
@@ -325,10 +329,11 @@ final class BandSurfaceView: NSView {
             let o = i * 4
             let dr = Float(pix[o]) / 255, dg = Float(pix[o + 1]) / 255
             let db = Float(pix[o + 2]) / 255, da = Float(pix[o + 3]) / 255
+            let pr = sr * sa, pg = sg * sa, pb = sb * sa   // premultiply source
             let oa = sa + da * (1 - sa)
-            let or = sr + dr * (1 - sa)
-            let og = sg + dg * (1 - sa)
-            let ob = sb + db * (1 - sa)
+            let or = pr + dr * (1 - sa)
+            let og = pg + dg * (1 - sa)
+            let ob = pb + db * (1 - sa)
             pix[o] = UInt8(min(255, (or * 255).rounded()))
             pix[o + 1] = UInt8(min(255, (og * 255).rounded()))
             pix[o + 2] = UInt8(min(255, (ob * 255).rounded()))
@@ -362,17 +367,23 @@ final class BandSurfaceView: NSView {
         }
 
         // Barycentric rasterization of a flat-shaded triangle with linearly
-        // interpolated depth.
+        // interpolated depth. The buffer is plot-local: vertices arrive in
+        // absolute view coordinates (as toScreen produces), so they are first
+        // offset by the plot origin — matching rasterLine/bufXY — otherwise the
+        // fill would be shifted and clipped relative to axes and outlines.
         func rasterTri(_ a: NSPoint, _ da: Float, _ b: NSPoint, _ db: Float,
                        _ c: NSPoint, _ dc: Float, _ sr: Float, _ sg: Float, _ sb: Float,
                        _ sa: Float, _ writeDepth: Bool) {
-            let minX = max(0, Int(min(a.x, b.x, c.x).rounded(.down)))
-            let maxX = min(W - 1, Int(max(a.x, b.x, c.x).rounded(.up)))
-            let minY = max(0, Int(min(a.y, b.y, c.y).rounded(.down)))
-            let maxY = min(H - 1, Int(max(a.y, b.y, c.y).rounded(.up)))
+            let ax = a.x - originX, ay = a.y - originY
+            let bx = b.x - originX, by = b.y - originY
+            let cx = c.x - originX, cy = c.y - originY
+            let minX = max(0, Int(min(ax, bx, cx).rounded(.down)))
+            let maxX = min(W - 1, Int(max(ax, bx, cx).rounded(.up)))
+            let minY = max(0, Int(min(ay, by, cy).rounded(.down)))
+            let maxY = min(H - 1, Int(max(ay, by, cy).rounded(.up)))
             guard minX <= maxX, minY <= maxY else { return }
-            let v0x = b.x - a.x, v0y = b.y - a.y
-            let v1x = c.x - a.x, v1y = c.y - a.y
+            let v0x = bx - ax, v0y = by - ay
+            let v1x = cx - ax, v1y = cy - ay
             let d00 = v0x * v0x + v0y * v0y
             let d01 = v0x * v1x + v0y * v1y
             let d11 = v1x * v1x + v1y * v1y
@@ -381,7 +392,7 @@ final class BandSurfaceView: NSView {
             let invDenom = 1 / denom
             for y in minY...maxY {
                 for x in minX...maxX {
-                    let v2x = CGFloat(x) - a.x, v2y = CGFloat(y) - a.y
+                    let v2x = CGFloat(x) - ax, v2y = CGFloat(y) - ay
                     let d20 = v2x * v0x + v2y * v0y
                     let d21 = v2x * v1x + v2y * v1y
                     let vv = (d11 * d20 - d01 * d21) * invDenom

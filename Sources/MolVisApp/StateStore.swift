@@ -78,6 +78,14 @@ enum StateStore {
             "azimuth": scene.lighting.azimuth, "elevation": scene.lighting.elevation,
         ]
         payload["currentFrame"] = scene.currentFrame
+        // Interactive orientation of the 3D band-surface plot. Optional: saved only
+        // when the scene carries one (saves from the live view always stamp it).
+        if let orientation = scene.bandSurfaceOrientation {
+            payload["bandSurfaceOrientation"] = [
+                "azimuthDegrees": orientation.azimuthDegrees,
+                "elevationDegrees": orientation.elevationDegrees,
+            ]
+        }
         // Per-segment k-path sampling density (UI-only preference). Persisted so a
         // saved session restores the user's export sampling choice; falls back to
         // 20 (the KPath default) for old state files that lack the key.
@@ -578,6 +586,19 @@ enum StateStore {
             }
         } else {
             candidateCamera = nil
+        }
+        // Band-surface orientation (optional). Absent key (old state files) -> nil,
+        // so the view falls back to its built-in defaults. Both angles must be
+        // finite; elevation is clamped to the view's ±89° range.
+        if let raw = obj["bandSurfaceOrientation"] as? [String: Any] {
+            guard let az = try finiteFloat(raw["azimuthDegrees"], field: "bandSurfaceOrientation.azimuthDegrees"),
+                  let el = try finiteFloat(raw["elevationDegrees"], field: "bandSurfaceOrientation.elevationDegrees") else {
+                throw ParseError.parse(path: url.path, line: 0,
+                                       reason: "malformed bandSurfaceOrientation: both angles must be finite numbers")
+            }
+            candidate.bandSurfaceOrientation = BandSurfaceOrientation(
+                azimuthDegrees: az,
+                elevationDegrees: min(89, max(-89, el)))
         }
         // Camera bookmarks are optional for backward compatibility. A missing
         // key is the same as three empty slots; a present array is normalized

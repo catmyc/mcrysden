@@ -187,7 +187,7 @@ enum BandSurfaceError: Error, CustomStringConvertible {
         case .notAxisAlignedGrid:
             return "band interpolation requires an axis-aligned Monkhorst-Pack-style mesh"
         case .requiresTwoDimensionalMesh:
-            return "band surfaces are limited to 2D k-point meshes (slabs); this mesh is not a 2D k-grid"
+            return "band surfaces are drawn on a 2D k-mesh (exactly two non-degenerate sampling axes, e.g. a slab calculation); this mesh is not a 2D k-grid"
         case .malformedBandStructure:
             return "band structure has malformed or non-finite data"
         case .degenerateRegion:
@@ -246,10 +246,13 @@ enum BandSurfaceBuilder {
     /// points (p0,p1,p2); the 4th parallelogram corner is computed inside.
     /// `regionLabels` must have at least 3 entries (the 4th is set to "").
     ///
-    /// Band surfaces are LIMITED TO 2D SYSTEMS: the mesh must be a 2D k-grid
-    /// (exactly two non-degenerate sampling axes, e.g. a slab). Bulk 3D meshes
-    /// throw `.requiresTwoDimensionalMesh` — a band surface of a 3D BZ would
-    /// need an arbitrary slice plane, which is out of scope.
+    /// Band surfaces require a 2D k-MESH: exactly two non-degenerate sampling
+    /// axes (the typical slab calculation). The gate is on the k-mesh sampling,
+    /// NOT the physical dimensionality — QE slab outputs usually report 3D
+    /// periodicity (`periodicDim == 3`) with a vacuum axis while sampling only
+    /// two k directions, and those are accepted. Bulk 3D meshes throw
+    /// `.requiresTwoDimensionalMesh` — a band surface of a 3D BZ would need an
+    /// arbitrary slice plane, which is out of scope.
     ///
     /// The region is validated against the sampled plane: degenerate-axis
     /// components of both edge vectors must be integer (mod 1), and the

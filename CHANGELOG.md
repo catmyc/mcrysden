@@ -2,6 +2,18 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.12] — 2026-08-13
+
+### Fixed
+
+- **Time-reversal unfolding negates the FULL k-vector** — unfolded mesh points now copy energies from `E(-k_x, -k_y, -k_z)` (all coordinates negated, e.g. `(0.625, 0.375) → (0.375, 0.625)`), not just the reduced axis; complete axes must be closed under negation or the mesh is rejected as non-TR.
+- **Plot-local triangle rasterization** — surface/Fermi/base triangle fills are now offset by the plot origin exactly like the line path, so fills register with axes, outlines, and tick marks instead of being shifted/clipped by the plot margins.
+- **Premultiplied-alpha blending** — translucent primitives (base plane, Fermi plane) are premultiplied before the blend and the `premultipliedLast` CGImage write, so transparent exports carry valid RGB instead of clamped-too-bright colors.
+- **Cartesian k-points require a reciprocal basis** — `kPointsAreCrystal == false` with a missing or singular reciprocal lattice now fails with an actionable error instead of silently sampling raw Cartesian coordinates as if fractional.
+- **Stale reciprocal metadata** — QE `reciprocal axes` blocks are now taken from the LAST complete block (matching the final band iteration and last real-space cell) instead of the first, so restarted/variable-cell outputs no longer combine incompatible bases.
+- **Band-surface orientation persisted in `.mvis-state`** — state files now store `bandSurfaceOrientation` (finite-validated, elevation clamped to ±89°), and `saveState` snapshots the live plot angles first; opening a scene without an orientation resets the view to defaults instead of leaking the previous document's rotation.
+- **Feature documented as a 2D k-mesh requirement** — band surfaces require exactly two non-degenerate sampling axes (the typical slab calculation); the gate is on the k-mesh sampling, not the physical dimensionality (QE slabs usually report `periodicDim == 3` with a vacuum axis and are still accepted).
+
 ## [1.2.11] — 2026-08-13
 
 ### Fixed
