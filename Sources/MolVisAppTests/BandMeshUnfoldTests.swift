@@ -14,7 +14,8 @@ final class BandMeshUnfoldTests: XCTestCase {
         nBands: Int,
         nSpin: Int = 1,
         bandSlope: (Float, Float, Float) = (1, 2, 3),
-        channelOffset: [Float] = []
+        channelOffset: [Float] = [],
+        timeReversalSymmetric: Bool = false
     ) -> BandStructure {
         let dims = nodeLists.map { $0.count }
         let perSpin = dims[0] * dims[1] * dims[2]
@@ -35,7 +36,8 @@ final class BandMeshUnfoldTests: XCTestCase {
         }
         return BandStructure(kPoints: kPoints, fermiEnergy: nil, nSpin: nSpin,
                              kPointsAreCrystal: true,
-                             kPointsPerSpin: perSpin, isMesh: true, periodicDim: 3)
+                             kPointsPerSpin: perSpin, isMesh: true, periodicDim: 3,
+                             timeReversalSymmetric: timeReversalSymmetric)
     }
 
     // MARK: - (a) Shifted-grid interpolation
@@ -76,7 +78,8 @@ final class BandMeshUnfoldTests: XCTestCase {
         let nodes: [[Float]] = [[0.125, 0.375],
                                  [0.125, 0.375, 0.625, 0.875],
                                  [0.5]]
-        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0))
+        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0),
+                                  timeReversalSymmetric: true)
         let grid = try! BandMeshInterpolator.meshGrid(from: bands)
 
         XCTAssertEqual(grid.dims, [4, 4, 1])
@@ -181,7 +184,8 @@ final class BandMeshUnfoldTests: XCTestCase {
         let nodes: [[Float]] = [[0.125, 0.375, 0.625, 0.875],
                                  [0.125, 0.375],
                                  [0.5]]
-        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0))
+        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0),
+                                  timeReversalSymmetric: true)
         let grid = try! BandMeshInterpolator.meshGrid(from: bands)
         XCTAssertEqual(grid.dims, [4, 4, 1])
         XCTAssertEqual(grid.pointCount, 16)
@@ -208,7 +212,8 @@ final class BandMeshUnfoldTests: XCTestCase {
         let nodes: [[Float]] = [[0.125, 0.375, 0.625, 0.875],
                                  [0.125, 0.375, 0.625, 0.875],
                                  [0.125, 0.375]]
-        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 1))
+        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 1),
+                                  timeReversalSymmetric: true)
         let grid = try! BandMeshInterpolator.meshGrid(from: bands)
         XCTAssertEqual(grid.dims, [4, 4, 4])
         XCTAssertEqual(grid.pointCount, 64)
@@ -234,7 +239,8 @@ final class BandMeshUnfoldTests: XCTestCase {
         let nodes: [[Float]] = [[0.125, 0.375],
                                  [0.125, 0.375, 0.625, 0.875],
                                  [0.25]]
-        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0))
+        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0),
+                                  timeReversalSymmetric: true)
         XCTAssertThrowsError(try BandMeshInterpolator.meshGrid(from: bands)) { err in
             XCTAssertEqual(err as? BandMeshInterpolationError, .symmetryReducedMesh)
         }
@@ -251,6 +257,31 @@ final class BandMeshUnfoldTests: XCTestCase {
         XCTAssertThrowsError(try BandMeshInterpolator.meshGrid(from: bands)) { err in
             XCTAssertEqual(err as? BandMeshInterpolationError, .symmetryReducedMesh)
         }
+    }
+
+    // MARK: - (k) Unknown time-reversal status must never unfold
+
+    func testUnfoldRequiresExplicitTimeReversal() {
+        // A metadata-less band structure (timeReversalSymmetric defaults to
+        // false) must NOT be unfolded even though its grid matches the TR-half
+        // signature — absence of evidence is not evidence of symmetry.
+        let nodes: [[Float]] = [[0.125, 0.375],
+                                 [0.125, 0.375, 0.625, 0.875],
+                                 [0.5]]
+        let bands = Self.makeMesh(nodeLists: nodes, nBands: 1, bandSlope: (1, 1, 0))
+        XCTAssertThrowsError(try BandMeshInterpolator.meshGrid(from: bands)) { err in
+            XCTAssertEqual(err as? BandMeshInterpolationError, .symmetryReducedMesh)
+        }
+    }
+
+    /// Legacy BandStructure documents (written before the field existed) decode
+    /// to the unknown/false status, never to an assumed-symmetric true.
+    func testLegacyStateDecodesUnknownTimeReversal() throws {
+        let json = #"{"kPoints":[],"fermiEnergy":null,"nSpin":1,"kPointsPerSpin":0,"isMesh":true}"#
+        let decoded = try JSONDecoder().decode(BandStructure.self,
+                                               from: json.data(using: .utf8)!)
+        XCTAssertFalse(decoded.timeReversalSymmetric,
+                       "legacy files without the key must not claim TR symmetry")
     }
 
     // MARK: - (g) Cartesian k-points require a reciprocal basis

@@ -53,13 +53,13 @@ struct BandStructure: Codable {
     /// Number of physically periodic dimensions used for DOS normalization:
     /// 0 molecule, 1 wire, 2 slab, 3 bulk crystal.
     var periodicDim: Int = 0
-    /// Whether the calculation is known to obey time-reversal symmetry
-    /// (E(k) = E(-k)): non-magnetic, collinear, spin-orbit-free. Set by the QE
-    /// parser from the output's magnetic/SOC/noncollinear markers; default true
-    /// for sources that carry no such metadata. TR-reduced k-meshes are only
-    /// unfolded when this holds — magnetic/SOC calculations break it and must
-    /// not have their half-meshes auto-unfolded.
-    var timeReversalSymmetric: Bool = true
+    /// Whether the calculation is KNOWN to obey time-reversal symmetry
+    /// (E(k) = E(-k)): non-magnetic, collinear, spin-orbit-free, as established
+    /// by the QE parser from the output's magnetic/SOC/noncollinear markers.
+    /// Defaults to FALSE — absence of evidence is not evidence of symmetry, so
+    /// metadata-less band structures (and legacy state files) are never
+    /// auto-unfolded. TR-reduced k-meshes are only unfolded when this is true.
+    var timeReversalSymmetric: Bool = false
 
     init(kPoints: [BandKPoint], fermiEnergy: Float?, nSpin: Int,
          reciprocal: [SIMD3<Float>]? = nil,
@@ -68,7 +68,7 @@ struct BandStructure: Codable {
          isMesh: Bool = false,
          cell: Cell? = nil,
          periodicDim: Int = 0,
-         timeReversalSymmetric: Bool = true) {
+         timeReversalSymmetric: Bool = false) {
         self.kPoints = kPoints
         self.fermiEnergy = fermiEnergy
         self.nSpin = nSpin
@@ -99,7 +99,9 @@ struct BandStructure: Codable {
         isMesh = try c.decodeIfPresent(Bool.self, forKey: .isMesh) ?? false
         cell = try c.decodeIfPresent(Cell.self, forKey: .cell)
         periodicDim = min(3, max(0, try c.decodeIfPresent(Int.self, forKey: .periodicDim) ?? 0))
-        timeReversalSymmetric = try c.decodeIfPresent(Bool.self, forKey: .timeReversalSymmetric) ?? true
+        // Unknown (missing key in legacy files) must NOT claim symmetry: reduced
+        // meshes are only unfolded on explicit parser-verified evidence.
+        timeReversalSymmetric = try c.decodeIfPresent(Bool.self, forKey: .timeReversalSymmetric) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -207,7 +209,21 @@ enum BandParser {
         // A reduced k-mesh may only be unfolded when the calculation obeys
         // time reversal (E(k) = E(-k)). Magnetic, spin-orbit/noncollinear, and
         // field-driven calculations break it even for a single spin channel.
-        let timeReversalSymmetric = !detectTimeReversalBreaking(text)
+        //
+        // Detection is bound to the LAST calculation in the file: QE marks a new
+        // run with a "Program PWSCF ... starts ..." banner (its end prints a
+        // "stops" line, which must not be mistaken for a new run), so
+        // concatenated output's earlier calculations (with their own input echo
+        // and SCF magnetization lines) must not veto the final selected mesh.
+        // Without a banner the whole text is scanned. Within one calculation the
+        // SCF section (early iterations) still counts — its magnetization
+        // markers are part of the same run.
+        let calcStart = lines.lastIndex(where: {
+            let lower = $0.lowercased()
+            return lower.contains("program pwscf") && lower.contains("starts")
+        }) ?? 0
+        let calcText = lines[calcStart...].joined(separator: "\n")
+        let timeReversalSymmetric = !detectTimeReversalBreaking(calcText)
         // Reciprocal axes are enough to establish that this is a periodic QE
         // calculation even when a bands-only file omitted the real-space axes;
         // DOS generation will then fail explicitly if the volume/area cannot
@@ -753,11 +769,27 @@ enum BandParser {
     /// symmetry, where E(k) = E(-k) does not hold: magnetic (nonzero
     /// magnetization), spin-orbit/noncollinear, or field-driven runs. Such
     /// calculations must not have symmetry-reduced k-meshes unfolded.
+    ///
+    /// Marker presence alone is not definitive: QE echoes `lspinorb = .false.`
+    /// and `total magnetization = 0.00` in runs that preserve TR, so echoed
+    /// values are parsed rather than the bare phrases.
     private static func detectTimeReversalBreaking(_ text: String) -> Bool {
         let lower = text.lowercased()
         if lower.contains("noncollinear") || lower.contains("non-collinear") { return true }
-        if lower.contains("spin-orbit") || lower.contains("lspinorb") { return true }
-        if lower.contains("magnetization (x)") || lower.contains("total magnetization") { return true }
+        // The "magnetization (x)" per-atom moment table is printed only by
+        // magnetic (nspin=2/4) runs.
+        if lower.contains("magnetization (x)") { return true }
+        // SOC flags: parse the echoed value — lspinorb = .true. breaks TR,
+        // lspinorb = .false. does not. A bare "spin-orbit" mention without a
+        // parseable value stays conservative (treated as breaking).
+        if flagBooleanAfter(marker: "lspinorb", in: lower) == true { return true }
+        if flagBooleanAfter(marker: "spin_orbit", in: lower) == true { return true }
+        if lower.contains("spin-orbit") { return true }
+        // Net magnetization: only a NONZERO value marks a magnetic calculation
+        // (a compensated AFM or a forced-but-unpolarized run prints 0.00).
+        if let mag = numericValueAfter(marker: "total magnetization", in: lower), mag != 0 {
+            return true
+        }
         // QE echoes "starting_magnetization(i)=0.0" even for non-magnetic runs,
         // so only a NONZERO value marks a magnetic calculation.
         var scan = lower.startIndex
@@ -774,6 +806,32 @@ enum BandParser {
             }
         }
         return false
+    }
+
+    /// The Fortran-boolean token echoed after `marker =` (e.g. "lspinorb = .true."):
+    /// true → .true., false → .false., nil when absent or unparseable.
+    private static func flagBooleanAfter(marker: String, in lower: String) -> Bool? {
+        guard let m = lower.range(of: marker) else { return nil }
+        guard let eq = lower.range(of: "=", range: m.upperBound..<lower.endIndex) else { return nil }
+        let tail = lower[eq.upperBound...].prefix(24)
+        guard let token = tail.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }).first?.lowercased() else {
+            return nil
+        }
+        if token.contains("true") || token == "t" { return true }
+        if token.contains("false") || token == "f" { return false }
+        return nil
+    }
+
+    /// The first numeric token echoed after `marker =` (e.g. "total magnetization = 0.72 a.u."),
+    /// or nil when the marker or a numeric value is absent.
+    private static func numericValueAfter(marker: String, in lower: String) -> Float? {
+        guard let m = lower.range(of: marker) else { return nil }
+        guard let eq = lower.range(of: "=", range: m.upperBound..<lower.endIndex) else { return nil }
+        let tail = lower[eq.upperBound...].prefix(48)
+        for token in tail.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }) {
+            if let value = Float(token) { return value }
+        }
+        return nil
     }
 
     /// Parse the reciprocal lattice vectors b1..b3 from the QE "reciprocal axes"

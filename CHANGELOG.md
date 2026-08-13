@@ -2,6 +2,14 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.14] — 2026-08-13
+
+### Fixed
+
+- **Unknown time-reversal status no longer defaults to true** — `timeReversalSymmetric` now defaults to `false` in both the initializer and the legacy Codable fallback, so metadata-less band structures and old state files are never auto-unfolded without parser-verified evidence.
+- **TR detection bound to the selected calculation** — markers are scanned from the last `Program PWSCF … starts …` banner onward (concatenated output's earlier calculations, with their own input echo and SCF magnetization lines, no longer veto the final selected mesh); within one calculation the SCF section still counts.
+- **Echoed values parsed instead of marker presence** — `lspinorb = .false.` no longer breaks TR (only `.true.` does), `total magnetization = 0.00` is not treated as magnetic (only a nonzero value is), and `starting_magnetization` was already value-gated; bare `spin-orbit` mentions without a parseable value stay conservatively treated as breaking.
+
 ## [1.2.13] — 2026-08-13
 
 ### Fixed
