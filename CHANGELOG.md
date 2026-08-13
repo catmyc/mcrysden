@@ -2,6 +2,13 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.15] — 2026-08-13
+
+### Fixed
+
+- **Unmagnetized SOC/noncollinear runs preserve time reversal** — QE (INPUT_PW) enforces TRS for zero starting magnetization in noncollinear and spin-orbit calculations, so those reduced meshes are validly unfoldable again. Classification now combines the run MODE with the actual magnetization/TR-control values: any nonzero starting magnetization, nonzero total magnetization, or nonzero atomic moment breaks TR in every mode; a zero-magnetization noncollinear/SOC run does not. Bare `spin-orbit` phrases without a parseable echoed flag stay conservatively breaking.
+- **Calculation boundary matches both banner spellings** — the last-calculation scoping now recognizes `Program PWSCF 1.2.0 starts ...` and bare version banners like `Program PWSCF v.6.7` (si_scf.out style) via a version token after the program name, while excluding non-banner mentions (`current dimensions of program pwscf are:`) and the `stops ...` exit line. Concatenated output using the v.6.7 form no longer lets earlier calculations veto the final mesh.
+
 ## [1.2.14] — 2026-08-13
 
 ### Fixed

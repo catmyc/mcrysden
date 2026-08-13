@@ -319,10 +319,11 @@ final class BandMeshSurfaceTests: XCTestCase {
     // MARK: - 4. Fixture integration
 
     /// Time-reversal classification by the parser: detection is bound to the
-    /// LAST calculation in the file (after the final "Program PWSCF" banner),
-    /// echoed values are parsed (lspinorb/total magnetization), and magnetic /
-    /// SOC / noncollinear markers make the structure unfoldable only when they
-    /// belong to the selected calculation.
+    /// LAST calculation in the file (from the final "Program PWSCF" banner in
+    /// either spelling), echoed values are parsed (lspinorb/total
+    /// magnetization/atomic moments), and the run MODE only matters when the
+    /// calculation is actually magnetized — QE enforces time reversal for
+    /// zero-magnetization noncollinear/SOC runs.
     func testParserDetectsTimeReversalBreaking() {
         let fixtureURL = Self.fixtureURL("CH3Rh111.out")
         let raw = try! String(contentsOf: fixtureURL, encoding: .utf8)
@@ -340,25 +341,46 @@ final class BandMeshSurfaceTests: XCTestCase {
         XCTAssertTrue(BandParser.parse(raw)!.timeReversalSymmetric,
                       "non-magnetic fixture must claim TR symmetry")
 
-        // --- Markers inside the selected calculation ---
+        // --- Magnetization values, in any mode, break TR ---
         XCTAssertFalse(BandParser.parse(afterBanner("total magnetization      =      1.2345"))!.timeReversalSymmetric,
                        "nonzero net magnetization breaks TR")
         // A zero net magnetization (compensated AFM / unpolarized nspin=2) does
         // NOT, by itself, break TR — the echoed VALUE is parsed.
         XCTAssertTrue(BandParser.parse(afterBanner("total magnetization      =      0.0000"))!.timeReversalSymmetric,
                       "zero net magnetization is not TR-breaking by itself")
-        XCTAssertFalse(BandParser.parse(afterBanner("Noncollinear calculation"))!.timeReversalSymmetric,
-                       "noncollinear breaks TR")
-        // lspinorb is value-parsed: .false. preserves TR, .true. breaks it.
-        XCTAssertTrue(BandParser.parse(afterBanner("lspinorb = .false."))!.timeReversalSymmetric,
-                      "lspinorb = .false. must not break TR")
-        XCTAssertFalse(BandParser.parse(afterBanner("lspinorb = .true."))!.timeReversalSymmetric,
-                       "lspinorb = .true. breaks TR")
-        // starting_magnetization: only a nonzero value marks a magnetic run.
-        XCTAssertTrue(BandParser.parse(afterBanner("starting_magnetization(1)=0.0"))!.timeReversalSymmetric,
-                      "zero starting magnetization is not magnetic")
         XCTAssertFalse(BandParser.parse(afterBanner("starting_magnetization(2)=0.7"))!.timeReversalSymmetric,
                        "nonzero starting magnetization breaks TR")
+        XCTAssertTrue(BandParser.parse(afterBanner("starting_magnetization(1)=0.0"))!.timeReversalSymmetric,
+                      "zero starting magnetization is not magnetic")
+        // Nonzero atomic moments in the magnetization (x) table break TR.
+        let momentTable = """
+        magnetization (x)
+             atom    1     charge     0.1711     magnetization     0.0282
+             atom    2     charge     0.1711     magnetization    -0.0282
+        """
+        XCTAssertFalse(BandParser.parse(afterBanner(momentTable))!.timeReversalSymmetric,
+                       "nonzero atomic moments break TR")
+        // A zero-moment table does not.
+        let zeroTable = """
+        magnetization (x)
+             atom    1     charge     0.1711     magnetization     0.0000
+        """
+        XCTAssertTrue(BandParser.parse(afterBanner(zeroTable))!.timeReversalSymmetric,
+                      "zero atomic moments preserve TR")
+
+        // --- Mode alone does not break TR: QE enforces TRS for unmagnetized ---
+        // --- noncollinear/SOC runs (zero starting magnetization).          ---
+        XCTAssertTrue(BandParser.parse(afterBanner("Noncollinear calculation"))!.timeReversalSymmetric,
+                      "unmagnetized noncollinear preserves TR")
+        XCTAssertTrue(BandParser.parse(afterBanner("lspinorb = .true."))!.timeReversalSymmetric,
+                      "unmagnetized SOC preserves TR")
+        XCTAssertTrue(BandParser.parse(afterBanner("lspinorb = .false."))!.timeReversalSymmetric,
+                      "lspinorb = .false. preserves TR")
+        // Mode + actual magnetization: still TR-breaking.
+        XCTAssertFalse(BandParser.parse(afterBanner("lspinorb = .true.\nstarting_magnetization(1)=0.7"))!.timeReversalSymmetric,
+                       "magnetized SOC breaks TR")
+        XCTAssertFalse(BandParser.parse(afterBanner("Noncollinear calculation\ntotal magnetization      =      1.2345"))!.timeReversalSymmetric,
+                       "magnetized noncollinear breaks TR")
 
         // --- Markers of an EARLIER calculation must not veto the last one ---
         // The fixture's banner sits at the top; text prepended before it belongs
@@ -367,6 +389,22 @@ final class BandMeshSurfaceTests: XCTestCase {
                       "an earlier calculation's markers must not veto the selected mesh")
         XCTAssertTrue(BandParser.parse(beforeBanner("lspinorb = .true."))!.timeReversalSymmetric,
                       "an earlier calculation's SOC flag must not veto the selected mesh")
+
+        // --- The bare "Program PWSCF v.6.7" banner form (si_scf.out) is a ---
+        // --- calculation boundary too, and the "stops" exit line is not.  ---
+        let v67Body = raw.replacingOccurrences(of: "     Program PWSCF 1.2.0  starts ...", with: "")
+        let v67Earlier = "total magnetization      =      9.9999\nProgram PWSCF v.6.7\n" + v67Body
+        XCTAssertTrue(BandParser.parse(v67Earlier)!.timeReversalSymmetric,
+                      "markers before the v.6.7 banner belong to an earlier run")
+        let v67Inside = "Program PWSCF v.6.7\n" + v67Body.replacingOccurrences(
+            of: "Today is", with: "total magnetization      =      9.9999\n     Today is")
+        XCTAssertFalse(BandParser.parse(v67Inside)!.timeReversalSymmetric,
+                       "markers after the v.6.7 banner are inside the selected calculation")
+        // The exit line must not be mistaken for a new calculation boundary.
+        let withStops = "total magnetization      =      9.9999\n" + raw
+            + "\n     Program PWSCF 1.2.0  stops ...\n"
+        XCTAssertTrue(BandParser.parse(withStops)!.timeReversalSymmetric,
+                      "the stops line must not re-scope the calculation")
     }
 
     /// Restarted/concatenated QE outputs can print several "reciprocal axes"

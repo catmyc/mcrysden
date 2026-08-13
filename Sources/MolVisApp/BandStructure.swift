@@ -211,16 +211,28 @@ enum BandParser {
         // field-driven calculations break it even for a single spin channel.
         //
         // Detection is bound to the LAST calculation in the file: QE marks a new
-        // run with a "Program PWSCF ... starts ..." banner (its end prints a
-        // "stops" line, which must not be mistaken for a new run), so
-        // concatenated output's earlier calculations (with their own input echo
-        // and SCF magnetization lines) must not veto the final selected mesh.
-        // Without a banner the whole text is scanned. Within one calculation the
-        // SCF section (early iterations) still counts — its magnetization
-        // markers are part of the same run.
-        let calcStart = lines.lastIndex(where: {
-            let lower = $0.lowercased()
-            return lower.contains("program pwscf") && lower.contains("starts")
+        // run with a "Program PWSCF <version>" banner — either the classic form
+        // "Program PWSCF 1.2.0 starts ..." or a bare "Program PWSCF v.6.7"
+        // (older outputs, e.g. si_scf.out). Lines that merely MENTION the
+        // program name ("current dimensions of program pwscf are:", the
+        // "stops ..." exit line) are not boundaries. Concatenated output's
+        // earlier calculations (with their own input echo and SCF magnetization
+        // lines) must not veto the final selected mesh. Without a banner the
+        // whole text is scanned. Within one calculation the SCF section (early
+        // iterations) still counts — its magnetization markers are part of the
+        // same run.
+        let calcStart = lines.lastIndex(where: { line in
+            let lower = line.lowercased()
+            guard lower.contains("program pwscf"), !lower.contains("stops") else { return false }
+            // A real banner carries a version token right after the program name
+            // ("1.2.0", "v.6.7"); "current dimensions of program pwscf are:"
+            // does not.
+            guard let range = lower.range(of: "program pwscf") else { return false }
+            guard let token = line[range.upperBound...]
+                .split(whereSeparator: { $0 == " " || $0 == "\t" }).first?.lowercased() else {
+                return false
+            }
+            return token.first?.isNumber == true || token.hasPrefix("v")
         }) ?? 0
         let calcText = lines[calcStart...].joined(separator: "\n")
         let timeReversalSymmetric = !detectTimeReversalBreaking(calcText)
@@ -766,30 +778,21 @@ enum BandParser {
     }
 
     /// True when the QE text indicates a calculation without time-reversal
-    /// symmetry, where E(k) = E(-k) does not hold: magnetic (nonzero
-    /// magnetization), spin-orbit/noncollinear, or field-driven runs. Such
-    /// calculations must not have symmetry-reduced k-meshes unfolded.
+    /// symmetry, where E(k) = E(-k) does not hold. Such calculations must not
+    /// have symmetry-reduced k-meshes unfolded.
     ///
-    /// Marker presence alone is not definitive: QE echoes `lspinorb = .false.`
-    /// and `total magnetization = 0.00` in runs that preserve TR, so echoed
-    /// values are parsed rather than the bare phrases.
+    /// Classification combines the run MODE with the actual magnetization /
+    /// TR-control values:
+    /// - ANY nonzero magnetization (starting magnetization input, converged
+    ///   total magnetization, or atomic moments) breaks TR in every mode.
+    /// - Unmagnetized noncollinear or spin-orbit runs PRESERVE time reversal:
+    ///   QE (INPUT_PW) enforces TRS for zero starting magnetization in those
+    ///   modes, so such reduced meshes are validly unfoldable.
+    /// - A bare "spin-orbit" phrase without a parseable echoed flag stays
+    ///   conservative (treated as breaking).
     private static func detectTimeReversalBreaking(_ text: String) -> Bool {
         let lower = text.lowercased()
-        if lower.contains("noncollinear") || lower.contains("non-collinear") { return true }
-        // The "magnetization (x)" per-atom moment table is printed only by
-        // magnetic (nspin=2/4) runs.
-        if lower.contains("magnetization (x)") { return true }
-        // SOC flags: parse the echoed value — lspinorb = .true. breaks TR,
-        // lspinorb = .false. does not. A bare "spin-orbit" mention without a
-        // parseable value stays conservative (treated as breaking).
-        if flagBooleanAfter(marker: "lspinorb", in: lower) == true { return true }
-        if flagBooleanAfter(marker: "spin_orbit", in: lower) == true { return true }
-        if lower.contains("spin-orbit") { return true }
-        // Net magnetization: only a NONZERO value marks a magnetic calculation
-        // (a compensated AFM or a forced-but-unpolarized run prints 0.00).
-        if let mag = numericValueAfter(marker: "total magnetization", in: lower), mag != 0 {
-            return true
-        }
+        // --- Magnetization is the decisive TR breaker, in any mode ---
         // QE echoes "starting_magnetization(i)=0.0" even for non-magnetic runs,
         // so only a NONZERO value marks a magnetic calculation.
         var scan = lower.startIndex
@@ -803,6 +806,46 @@ enum BandParser {
             if let token = tail.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }).first,
                let value = Float(token), value != 0 {
                 return true
+            }
+        }
+        // Net magnetization: only a NONZERO value marks a magnetic calculation
+        // (a compensated AFM or a forced-but-unpolarized run prints 0.00).
+        if let mag = numericValueAfter(marker: "total magnetization", in: lower), mag != 0 {
+            return true
+        }
+        // Atomic moments from the "magnetization (x)" / "(x,y,z)" tables.
+        if hasNonzeroAtomicMoments(lower) { return true }
+
+        // --- Unmagnetized mode handling ---
+        // Noncollinear/SOC with zero magnetization: QE enforces time reversal,
+        // so the run is TR-symmetric (unfoldable) despite the mode.
+        if lower.contains("noncollinear") || lower.contains("non-collinear") { return false }
+        let socFlag = flagBooleanAfter(marker: "lspinorb", in: lower)
+            ?? flagBooleanAfter(marker: "spin_orbit", in: lower)
+        if socFlag != nil { return false }   // parsed flag, unmagnetized => TRS
+        // A bare "spin-orbit" mention without a parseable echoed value stays
+        // conservative (treated as breaking).
+        return lower.contains("spin-orbit")
+    }
+
+    /// True when any per-atom moment in the "magnetization (x)" (or "(x,y,z)")
+    /// table is nonzero (beyond numerical noise).
+    private static func hasNonzeroAtomicMoments(_ lower: String) -> Bool {
+        let lines = lower.components(separatedBy: "\n")
+        for (i, line) in lines.enumerated() where line.contains("magnetization (x") {
+            var j = i + 1
+            while j < lines.count && j - i <= 50 {
+                let row = lines[j]
+                if row.contains("==") || row.trimmingCharacters(in: .whitespaces).isEmpty
+                    || row.contains("total magnetization") { break }
+                // Moment rows contain the keyword "magnetization" followed by
+                // the moment value(s) ("atom 1 charge C magnetization M").
+                if let mRange = row.range(of: "magnetization") {
+                    for token in row[mRange.upperBound...].split(whereSeparator: { $0 == " " || $0 == "\t" }) {
+                        if let value = Float(token), abs(value) > 1e-3 { return true }
+                    }
+                }
+                j += 1
             }
         }
         return false
