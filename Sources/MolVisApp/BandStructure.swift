@@ -334,8 +334,19 @@ enum BandParser {
                 i += 1; continue
             }
             if isKPointListHeader(line) {
-                if let w = parseWeight(line) { curMeta.weights.append(w) }
-                curMeta.count += 1
+                // A single "number of k points= N" section can print the same
+                // k-list twice — first cart. coord., then cryst. coord. Without
+                // a cap, both lists feed the metadata accumulator (648 weights
+                // for 324 eigenvalue blocks), corrupting the per-channel layout.
+                // When the header declares N, collect at most N k-list lines; the
+                // duplicate coordinate-system list is then silently skipped.
+                // Without a declared count (headerCount == 0) we cannot
+                // distinguish a duplicate from a genuine longer list, so fall
+                // back to collecting everything (the old single-list behavior).
+                if curMeta.headerCount == 0 || curMeta.count < curMeta.headerCount {
+                    if let w = parseWeight(line) { curMeta.weights.append(w) }
+                    curMeta.count += 1
+                }
                 i += 1; continue
             }
             guard let k = parseKHeader(line) else { i += 1; continue }
@@ -1043,6 +1054,23 @@ enum BandParser {
         }
     }
 
+    /// Extract all signed-decimal numbers from `text` in scan order, WITHOUT
+    /// the finite-only filter. Used by `parseKHeader` where the raw match must
+    /// be returned (the caller validates finiteness). Adjacent signed values
+    /// such as "0.0278-0.5292" yield two numbers (0.0278, -0.5292) because the
+    /// leading minus of the second is a sign, not an operator between tokens.
+    private static func signedDecimals(in text: String) -> [Float] {
+        let pattern = #"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = text as NSString
+        return expression.matches(in: text, range: NSRange(location: 0, length: ns.length)).compactMap { match in
+            guard let range = Range(match.range, in: text) else { return nil }
+            let token = String(text[range]).replacingOccurrences(of: "D", with: "e")
+                .replacingOccurrences(of: "d", with: "e")
+            return Float(token)
+        }
+    }
+
     /// Parse "  k =  .1250  .2165 -.1852 ( 6180 PWs)   bands (ev):" ->
     /// k=(0.125,0.2165,-0.1852).
     ///
@@ -1050,13 +1078,19 @@ enum BandParser {
     /// this header is the plane-wave count "( 6180 PWs)", NOT a k-point weight, so
     /// we stop at three. (The BandKPoint.weight field exists for completeness but
     /// is not populated, since the bands header carries no valid weight.)
+    ///
+    /// QE can emit fixed-width adjacent signed values (e.g.
+    /// "k = 0.0278-0.5292 0.0000 ..." where the minus sign of the second
+    /// component abuts the first). A whitespace split would join "0.0278-0.5292"
+    /// into one token that Float rejects; instead we scan for signed-decimal
+    /// numbers with the same regex used elsewhere in the parser, so each
+    /// component is extracted independently.
     private static func parseKHeader(_ line: String) -> SIMD3<Float>? {
         guard let eqRange = line.range(of: "k =") ?? line.range(of: "k=") else { return nil }
         let after = String(line[eqRange.upperBound...])
-        let toks = after.split(whereSeparator: { $0 == " " || $0 == "\t" })
         var nums: [Float] = []
-        for t in toks {
-            if let v = Float(t) { nums.append(v) }
+        for match in signedDecimals(in: after) {
+            nums.append(match)
             if nums.count == 3 { break }   // kx, ky, kz only — skip the PW count
         }
         guard nums.count >= 3, nums[0].isFinite, nums[1].isFinite, nums[2].isFinite else { return nil }

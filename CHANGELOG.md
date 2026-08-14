@@ -2,6 +2,12 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.17] — 2026-08-15
+
+### Fixed
+
+- **QE 7.x band-grid parsing** — accept fixed-width adjacent signed k coordinates and avoid counting QE's repeated Cartesian/crystallographic k-list representation twice, so valid NSCF mesh outputs load through `--band-surf`.
+
 ## [1.2.16] — 2026-08-13
 
 ### Added

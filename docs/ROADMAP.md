@@ -1,10 +1,10 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-13 (v1.2.15: TR classification refined — unmagnetized noncollinear/SOC runs preserve TR (mode combined with magnetization values), calculation boundary accepts both PWSCF banner spellings; 99 focused tests)**.
+Last updated: **2026-08-15 (v1.2.17: QE 7.x NSCF band-grid parsing hardened for repeated coordinate lists and adjacent signed k coordinates; 119 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-Current v1.2.16 verification: `--bands`/`--dos`/`--band-surf` CLI selection, mesh→path interpolation (shifted grids, TR-unfolded half meshes on x/y/z with full-vector negation and magnetization-aware TR gating, Cartesian-conversion rejection), band-surface construction (mesh-derived regions, 2D-plane validation, decode validation), z-buffered rendering (depth occlusion, Fermi domain, plot-local fills, premultiplied alpha, coplanar-band visibility, quad-rasterized translucent planes, WYSIWYG export orientation), state-file orientation persistence, and the existing band/DOS/bond regressions are covered by a passing 116-test suite.
+Current v1.2.17 verification: `--bands`/`--dos`/`--band-surf` CLI selection, mesh→path interpolation (shifted grids, TR-unfolded half meshes on x/y/z with full-vector negation and magnetization-aware TR gating, Cartesian-conversion rejection), QE fixed-width adjacent-signed k headers and repeated Cartesian/crystal k-list handling, band-surface construction (mesh-derived regions, 2D-plane validation, decode validation), z-buffered rendering (depth occlusion, Fermi domain, plot-local fills, premultiplied alpha, coplanar-band visibility, quad-rasterized translucent planes, WYSIWYG export orientation), state-file orientation persistence, and the existing band/DOS/bond regressions are covered by a passing 119-test suite.
 
 ## Implemented foundation (through v1.1.32)
 
