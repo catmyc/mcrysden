@@ -19,50 +19,6 @@ The subagents fix the issues from the review.
 
 Primary agent sends the issues back to relevant subagent sessions (if any) for fixing.
 
-## Subagent Dispatch in `Pi` CLI
-This subagent dispatch instruction is uniquely for `Pi` CLI agent tool. 
-
-Do not consider this if not running in `Pi`.
-
-Pi has no built-in subagent primitive. Launch isolated subagents as `pi` CLI subprocesses.
-Prioritize using `longcat/LongCat-2.0` with `high` reasoning for subagent tasks.
-The `openai-codex/gpt-5.6-luna` model with `max` reasoning is also callable under user's permission.
-
-Do not use other model for subagent tasks unless explicit instruction.
-
-### Subprocess invocation
-
-For a one-shot implementation agent:
-
-```bash
-pi --mode json -p \
-  --model longcat/LongCat-2.0 \
-  --thinking high \
-  --tools read,bash,edit,write \
-  --no-extensions --no-skills --no-prompt-templates \
-  "Implement the narrowly scoped task. Do not delegate further. ..." \
-  > /tmp/pi-subagent-name.jsonl \
-  2> /tmp/pi-subagent-name.err
-```
-
-- Run independent agents concurrently from one shell command with background jobs (`&`) followed by `wait`; do not launch independent jobs sequentially.
-- Give every agent a narrow task, explicit file scope, acceptance criteria, verification commands, and an instruction not to delegate further.
-- Keep project context files enabled for implementation work so subagents receive repository invariants. Use `--no-context-files` only for isolated capability probes.
-- Use an explicit tool allowlist. Analysis/review agents should normally receive only `read,grep,find,ls` (and `bash` when tests or git inspection are required).
-- `--mode json` produces JSONL suitable for capturing tool progress, final output, model identity, and failures. Check the process exit status and stderr before accepting a result.
-- Confirm the selected runtime when needed by having the child print `$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL`; the expected value is `longcat|LongCat-2.0|high`.
-
-For a subagent that must receive later review fixes, omit `--no-session`, give it a dedicated `--session-dir`, capture the session id from the JSONL `session` event, and resume it with `--session <id>`. Do not use `--continue` for parallel agents because it can select the wrong session.
-
-Key rules:
-- Reuse subagent sessions as much as possible. Send fix tasks back to the relevant implementation session.
-- Never dispatch overlapping file scopes to parallel agents. Parallel editing is allowed only for disjoint files.
-- The primary agent owns integration, reviews combined changes, and runs final repository-wide verification.
-- Never assume subprocess success from output alone; require exit code zero, inspect the final assistant event, and review `git diff`.
-- Remove diagnostic/development-only tests after features stabilize.
-- Update `CHANGELOG.md` and `docs/ROADMAP.md` after each commit that implements a roadmap item.
-
-
 ## Platform And Verification
 
 - This is a macOS 14+ SwiftPM executable; there is no Xcode project and Metal/AppKit tests require macOS with a Metal device.
