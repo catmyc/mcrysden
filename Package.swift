@@ -38,9 +38,17 @@ let package = Package(
                 .unsafeFlags(["-fno-modules"]),
             ]
         ),
+        .target(
+            name: "BandSurfaceRaster",
+            path: "Sources/BandSurfaceRaster",
+            publicHeadersPath: "include",
+            cSettings: [
+                .unsafeFlags(["-fno-modules"]),
+            ]
+        ),
         .executableTarget(
             name: "MolVisApp",
-            dependencies: ["MolEnvParse", "MolEnvSpglib"],
+            dependencies: ["MolEnvParse", "MolEnvSpglib", "BandSurfaceRaster"],
             path: "Sources/MolVisApp",
             exclude: ["Shaders.metal"],
             resources: [.copy("Resources/SEEKPATH_LICENSE.txt")],
@@ -53,7 +61,7 @@ let package = Package(
         ),
         .testTarget(
             name: "MolVisAppTests",
-            dependencies: ["MolVisApp"],
+            dependencies: ["MolVisApp", "BandSurfaceRaster"],
             path: "Sources/MolVisAppTests",
             resources: [.process("Fixtures")]
         ),

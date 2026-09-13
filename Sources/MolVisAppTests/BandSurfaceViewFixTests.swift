@@ -543,4 +543,25 @@ final class BandSurfaceViewFixTests: XCTestCase {
         XCTAssertGreaterThan(near, 5000,
                              "premultiplied base fill should produce a large near-249 region, got \(near)")
     }
+
+    /// Regression for finite energies whose Float range overflows: the old
+    /// `energyMax - energyMin` became infinity, tick generation produced NaN
+    /// AppKit geometry, and the view raised NSGenericException instead of
+    /// failing closed. The draw must complete as the empty/error state.
+    func testExtremeFiniteEnergyRangeIsRejectedWithoutCrash() {
+        let gridSize = 8
+        let huge: Float = 3.0e38
+        func vals(_ e: Float) -> [Float] { [Float](repeating: e, count: gridSize * gridSize) }
+        let surface = BandSurface(
+            region: [SIMD3<Float>(0, 0, 0), SIMD3<Float>(1, 0, 0),
+                     SIMD3<Float>(0, 1, 0), SIMD3<Float>(1, 1, 0)],
+            regionLabels: ["G", "X", "Y", ""],
+            gridSize: gridSize,
+            sheets: [BandSurfaceSheet(band: 0, spin: 0, label: "extreme", values: vals(huge))],
+            fermiEnergy: nil, spinCount: 1, energyMin: -huge, energyMax: huge)
+        let view = BandSurfaceView(frame: NSRect(x: 0, y: 0, width: 320, height: 260))
+        view.bandSurface = surface
+        XCTAssertNotNil(renderToBitmap(view),
+                        "finite but unrenderable energy ranges must draw an empty state, not raise")
+    }
 }

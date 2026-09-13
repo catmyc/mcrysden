@@ -462,31 +462,12 @@ struct FermiSurface: Codable {
     }
 }
 
-/// Read a text file with a size cap, mirroring Parser.readCappedText but
-/// defined privately here (that helper is fileprivate to Parser.swift).
-/// Pre-checks the on-disk size, then reads through FileHandle so a malicious
-/// file cannot allocate unbounded memory before the cap is detected.
+/// Read a BXSF text file through the shared bounded reader. Kept as a named
+/// wrapper so the BXSF loader's original call site stays explicit; this avoids
+/// the previous duplicated implementation silently drifting from
+/// `readCappedText` (including its read-error handling).
 private func readCappedBXSFText(_ url: URL, cap: Int = 200 * 1024 * 1024) throws -> String {
-    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-    if let fileSize = attributes[.size] as? Int, fileSize > cap {
-        throw ParseError.io(path: url.path, reason: "file size \(fileSize) exceeds \(cap) byte limit")
-    }
-    guard let handle = try? FileHandle(forReadingFrom: url) else {
-        throw ParseError.io(path: url.path, reason: "could not open file for reading")
-    }
-    defer { try? handle.close() }
-    var data = Data()
-    while true {
-        guard let chunk = try? handle.read(upToCount: 8192), !chunk.isEmpty else { break }
-        data.append(chunk)
-        if data.count > cap {
-            throw ParseError.io(path: url.path, reason: "file exceeds \(cap) byte limit")
-        }
-    }
-    guard let text = String(data: data, encoding: .utf8) else {
-        throw ParseError.io(path: url.path, reason: "file is not valid UTF-8")
-    }
-    return text
+    try readCappedText(url, cap: cap)
 }
 
 /// File-based BXSF loader that transparently decompresses `.gz` (shelling out to

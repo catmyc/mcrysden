@@ -166,17 +166,26 @@ enum StateStore {
                                   cameraBookmarks: inout [CameraBookmark?], from url: URL) throws -> Int {
         // Pre-check the on-disk size so a malformed/giant state file cannot allocate
         // unbounded memory before any parsing. A 50 MB cap is generous for a flat
-        // view-state file (typical size is a few KB).
+        // view-state file (typical size is a few KB). The check is fail-closed:
+        // an unreadable/metadata-less file is rejected instead of falling
+        // through to an unbounded Data(contentsOf:).
+        let fileSize: Int64
         do {
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            if let fileSize = attributes[.size] as? Int, fileSize > 50 * 1024 * 1024 {
-                throw ParseError.io(path: url.path, reason: "state file too large (\(fileSize) bytes)")
+            guard let number = attributes[.size] as? NSNumber else {
+                throw ParseError.io(path: url.path, reason: "could not determine state file size")
             }
+            fileSize = number.int64Value
         } catch let error as ParseError {
             throw error
         } catch {
-            // File attribute errors fall through to Data(contentsOf:) which will
-            // produce its own path-bearing error below.
+            throw ParseError.io(path: url.path, reason: "could not inspect state file: \(error.localizedDescription)")
+        }
+        if fileSize < 0 {
+            throw ParseError.io(path: url.path, reason: "state file has an invalid negative size")
+        }
+        if fileSize > 50 * 1024 * 1024 {
+            throw ParseError.io(path: url.path, reason: "state file too large (\(fileSize) bytes)")
         }
         let data: Data
         do {

@@ -2,6 +2,21 @@
 
 All notable changes to mcrysden will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.18] — 2026-09-13
+
+### Fixed
+
+- **Band-surface energy overflow** — energy center/span are now computed in `Double` and validated against renderability bounds; projected geometry is checked for finiteness before CoreGraphics/`NSBezierPath` drawing or the C rasterizer. A crafted finite BXSF band grid spanning roughly ±3e38 eV no longer produces infinite scale/NaN geometry and an AppKit `NSGenericException` (which hung headless export); it fails cleanly during construction, while already-persisted malformed surfaces draw the empty/error state.
+- **Atomic animation overwrite** — GIF/MP4/APNG export now writes a sibling temporary file and installs it with `FileManager.replaceItem`, removing the delete-before-move data-loss window. APNG output streams chunks to disk instead of accumulating the entire encoded animation in `NSMutableData`.
+- **Frame-indexed input cap** — the 200 MB cap is enforced in `Parser.load(_:frameIndex:as:)` and `Parser.frameCount` as well as the single-frame loader, so `--frame`, the GUI scrubber, and animation export can no longer feed an oversized AXSF file directly to the C parser.
+- **Bounded-reader hardening** — `readCappedText` and BXSF text loading now surface I/O errors instead of mistaking them for EOF; project, state, and k-path size checks fail closed when file metadata is unavailable or is not a usable numeric size.
+- **C rasterizer hardening** — non-finite or huge coordinates/colors are rejected before any float-to-int conversion, zero-pixel spans and over-`Int` pixel counts are handled, denormal edges are skipped, and the unused per-row derivative variables were removed.
+- **Script `project-save` alias guard** — a script can no longer overwrite the structure file it loaded with a project JSON; the output is rejected with the same source-alias message used by the GUI Save Project path.
+
+### Tests
+
+- 122 focused tests: direct C rasterizer boundary coverage for non-finite/huge triangles and quads, the extreme finite energy-range view regression, and the oversized frame-indexed animation loader regression; animation format coverage now pre-creates destination files to exercise atomic replacement.
+
 ## [1.2.17] — 2026-08-15
 
 ### Fixed

@@ -59,6 +59,13 @@ struct BandSurface: Codable, Equatable {
     /// selection keys include it.
     var bandOffset: Int = 0
 
+    /// Renderability limits. Finite Float energies can still overflow a Float
+    /// range subtraction (for example -3e38...3e38), which previously produced
+    /// infinite scales and NaN AppKit geometry. Values above these limits are
+    /// deemed malformed rather than passed through to the 3D view.
+    static let maxRenderableEnergyMagnitude: Double = 1e12
+    static let maxRenderableEnergySpan: Double = 1e12
+
     private enum CodingKeys: String, CodingKey {
         case region, regionLabels, gridSize, sheets, fermiEnergy, spinCount,
              energyMin, energyMax, kBasis, bandOffset
@@ -114,6 +121,15 @@ struct BandSurface: Codable, Equatable {
         guard energyMin.isFinite, energyMax.isFinite, energyMin <= energyMax else {
             let ctx = DecodingError.Context(codingPath: c.codingPath,
                 debugDescription: "energyMin/energyMax non-finite or inverted")
+            throw DecodingError.dataCorrupted(ctx)
+        }
+        let energySpanD = Double(energyMax) - Double(energyMin)
+        guard energySpanD.isFinite,
+              energySpanD <= BandSurface.maxRenderableEnergySpan,
+              abs(Double(energyMin)) <= BandSurface.maxRenderableEnergyMagnitude,
+              abs(Double(energyMax)) <= BandSurface.maxRenderableEnergyMagnitude else {
+            let ctx = DecodingError.Context(codingPath: c.codingPath,
+                debugDescription: "energyMin/energyMax outside renderable bounds")
             throw DecodingError.dataCorrupted(ctx)
         }
         for sheet in sheets {
@@ -471,6 +487,14 @@ enum BandSurfaceBuilder {
         } else {
             energyMin = sampleMin
             energyMax = sampleMax
+        }
+        let energySpanD = Double(energyMax) - Double(energyMin)
+        guard energyMin.isFinite, energyMax.isFinite, energyMin <= energyMax,
+              energySpanD.isFinite,
+              energySpanD <= BandSurface.maxRenderableEnergySpan,
+              abs(Double(energyMin)) <= BandSurface.maxRenderableEnergyMagnitude,
+              abs(Double(energyMax)) <= BandSurface.maxRenderableEnergyMagnitude else {
+            throw BandSurfaceError.malformedBandStructure
         }
 
         // kBasis from the source cell when all 9 components are finite.

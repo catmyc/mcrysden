@@ -40,6 +40,9 @@ final class AnimationExportTests: XCTestCase {
         // GIF
         let gifURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("mcrysden_test_\(UUID().uuidString).gif")
+        // Pre-existing destination exercises the atomic replace path; the old
+        // remove-then-move implementation could lose this file on a failed move.
+        try Data("stale".utf8).write(to: gifURL)
         try AnimationExporter.export(frames: frames, camera: fixedCamera, size: size, fps: 10, format: .gif, to: gifURL)
         let gifData = try Data(contentsOf: gifURL)
         XCTAssertTrue(gifData.count > 6)
@@ -58,6 +61,7 @@ final class AnimationExportTests: XCTestCase {
         // APNG: contains acTL chunk and frame count == 3
         let apngURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("mcrysden_test_\(UUID().uuidString).apng")
+        try Data("stale".utf8).write(to: apngURL)
         try AnimationExporter.export(frames: frames, camera: fixedCamera, size: size, fps: 10, format: .apng, to: apngURL)
         let apngData = try Data(contentsOf: apngURL)
         XCTAssertTrue(apngData.count > 8)
@@ -85,6 +89,7 @@ final class AnimationExportTests: XCTestCase {
         // MP4: file starts with the ISO BMFF "ftyp" box (bytes 4..8)
         let mp4URL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("mcrysden_test_\(UUID().uuidString).mp4")
+        try Data("stale".utf8).write(to: mp4URL)
         do {
             try AnimationExporter.export(frames: frames, camera: fixedCamera, size: size, fps: 10, format: .mp4, to: mp4URL)
             let mp4Data = try Data(contentsOf: mp4URL)

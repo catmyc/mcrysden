@@ -1,5 +1,7 @@
 import AppKit
+import Darwin
 import simd
+import BandSurfaceRaster
 
 /// 3D band-surface plot. A parallelogram patch of reciprocal space is parameterized
 /// by (s,t) in [0,1]^2; each sheet's energy is sampled on a grid over that patch and
@@ -87,10 +89,10 @@ final class BandSurfaceView: NSView {
         // Background fill.
         if let bg = exportBackground {
             bg.setFill()
-            dirtyRect.fill()
+            bounds.fill()
         } else if !isExportTransparent {
             NSColor.white.setFill()
-            dirtyRect.fill()
+            bounds.fill()
         }
 
         let plot = plotRect()
@@ -99,8 +101,24 @@ final class BandSurfaceView: NSView {
         let gridSize = surface.gridSize
         let energyMin = surface.energyMin
         let energyMax = surface.energyMax
-        let energyCenter = (energyMin + energyMax) / 2
-        let energyRange = max(1e-6, energyMax - energyMin)
+        // Validate and normalize the energy window in Double. Float arithmetic
+        // overflows for otherwise finite band data, e.g. a BXSF band sampled
+        // near -3e38...+3e38; the resulting infinity then becomes NaN inside
+        // NSBezierPath ticks (or a NaN projection), which raises an AppKit
+        // exception instead of failing the draw.
+        let energyLoD = Double(energyMin)
+        let energyHiD = Double(energyMax)
+        let energySpanD = energyHiD - energyLoD
+        let maxRenderableEnergy = BandSurface.maxRenderableEnergyMagnitude
+        guard energySpanD.isFinite,
+              energySpanD <= BandSurface.maxRenderableEnergySpan,
+              abs(energyLoD) <= maxRenderableEnergy,
+              abs(energyHiD) <= maxRenderableEnergy else {
+            drawEmpty(dirtyRect, "Band surface energy range is invalid")
+            return
+        }
+        let energyCenter = Float(energyLoD + energySpanD / 2)
+        let energyRange = Float(max(1e-6, energySpanD))
 
         // Light direction (world space, normalized).
         let L = SIMD3<Float>(0.35, 0.45, 0.85)
@@ -263,6 +281,10 @@ final class BandSurfaceView: NSView {
         let scale = min(scaleX, scaleY)
         let cx = plot.midX - CGFloat((minSX + maxSX) / 2) * scale
         let cy = plot.midY - CGFloat((minSY + maxSY) / 2) * scale
+        guard scale.isFinite, scale > 0, cx.isFinite, cy.isFinite else {
+            drawEmpty(dirtyRect, "Band surface projection is invalid")
+            return
+        }
 
         // Model-space projection -> view coordinates. Larger screen y is nearer the
         // bottom of the (flipped) view.
@@ -276,7 +298,6 @@ final class BandSurfaceView: NSView {
             SIMD3<Float>(Lsafe + c - GC.x, h - GC.y, zBase),
             SIMD3<Float>(c - GC.x, h - GC.y, zBase)
         ]
-        let baseCorners = baseCorners3D.map { toScreen(vert($0)) }
 
         // --- Raster pipeline: z-buffer into a pixel buffer sized to the plot rect ---
         let W = max(1, Int(plot.width.rounded(.up)))
@@ -286,24 +307,11 @@ final class BandSurfaceView: NSView {
         let zbuf = UnsafeMutablePointer<Float>.allocate(capacity: W * H)
         defer { zbuf.deallocate() }
 
-        // Background color (premultiplied RGBA in 0...1).
-        let bgR: Float, bgG: Float, bgB: Float, bgA: Float
-        if let bg = exportBackground {
-            let rgb = bg.usingColorSpace(.deviceRGB) ?? bg
-            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
-            rgb.getRed(&r, green: &g, blue: &b, alpha: &a)
-            bgA = Float(a); bgR = Float(r) * bgA; bgG = Float(g) * bgA; bgB = Float(b) * bgA
-        } else if !isExportTransparent {
-            bgA = 1; bgR = 1; bgG = 1; bgB = 1
-        } else {
-            bgA = 0; bgR = 0; bgG = 0; bgB = 0
-        }
-        for i in 0..<(W * H) {
-            let o = i * 4
-            pix[o] = UInt8((bgR * 255).rounded()); pix[o + 1] = UInt8((bgG * 255).rounded())
-            pix[o + 2] = UInt8((bgB * 255).rounded()); pix[o + 3] = UInt8((bgA * 255).rounded())
-            zbuf[i] = -Float.greatestFiniteMagnitude
-        }
+        // The raster buffer starts fully transparent. The view background was
+        // painted above, so transparent pixels composite over the correct
+        // backdrop when the buffer image is blitted below.
+        memset(pix, 0, W * H * 4)
+        zbuf.initialize(repeating: -Float.greatestFiniteMagnitude, count: W * H)
 
         // Map a view-coordinate point to clamped buffer indices. The plot rect sits
         // inside the view; we offset by the plot origin so buffer (0,0) = plot's
@@ -318,10 +326,10 @@ final class BandSurfaceView: NSView {
         // Write a pixel with depth testing. `depth` larger = nearer. When the test
         // passes, blend the source over the existing pixel and, optionally, update
         // the depth buffer. Source colors arrive STRAIGHT (non-premultiplied):
-        // translucent primitives (base plane, Fermi plane) pass e.g. (1,0,0,0.15),
-        // so RGB is premultiplied by alpha here — the blend equation and the final
-        // premultipliedLast CGImage both require premultiplied values, otherwise
-        // transparent pixels carry invalid (too-bright) RGB.
+        // translucent lines pass e.g. (1,0,0,0.6), so RGB is premultiplied by
+        // alpha here — the blend equation and the final premultipliedLast CGImage
+        // both require premultiplied values, otherwise transparent pixels carry
+        // invalid (too-bright) RGB.
         func writePx(_ x: Int, _ y: Int, _ sr: Float, _ sg: Float, _ sb: Float, _ sa: Float,
                      _ depth: Float, _ writeDepth: Bool) {
             let i = idx(x, y)
@@ -366,107 +374,78 @@ final class BandSurfaceView: NSView {
             }
         }
 
-        // Barycentric rasterization of a flat-shaded triangle with linearly
-        // interpolated depth. The buffer is plot-local: vertices arrive in
-        // absolute view coordinates (as toScreen produces), so they are first
-        // offset by the plot origin — matching rasterLine/bufXY — otherwise the
-        // fill would be shifted and clipped relative to axes and outlines.
-        func rasterTri(_ a: NSPoint, _ da: Float, _ b: NSPoint, _ db: Float,
-                       _ c: NSPoint, _ dc: Float, _ sr: Float, _ sg: Float, _ sb: Float,
-                       _ sa: Float, _ writeDepth: Bool) {
-            let ax = a.x - originX, ay = a.y - originY
-            let bx = b.x - originX, by = b.y - originY
-            let cx = c.x - originX, cy = c.y - originY
-            let minX = max(0, Int(min(ax, bx, cx).rounded(.down)))
-            let maxX = min(W - 1, Int(max(ax, bx, cx).rounded(.up)))
-            let minY = max(0, Int(min(ay, by, cy).rounded(.down)))
-            let maxY = min(H - 1, Int(max(ay, by, cy).rounded(.up)))
-            guard minX <= maxX, minY <= maxY else { return }
-            let v0x = bx - ax, v0y = by - ay
-            let v1x = cx - ax, v1y = cy - ay
-            let d00 = v0x * v0x + v0y * v0y
-            let d01 = v0x * v1x + v0y * v1y
-            let d11 = v1x * v1x + v1y * v1y
-            let denom = d00 * d11 - d01 * d01
-            guard denom != 0 else { return }
-            let invDenom = 1 / denom
-            for y in minY...maxY {
-                for x in minX...maxX {
-                    let v2x = CGFloat(x) - ax, v2y = CGFloat(y) - ay
-                    let d20 = v2x * v0x + v2y * v0y
-                    let d21 = v2x * v1x + v2y * v1y
-                    let vv = (d11 * d20 - d01 * d21) * invDenom
-                    let ww = (d00 * d21 - d01 * d20) * invDenom
-                    let uu = 1 - vv - ww
-                    if uu < 0 || vv < 0 || ww < 0 { continue }
-                    let depth = Float(uu) * da + Float(vv) * db + Float(ww) * dc
-                    writePx(x, y, sr, sg, sb, sa, depth, writeDepth)
-                }
-            }
-        }
-
         // Convert a model-space projected vertex into its screen point + depth pair.
         func projToScreen(_ pr: ProjVert) -> (NSPoint, Float) {
             (toScreen(pr), pr.depth)
         }
 
-        // Rasterize a convex quadrilateral (parallelogram in screen space — the
-        // affine image of the model-space patch under orthographic projection)
-        // with bilinear depth. Rasterizing the quad as ONE primitive avoids the
-        // shared-diagonal double-blend of a two-triangle split: translucent
-        // planes (base, Fermi) would otherwise show a darker seam along the
-        // diagonal. Depth is bilinear over the parallelogram, which is exact for
-        // the affine screen mapping of a flat plane.
-        func rasterQuad(_ p0: NSPoint, _ d0: Float, _ p1: NSPoint, _ d1: Float,
-                        _ p2: NSPoint, _ d2: Float, _ p3: NSPoint, _ d3: Float,
-                        _ sr: Float, _ sg: Float, _ sb: Float, _ sa: Float,
-                        _ writeDepth: Bool) {
-            // Corners in parameter order (0,0), (1,0), (1,1), (0,1):
-            // p1 = p0 + U, p3 = p0 + V.
-            let x0 = p0.x - originX, y0 = p0.y - originY
-            let x1 = p1.x - originX, y1 = p1.y - originY
-            let x2 = p2.x - originX, y2 = p2.y - originY
-            let x3 = p3.x - originX, y3 = p3.y - originY
-            let ux = x1 - x0, uy = y1 - y0
-            let vx = x3 - x0, vy = y3 - y0
-            let denom = ux * vy - uy * vx
-            guard abs(denom) > 1e-6 else { return }   // edge-on: nothing to fill
-            let minX = max(0, Int(min(x0, x1, x2, x3).rounded(.down)))
-            let maxX = min(W - 1, Int(max(x0, x1, x2, x3).rounded(.up)))
-            let minY = max(0, Int(min(y0, y1, y2, y3).rounded(.down)))
-            let maxY = min(H - 1, Int(max(y0, y1, y2, y3).rounded(.up)))
-            guard minX <= maxX, minY <= maxY else { return }
-            let invDenom = 1 / denom
-            for y in minY...maxY {
-                for x in minX...maxX {
-                    let qx = CGFloat(x) - x0, qy = CGFloat(y) - y0
-                    let s = (qx * vy - qy * vx) * invDenom
-                    let t = (ux * qy - uy * qx) * invDenom
-                    guard s >= 0, t >= 0, s <= 1, t <= 1 else { continue }
-                    let w00 = Float((1 - s) * (1 - t))
-                    let w10 = Float(s * (1 - t))
-                    let w11 = Float(s * t)
-                    let w01 = Float((1 - s) * t)
-                    let depth = w00 * d0 + w10 * d1 + w11 * d2 + w01 * d3
-                    writePx(x, y, sr, sg, sb, sa, depth, writeDepth)
-                }
-            }
-        }
-
-        // 1. Base plane (floor): translucent gray quad, NO depth write. A band
-        //    fragment exactly at energyMin is coplanar with the floor; the
-        //    strict `>` depth test would hide it. Nothing lies behind the floor,
-        //    so it never needs to occlude anything.
+        // 1. Base plane (floor): translucent gray quad, drawn with CoreGraphics
+        //    BEHIND the raster buffer (which starts transparent). It never
+        //    writes depth and nothing lies behind the floor, so drawing it
+        //    first is equivalent to the old per-pixel rasterization, but a
+        //    path fill is GPU-backed and much faster. A band exactly at
+        //    energyMin is rasterized into the buffer above the fill, so it
+        //    wins the coplanar tie exactly as before.
         let b0 = projToScreen(vert(baseCorners3D[0]))
         let b1 = projToScreen(vert(baseCorners3D[1]))
         let b2 = projToScreen(vert(baseCorners3D[2]))
         let b3 = projToScreen(vert(baseCorners3D[3]))
-        rasterQuad(b0.0, b0.1, b1.0, b1.1, b2.0, b2.1, b3.0, b3.1, 0.9, 0.9, 0.9, 0.25, false)
+        func finitePoint(_ p: NSPoint) -> Bool { p.x.isFinite && p.y.isFinite }
+        guard finitePoint(b0.0), finitePoint(b1.0), finitePoint(b2.0), finitePoint(b3.0),
+              b0.1.isFinite, b1.1.isFinite, b2.1.isFinite, b3.1.isFinite else {
+            drawEmpty(dirtyRect, "Band surface projection is invalid")
+            return
+        }
 
-        // 2. Surface triangles (opaque, depth write).
+        // 2. Surface triangles (opaque, depth write). Project them once and
+        //    hand the flat-shaded triangles to the C rasterizer: a tight
+        //    native loop is several times faster than a Swift per-pixel
+        //    barycentric walk during mouse rotation. Validate every projected
+        //    coordinate before writing anything, so malformed geometry can
+        //    never reach NSBezierPath/the C rasterizer.
+        var triXYZ: [Float] = []
+        triXYZ.reserveCapacity(surfTris.count * 9)
+        var triRGB: [UInt8] = []
+        triRGB.reserveCapacity(surfTris.count * 3)
         for tri in surfTris {
             let a = projToScreen(tri.v.0), b = projToScreen(tri.v.1), c = projToScreen(tri.v.2)
-            rasterTri(a.0, a.1, b.0, b.1, c.0, c.1, tri.r, tri.g, tri.b, 1, true)
+            guard finitePoint(a.0), finitePoint(b.0), finitePoint(c.0),
+                  a.1.isFinite, b.1.isFinite, c.1.isFinite else {
+                drawEmpty(dirtyRect, "Band surface geometry is invalid")
+                return
+            }
+            triXYZ.append(contentsOf: [Float(a.0.x - originX), Float(a.0.y - originY), a.1,
+                                       Float(b.0.x - originX), Float(b.0.y - originY), b.1,
+                                       Float(c.0.x - originX), Float(c.0.y - originY), c.1])
+            triRGB.append(contentsOf: [UInt8(min(255, max(0, (tri.r * 255).rounded()))),
+                                       UInt8(min(255, max(0, (tri.g * 255).rounded()))),
+                                       UInt8(min(255, max(0, (tri.b * 255).rounded())))])
+        }
+
+        // 1. Base plane (floor): translucent gray quad, drawn with CoreGraphics
+        //    BEHIND the raster buffer (which starts transparent). It never
+        //    writes depth and nothing lies behind the floor, so drawing it
+        //    first is equivalent to the old per-pixel rasterization, but a
+        //    path fill is GPU-backed and much faster. A band exactly at
+        //    energyMin is rasterized into the buffer above the fill, so it
+        //    wins the coplanar tie exactly as before.
+        NSColor(calibratedWhite: 0.9, alpha: 0.25).setFill()
+        let basePath = NSBezierPath()
+        basePath.move(to: b0.0)
+        basePath.line(to: b1.0)
+        basePath.line(to: b2.0)
+        basePath.line(to: b3.0)
+        basePath.close()
+        basePath.fill()
+
+        if surfTris.isEmpty == false {
+            triXYZ.withUnsafeBufferPointer { xyz in
+                triRGB.withUnsafeBufferPointer { rgb in
+                    band_surface_raster_triangles_opaque(pix, zbuf, Int32(W), Int32(H),
+                                                         xyz.baseAddress, rgb.baseAddress,
+                                                         Int32(surfTris.count))
+                }
+            }
         }
 
         // 3. 3D axes (depth-tested lines from the origin along k₁, k₂ and E). Coplanar
@@ -501,8 +480,16 @@ final class BandSurfaceView: NSView {
                 return vert(SIMD3<Float>(gx - GC.x, gy - GC.y, zf))
             }
             let f = f3D.map { projToScreen($0) }
-            rasterQuad(f[0].0, f[0].1, f[1].0, f[1].1, f[2].0, f[2].1, f[3].0, f[3].1,
-                       1, 0, 0, 0.15, false)
+            let fermiXYZ: [Float] = [
+                Float(f[0].0.x - originX), Float(f[0].0.y - originY), f[0].1,
+                Float(f[1].0.x - originX), Float(f[1].0.y - originY), f[1].1,
+                Float(f[2].0.x - originX), Float(f[2].0.y - originY), f[2].1,
+                Float(f[3].0.x - originX), Float(f[3].0.y - originY), f[3].1
+            ]
+            fermiXYZ.withUnsafeBufferPointer { xyz in
+                band_surface_raster_quad_blended(pix, zbuf, Int32(W), Int32(H),
+                                                 xyz.baseAddress, 1, 0, 0, 0.15, 0)
+            }
             for (p, q) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[3]), (f[3], f[0])] {
                 rasterLine(p.0, q.0, p.1, q.1, 1, 0, 0, 0.6, false)
             }
@@ -558,7 +545,7 @@ final class BandSurfaceView: NSView {
         }
         let eTickCount = 5
         for i in 0...eTickCount {
-            let e = energyMin + (energyMax - energyMin) * Float(i) / Float(eTickCount)
+            let e = Float(energyLoD + energySpanD * Double(i) / Double(eTickCount))
             let lp = toScreen(vert(SIMD3<Float>(-GC.x, -GC.y, zEnergy(e))))
             let (x, y) = (lp.x, lp.y)
             let tick = NSBezierPath()

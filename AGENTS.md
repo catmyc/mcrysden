@@ -34,7 +34,7 @@ Primary agent sends the issues back to relevant subagent sessions (if any) for f
 
 ## Package Boundaries
 
-- `Package.swift` defines five targets: C parser/bond library `MolEnvParse`, executable `MolVisApp`, spglib façade `MolEnvSpglib`, vendored spglib 2.7.0 library `SpglibCore` (`Sources/SpglibCore/`), and test target `MolVisAppTests` (`Sources/MolVisAppTests/`, not `Tests/`).
+- `Package.swift` defines six targets: C parser/bond library `MolEnvParse`, band-surface C rasterizer `BandSurfaceRaster` (`Sources/BandSurfaceRaster/`), executable `MolVisApp`, spglib façade `MolEnvSpglib`, vendored spglib 2.7.0 library `SpglibCore` (`Sources/SpglibCore/`), and test target `MolVisAppTests` (`Sources/MolVisAppTests/`, not `Tests/`).
 - `Sources/MolVisApp/main.swift` explicitly installs the `NSApplicationDelegate`. Replacing it with a conventional `@main` delegate can leave the headless export path hanging because this SwiftPM executable has no nib or Info.plist.
 - `App.swift` owns CLI parsing, GUI/headless startup, export dispatch, the canonical format table, and the app version string. Add a force-format flag there and matching `ParseFormat` dispatch together.
 - `Parser.swift` is the main C-to-Swift bridge and also hosts Swift-only loaders. Copy `MolEnvScene` data into Swift values and free C allocations synchronously; do not retain C pointers across callbacks or async work. `Scene+Init.swift` is the intentional exception that calls the C bond heuristic when rebonding transformed structures.

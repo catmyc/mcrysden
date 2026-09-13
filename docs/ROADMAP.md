@@ -1,10 +1,18 @@
 # mcrysden roadmap
 
-Last updated: **2026-08-15 (v1.2.17: QE 7.x NSCF band-grid parsing hardened for repeated coordinate lists and adjacent signed k coordinates; 119 focused tests)**.
+Last updated: **2026-09-13 (v1.2.18: adversarial-review hardening for band-surface energy overflow, frame-indexed input caps, bounded-reader I/O errors, atomic animation writes, and C rasterizer bounds; 122 focused tests)**.
 
 Status legend: `[x]` done · `[~]` partly done · `[ ]` todo. "file" = an example input is on hand for immediate test.
 
-Current v1.2.17 verification: `--bands`/`--dos`/`--band-surf` CLI selection, mesh→path interpolation (shifted grids, TR-unfolded half meshes on x/y/z with full-vector negation and magnetization-aware TR gating, Cartesian-conversion rejection), QE fixed-width adjacent-signed k headers and repeated Cartesian/crystal k-list handling, band-surface construction (mesh-derived regions, 2D-plane validation, decode validation), z-buffered rendering (depth occlusion, Fermi domain, plot-local fills, premultiplied alpha, coplanar-band visibility, quad-rasterized translucent planes, WYSIWYG export orientation), state-file orientation persistence, and the existing band/DOS/bond regressions are covered by a passing 119-test suite.
+Current v1.2.18 verification: `--bands`/`--dos`/`--band-surf` CLI selection, mesh→path interpolation (shifted grids, TR-unfolded half meshes on x/y/z with full-vector negation and magnetization-aware TR gating, Cartesian-conversion rejection), QE fixed-width adjacent-signed k headers and repeated Cartesian/crystal k-list handling, band-surface construction (mesh-derived regions, 2D-plane validation, decode validation, renderable energy bounds), z-buffered rendering (depth occlusion, Fermi domain, plot-local fills, premultiplied alpha, coplanar-band visibility, quad-rasterized translucent planes, WYSIWYG export orientation), state-file orientation persistence, atomic GIF/MP4/APNG replacement, fail-closed input-size limits, and the existing band/DOS/bond regressions are covered by a passing 122-test suite.
+
+## v1.2.18 adversarial-review hardening
+- [x] Band-surface energy normalization uses `Double` bounds validation; finite huge (`±3e38 eV`) BXSF inputs no longer overflow the Float range and feed NaN geometry to AppKit. Projected points are checked before CoreGraphics/C rasterization.
+- [x] `Parser.load(_:frameIndex:as:)` and `Parser.frameCount` enforce the 200 MB input cap, closing the AXSF `--frame`/scrubber/animation-export bypass.
+- [x] `readCappedText` and BXSF text loading reveal read errors instead of truncating silently; project/state/k-path metadata checks fail closed.
+- [x] GIF/MP4/APNG animation export writes a sibling temporary file and installs it with atomic replacement; APNG streams chunks to disk rather than growing `NSMutableData` for the whole animation.
+- [x] The C band-surface rasterizer rejects non-finite/huge coordinates and colors before float-to-int conversion, enforces safe buffer arithmetic, and is covered by direct boundary tests.
+- [x] Script `project-save` rejects output paths aliasing the structure loaded by `load`/`plugins`.
 
 ## Implemented foundation (through v1.1.32)
 

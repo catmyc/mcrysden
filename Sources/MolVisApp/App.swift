@@ -1009,6 +1009,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                 }
                 final class Holder<T> { var value: T?; init() {} }
                 let currentScene = Holder<Scene>()
+                /// Source structure file backing `currentScene` (set by `load`),
+                /// used to reject `project-save` aliases the same way the GUI's
+                /// Save Project path does.
+                var currentSourceURL: URL?
                 var commands: [String: ([String]) throws -> String] = [:]
 
                 commands["echo"] = { args in
@@ -1065,8 +1069,10 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                     guard args.count == 1 else {
                         throw CLIError.invalid("load requires <input>")
                     }
-                    let scene = Scene(loaded: try Parser.load(resolve(args[0]), as: nil))
+                    let inURL = resolve(args[0])
+                    let scene = Scene(loaded: try Parser.load(inURL, as: nil))
                     currentScene.value = scene
+                    currentSourceURL = inURL
                     return "loaded \(args[0])"
                 }
 
@@ -1078,7 +1084,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
                         throw CLIError.invalid("project-save requires a loaded scene (run load first)")
                     }
                     let outURL = resolve(args[0])
-                    // TODO: alias guard needs source URL
+                    if let source = currentSourceURL, App.sameFile(outURL, source) {
+                        throw CLIError.invalid("project-save output aliases loaded source: \(source.path)")
+                    }
                     try ProjectStore.save(scene, to: outURL)
                     return "saved project -> \(outURL.path)"
                 }
@@ -1094,7 +1102,9 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
 
                 commands["plugins"] = { args in
                     if args.count == 1 {
-                        currentScene.value = Scene(loaded: try Parser.load(resolve(args[0]), as: nil))
+                        let inURL = resolve(args[0])
+                        currentScene.value = Scene(loaded: try Parser.load(inURL, as: nil))
+                        currentSourceURL = inURL
                     }
                     var out = PluginRegistry.listText()
                         .split(separator: "\n", omittingEmptySubsequences: false)
@@ -1983,7 +1993,7 @@ final class App: NSObject, NSApplicationDelegate, NSOpenSavePanelDelegate, NSMen
     }
 
     /// Current app version, surfaced in --help output.
-    static let appVersion = "1.2.17"
+    static let appVersion = "1.2.18"
 
     static func printHelp() {
         // Help text is GENERATED from the format table so flags, extensions and the

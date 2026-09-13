@@ -277,4 +277,28 @@ final class ParserRobustnessTests: XCTestCase {
         XCTAssertThrowsError(try Parser.load(fhiURL, as: .fhi),
                             "absurd FHI-aims nSpecies must be rejected")
     }
+
+    /// Adversarial-review regression: the frame-indexed loader used by the GUI
+    /// scrubber and animation export must enforce the same 200 MB input cap as
+    /// the single-frame loader instead of handing oversized AXSF files to the C
+    /// parser.
+    func testOversizedAnimationFramePathIsCapped() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcrysden-test-\(UUID().uuidString).axsf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: 201 * 1024 * 1024)
+        try handle.close()
+
+        XCTAssertEqual(Parser.frameCount(url), 0,
+                       "frameCount must not scan an oversized file")
+        XCTAssertThrowsError(try Parser.load(url, frameIndex: 0, as: nil)) { error in
+            guard case ParseError.io(_, let reason) = error else {
+                return XCTFail("expected ParseError.io, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("limit"),
+                          "reason should mention the size limit, got: \(reason)")
+        }
+    }
 }

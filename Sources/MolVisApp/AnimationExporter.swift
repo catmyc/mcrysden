@@ -17,6 +17,27 @@ enum AnimationExporter {
     static let maxDimension = 16_384
     static let maxTotalPixels = 16_000_000
 
+    /// Temporary output path in the destination's directory so replacement is
+    /// on the same filesystem (and therefore atomic). Writing the temp file in
+    /// `NSTemporaryDirectory()` and then moving/deleting across volumes turned
+    /// the previous "atomic" overwrite into a delete-then-move data-loss window.
+    fileprivate static func temporarySibling(of url: URL, tag: String) -> URL {
+        url.deletingLastPathComponent()
+            .appendingPathComponent("mcrysden-\(tag)-\(UUID().uuidString).\(url.pathExtension)")
+    }
+
+    /// Install a completed temporary file at `url`, preserving any existing
+    /// destination until replacement is guaranteed.
+    fileprivate static func installTemporaryFile(_ tempURL: URL, at url: URL) throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: url.path) {
+            try fm.replaceItem(at: url, withItemAt: tempURL, backupItemName: nil,
+                               options: [], resultingItemURL: nil)
+        } else {
+            try fm.moveItem(at: tempURL, to: url)
+        }
+    }
+
     static func export(frames: [Scene], camera: Camera?, size: CGSize, fps: Int,
                        format: AnimationExportFormat, to url: URL) throws {
         guard !frames.isEmpty else { throw AnimationExportError.noFrames }
@@ -46,9 +67,9 @@ enum AnimationExporter {
                                   to url: URL) throws {
         // Write to a temp file first; only on successful finalize do we atomically
         // move temp→final so a failed encode leaves any pre-existing file intact.
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("mcrysden-\(UUID().uuidString).\(url.pathExtension)")
+        let tempURL = temporarySibling(of: url, tag: "gif")
         var moved = false
-        defer { if !moved { try? FileManager.default.removeItem(at: tempURL) } }
+        defer { if moved == false { try? FileManager.default.removeItem(at: tempURL) } }
         guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, kUTTypeGIF, frames.count, nil) else {
             throw AnimationExportError.encodeFailed
         }
@@ -64,8 +85,7 @@ enum AnimationExporter {
             CGImageDestinationAddImage(dest, cg, frameProps as CFDictionary)
         }
         guard CGImageDestinationFinalize(dest) else { throw AnimationExportError.encodeFailed }
-        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
-        try FileManager.default.moveItem(at: tempURL, to: url)
+        try installTemporaryFile(tempURL, at: url)
         moved = true
     }
 
@@ -100,9 +120,9 @@ enum AnimationExporter {
         // atomically move temp→final so a failed encode leaves any pre-existing
         // file intact. (Previously the final URL was deleted BEFORE encoding,
         // which destroyed the original on mid-stream failure.)
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("mcrysden-\(UUID().uuidString).\(url.pathExtension)")
+        let tempURL = temporarySibling(of: url, tag: "mp4")
         var moved = false
-        defer { if !moved { try? FileManager.default.removeItem(at: tempURL) } }
+        defer { if moved == false { try? FileManager.default.removeItem(at: tempURL) } }
         let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mp4)
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -161,8 +181,7 @@ enum AnimationExporter {
         done.wait()
         if let finishError { throw AnimationExportError.avFoundationFailed(finishError) }
         guard writer.status == .completed else { throw AnimationExportError.encodeFailed }
-        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
-        try FileManager.default.moveItem(at: tempURL, to: url)
+        try installTemporaryFile(tempURL, at: url)
         moved = true
     }
 }
@@ -210,46 +229,68 @@ enum ApngWriter {
             throw AnimationExportError.invalidSize
         }
         let pixels = width.multipliedReportingOverflow(by: height)
-        guard !pixels.overflow, pixels.partialValue <= AnimationExporter.maxTotalPixels else {
+        guard pixels.overflow == false, pixels.partialValue <= AnimationExporter.maxTotalPixels else {
             throw AnimationExportError.invalidSize
         }
-        let data = NSMutableData()
-        data.append(ApngWriter.signature, length: 8)
-        // IHDR: 13-byte payload, serialized as big-endian bytes to avoid struct
-        // alignment padding corrupting the wire format.
-        writeChunk(data: data, type: "IHDR", bytes: ihdrBytes(width: width, height: height))
-        // acTL: num_frames, num_plays
-        writeChunk(data: data, type: "acTL", bytes: actlBytes(numFrames: UInt32(frameCount), numPlays: 0))
-        // APNG spec: fcTL and fdAT chunks share one sequence-number space.
-        // Frame 0: fcTL seq=0, then for frame i>=1: fcTL seq=2i-1, fdAT seq=2i.
-        // IDAT (first frame) carries no sequence number. Delay = 1/fps seconds.
-        let delayNum: UInt16 = 1
-        let delayDen = fps > 0 ? UInt16(fps) : 1
-        var seq = 0
-        for i in 0..<frameCount {
-            let isFirst = i == 0
-            let cg = try render(i)
-            let frameData = try frameRowData(cg: cg, width: width, height: height)
-            let deflated = deflate(frameData)
-            writeChunk(data: data, type: "fcTL", bytes: fcTLBytes(
-                sequenceNumber: UInt32(seq),
-                width: UInt32(width), height: UInt32(height),
-                xOffset: 0, yOffset: 0,
-                delayNum: delayNum, delayDen: delayDen,
-                disposeOp: 0, blendOp: 0))
-            seq += 1
-            // IDAT for first frame (carries no sequence number), fdAT for rest.
-            if isFirst {
-                deflated.withUnsafeBytes { writeChunk(data: data, type: "IDAT", ptr: $0) }
-            } else {
-                let fdat = fdATData(sequenceNumber: UInt32(seq), frameData: deflated)
-                fdat.withUnsafeBytes { writeChunk(data: data, type: "fdAT", ptr: $0) }
-                seq += 1
-            }
+        // Stream directly to a sibling temp file. The previous NSMutableData
+        // implementation accumulated the entire encoded animation in memory
+        // even though it rendered one frame at a time.
+        let tempURL = AnimationExporter.temporarySibling(of: url, tag: "apng")
+        var moved = false
+        defer { if moved == false { try? FileManager.default.removeItem(at: tempURL) } }
+        guard FileManager.default.createFile(atPath: tempURL.path, contents: nil) else {
+            throw AnimationExportError.encodeFailed
         }
-        let empty = UnsafeRawBufferPointer(start: nil, count: 0)
-        writeChunk(data: data, type: "IEND", ptr: empty)
-        try data.write(to: url, options: .atomic)
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forWritingTo: tempURL)
+        } catch {
+            throw AnimationExportError.encodeFailed
+        }
+        do {
+            try handle.write(contentsOf: Data(ApngWriter.signature))
+            // IHDR: 13-byte payload, serialized as big-endian bytes to avoid struct
+            // alignment padding corrupting the wire format.
+            try writeChunk(to: handle, type: "IHDR",
+                           data: Data(ihdrBytes(width: width, height: height)))
+            // acTL: num_frames, num_plays
+            try writeChunk(to: handle, type: "acTL",
+                           data: Data(actlBytes(numFrames: UInt32(frameCount), numPlays: 0)))
+            // APNG spec: fcTL and fdAT chunks share one sequence-number space.
+            // Frame 0: fcTL seq=0, then for frame i>=1: fcTL seq=2i-1, fdAT seq=2i.
+            // IDAT (first frame) carries no sequence number. Delay = 1/fps seconds.
+            let delayNum: UInt16 = 1
+            let delayDen = fps > 0 ? UInt16(fps) : 1
+            var seq = 0
+            for i in 0..<frameCount {
+                let isFirst = i == 0
+                let cg = try render(i)
+                let frameData = try frameRowData(cg: cg, width: width, height: height)
+                let deflated = deflate(frameData)
+                try writeChunk(to: handle, type: "fcTL", data: Data(fcTLBytes(
+                    sequenceNumber: UInt32(seq),
+                    width: UInt32(width), height: UInt32(height),
+                    xOffset: 0, yOffset: 0,
+                    delayNum: delayNum, delayDen: delayDen,
+                    disposeOp: 0, blendOp: 0)))
+                seq += 1
+                // IDAT for first frame (carries no sequence number), fdAT for rest.
+                if isFirst {
+                    try writeChunk(to: handle, type: "IDAT", data: deflated)
+                } else {
+                    let fdat = fdATData(sequenceNumber: UInt32(seq), frameData: deflated)
+                    try writeChunk(to: handle, type: "fdAT", data: fdat)
+                    seq += 1
+                }
+            }
+            try writeChunk(to: handle, type: "IEND", data: Data())
+            try handle.close()
+            try AnimationExporter.installTemporaryFile(tempURL, at: url)
+            moved = true
+        } catch {
+            try? handle.close()
+            throw error
+        }
     }
 
     private static func frameRowData(cg: CGImage, width: Int, height: Int) throws -> Data {
@@ -272,29 +313,21 @@ enum ApngWriter {
         return result
     }
 
-    private static func writeChunk(data: NSMutableData, type: String, bytes: [UInt8]) {
-        bytes.withUnsafeBytes { writeChunk(data: data, type: type, ptr: $0) }
-    }
-
-    private static func writeChunk(data: NSMutableData, type: String, ptr: UnsafeRawBufferPointer) {
-        let count = ptr.count
-        var length = UInt32(count).bigEndian
-        data.append(&length, length: 4)
-        let typeBytes = Array(type.utf8)
-        data.append(typeBytes, length: 4)
-        if let base = ptr.baseAddress, count > 0 {
-            data.append(base, length: count)
+    private static func writeChunk(to handle: FileHandle, type: String, data: Data) throws {
+        let typeBytes = Data(type.utf8)
+        var length = UInt32(data.count).bigEndian
+        try handle.write(contentsOf: Data(bytes: &length, count: 4))
+        try handle.write(contentsOf: typeBytes)
+        if data.isEmpty == false {
+            try handle.write(contentsOf: data)
         }
-        // CRC over type + data
-        var crcInput = Data()
-        crcInput.append(contentsOf: typeBytes)
-        if let base = ptr.baseAddress, count > 0 {
-            base.withMemoryRebound(to: UInt8.self, capacity: count) { bound in
-                crcInput.append(bound, count: count)
-            }
-        }
-        var crcBE = crc32(crcInput).bigEndian
-        data.append(&crcBE, length: 4)
+        // CRC over type + data, updated incrementally so large payloads are
+        // never copied into a second NSMutableData/Data buffer.
+        var crc = crc32Continue(0xFFFFFFFF, typeBytes)
+        crc = crc32Continue(crc, data)
+        crc ^= 0xFFFFFFFF
+        var crcBE = crc.bigEndian
+        try handle.write(contentsOf: Data(bytes: &crcBE, count: 4))
     }
 
     // MARK: - Chunk payload serializers (big-endian wire bytes)
@@ -378,12 +411,12 @@ enum ApngWriter {
         }
     }()
 
-    private static func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFFFFFF
+    private static func crc32Continue(_ seed: UInt32, _ data: Data) -> UInt32 {
+        var crc = seed
         for byte in data {
             let idx = Int((crc ^ UInt32(byte)) & 0xFF)
             crc = crcTable[idx] ^ (crc >> 8)
         }
-        return crc ^ 0xFFFFFFFF
+        return crc
     }
 }

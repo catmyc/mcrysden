@@ -532,8 +532,25 @@ enum KPathImport {
     // MARK: - Token helpers
 
     private static func checkFileWithinLimits(_ url: URL) throws {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attrs[.size] as? Int64 else { return }
+        // Fail closed: a file whose metadata/size cannot be established is not
+        // read unbounded. This also avoids silently skipping the cap when the
+        // size bridges to an unexpected type.
+        let attrs: [FileAttributeKey: Any]
+        do {
+            attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        } catch {
+            throw KPathImportError.malformed(
+                path: url.path,
+                reason: "could not inspect file size: \(error.localizedDescription)")
+        }
+        guard let number = attrs[.size] as? NSNumber else {
+            throw KPathImportError.malformed(path: url.path,
+                                             reason: "could not determine file size")
+        }
+        let size = number.int64Value
+        if size < 0 {
+            throw KPathImportError.malformed(path: url.path, reason: "invalid negative file size")
+        }
         if size > Int64(maxFileBytes) {
             throw KPathImportError.malformed(path: url.path, reason: "file too large")
         }

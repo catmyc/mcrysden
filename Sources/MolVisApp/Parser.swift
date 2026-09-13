@@ -55,21 +55,48 @@ internal func gunzipData(_ url: URL) throws -> Data {
     return data
 }
 
-/// Read a text file with a size cap, mirroring gunzipData's 200 MB bound.
-/// Pre-checks the on-disk size, then reads through FileHandle so a malformed
-/// file cannot allocate unbounded memory before the cap is detected.
-internal func readCappedText(_ url: URL, cap: Int = 200 * 1024 * 1024) throws -> String {
-    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-    if let fileSize = attributes[.size] as? Int, fileSize > cap {
+/// Fail-closed size validation used by every parser entry point, including the
+/// frame-indexed overload and frame counting. The previous cap lived only in
+/// the single-frame `load`, so the GUI scrubber, animation export, and `--frame`
+/// could feed an arbitrarily large AXSF file directly to the C parser.
+internal func validateInputSize(_ url: URL, cap: Int = 200 * 1024 * 1024) throws {
+    let attributes: [FileAttributeKey: Any]
+    do {
+        attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    } catch {
+        throw ParseError.io(path: url.path, reason: "could not inspect file size: \(error.localizedDescription)")
+    }
+    guard let number = attributes[.size] as? NSNumber else {
+        throw ParseError.io(path: url.path, reason: "could not determine file size")
+    }
+    let fileSize = number.int64Value
+    if fileSize < 0 {
+        throw ParseError.io(path: url.path, reason: "invalid negative file size \(fileSize)")
+    }
+    if fileSize > Int64(cap) {
         throw ParseError.io(path: url.path, reason: "file size \(fileSize) exceeds \(cap) byte limit")
     }
+}
+
+/// Read a text file with a size cap, mirroring gunzipData's 200 MB bound.
+/// Pre-checks the on-disk size, then reads through FileHandle so a malformed
+/// file cannot allocate unbounded memory before the cap is detected. Read
+/// errors are surfaced instead of being mistaken for EOF.
+internal func readCappedText(_ url: URL, cap: Int = 200 * 1024 * 1024) throws -> String {
+    try validateInputSize(url, cap: cap)
     guard let handle = try? FileHandle(forReadingFrom: url) else {
         throw ParseError.io(path: url.path, reason: "could not open file for reading")
     }
     defer { try? handle.close() }
     var data = Data()
     while true {
-        guard let chunk = try? handle.read(upToCount: 8192), !chunk.isEmpty else { break }
+        let chunk: Data
+        do {
+            guard let read = try handle.read(upToCount: 8192), read.isEmpty == false else { break }
+            chunk = read
+        } catch {
+            throw ParseError.io(path: url.path, reason: "read failed: \(error.localizedDescription)")
+        }
         data.append(chunk)
         if data.count > cap {
             throw ParseError.io(path: url.path, reason: "file exceeds \(cap) byte limit")
@@ -285,10 +312,7 @@ enum Parser {
         // dispatched to C parsers with no size cap, so reject oversized files
         // here before any parser runs. Mirrors readCappedText's bound (the gzip
         // XSF path also caps via gunzipData; redundant-but-harmless there).
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        if let size = attributes[.size] as? Int, size > 200 * 1024 * 1024 {
-            throw ParseError.io(path: url.path, reason: "file size \(size) exceeds 200 MB limit")
-        }
+        try validateInputSize(url)
         let effective = format ?? ParseFormat.from(url: url)
         guard let effective else {
             throw ParseError.io(path: url.path, reason: "unknown extension \(url.pathExtension)")
@@ -462,6 +486,10 @@ enum Parser {
     /// the playback controls at all. `format` forces the parser when the
     /// extension is ambiguous or was renamed.
     static func frameCount(_ url: URL, as format: ParseFormat? = nil) -> Int {
+        // Non-throwing API: treat an oversized or unreadable file as "not
+        // animated" here. The actual load path calls validateInputSize again and
+        // reports the precise error.
+        guard (try? validateInputSize(url)) != nil else { return 0 }
         let cPath = url.path.cString(using: .utf8)!
         let effective = format ?? ParseFormat.from(url: url)
         switch effective {
@@ -478,6 +506,7 @@ enum Parser {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ParseError.io(path: url.path, reason: "file not found")
         }
+        try validateInputSize(url)
         let cPath = url.path.cString(using: .utf8)!
         // Choose the per-format frame loader honoring a forced format. AXSF is
         // the original animated format; QE .pwo output adds ionic steps as
